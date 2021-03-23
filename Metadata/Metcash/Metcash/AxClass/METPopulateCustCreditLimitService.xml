@@ -9,6 +9,7 @@
 /// </summary>
 public class METPopulateCustCreditLimitService extends SysOperationServiceBase
 {
+    
 }
 ]]></Declaration>
 		<Methods>
@@ -19,24 +20,76 @@ public class METPopulateCustCreditLimitService extends SysOperationServiceBase
     /// MPJ_2864_CreditLimitBalance 03/11/2021
     /// Checks if run in batch or not.
     /// </summary>
-    public void processOperation()
+    /// <param name = "_dataContract">Data contract</param>
+    public void processOperation(METPopulateCustCreditLimitContract _dataContract)
     {
-        BatchHeader                        batchHeader;
-        SysOperationServiceController      controller;
+        BatchHeader                             batchHeader;
+        SysOperationServiceController           controller;
+        METPopulateCustCreditLimitContract      dataContract;
+        Query                                   q;
+        QueryBuildDataSource                    qbds;
+        QueryRun                                queryRun;
+        CustTable                               custTable;
+        int                                     totalCount, bundleSize, i, j;
+        CustAccount                             fromCustomer,toCustomer;
+        List                                    custAccounts;
+        
+
+        totalCount = this.custRecordCount();
+        bundleSize = real2int(roundUp((totalCount / _dataContract.getNumOfTasks()), 1.0));
+
+        q          = new Query();
+        qbds       = q.addDataSource(TableNum(CustTable));
+        queryRun   = new QueryRun(q);
+
+        custAccounts = new List(Types::String);
 
         try
         {
             if (this.isExecutingInBatch())
             {
-                if (!batchHeader)
+                while (queryRun.next())
                 {
-                    batchHeader = this.getCurrentBatchHeader();
-                }
+                    custTable = queryRun.get(tablenum(CustTable), 1);
+                    
+                    if (custTable)
+                    {
+                        i++;
+                        j++;
+                        custAccounts.addEnd(custTable.AccountNum);
 
-                // create new controller for the runtime task
-                controller = new SysOperationServiceController(classStr(METPopulateCustCreditLimitService), methodStr(METPopulateCustCreditLimitService, run));
-                
-                batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
+                        if (i == 1)
+                        {
+                            fromCustomer = custTable.AccountNum;
+                        }
+                        
+                        if (i >= bundleSize || j == totalCount)
+                        {
+                            toCustomer = custTable.AccountNum;
+
+                            if (!batchHeader)
+                            {
+                                batchHeader = this.getCurrentBatchHeader();
+                            }
+
+                            // create new controller for the runtime task
+                            controller = new SysOperationServiceController(classStr(METPopulateCustCreditLimitSubTaskService), methodStr(METPopulateCustCreditLimitSubTaskService, processSubTask));
+                            controller.parmDialogCaption(strFmt("@MET:CustCreditLimitServiceSubTaskDesc", fromCustomer, toCustomer));
+
+                            // grab contract instance from controller
+                            dataContract = controller.getDataContractObject() as METPopulateCustCreditLimitContract;
+                            dataContract.getCustAccountList(custAccounts);
+                            dataContract.getNumOfTasks(_dataContract.getNumOfTasks());
+                            
+                            // create subTask according to controller instance and header recid
+                            batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
+
+                            // Resets counts. int j is not reset due to spill over of recrods at the end
+                            custAccounts = new List(Types::String);
+                            i = 0;
+                        }
+                    }
+                }
             }
             else
             {
@@ -74,14 +127,17 @@ public class METPopulateCustCreditLimitService extends SysOperationServiceBase
         AmountMST           balance;
 
         while select CreditMax, AccountNum from custTable
+            outer join metCustTable
+                where metCustTable.AccountNum == custTable.AccountNum
+            outer join metCustCreditLimit
+                where metCustCreditLimit.AccountNum == custTable.AccountNum
         {
-            metCustCreditLimit = metCustCreditLimit::find(custTable.AccountNum, true);
-            metCustTable       = metCustTable::find(custTable.AccountNum);
-            balance            = this.getBalance(custTable.AccountNum);
+            balance = this.getBalance(custTable.AccountNum);
 
             if (metCustCreditLimit)
             {
                 ttsbegin;
+                metCustCreditLimit.selectForUpdate(true);
                 metCustCreditLimit.FrozenBalance    = metCustTable.FrozenBalance;
                 metCustCreditLimit.ArrearsFlag      = metCustTable.ArrearsFlag;
                 metCustCreditLimit.Balance          = balance;
@@ -114,12 +170,34 @@ public class METPopulateCustCreditLimitService extends SysOperationServiceBase
     /// <returns>total amount mst</returns>
     public AmountMST getBalance(AccountNum _AccountNum)
     {
-        CustTrans custTrans;
+        CustTrans   custTrans;
+        SalesTable  salesTable;
 
         select sum(AmountMST) from custTrans
             where custTrans.AccountNum == _AccountNum;
 
-        return custTrans.AmountMST;
+        select sum(Estimate) from salesTable
+            where salesTable.custAccount == _AccountNum;
+
+        return custTrans.AmountMST + salesTable.Estimate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>custRecordCount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_2864_CreditLimitBalance - kscerri - 22/03/2021
+    /// </summary>
+    /// <returns>total row count</returns>
+    public int custRecordCount()
+    {
+        CustTable custTable;
+
+        select count(RecId) from custTable;
+
+        return custTable.RecId;
     }
 
 ]]></Source>
