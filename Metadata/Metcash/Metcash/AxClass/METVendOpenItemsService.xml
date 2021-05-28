@@ -1,0 +1,250 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METVendOpenItemsService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_5046_MetpayInterfaces 05/05/2021
+/// Service class to run the update and creation of new record
+/// </summary>
+public class METVendOpenItemsService extends SysOperationServiceBase
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_5046_MetpayInterfaces 05/05/2021
+    /// Checks if run in batch or not.
+    /// </summary>
+    /// <param name = "_dataContract">Data contract</param>
+    public void processOperation(METVendOpenItemsContract _dataContract)
+    {
+        BatchHeader                             batchHeader;
+        SysOperationServiceController           controller;
+        METVendOpenItemsContract                dataContract;
+        Query                                   q;
+        QueryBuildDataSource                    qbds;
+        QueryRun                                queryRun;
+        VendTransOpen                           vendTransOpen;
+        int                                     totalCount, bundleSize, i, j;
+        RecId                                   fromRecId,toRecId;
+        List                                    recList;
+        
+
+        totalCount = this.vendTransOpenRecCount();
+        bundleSize = real2int(roundUp((totalCount / _dataContract.getNumOfTasks()), 1.0));
+
+        q          = new Query();
+        qbds       = q.addDataSource(TableNum(VendTransOpen));        
+        queryRun   = new QueryRun(q);
+        queryRun.allowCrossCompany(true);
+
+        recList = new List(Types::Int64);
+
+        try
+        {
+            if (this.isExecutingInBatch())
+            {
+                while (queryRun.next())
+                {    
+                    vendTransOpen = queryRun.get(tablenum(VendTransOpen), 1);
+                    
+                    if (vendTransOpen)
+                    {
+                        i++;
+                        j++;
+                        recList.addEnd(vendTransOpen.RecId);
+
+                        if (i == 1)
+                        {
+                            fromRecId = vendTransOpen.RecId;
+                        }
+                        
+                        if (i >= bundleSize || j == totalCount)
+                        {
+                            toRecId = vendTransOpen.RecId;
+
+                            if (!batchHeader)
+                            {
+                                batchHeader = this.getCurrentBatchHeader();
+                            }
+
+                            // create new controller for the runtime task
+                            controller = new SysOperationServiceController(classStr(METVendOpenItemsSubTaskService), methodStr(METVendOpenItemsSubTaskService, processSubTask));
+                            controller.parmDialogCaption(strFmt("@MET:VendOpenItemsServiceSubTaskDesc", fromRecId, toRecId));
+
+                            // grab contract instance from controller
+                            dataContract = controller.getDataContractObject() as METVendOpenItemsContract;
+                            dataContract.getrecList(recList);
+                            dataContract.getNumOfTasks(_dataContract.getNumOfTasks());
+                            
+                            // create subTask according to controller instance and header recid
+                            batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
+
+                            // Resets counts. int j is not reset due to spill over of recrods at the end
+                            recList = new List(Types::Int64);
+                            i = 0;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                this.run();
+            }
+
+            if(batchHeader)
+            {
+                // save the batchheader if it has been created
+                batchHeader.save();
+            }
+            
+        }
+        catch
+        {
+            info ("@MET:VendOpenItemsErrorHandler");
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_5046_MetpayInterfaces 05/05/2021
+    /// Creates / updates the records
+    /// </summary>
+    public void run()
+    {
+        VendOnHoldHistory                   onHoldHistory;
+        VendTransOpen                       vendTransOpen;
+        VendTrans                           vendTrans;
+        VendTable                           vendTable;
+        METVendOpenItems                    metVendOpenItems;
+        TaxTrans                            taxTrans;
+
+
+        while select crosscompany VendTransOpen
+                join vendTrans
+                    where vendTrans.Recid == vendTransOpen.RefRecID
+                join vendTable
+                    where vendTable.AccountNum == vendTransOpen.AccountNum
+                join onHoldHistory
+                    where onHoldHistory.VendAccount == VendTable.AccountNum
+                outer join taxTrans
+                    where taxTrans.Voucher      == vendTrans.Voucher
+                        && taxTrans.TransDate   == vendTrans.TransDate
+                        && taxTrans.TaxCode     == METConstants::taxCode
+                        && VendTrans.approved   == NoYes::Yes
+                        && VendTrans.PaymMode   == METConstants::payMode
+                        && onHoldHistory.onHold != CustVendorBlocked::All
+                        && onHoldHistory.onHold != CustVendorBlocked::Payment
+        {
+            
+            if (VendTransOpen)
+            {
+                metVendOpenItems = metVendOpenItems.find(vendTransOpen.RefRecID,
+                                                        vendTransOpen.AccountNum,
+                                                        vendTrans.Invoice);
+                if (metVendOpenItems)
+                {
+                    this.updateRecord(metVendOpenItems, vendTransOpen, vendTrans, taxTrans);
+                }
+                else
+                {
+                    this.insertRecord(metVendOpenItems, vendTransOpen, vendTrans, taxTrans);
+                }
+            }            
+        }      
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>vendTransOpenRecCount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_5046_MetpayInterfaces 05/05/2021
+    /// </summary>
+    /// <returns>total row count</returns>
+    public counter vendTransOpenRecCount()
+    {
+        VendTransOpen vendTransOpen;
+
+        select crosscompany count(RecId) from vendTransOpen;
+
+        return int642int(vendTransOpen.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_5046_MetpayInterfaces 05/05/2021
+    /// Inserts a record in the table
+    /// </summary>
+    /// <param name = "_metVendOpenItems">metVendOpenItems table</param>
+    /// <param name = "_vendTransOpen">vendtransopen table</param>
+    /// <param name = "_vendTrans">vendtrans table</param>
+    /// <param name = "_taxTrans">taxtrans table</param>
+    public void insertRecord(METVendOpenItems _metVendOpenItems, VendTransOpen _vendTransOpen, VendTrans _vendTrans, TaxTrans _taxTrans)
+    {
+        ttsbegin;
+        _metVendOpenItems.selectForUpdate(true);
+        _metVendOpenItems.AccountNum             = _vendTransOpen.AccountNum;
+        _metVendOpenItems.AmountCur              = _vendTransOpen.AmountCur;
+        _metVendOpenItems.DueDate                = _vendTransOpen.DueDate;
+        _metVendOpenItems.Invoice                = _vendTrans.Invoice;
+        _metVendOpenItems.JournalName            = LedgerJournalTable::find(_vendTrans.JournalNum).JournalName;
+        _metVendOpenItems.DefaultDimension       = _vendTrans.DefaultDimension;
+        _metVendOpenItems.GSTAmount              = _taxTrans.SourceTaxAmountCur;
+        _metVendOpenItems.Currency               = _vendTrans.CurrencyCode;
+        _metVendOpenItems.DocumentDate           = _vendTrans.DocumentDate;
+        _metVendOpenItems.InvoiceDate            = _vendTransOpen.TransDate;
+        _metVendOpenItems.VendTransOpenRecId     = _vendTransOpen.RecId;
+        _metVendOpenItems.AckStatus              = METAckStatus::Blank;        
+        _metVendOpenItems.RecordStatus           = METRecordStatus::New;
+        _metVendOpenItems.update();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_5046_MetpayInterfaces 05/05/2021
+    /// Updates a record in the table
+    /// </summary>
+    /// <param name = "_metVendOpenItems">metVendOpenItems table</param>
+    /// <param name = "_vendTransOpen">vendtransopen table</param>
+    /// <param name = "_vendTrans">vendtrans table</param>
+    /// <param name = "_taxTrans">taxtrans table</param>
+    public void updateRecord(METVendOpenItems _metVendOpenItems, VendTransOpen _vendTransOpen, VendTrans _vendTrans, TaxTrans _taxTrans)
+    {
+        _metVendOpenItems.AmountCur              = _vendTransOpen.AmountCur;
+        _metVendOpenItems.DueDate                = _vendTransOpen.DueDate;
+        _metVendOpenItems.JournalName            = LedgerJournalTable::find(_vendTrans.JournalNum).JournalName;
+        _metVendOpenItems.DefaultDimension       = _vendTrans.DefaultDimension;
+        _metVendOpenItems.GSTAmount              = _taxTrans.SourceTaxAmountCur;
+        _metVendOpenItems.Currency               = _vendTrans.CurrencyCode;
+        _metVendOpenItems.DocumentDate           = _vendTrans.DocumentDate;
+        _metVendOpenItems.InvoiceDate            = _vendTransOpen.TransDate;
+        _metVendOpenItems.AckStatus              = METAckStatus::Blank;        
+        _metVendOpenItems.RecordStatus           = METRecordStatus::New;
+        _metVendOpenItems.insert();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
