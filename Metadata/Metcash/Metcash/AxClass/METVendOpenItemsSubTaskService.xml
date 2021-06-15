@@ -11,6 +11,8 @@ public class METVendOpenItemsSubTaskService
 {
     str                                 errorMessage;
     str                                 infologMessage;
+
+
 }
 ]]></Declaration>
 		<Methods>
@@ -33,7 +35,7 @@ public class METVendOpenItemsSubTaskService
         List                                recList                   = new List(Types::Int64);
         ListEnumerator                      enumerator;
         
-
+        
 
         try
         {
@@ -42,24 +44,45 @@ public class METVendOpenItemsSubTaskService
 
             while (enumerator.moveNext())
             {
-                select firstonly crosscompany VendTransOpen
-                where VendTransOpen.RecId == enumerator.current()
-                join vendTrans
+                
+                select firstonly crosscompany 
+                    RecId,
+                    RefRecID,
+                    AccountNum,
+                    AmountCur,
+                    DueDate,
+                    TransDate,
+                    DataAreaId
+                from VendTransOpen
+                    where VendTransOpen.RecId == enumerator.current()
+                join Invoice,
+                    approved,
+                    PaymMode,
+                    CurrencyCode,
+                    DocumentDate,
+                    JournalNum,
+                    DocumentNum,
+                    RecId,
+                    TransDate
+                from vendTrans
                     where vendTrans.Recid == vendTransOpen.RefRecID
-                exists join vendTable
+                join AccountNum
+                from vendTable
                     where vendTable.AccountNum == vendTransOpen.AccountNum
-                exists join onHoldHistory
+                join onHoldHistory
                     where onHoldHistory.VendAccount == VendTable.AccountNum
-                outer join taxTrans
+                outer join Voucher,
+                    TransDate
+                from taxTrans
                     where taxTrans.Voucher      == vendTrans.Voucher
                         && taxTrans.TransDate   == vendTrans.TransDate
-                        && taxTrans.TaxCode     == METConstants::taxCode
+                        //&& taxTrans.TaxCode     == 'GST'
                         && VendTrans.approved   == NoYes::Yes
                         && VendTrans.PaymMode   == METConstants::payMode
                         && onHoldHistory.onHold != CustVendorBlocked::All
                         && onHoldHistory.onHold != CustVendorBlocked::Payment;
             
-                if (VendTransOpen)
+                if (VendTransOpen && VendTrans && vendTable && onHoldHistory)
                 {
                     metVendOpenItems = metVendOpenItems.find(vendTransOpen.RefRecID,
                                                         vendTransOpen.AccountNum,
@@ -82,11 +105,7 @@ public class METVendOpenItemsSubTaskService
             //If an error occurs, check if log header is available
             this.getInfologMessage();
             System.Exception ex = CLRInterop::getLastException();
-            errorMessage += ex.Message + ex.ToString();
-            if (metVendOpenItems)
-            {
-                this.updateLogLine(errorMessage, infologMessage, metVendOpenItems);
-            }
+            errorMessage += ex.Message + ex.ToString();            
             info(errorMessage + infologMessage);
             
 
@@ -124,6 +143,49 @@ public class METVendOpenItemsSubTaskService
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>initFromVendorTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_5046_MetpayInterfaces 11/06/2021
+    /// Setting the fields for update/insert
+    /// </summary>
+    /// <param name = "_metVendOpenItems">metVendOpenItems table</param>
+    /// <param name = "_vendTransOpen">vendtransopen table</param>
+    /// <param name = "_vendTrans">vendtrans table</param>
+    /// <param name = "_taxTrans">taxtrans table</param>
+    private void initFromVendorTransaction(METVendOpenItems _metVendOpenItems, VendTransOpen _vendTransOpen, VendTrans _vendTrans, TaxTrans _taxTrans)
+    {
+        LedgerJournalTrans  ledgerJournalTrans;        
+        
+        _metVendOpenItems.AmountCur              = _vendTransOpen.AmountCur;
+        _metVendOpenItems.DueDate                = _vendTransOpen.DueDate;        
+        _metVendOpenItems.JournalName            = LedgerJournalTable::find(_vendTrans.JournalNum).JournalName;
+        _metVendOpenItems.DefaultDimension       = _vendTrans.DefaultDimension;
+        _metVendOpenItems.GSTAmount              = this.calculateGSTAmount(_vendTrans);
+        _metVendOpenItems.Currency               = _vendTrans.CurrencyCode;
+        _metVendOpenItems.DocumentDate           = _vendTrans.DocumentDate;
+        _metVendOpenItems.InvoiceDate            = _vendTransOpen.TransDate;        
+        _metVendOpenItems.AckStatus              = METAckStatus::Blank;
+        _metVendOpenItems.RecordStatus           = METRecordStatus::New;
+        _metVendOpenItems.JournalType            = LedgerJournalTable::find(_vendTrans.JournalNum).JournalType;
+        _metVendOpenItems.Document               = _vendTrans.DocumentNum;
+        _metVendOpenItems.CompanyCode            = _vendTransOpen.DataAreaId;
+        _metVendOpenItems.JournalBatchNumber     = _vendTrans.JournalNum;
+
+        select Txt,OffsetTxt from ledgerJournalTrans
+            where ledgerJournalTrans.TransactionType == LedgerTransType::Vend
+            && ledgerJournalTrans.JournalNum    == _vendTrans.JournalNum
+            && ledgerJournalTrans.Voucher       == _vendTrans.Voucher
+            && ledgerJournalTrans.VendTransId   == _vendTrans.RecId;
+
+        _metVendOpenItems.Description            = ledgerJournalTrans.Txt;
+        _metVendOpenItems.OffsetTransactionText  = ledgerJournalTrans.OffsetTxt;          
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>insertRecord</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -135,22 +197,14 @@ public class METVendOpenItemsSubTaskService
     /// <param name = "_vendTrans">vendtrans table</param>
     /// <param name = "_taxTrans">taxtrans table</param>
     public void insertRecord(METVendOpenItems _metVendOpenItems, VendTransOpen _vendTransOpen, VendTrans _vendTrans, TaxTrans _taxTrans)
-    {
-        ttsbegin;
-        _metVendOpenItems.selectForUpdate(true);
+    {        
+        this.initFromVendorTransaction(_metVendOpenItems, _vendTransOpen, _vendTrans, _taxTrans);
+
         _metVendOpenItems.AccountNum             = _vendTransOpen.AccountNum;
-        _metVendOpenItems.AmountCur              = _vendTransOpen.AmountCur;
-        _metVendOpenItems.DueDate                = _vendTransOpen.DueDate;
         _metVendOpenItems.Invoice                = _vendTrans.Invoice;
-        _metVendOpenItems.JournalName            = LedgerJournalTable::find(_vendTrans.JournalNum).JournalName;
-        _metVendOpenItems.DefaultDimension       = _vendTrans.DefaultDimension;
-        _metVendOpenItems.GSTAmount              = _taxTrans.SourceTaxAmountCur;
-        _metVendOpenItems.Currency               = _vendTrans.CurrencyCode;
-        _metVendOpenItems.DocumentDate           = _vendTrans.DocumentDate;
-        _metVendOpenItems.InvoiceDate            = _vendTransOpen.TransDate;
         _metVendOpenItems.VendTransOpenRecId     = _vendTransOpen.RecId;
-        _metVendOpenItems.AckStatus              = METAckStatus::Blank;
-        _metVendOpenItems.RecordStatus           = METRecordStatus::New;
+
+        ttsbegin;       
         _metVendOpenItems.insert();
         ttscommit;
     }
@@ -170,18 +224,10 @@ public class METVendOpenItemsSubTaskService
     /// <param name = "_taxTrans">taxtrans table</param>
     public void updateRecord(METVendOpenItems _metVendOpenItems, VendTransOpen _vendTransOpen, VendTrans _vendTrans, TaxTrans _taxTrans)
     {
+        this.initFromVendorTransaction(_metVendOpenItems, _vendTransOpen, _vendTrans, _taxTrans);
+
         ttsbegin;
-        _metVendOpenItems.selectForUpdate(true);
-        _metVendOpenItems.AmountCur              = _vendTransOpen.AmountCur;
-        _metVendOpenItems.DueDate                = _vendTransOpen.DueDate;
-        _metVendOpenItems.JournalName            = LedgerJournalTable::find(_vendTrans.JournalNum).JournalName;
-        _metVendOpenItems.DefaultDimension       = _vendTrans.DefaultDimension;
-        _metVendOpenItems.GSTAmount              = _taxTrans.SourceTaxAmountCur;
-        _metVendOpenItems.Currency               = _vendTrans.CurrencyCode;
-        _metVendOpenItems.DocumentDate           = _vendTrans.DocumentDate;
-        _metVendOpenItems.InvoiceDate            = _vendTransOpen.TransDate;
-        _metVendOpenItems.AckStatus              = METAckStatus::Blank;
-        _metVendOpenItems.RecordStatus           = METRecordStatus::New;
+        _metVendOpenItems.selectForUpdate(true);      
         _metVendOpenItems.update();
         ttscommit;
     }
@@ -189,26 +235,27 @@ public class METVendOpenItemsSubTaskService
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>updateLogLine</Name>
+				<Name>calculateGSTAmount</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// MPJ_5046_MetpayInterfaces 05/05/2021
-    /// This method updates the error field in the table
+    /// <summary>
+    /// MPJ_5046_MetpayInterfaces 11/06/2021
+    /// Method to return the GST Amount
     /// </summary>
-    /// <param name = "_mbsErrorMsg">error message</param>
-    /// <param name = "_mbsInfologMsg">info log</param>
-    /// <param name = "_metVendOpenItems">METVendOpenItems table</param>
-    private void updateLogLine(str _mbsErrorMsg, str _mbsInfologMsg, METVendOpenItems _metVendOpenItems)
+    /// <param name = "_vendTrans">vendtrans table</param>
+    /// <returns></returns>
+    public TaxAmountCur calculateGSTAmount(VendTrans _vendTrans)
     {
-        ttsbegin;
+        TaxAmountCur GSTAmount;
+        TaxTrans taxTrans;
 
-        // if log header is available use the global variable to update the current log line to the below
-        // status
-        _metVendOpenItems.selectForUpdate(true);
-        _metVendOpenItems.Error = _mbsErrorMsg + _mbsInfologMsg;
-        _metVendOpenItems.update();
+        select sum(SourceRegulateAmountCur) from taxTrans
+            where taxTrans.Voucher == _vendTrans.Voucher
+            && taxTrans.TransDate == _vendTrans.TransDate;
 
-        ttscommit;
+        GSTAmount = -taxTrans.SourceRegulateAmountCur;
+
+        return GSTAmount;
     }
 
 ]]></Source>
