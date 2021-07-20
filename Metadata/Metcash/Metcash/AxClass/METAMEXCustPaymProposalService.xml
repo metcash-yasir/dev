@@ -1,0 +1,320 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METAMEXCustPaymProposalService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_3338_AMEXCustomerPaymentProcessing
+/// This class contains the business logic to automatically create AMEX payment proposals,
+/// generate payments and send statements to customers.
+/// </summary>
+class METAMEXCustPaymProposalService extends SysOperationServiceBase
+{
+    LedgerJournalNameId             journalName;
+    LedgerJournalTable              journalTable;
+    METAMEXCustPaymProposalContract contract;
+    Args                            args;
+    Date                            sysDate;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>runOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs the actual operation.
+    /// </summary>
+    /// <param name = "_contract"><c>METAMEXCustPaymProposalContract</c></param>
+    public void runOperation(METAMEXCustPaymProposalContract _contract)
+    {
+        #OCCRetryCount
+        try
+        {
+            if (!this.isExecutingInBatch())
+            {
+                throw error ("@MET:BatchProcessingMustBeSelected");
+            }
+
+            ttsbegin;
+            contract = _contract;
+            
+            this.initParameters();
+
+            if (journalTable &&
+                !journalTable.Posted)
+            {
+                this.runPaymentproposal();
+
+                this.updateJournalNum();
+
+                Info(strFmt("@MET:METAMEXPaymentJournalMsg", journalTable.JournalNum));
+
+            }
+            else
+            {
+                throw Error("@MET:AMEXJournalError");
+            }
+            ttscommit;
+
+        }
+        catch (Exception::Error)
+        {
+            error ("@MET:AMEXJobError");
+            this.checkDeleteJournal(); //Delete journal if no lines are created.
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+
+        if (journalTable)
+        {
+
+            this.generatePayments();
+
+            this.sendStatements(journalTable.JournalNum,
+                                    _contract.parmFromDate(),
+                                    _contract.parmToDate());
+
+            this.checkDeleteJournal(); //Delete journal if no lines are created.
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateJournalNum</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method updates the <c>CustParameters</c> with the journal created.
+    /// </summary>
+    private void updateJournalNum()
+    {
+        CustParameters::UpdateAMEXJournalNum(journalTable.JournalNum);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkDeleteJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delete the <c>LedgerJournalTable</c> record created if there are no lines created.
+    /// </summary>
+    private void checkDeleteJournal()
+    {
+        if (journalTable &&
+            !journalTable.numOfLines())
+        {
+            journalTable.selectForUpdate(true);
+            journalTable.delete();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialises requried parameters for the payment proposal processing
+    /// </summary> 
+    private void initParameters()
+    {
+        sysDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+
+        journalName = contract.parmJournalName();
+        if (contract.parmCreateJournal())
+        {
+            this.createJournal();
+        }
+        else
+        {
+            journalTable = LedgerJournalTable::find(CustParameters::find().METAMEXPaymJournalNum);
+        }
+        args = new Args();
+        args.caller(this);
+        args.record(journalTable);
+        args.parmEnumType(enumNum(UserInteractive));
+        args.parmEnum(UserInteractive::No);
+
+        xSession xSession = new xSession();
+        
+        if (contract.parmRegion() == METAMEXRegion::AUS)
+        {
+            if(contract.parmPaymentRun() == CustAccountStatement::AMEXWeekly)
+            {
+                contract.parmFromDate(sysDate-7);
+                contract.parmToDate(sysDate-1);
+            }
+            else if(contract.parmPaymentRun() == CustAccountStatement::AMEXFortnightly)
+            {
+                contract.parmFromDate(sysDate-15);
+                contract.parmToDate(sysDate-1);
+            }
+            else if(contract.parmPaymentRun() == CustAccountStatement::AMEXMonthly)
+            {
+                contract.parmFromDate(dateStartMth(prevMth(sysDate)));
+                contract.parmToDate(dateEndMth(prevMth(sysDate)));
+            }
+            else if(contract.parmPaymentRun() == CustAccountStatement::AMEXPeriod)
+            {
+                FiscalCalendarRecIdBase     fiscalCalendarRecId = Ledger::fiscalCalendar();
+
+                contract.parmFromDate(FiscalCalendars::findPreviousPeriod(fiscalCalendarRecId, sysDate));
+                contract.parmToDate(FiscalCalendars::findPrevPeriodEndDateByDate(fiscalCalendarRecId, sysDate));
+            }
+            else if(contract.parmPaymentRun() == CustAccountStatement::Yearly)
+            {
+                contract.parmFromDate(DateTimeUtil::getStartOfYearDate(xSession.preferredLocale(), prevYr(SysDate)));
+                contract.parmToDate(DateTimeUtil::getEndOfYearDate(xSession.preferredLocale(), prevYr(SysDate)));
+            }
+        }
+        else if(contract.parmRegion() == METAMEXRegion::NZL)
+        {
+            contract.parmFromDate(DateTimeUtil::getStartOfYearDate(xSession.preferredLocale(), prevYr(SysDate)));
+            contract.parmToDate(DateTimeUtil::getEndOfYearDate(xSession.preferredLocale(), prevYr(SysDate)));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates <c>LedgerJournalTable</c> record.
+    /// </summary>
+    private void createJournal()
+    {
+        
+        journalTable.clear();
+        journalTable.initFromLedgerJournalName(journalName);
+        journalTable.InUseBy = curUserId();
+        journalTable.SystemBlocked = NoYes::Yes;
+        journalTable.JournalNum = JournalTableData::newTable(journalTable).nextJournalId();
+        journalTable.Name = strFmt("%1 %2",journalTable.Name, sysDate);
+        journalTable.doInsert(); //Insert method is overriding the Name field.
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ledgerJournalTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// ledger journal table buffer.
+    /// </summary>
+    ///<returns><c>LedgerJournalTable</c></returns>
+    public LedgerJournalTable ledgerJournalTable()
+    {
+        return journalTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runPaymentproposal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes automatic payment proposal logic.
+    /// </summary>
+    private void runPaymentproposal()
+    {
+        METAMEXCreatePaymJournal_Cust::main(args);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generatePayments</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes generate payments logic.
+    /// </summary>
+    private void generatePayments()
+    {
+        try
+        {
+            ttsbegin;
+            METAMEXCustSumForPaym::Main(args);
+            ttscommit;
+        }
+        catch (Exception::Error)
+        {
+            error(strFmt("@MET:METAMEXGeneratePaymentsError", journalTable.JournalNum));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendStatements</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Triggers business logic to send customer statements.
+    /// </summary>
+    /// <param name = "_journalId">Journal id.</param>
+    /// <param name = "_fromDate">Fromdate</param>
+    /// <param name = "_toDate">Todate</param>
+    private void sendStatements(JournalId _journalId,
+                            FromDate    _fromDate,
+                            ToDate      _toDate)
+    {
+        SysOperationServiceController controller = new SysOperationServiceController(
+                                                    classStr(METAMEXCustStmtSendService),
+                                                    methodStr(METAMEXCustStmtSendService, sendStatements),
+                                                    SysOperationExecutionMode::Synchronous);
+
+        METAMEXCustStmtSendContract dataContract = controller.getDataContractObject() as METAMEXCustStmtSendContract;
+        dataContract.parmJournalNum(_journalId);
+        dataContract.parmFromDate(_fromDate);
+        dataContract.parmToDate(_toDate);
+        controller.runOperation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>contract</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Data contract class.
+    /// </summary>
+    /// <returns><c>METAMEXCustPaymProposalContract</c></returns>
+    public METAMEXCustPaymProposalContract contract()
+    {
+        return contract;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

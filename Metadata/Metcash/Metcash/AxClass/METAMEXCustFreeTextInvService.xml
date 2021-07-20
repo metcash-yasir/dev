@@ -1,0 +1,251 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METAMEXCustFreeTextInvService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_3338_AMEXCustomerPaymentProcessing - vpotula
+/// This class posts free text invoices for the AMEX customers as per their AMEX charges.
+/// </summary>
+class METAMEXCustFreeTextInvService extends SysOperationServiceBase
+{
+    LedgerJournalTable                      ledgerJournalTable;
+    DimensionAttributeValuecombination      dimensionAttribute;
+    CustInvoiceTable                        custInvoiceTable;
+    CustInvoiceLine                         custInvoiceLine;
+    METCustTable                            metCustTable ;    
+    LineNum                                 lineNum;
+
+    METAMEXBatchId                          batchId;
+    LedgerDimensionAccount                  lineLedgerDimension;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>postInvoiceSubTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Performs the actual operation to create and post invoices per company and per customer.
+    /// </summary>
+    /// <param name = "_contract"><c>METAMEXCustFreeTextInvContract</c> class instance.</param>
+    private void postInvoiceSubTask(METAMEXCustFreeTextInvContract    _contract)
+    {
+        #OCCRetryCount
+
+        LedgerJournalTrans      ledgerJournalTrans;
+        MapEnumerator           companyCustMapEnum;
+        METAmexCharge           chargeAmount;
+
+        companyCustMapEnum      = _contract.getCompanyCustMap().getEnumerator();
+        ledgerJournalTable      = LedgerJournalTable::find(_contract.parmJournalId());
+
+        while (companyCustMapEnum.moveNext())
+        {
+            try
+            {
+                ttsBegin;
+                lineNum  = 0;           
+                while select LedgerDimension, Company, AmountCurDebit, AmountCurCredit, TransDate from ledgerJournalTrans
+                    where ledgerJournalTrans.JournalNum == ledgerJournalTable.JournalNum
+                    && ledgerJournalTrans.company == companyCustMapEnum.currentKey()
+                    && ledgerJournalTrans.PaymentStatus != CustVendPaymStatus::Rejected
+                    join dimensionAttribute
+                    where dimensionAttribute.RecId == ledgerJournalTrans.LedgerDimension
+                    && dimensionAttribute.DisplayValue == companyCustMapEnum.currentValue()
+                {
+                    custInvoiceTable.clear();
+
+                    //To create invoice in specific company
+                    changecompany(ledgerJournalTrans.company)
+                    {
+                        custInvoiceTable = null;
+                        CustInvoiceLine  = null; 
+                        metCustTable     = null; 
+                        metCustTable = METCustTable::find(dimensionAttribute.DisplayValue);
+                        if (metCustTable.AMEXChargeAccount)
+                        {
+                            metCustTable = metCustTable.getAMEXChargeAccount();
+                        }
+                        chargeAmount = metCustTable.AMEXChargeFee;
+                        if (chargeAmount)
+                        {
+                            select * from custInvoiceTable
+                            where custInvoiceTable.InvoiceId == _contract.parmBatchId()
+                            && custInvoiceTable.OrderAccount == metCustTable.AccountNum
+                            && custInvoiceTable.DataAreaId == companyCustMapEnum.current()
+                            && !custInvoiceTable.Posted;
+
+                            if (!custInvoiceTable)
+                            {
+                                custInvoiceTable = this.createInvoiceHeader(
+                                                    CustTable::find(metCustTable.AccountNum),
+                                                    _contract.parmBatchId());
+                            }
+                        }
+                        else
+                        {
+                            error(strFmt("@MET:METAMEXChargeNotFoundError", dimensionAttribute.DisplayValue,companyCustMapEnum.currentKey()));
+                        }
+
+                        if(custInvoiceTable)
+                        {
+                            lineNum++;
+                            this.createInvoiceLine(ledgerJournalTrans , custInvoiceTable, chargeAmount);
+                        }
+                    }
+                }
+                //To post invoice in specific company
+                changecompany(custInvoiceTable.DataAreaId)
+                {
+                    if (custInvoiceTable)
+                    {
+                        METAMEXCustPostInvoice custPostInvoice = METAMEXCustPostInvoice::construct(custInvoiceTable,
+                                                                CustParameters::find().CreditMaxCheck,
+                                                                NoYes::No);
+                        custPostInvoice.run();
+                    }
+                }
+                ttsCommit;
+            }
+            catch (Exception::Error)
+            {
+                error (strFmt("@MET:METAMEXFreeTxtInvError", companyCustMapEnum.currentValue(), companyCustMapEnum.currentKey()));
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createInvoiceHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates <c>CustInvocieTable</c> record.
+    /// </summary>
+    /// <param name = "_custTable"><c>CustTable</c> buffer.</param>
+    /// <param name = "_batchId">Batch id from the parameters.</param>
+    /// <returns><c>CustInvoiceTable</c> record.</returns>
+    private CustInvoiceTable createInvoiceHeader(CustTable _custTable,
+                                                METAMEXBatchId _batchId)
+    {
+        custInvoiceTable = this.initializeCustInvoiceTable(_custTable);
+        custInvoiceTable.InclTax = NoYes::Yes;
+        custInvoiceTable.InvoiceId = _batchId;
+        custInvoiceTable.setListCode();
+
+        custInvoiceTable.insert();
+
+        return custInvoiceTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeCustInvoiceTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes <c>CustInvoiceTable</c> buffer..
+    /// </summary>
+    /// <param name="_custTable">
+    /// The <c>CustTable</c> record to use for initializing <c>CustInvoiceTable</c> fields.
+    /// </param>
+    /// <returns>
+    /// The <c>CustInvoiceTable</c> instance.
+    /// </returns>
+    protected CustInvoiceTable initializeCustInvoiceTable(CustTable _custTable)
+    {
+        custInvoiceTable.initFromCustTable(_custTable);
+        custInvoiceTable.InvoiceDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        custInvoiceTable.WorkflowApprovalStatus = CustFreeInvoiceWFApprovalStatus::Approved;
+        custInvoiceTable.WorkflowApprovalState = CustFreeInvoiceWFApprovalState::Completed;
+
+        return custInvoiceTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createInvoiceLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the  invoice line.
+    /// </summary>
+    /// <param name = "_journalTrans">
+    ///  <c>LedgerJournaTrans</c> buffer.
+    ///  <c>LedgerJournaTrans</c> buffer.
+    /// </param>
+    /// <param name = "_invoice">
+    /// An instance of <c>CustInvoiceTable</c> buffer.
+    /// </param>
+    /// <param name = "_amexFee">
+    /// Amex charge amount.
+    /// </param>
+    /// <returns>
+    /// returns the created customer invoice line <c>createInvoiceLine</c>.
+    /// </returns>
+    protected CustInvoiceLine createInvoiceLine(LedgerJournalTrans      _journalTrans,
+                                                CustInvoiceTable        _invoice,
+                                                METAMEXCharge           _amexFee)
+    {
+        CustInvoiceLine     newLine;
+        AmountCur           amount = abs(_journalTrans.AmountCurDebit - _journalTrans.AmountCurCredit);
+
+        CustParameters      parameters = CustParameters::find();
+
+        newLine.initFromCustInvoiceTable(_invoice);
+
+        newLine.LineNum = lineNum;
+       
+        newLine.ParentRecId     = _invoice.RecId;
+        newLine.AmountCur       = (amount * _amexFee/100);
+        newLine.Quantity        = 1;
+        newLine.UnitPrice       = newLine.AmountCur;
+
+        newLine.Description     = strFmt("@MET:METAMEXInvoiceDescription", _amexFee, amount, _journalTrans.TransDate);
+        newLine.InvoiceTxt      = newLine.Description;
+        newLine.TaxItemGroup    = parameters.METAMEXTaxItemGroup;
+        newLine.TaxGroup        = parameters.METAMEXTaxGroup;
+        
+        newLine.LedgerDimension = CustParameters::find().METAMEXChargePostingLedgerDim;
+        newLine.DefaultDimension = _invoice.mergeDimension(_journalTrans.DefaultDimension, _invoice.DefaultDimension);
+        newLine.insert();
+
+        return newLine;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
