@@ -1,0 +1,258 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METVendOpenItemsSubTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_5046_MetpayInterfaces 05/05/2021
+/// Subtask class created to process all sub task process
+/// </summary>
+public class METVendOpenItemsSubTaskService
+{
+    str                                 errorMessage;
+    str                                 infologMessage;
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processSubTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_5046_MetpayInterfaces 05/05/2021
+    /// processSubTask contains the business logic to create/update according to the task and its parameters
+    /// </summary>
+    /// <param name = "_dataContract">Contract contains the custAccount list required per task</param>
+    public void processSubTask( METVendOpenItemsContract _dataContract)
+    {
+        VendOnHoldHistory                   onHoldHistory;
+        VendTransOpen                       vendTransOpen;
+        VendTrans                           vendTrans;
+        VendTable                           vendTable;
+        METVendOpenItems                    metVendOpenItems;
+        List                                recList                   = new List(Types::Int64);
+        ListEnumerator                      enumerator;
+        VendParameters                      vendParameters = VendParameters::find();
+        
+
+        try
+        {
+            recList    = _dataContract.getRecList();
+            enumerator      = recList.getEnumerator();
+
+            while (enumerator.moveNext())
+            {
+                
+                select firstonly crosscompany 
+                    RecId,
+                    RefRecID,
+                    AccountNum,
+                    AmountCur,
+                    DueDate,
+                    TransDate,
+                    DataAreaId
+                from VendTransOpen
+                    where VendTransOpen.RecId == enumerator.current()
+                join Invoice,
+                    approved,
+                    PaymMode,
+                    CurrencyCode,
+                    DocumentDate,
+                    JournalNum,
+                    DocumentNum,
+                    RecId,
+                    TransDate,
+                    DataAreaId
+                from vendTrans
+                    where vendTrans.Recid == vendTransOpen.RefRecID
+                join AccountNum
+                from vendTable
+                    where vendTable.AccountNum == vendTransOpen.AccountNum
+                notexists join onHoldHistory
+                    where onHoldHistory.VendAccount == VendTable.AccountNum
+                        && (onHoldHistory.onHold == CustVendorBlocked::All
+                        || onHoldHistory.onHold == CustVendorBlocked::Payment)
+                        && VendTrans.approved   == NoYes::Yes
+                    && VendTrans.PaymMode   == vendParameters.METpayPaymMode;
+            
+                if (VendTransOpen && VendTrans && vendTable)
+                {
+                    metVendOpenItems = METVendOpenItems::find(vendTransOpen.RecId,
+                                                        vendTransOpen.AccountNum,
+                                                        vendTrans.Invoice,
+                                                        vendTransOpen.DataAreaId);
+                    if (!metVendOpenItems)
+                    {
+                        this.insertRecord(metVendOpenItems, vendTransOpen, vendTrans);
+                    }
+                    else if (metVendOpenItems
+                                && metVendOpenItems.AckStatus != METAckStatus::Approved)
+                    {
+                        this.updateRecord(metVendOpenItems, vendTransOpen, vendTrans);
+                    }
+                }
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            //If an error occurs, check if log header is available
+            this.getInfologMessage();
+            System.Exception ex = CLRInterop::getLastException();
+            errorMessage += ex.Message + ex.ToString();            
+            info(errorMessage + infologMessage);
+            
+
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInfologMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_5046_MetpayInterfaces 05/05/2021
+    /// This method gets the info of the error into a variable
+    /// </summary>
+    private void getInfologMessage()
+    {
+        SysInfologEnumerator sysInfologEnumerator;
+        SysInfologMessageStruct sysInfologMessageStruct;
+
+        sysInfologEnumerator = SysInfologEnumerator::newData(infolog.infologData());
+
+        while (sysInfologEnumerator.moveNext())
+        {
+            sysInfologMessageStruct = new SysInfologMessageStruct(sysInfologEnumerator.currentMessage());
+
+            if (sysInfologEnumerator.currentException() == Exception::Error)
+            {
+                errorMessage += strfmt(sysInfologMessageStruct.message());
+            }
+            infologMessage += strfmt(sysInfologMessageStruct.message());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFromVendorTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_5046_MetpayInterfaces
+    /// Setting the fields for update/insert
+    /// </summary>
+    /// <param name = "_metVendOpenItems">metVendOpenItems table</param>
+    /// <param name = "_vendTransOpen">vendtransopen table</param>
+    /// <param name = "_vendTrans">vendtrans table</param>
+    private void initFromVendorTransaction(METVendOpenItems _metVendOpenItems, VendTransOpen _vendTransOpen, VendTrans _vendTrans)
+    {
+        LedgerJournalTable  ledgerJournalTable;
+        LedgerJournalTrans  ledgerJournalTrans;        
+        
+        changecompany(_vendTransOpen.DataAreaId)
+        {
+            ledgerJournalTable  = LedgerJournalTable::find(_vendTrans.JournalNum);
+            select firstonly1 Txt,OffsetTxt from ledgerJournalTrans
+            where ledgerJournalTrans.VendTransId   == _vendTrans.RecId;
+        }
+
+        _metVendOpenItems.AmountCur              = _vendTransOpen.AmountCur;
+        _metVendOpenItems.DueDate                = _vendTransOpen.DueDate;        
+        _metVendOpenItems.JournalName            = ledgerJournalTable.JournalName;
+        _metVendOpenItems.DefaultDimension       = _vendTrans.DefaultDimension;
+        _metVendOpenItems.GSTAmount              = this.calculateGSTAmount(_vendTrans);
+        _metVendOpenItems.Currency               = _vendTrans.CurrencyCode;
+        _metVendOpenItems.DocumentDate           = _vendTrans.DocumentDate;
+        _metVendOpenItems.InvoiceDate            = _vendTransOpen.TransDate;        
+        _metVendOpenItems.AckStatus              = METAckStatus::Blank;
+        _metVendOpenItems.RecordStatus           = METRecordStatus::New;
+        _metVendOpenItems.JournalType            = ledgerJournalTable.JournalType;
+        _metVendOpenItems.Document               = _vendTrans.DocumentNum;
+        _metVendOpenItems.CompanyCode            = _vendTransOpen.DataAreaId;
+        _metVendOpenItems.JournalBatchNumber     = _vendTrans.JournalNum;
+        _metVendOpenItems.Description            = ledgerJournalTrans.Txt;
+        _metVendOpenItems.OffsetTransactionText  = ledgerJournalTrans.OffsetTxt;          
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_5046_MetpayInterfaces 05/05/2021
+    /// Inserts a record in the table
+    /// </summary>
+    /// <param name = "_metVendOpenItems">metVendOpenItems table</param>
+    /// <param name = "_vendTransOpen">vendtransopen table</param>
+    /// <param name = "_vendTrans">vendtrans table</param>
+    public void insertRecord(METVendOpenItems _metVendOpenItems, VendTransOpen _vendTransOpen, VendTrans _vendTrans)
+    {        
+        this.initFromVendorTransaction(_metVendOpenItems, _vendTransOpen, _vendTrans);
+
+        _metVendOpenItems.AccountNum            = _vendTransOpen.AccountNum;
+        _metVendOpenItems.Invoice               = _vendTrans.Invoice;
+        _metVendOpenItems.VendTransOpenRecId    = _vendTransOpen.RecId;
+        _metVendOpenItems.AckStatus             = METAckStatus::Blank;
+        ttsbegin;       
+        _metVendOpenItems.insert();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_5046_MetpayInterfaces
+    /// Update a record in the table
+    /// </summary>
+    /// <param name = "_metVendOpenItems">metVendOpenItems table</param>
+    /// <param name = "_vendTransOpen">vendtransopen table</param>
+    /// <param name = "_vendTrans">vendtrans table</param>
+    public void updateRecord(METVendOpenItems _metVendOpenItems, VendTransOpen _vendTransOpen, VendTrans _vendTrans)
+    {
+        this.initFromVendorTransaction(_metVendOpenItems, _vendTransOpen, _vendTrans);
+
+        ttsbegin;
+        _metVendOpenItems.selectForUpdate(true);   
+        _metVendOpenItems.AckStatus = METAckStatus::Blank;
+        _metVendOpenItems.update();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateGSTAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_5046_MetpayInterfaces 11/06/2021
+    /// Method to return the GST Amount
+    /// </summary>
+    /// <param name = "_vendTrans">vendtrans table</param>
+    /// <returns>Tax amount</returns>
+    public TaxAmountCur calculateGSTAmount(VendTrans _vendTrans)
+    {
+        TaxAmountCur GSTAmount;
+        TaxTrans taxTrans;
+        changecompany(_vendTrans.DataAreaId)
+        {
+            select sum(SourceRegulateAmountCur) from taxTrans
+                where taxTrans.Voucher == _vendTrans.Voucher
+                && taxTrans.TransDate == _vendTrans.TransDate;
+
+            GSTAmount = -taxTrans.SourceRegulateAmountCur;
+        }
+        return GSTAmount;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
