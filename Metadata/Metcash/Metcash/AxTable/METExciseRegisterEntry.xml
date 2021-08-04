@@ -5,28 +5,10 @@
 		<Declaration><![CDATA[
 public class METExciseRegisterEntry extends common
 {
-   
-
 
 }
 ]]></Declaration>
 		<Methods>
-			<Method>
-				<Name>curUserInfo</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Gets the value  of the UserId .
-    /// </summary>
-    /// <returns>
-    /// UserId.
-    /// </returns>
-    display Name curUserInfo()
-    {
-        return curUserId();
-    }
-
-]]></Source>
-			</Method>
 			<Method>
 				<Name>insert</Name>
 				<Source><![CDATA[
@@ -35,26 +17,95 @@ public class METExciseRegisterEntry extends common
     /// </summary>
     public void insert()
     {
+        this.metUpdateRefFields();
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metUpdateRefFields</Name>
+				<Source><![CDATA[
+    public void metUpdateRefFields()
+    {
         InventTable         inventTable;
         METInventTable      metInventTable;
         METTariffItemCode   metTariffItemCode;
         InventSite          inventSite;
 
-        
-        select firstonly RecId from inventTable where inventTable.ItemId == this.ItemNo;
-        select firstonly InventTableRefRecid from metInventTable where metInventTable.InventTableRefRecid == inventTable.RecId;
-        select firstonly RecId from metTariffItemCode where metTariffItemCode.RecId == metInventTable.METTariffItemCodeRecid;
-        select firstonly inventSite where inventSite.SiteId == this.Site;
-
-
+        //Fetch Inventory unit
+        select firstonly ItemId,Product,RecId
+            from inventTable
+                where inventTable.ItemId == this.ItemNo;
         this.InventoryUnitOfMeasure = inventtable.InventUnitId();
-        //this.ReceiptUnitOfMeasure   = inventTable.inventTableModulePurch().UnitId;
+
+        //Duty of Country Code
+        select firstonly InventTableRefRecid,CountryCode
+            from metInventTable
+                where metInventTable.InventTableRefRecid == inventTable.RecId;
+        this.DutyOriginCountryCode = metInventTable.CountryCode;
+
+        METDutyCountryOfOrigin METDutyCountryOfOrigin= METDutyCountryOfOrigin::find(this.DutyOriginCountryCode);
+        this.PreferenceRule   = METDutyCountryOfOrigin.PreferenceRule;
+        this.PreferenceScheme = METDutyCountryOfOrigin.PreferenceScheme;
+        this.Advalorem        = METDutyCountryOfOrigin.AdValorem;
+
+        //Fetch Tariff Item Code
+        select firstonly TariffItem,StatCode,CustomsExcise,RecId
+            from metTariffItemCode
+                where metTariffItemCode.RecId == metInventTable.METTariffItemCodeRecid;
+
         this.TariffItemCode         = metTariffItemCode.TariffItem;
         this.StatCode               = metTariffItemCode.StatCode;
         this.CustomsExcise          = metTariffItemCode.CustomsExcise;
+        this.DutyRate               = metTariffItemCode.DutyLAL;
+
+        //Fetch Site Bond Number
+        select firstonly MetBondNumber
+            from inventSite
+                where inventSite.SiteId == this.Site;
         this.SiteBondNumber         = inventSite.METBondNumber;
         
-        super();
+        //Fetch Origin details
+        if(this.OriginType == METOriginType::PurchaseOrder)
+        {
+            PurchTable purchTable;
+            select firstonly OrderAccount from purchTable
+                    where purchTable.PurchId        == this.OriginNumber;
+
+            this.OriginParty = purchTable.OrderAccount;
+
+            PurchLine purchLine;
+            select firstonly PurchUnit from purchLine
+                where purchLine.PurchId == this.OriginNumber
+                  &&  purchLine.ItemId  == this.ItemNo;
+            if(!purchLine.RecId)
+            {
+                throw error(strFmt('Purchase line not found with ItemId - %1 in purchase order - %2', this.ItemNo, this.OriginNumber));
+            }
+            this.ReceiptUnitOfMeasure = purchLine.PurchUnit;
+
+            //Do Unit Conversion & get the quantity filled in Inventory Unit
+
+            this.Quantity = UnitOfMeasureConverter::convert(this.ReceiptQuantity, ///qty to be converted
+                                                        UnitOfMeasure::findBySymbol(this.ReceiptUnitOfMeasure).RecId, //from Unit Id
+                                                        UnitOfMeasure::findBySymbol(this.InventoryUnitOfMeasure).RecId, // TO Unit Id
+                                                        NoYes::No, //roundAbsoluteValue
+                                                        inventTable.Product, //Item Detail
+                                                        NoYes::No); //Apply rounding
+
+            this.AvailableQuantity = this.Quantity;
+        }
+        else if (this.OriginType == METOriginType::SalesOrder)
+        {
+            this.AvailableQuantity    = 0;
+            this.Closed = NoYes::Yes;
+
+            SalesTable salesTable;
+            select firstonly CustAccount from salesTable
+                where salesTable.SalesId == this.OriginNumber;
+            this.OriginParty = salesTable.CustAccount;
+        }
     }
 
 ]]></Source>
@@ -71,24 +122,17 @@ public class METExciseRegisterEntry extends common
     public boolean validateWrite()
     {
         boolean ret;
-        InventTable         inventTable;
-       
-        METInventTable      metInventTable;
-
-        ret = super();
         
-        select firstonly RecId from inventTable where inventTable.ItemId == this.ItemNo;
-        select firstonly InventTableRefRecid from metInventTable where metInventTable.InventTableRefRecid == inventTable.RecId;
-       
-        if (metInventTable.InventTableRefRecid == 0)
+        ret = super();
+
+        //If Site is bonded site or not
+        InventSite inventSite;
+        select METBondedWarehouse from inventSite where InventSite.SiteId == this.Site;
+        if(!inventSite.METBondedWarehouse)
         {
-            ret =  checkFailed ("Item is not a Bonded item ");
+            ret = checkFailed(strFmt("Site %1 is not a bonded site",this.Site));
         }
 
-        if(metInventTable.METTariffItemCodeRecid == 0)
-        {
-            ret = checkFailed("@MET:TariffItemCodeIsNotLinkedToTheItem");
-        }
         return ret;
     }
 
@@ -106,9 +150,8 @@ public class METExciseRegisterEntry extends common
 	<TitleField1>Lodgement</TitleField1>
 	<TitleField2>PermissionNumber</TitleField2>
 	<CacheLookup>Found</CacheLookup>
-	<ClusteredIndex>LodgementIdx</ClusteredIndex>
-	<PrimaryIndex>LodgementIdx</PrimaryIndex>
-	<ReplacementKey>LodgementIdx</ReplacementKey>
+	<CreatedBy>Yes</CreatedBy>
+	<CreatedDateTime>Yes</CreatedDateTime>
 	<DeleteActions />
 	<FieldGroups>
 		<AxTableFieldGroup>
@@ -131,9 +174,6 @@ public class METExciseRegisterEntry extends common
 				</AxTableFieldGroupField>
 				<AxTableFieldGroupField>
 					<DataField>TariffItemCode</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>TariffClassNumber</DataField>
 				</AxTableFieldGroupField>
 				<AxTableFieldGroupField>
 					<DataField>StatCode</DataField>
@@ -231,11 +271,7 @@ public class METExciseRegisterEntry extends common
 		<AxTableFieldGroup>
 			<Name>AutoIdentification</Name>
 			<AutoPopulate>Yes</AutoPopulate>
-			<Fields>
-				<AxTableFieldGroupField>
-					<DataField>Lodgement</DataField>
-				</AxTableFieldGroupField>
-			</Fields>
+			<Fields />
 		</AxTableFieldGroup>
 		<AxTableFieldGroup>
 			<Name>AutoSummary</Name>
@@ -269,6 +305,7 @@ public class METExciseRegisterEntry extends common
 			i:type="AxTableFieldString">
 			<Name>OriginNumber</Name>
 			<ExtendedDataType>METOriginNumber</ExtendedDataType>
+			<Mandatory>Yes</Mandatory>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldString">
@@ -285,17 +322,13 @@ public class METExciseRegisterEntry extends common
 			<Name>ItemNo</Name>
 			<ExtendedDataType>ItemId</ExtendedDataType>
 			<Label>@MET:ItemNo</Label>
+			<Mandatory>Yes</Mandatory>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldString">
 			<Name>TariffItemCode</Name>
 			<ExtendedDataType>ItemCodeStr</ExtendedDataType>
 			<Label>@MET:TariffItemCode</Label>
-		</AxTableField>
-		<AxTableField xmlns=""
-			i:type="AxTableFieldString">
-			<Name>TariffClassNumber</Name>
-			<ExtendedDataType>METTariffClassNumber</ExtendedDataType>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldString">
@@ -344,6 +377,7 @@ public class METExciseRegisterEntry extends common
 			<Name>Site</Name>
 			<ExtendedDataType>InventSiteId</ExtendedDataType>
 			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
+			<Mandatory>Yes</Mandatory>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldString">
@@ -445,7 +479,7 @@ public class METExciseRegisterEntry extends common
 	<Indexes>
 		<AxTableIndex>
 			<Name>LodgementIdx</Name>
-			<AlternateKey>Yes</AlternateKey>
+			<AllowDuplicates>Yes</AllowDuplicates>
 			<Fields>
 				<AxTableIndexField>
 					<DataField>Lodgement</DataField>
