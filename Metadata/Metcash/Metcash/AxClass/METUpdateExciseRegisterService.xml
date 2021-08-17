@@ -9,6 +9,7 @@
 /// </summary>
 class METUpdateExciseRegisterService extends SysOperationServiceBase
 {
+    str errorMessage,infologMessage;
     
 }
 ]]></Declaration>
@@ -18,8 +19,9 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
 				<Source><![CDATA[
     /// <summary>
     /// MPJ_5013_ExciseRegister
-    /// Checks if run in batch or not.
+    /// Processes the Invoiced Sales order and creates entries in Excise Register accordingly
     /// </summary>
+    /// <param name = "_contract">METUpdateExciseRegisterContract class for Sales Id input</param>
     public void processOperation(METUpdateExciseRegisterContract _contract)
     {
         SalesId salesId = _contract.parmSalesId();
@@ -29,49 +31,133 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
         CustInvoiceTrans       custInvoiceTrans;
         InventDim              inventDim;
         
-        ttsbegin;
-
-        while select SalesId, InvoiceId from custInvoiceJour
-                where custInvoiceJour.SalesId == salesId
-            join InventDimId,Qty,SalesUnit,ItemId from custInvoiceTrans
-                where custInvoiceTrans.SalesId == custInvoiceJour.SalesId
-            join InventSiteId from inventDim
-                where inventDim.inventDimId == custInvoiceTrans.InventDimId
-            join SiteId from InventSite
-                where InventSite.SiteId             == inventDim.InventSiteId
-                   && InventSite.MetBondedWarehouse == NoYes::Yes
-            
+        try
         {
-            METExciseRegisterEntry metExciseRegisterEntry;
+            ttsbegin;
+            _contract.parmLastExecutionStartDateTime(DateTimeUtil::utcNow());
 
-            metExciseRegisterEntry.OriginType               = METOriginType::SalesOrder;
-            metExciseRegisterEntry.OriginNumber             = custInvoiceJour.SalesId;
-            metExciseRegisterEntry.OriginDocumentNumber     = custInvoiceJour.InvoiceId;
-            metExciseRegisterEntry.ReceiptQuantity          = - custInvoiceTrans.Qty;
-            metExciseRegisterEntry.ReceiptUnitOfMeasure     = custInvoiceTrans.SalesUnit;
-            metExciseRegisterEntry.ItemNo                   = custInvoiceTrans.ItemId;
-            metExciseRegisterEntry.Site                     = InventSite.SiteId;
+            while select SalesId, InvoiceId from custInvoiceJour
+                    where custInvoiceJour.SalesId == salesId
+                join InventDimId,Qty,SalesUnit,ItemId from custInvoiceTrans
+                    where custInvoiceTrans.SalesId == custInvoiceJour.SalesId
+                join InventSiteId from inventDim
+                    where inventDim.inventDimId == custInvoiceTrans.InventDimId
+                join SiteId from InventSite
+                    where InventSite.SiteId             == inventDim.InventSiteId
+                       && InventSite.MetBondedWarehouse == NoYes::Yes
+            
+            {
+                this.createExciseRegisterEntryForSO(custInvoiceJour.SalesId,custInvoiceJour.InvoiceId,
+                                                    custInvoiceTrans.Qty,custInvoiceTrans.SalesUnit,custInvoiceTrans.ItemId,
+                                                    InventSite.SiteId);
+            }
+
+            _contract.parmLastExecutionEndDateTime(DateTimeUtil::utcNow());
+            ttscommit;
+        }
+        catch
+        {
+            //If an error occurs, check if log header is available
+            this.getInfologMessage();
+            System.Exception ex = CLRInterop::getLastException();
+            errorMessage += ex.Message + ex.ToString();
+            info(errorMessage + infologMessage);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createExciseRegisterEntryForSO</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// create Excise Register Entry for Sales Order invoice
+    /// </summary>
+    /// <param name = "_salesId">Sales Id</param>
+    /// <param name = "_invoiceId">Invoice Id</param>
+    /// <param name = "_qty">Qty of the Invoice Line</param>
+    /// <param name = "_salesUnit">Sales Unit</param>
+    /// <param name = "_itemId">Item Id</param>
+    /// <param name = "_site">SiteId</param>
+    private void createExciseRegisterEntryForSO(SalesId _salesId, InvoiceId _invoiceId, 
+                                                Qty _qty, SalesUnit _salesUnit, ItemId _itemId,
+                                                InventSiteId _site)
+    {
+        METExciseRegisterEntry metExciseRegisterEntry;
+        
+        metExciseRegisterEntry.OriginNumber             = _salesId;
+        metExciseRegisterEntry.OriginDocumentNumber     = _invoiceId;
+        metExciseRegisterEntry.ReceiptQuantity          = - _qty; //sales will have -ve qty in register entry, return orders will have +ve qty in register entry
+        metExciseRegisterEntry.ReceiptUnitOfMeasure     = _salesUnit;
+        metExciseRegisterEntry.ItemId                   = _itemId;
+        metExciseRegisterEntry.Site                     = _site;
+
+        if(_qty >0)
+        {
+            metExciseRegisterEntry.OriginType = METOriginType::SalesOrder;
 
             //Do Unit Conversion & get the quantity filled in Inventory Unit
-            InventTable inventTable = InventTable::find(metExciseRegisterEntry.ItemNo);
+            InventTable inventTable = InventTable::find(metExciseRegisterEntry.ItemId);
             metExciseRegisterEntry.InventoryUnitOfMeasure = inventTable.inventUnitId();
 
             metExciseRegisterEntry.Quantity = UnitOfMeasureConverter::convert(metExciseRegisterEntry.ReceiptQuantity, ///qty to be converted
-                                                        UnitOfMeasure::findBySymbol(metExciseRegisterEntry.ReceiptUnitOfMeasure).RecId, //from Unit Id
-                                                        UnitOfMeasure::findBySymbol(metExciseRegisterEntry.InventoryUnitOfMeasure).RecId, // TO Unit Id
-                                                        NoYes::No, //roundAbsoluteValue
-                                                        inventTable.Product, //Item Detail
-                                                        NoYes::No); //Apply rounding
+                                                            UnitOfMeasure::findBySymbol(metExciseRegisterEntry.ReceiptUnitOfMeasure).RecId, //from Unit Id
+                                                            UnitOfMeasure::findBySymbol(metExciseRegisterEntry.InventoryUnitOfMeasure).RecId, // TO Unit Id
+                                                            NoYes::No, //roundAbsoluteValue
+                                                            inventTable.Product, //Item Detail
+                                                            NoYes::No); //Apply rounding
 
-            
+            //Create Excise Register Entries untill all the Sales Order Units/qty is consumed or there are no more entries available for consumption
             while(metExciseRegisterEntry.Quantity != 0)
             {
                 metExciseRegisterEntry.Quantity = this.insertExciseRegisterEntry(metExciseRegisterEntry);
             }
-            
         }
+        else
+        {
+            metExciseRegisterEntry.OriginType                       = METOriginType::SalesOrderReturn;
 
-        ttscommit;
+            metExciseRegisterEntry metExciseRegisterEntryReturnSO   = this.getLodgementDetailsForReturnSales(_site,_itemId);
+            metExciseRegisterEntry.Lodgement                        = metExciseRegisterEntryReturnSO.Lodgement;
+        
+            metExciseRegisterEntry.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLodgementDetailsForReturnSales</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get Lodgment Details for a Return Sales Order
+    ///    check for latest open Purchase Entry which is under consumption, use that as lodgment details
+    ///    - If no open purchase found, use the latest closed entry line for lodgement details
+    /// </summary>
+    /// <param name = "_siteId">SiteId</param>
+    /// <param name = "_itemId">ItemId</param>
+    /// <returns>excise register record for lodgement reference</returns>
+    private metExciseRegisterEntry getLodgementDetailsForReturnSales(InventSiteId _siteId,ItemId _itemId)
+    {
+        METExciseRegisterEntry metExciseRegisterEntry;
+
+        //find current Open excise register line for Lodgement Number which is under consumption
+        metExciseRegisterEntry = this.findOldestExciseRegisterEntry(_itemId,_siteId,METOriginType::PurchaseOrder,NoYes::No);
+        if(metExciseRegisterEntry.Recid)
+        {
+            return metExciseRegisterEntry;
+        }
+        
+        //if open line not found, find the latest closed line
+        select firstonly Lodgement from metExciseRegisterEntry
+        order by metExciseRegisterEntry.CreatedDateTime desc
+        where metExciseRegisterEntry.OriginType   == METOriginType::PurchaseOrder
+            && metExciseRegisterEntry.Site        == _siteId
+            && metExciseRegisterEntry.ItemId      == _itemId
+            && metExciseRegisterEntry.Closed      == NoYes::Yes;
+
+        //shouldn't be blank as we will always have atleast 1 purchase line before sales
+        return metExciseRegisterEntry;
     }
 
 ]]></Source>
@@ -80,30 +166,26 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
 				<Name>insertExciseRegisterEntry</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Create new record for Sales Order and update the Purchase ORder record in the Excise Register table
+    /// Create new record for Sales Order and update the consumed Purchase Order record in the Excise Register table
     /// </summary>
     /// <param name = "_metExciseRegisterEntry">base Excise register data to be created</param>
-    /// <returns>remaining qty available from Sales Order that can be settled against another purchase order</returns>
+    /// <returns>remaining qty available from Sales Order that can be settled against another purchase/return sales order</returns>
     private SalesQty insertExciseRegisterEntry(METExciseRegisterEntry _metExciseRegisterEntry)
     {
-        METExciseRegisterEntry METExciseRegisterEntryInsert = _metExciseRegisterEntry.data();
+        METExciseRegisterEntry METExciseRegisterEntryInsert = _metExciseRegisterEntry.data();//copy data into new record (dont make changes in the variable record)
 
-        METExciseRegisterEntry metExciseRegisterEntryPurchase;
+        //find the record against which SO quantity to be settled against.
+        METExciseRegisterEntry metExciseRegisterEntryPurchase = this.findExciseRegisterEntryForSettlement(METExciseRegisterEntryInsert.ItemId,METExciseRegisterEntryInsert.Site);
+        
         SalesQty availableQtyToSettle;
-
-        select forupdate firstonly metExciseRegisterEntryPurchase
-                order by metExciseRegisterEntryPurchase.CreatedDateTime asc
-                where metExciseRegisterEntryPurchase.ItemNo == METExciseRegisterEntryInsert.Itemno
-                   && metExciseRegisterEntryPurchase.Site   == METExciseRegisterEntryInsert.Site
-                   && metExciseRegisterEntryPurchase.Closed == NoYes::No
-                   && metExciseRegisterEntryPurchase.Quantity > 0;
 
         if(metExciseRegisterEntryPurchase.RecId)
         {
+            metExciseRegisterEntryPurchase.selectForUpdate(true);
+
             METExciseRegisterEntryInsert.Lodgement = metExciseRegisterEntryPurchase.Lodgement;
-            //metExciseRegisterEntry.PermissionNumber = '';
-            //metExciseRegisterEntry.DutyRateReceived = 0;
             
+            //IF Settlement (+ve qty) record has more available quantity than the SO qty, subtract SO quantity from the available quantity of Settlement record
             if(metExciseRegisterEntryPurchase.AvailableQuantity >= abs(METExciseRegisterEntryInsert.Quantity))
             {
                 metExciseRegisterEntryPurchase.AvailableQuantity = metExciseRegisterEntryPurchase.AvailableQuantity + METExciseRegisterEntryInsert.Quantity;
@@ -113,19 +195,106 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
             }
             else
             {
+                //IF Settlement (+ve qty) record has less available qty, make availabl qty 0 and close the current settlement record.
+                    //Carry forward the remaining SO qty to settle against the next Settlement record
                 METExciseRegisterEntryInsert.Quantity = - metExciseRegisterEntryPurchase.AvailableQuantity;
 
                 availableQtyToSettle = _metExciseRegisterEntry.Quantity + metExciseRegisterEntryPurchase.AvailableQuantity;
                 metExciseRegisterEntryPurchase.AvailableQuantity = 0;
                 metExciseRegisterEntryPurchase.Closed = NoYes::Yes;
                 metExciseRegisterEntryPurchase.update();
-                
             }
-            METExciseRegisterEntryInsert.ReceiptQuantity = 0;
-            METExciseRegisterEntryInsert.ReceiptUnitOfMeasure = '';
+            
             METExciseRegisterEntryInsert.insert();
         }
         return availableQtyToSettle;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findExciseRegisterEntryForSettlement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Find the Excise Register Record against which we need to settle the SO qty
+    ///     Return Sales Order is preferred over Purchase order even if Purchase order was previously consumed.
+    /// </summary>
+    /// <param name = "_itemId">Item Id</param>
+    /// <param name = "_site">Site Id</param>
+    /// <returns>METExciseRegisterEntry record</returns>
+    private METExciseRegisterEntry findExciseRegisterEntryForSettlement(ItemId _itemId,InventSiteId _site)
+    {
+        METExciseRegisterEntry metExciseRegisterEntry;
+
+        //find Return Sales order entry for Settlement first
+        metExciseRegisterEntry = this.findOldestExciseRegisterEntry(_itemId,_site,METOriginType::SalesOrderReturn,NoYes::No);
+
+        if(metExciseRegisterEntry)
+        {
+            return metExciseRegisterEntry;
+        }
+
+        //find Return Sales order entry for Settlement first
+        metExciseRegisterEntry = this.findOldestExciseRegisterEntry(_itemId,_site,METOriginType::PurchaseOrder,NoYes::No);
+
+        return metExciseRegisterEntry;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findOldestExciseRegisterEntry</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Find the Excise Register Record against which we need to settle the SO qty based on Origin Type
+    /// </summary>
+    /// <param name = "_itemId">Item Id</param>
+    /// <param name = "_site">Site Id</param>
+    /// <param name = "_OriginType">Origin Type</param>
+    /// <param name = "_isClosed">Is Excise Register line closed</param>
+    /// <returns>METExciseRegisterEntry record</returns>
+    private METExciseRegisterEntry findOldestExciseRegisterEntry(ItemId _itemId,InventSiteId _site,METOriginType _OriginType, NoYes _isClosed)
+    {
+        METExciseRegisterEntry metExciseRegisterEntry;
+
+        select firstonly metExciseRegisterEntry
+                order by createdDateTime asc
+                where metExciseRegisterEntry.Site       == _site
+                   && metExciseRegisterEntry.ItemId     == _itemId
+                   && metExciseRegisterEntry.Closed     == _isClosed
+                   && metExciseRegisterEntry.OriginType == _OriginType//METOriginType::PurchaseOrder
+                   && metExciseRegisterEntry.Quantity   > 0;
+
+        return metExciseRegisterEntry;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInfologMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copied from MPJ_5046_MetpayInterfaces 05/05/2021
+    /// This method gets the info of the error into a variable
+    /// </summary>
+    private void getInfologMessage()
+    {
+        SysInfologEnumerator sysInfologEnumerator;
+        SysInfologMessageStruct sysInfologMessageStruct;
+        errorMessage    = '';
+        infologMessage  = '';
+        sysInfologEnumerator = SysInfologEnumerator::newData(infolog.infologData());
+
+        while (sysInfologEnumerator.moveNext())
+        {
+            sysInfologMessageStruct = new SysInfologMessageStruct(sysInfologEnumerator.currentMessage());
+
+            if (sysInfologEnumerator.currentException() == Exception::Error)
+            {
+                errorMessage += strfmt(sysInfologMessageStruct.message());
+            }
+            infologMessage += strfmt(sysInfologMessageStruct.message());
+        }
     }
 
 ]]></Source>
