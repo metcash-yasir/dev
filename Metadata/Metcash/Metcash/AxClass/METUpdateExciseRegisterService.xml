@@ -37,7 +37,7 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
             _contract.parmLastExecutionStartDateTime(DateTimeUtil::utcNow());
 
             while select SalesId, InvoiceId from custInvoiceJour
-                    where custInvoiceJour.SalesId == salesId
+                    where custInvoiceJour.SalesId == salesId // compare previous end time of batch job
                 join InventDimId,Qty,SalesUnit,ItemId from custInvoiceTrans
                     where custInvoiceTrans.SalesId == custInvoiceJour.SalesId
                 join InventSiteId from inventDim
@@ -51,8 +51,24 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
                                                     custInvoiceTrans.Qty,custInvoiceTrans.SalesUnit,custInvoiceTrans.ItemId,
                                                     InventSite.SiteId);
             }
-
             _contract.parmLastExecutionEndDateTime(DateTimeUtil::utcNow());
+
+            InventTransferTable transferTable;
+            InventTransferLine  transferLine;
+            
+            while select transferTable
+                where transferTable.TransferStatus == InventTransferStatus::Received;
+
+                join transferLine
+                   where transferLine.TransferId == transferTable.TransferId
+            {
+                InventSiteId inventSiteFrom = InventLocation::find(transferTable.InventLocationIdFrom).InventSiteId;
+                InventSiteId inventSiteTo   = InventLocation::find(transferTable.InventLocationIdTo).InventSiteId;
+
+                this.createRegisterEntryForTransfer(inventSiteFrom,inventSiteTo, transferLine.ItemId, transferLine.QtyShipped,transferLine.QtyReceived, transferLine.UnitId, transferLine.TransferId);
+            }
+
+            
             ttscommit;
         }
         catch
@@ -63,6 +79,75 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
             errorMessage += ex.Message + ex.ToString();
             info(errorMessage + infologMessage);
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRegisterEntryForTransfer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// enter the transfer Order details to Excise Register 
+    /// </summary>
+    /// <param name = "_fromSite">From Site</param>
+    /// <param name = "_toSite">To Site</param>
+    /// <param name = "_itemId">ItemId</param>
+    /// <param name = "_qtyShipped">qty Shipped</param>
+    /// <param name = "_qtyReceived">qty Received</param>
+    /// <param name = "_unit">Unit Id </param>
+    /// <param name = "_transferId">Transfer id</param>
+    private void createRegisterEntryForTransfer(InventSiteId _fromSite, InventSiteId _toSite, ItemId _itemId, Qty _qtyShipped, Qty _qtyReceived, InventUnitId _unit, InventTransferId _transferId)
+    {
+        METExciseRegisterEntry metExciseRegisterEntry;
+
+        metExciseRegisterEntry.OriginType               =  METOriginType::TransferOrder;
+        metExciseRegisterEntry.OriginNumber             = _transferId;
+        //metExciseRegisterEntry.OriginDocumentNumber     = _transferId;
+        
+        metExciseRegisterEntry.ReceiptUnitOfMeasure     = _unit;
+        metExciseRegisterEntry.ItemId                   = _itemId;
+
+        //create entries for outgoing and incoming
+        this.createRegisterEntryForTransferIncoming(metExciseRegisterEntry, _toSite,_qtyReceived);
+        this.createRegisterEntryForTransferOutgoing(metExciseRegisterEntry, _fromSite, _qtyShipped);
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRegisterEntryForTransferOutgoing</Name>
+				<Source><![CDATA[
+    private void createRegisterEntryForTransferOutgoing(METExciseRegisterEntry _registerEntry, InventSiteId _site,Qty _qty)
+    {
+        METExciseRegisterEntry METExciseRegisterEntry = _registerEntry.data();
+
+        METExciseRegisterEntry.Site             = _site;
+        METExciseRegisterEntry.ReceiptQuantity  = -_qty; //Outgoing will have -ve qty in register entry
+        METExciseRegisterEntry.setInventUnitQty();
+        
+        //Create Excise Register Entries untill all the Ougoing transfer Order Units/qty is consumed or there are no more entries available for consumption
+        while(METExciseRegisterEntry.Quantity != 0)
+        {
+            METExciseRegisterEntry.Quantity = this.insertExciseRegisterEntryOutgoing(METExciseRegisterEntry);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRegisterEntryForTransferIncoming</Name>
+				<Source><![CDATA[
+    private void createRegisterEntryForTransferIncoming(METExciseRegisterEntry _registerEntry, InventSiteId _site,Qty _qty)
+    {
+        METExciseRegisterEntry METExciseRegisterEntryInsert = _registerEntry.data();
+
+        METExciseRegisterEntryInsert.Site               = _site;
+        METExciseRegisterEntryInsert.ReceiptQuantity    = _qty; //Outgoing will have -ve qty in register entry
+        METExciseRegisterEntryInsert.setAvailableQty();
+
+        METExciseRegisterEntryInsert.Lodgement          = this.getLodgementDetailsForIncoming(_site,_registerEntry.ItemId);
+        METExciseRegisterEntryInsert.insert();
     }
 
 ]]></Source>
@@ -95,30 +180,19 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
         if(_qty >0)
         {
             metExciseRegisterEntry.OriginType = METOriginType::SalesOrder;
-
-            //Do Unit Conversion & get the quantity filled in Inventory Unit
-            InventTable inventTable = InventTable::find(metExciseRegisterEntry.ItemId);
-            metExciseRegisterEntry.InventoryUnitOfMeasure = inventTable.inventUnitId();
-
-            metExciseRegisterEntry.Quantity = UnitOfMeasureConverter::convert(metExciseRegisterEntry.ReceiptQuantity, ///qty to be converted
-                                                            UnitOfMeasure::findBySymbol(metExciseRegisterEntry.ReceiptUnitOfMeasure).RecId, //from Unit Id
-                                                            UnitOfMeasure::findBySymbol(metExciseRegisterEntry.InventoryUnitOfMeasure).RecId, // TO Unit Id
-                                                            NoYes::No, //roundAbsoluteValue
-                                                            inventTable.Product, //Item Detail
-                                                            NoYes::No); //Apply rounding
+            metExciseRegisterEntry.setInventUnitQty();
 
             //Create Excise Register Entries untill all the Sales Order Units/qty is consumed or there are no more entries available for consumption
             while(metExciseRegisterEntry.Quantity != 0)
             {
-                metExciseRegisterEntry.Quantity = this.insertExciseRegisterEntry(metExciseRegisterEntry);
+                //We will always be able to consume the purchase qty for a transfer order
+                metExciseRegisterEntry.Quantity = this.insertExciseRegisterEntryOutgoing(metExciseRegisterEntry);
             }
         }
         else
         {
-            metExciseRegisterEntry.OriginType                       = METOriginType::SalesOrderReturn;
-
-            metExciseRegisterEntry metExciseRegisterEntryReturnSO   = this.getLodgementDetailsForReturnSales(_site,_itemId);
-            metExciseRegisterEntry.Lodgement                        = metExciseRegisterEntryReturnSO.Lodgement;
+            metExciseRegisterEntry.OriginType   = METOriginType::SalesOrderReturn;
+            metExciseRegisterEntry.Lodgement    = this.getLodgementDetailsForIncoming(_site,_itemId);
         
             metExciseRegisterEntry.insert();
         }
@@ -127,7 +201,7 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>getLodgementDetailsForReturnSales</Name>
+				<Name>getLodgementDetailsForIncoming</Name>
 				<Source><![CDATA[
     /// <summary>
     /// Get Lodgment Details for a Return Sales Order
@@ -137,7 +211,7 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
     /// <param name = "_siteId">SiteId</param>
     /// <param name = "_itemId">ItemId</param>
     /// <returns>excise register record for lodgement reference</returns>
-    private metExciseRegisterEntry getLodgementDetailsForReturnSales(InventSiteId _siteId,ItemId _itemId)
+    private METLodgement getLodgementDetailsForIncoming(InventSiteId _siteId,ItemId _itemId)
     {
         METExciseRegisterEntry metExciseRegisterEntry;
 
@@ -145,32 +219,32 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
         metExciseRegisterEntry = this.findOldestExciseRegisterEntry(_itemId,_siteId,METOriginType::PurchaseOrder,NoYes::No);
         if(metExciseRegisterEntry.Recid)
         {
-            return metExciseRegisterEntry;
+            return metExciseRegisterEntry.Lodgement;
         }
         
         //if open line not found, find the latest closed line
         select firstonly Lodgement from metExciseRegisterEntry
         order by metExciseRegisterEntry.CreatedDateTime desc
-        where metExciseRegisterEntry.OriginType   == METOriginType::PurchaseOrder
+        where (metExciseRegisterEntry.OriginType   == METOriginType::PurchaseOrder || metExciseRegisterEntry.OriginType   == METOriginType::TransferOrder)
             && metExciseRegisterEntry.Site        == _siteId
             && metExciseRegisterEntry.ItemId      == _itemId
             && metExciseRegisterEntry.Closed      == NoYes::Yes;
 
         //shouldn't be blank as we will always have atleast 1 purchase line before sales
-        return metExciseRegisterEntry;
+        return metExciseRegisterEntry.Lodgement;
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>insertExciseRegisterEntry</Name>
+				<Name>insertExciseRegisterEntryOutgoing</Name>
 				<Source><![CDATA[
     /// <summary>
     /// Create new record for Sales Order and update the consumed Purchase Order record in the Excise Register table
     /// </summary>
     /// <param name = "_metExciseRegisterEntry">base Excise register data to be created</param>
     /// <returns>remaining qty available from Sales Order that can be settled against another purchase/return sales order</returns>
-    private SalesQty insertExciseRegisterEntry(METExciseRegisterEntry _metExciseRegisterEntry)
+    private SalesQty insertExciseRegisterEntryOutgoing(METExciseRegisterEntry _metExciseRegisterEntry)
     {
         METExciseRegisterEntry METExciseRegisterEntryInsert = _metExciseRegisterEntry.data();//copy data into new record (dont make changes in the variable record)
 
@@ -234,7 +308,7 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
             return metExciseRegisterEntry;
         }
 
-        //find Return Sales order entry for Settlement first
+        //find oldest open Purchase order entry for Settlement first
         metExciseRegisterEntry = this.findOldestExciseRegisterEntry(_itemId,_site,METOriginType::PurchaseOrder,NoYes::No);
 
         return metExciseRegisterEntry;
@@ -257,14 +331,29 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
     {
         METExciseRegisterEntry metExciseRegisterEntry;
 
-        select firstonly metExciseRegisterEntry
+        if(_OriginType == METOriginType::SalesOrderReturn)
+        {
+            select firstonly metExciseRegisterEntry
                 order by createdDateTime asc
                 where metExciseRegisterEntry.Site       == _site
                    && metExciseRegisterEntry.ItemId     == _itemId
                    && metExciseRegisterEntry.Closed     == _isClosed
-                   && metExciseRegisterEntry.OriginType == _OriginType//METOriginType::PurchaseOrder
+                   && metExciseRegisterEntry.OriginType == _OriginType
                    && metExciseRegisterEntry.Quantity   > 0;
-
+        }
+        else
+        {
+            select firstonly metExciseRegisterEntry
+                order by createdDateTime asc
+                where metExciseRegisterEntry.Site       == _site
+                   && metExciseRegisterEntry.ItemId     == _itemId
+                   && metExciseRegisterEntry.Closed     == _isClosed
+                   && (
+                        metExciseRegisterEntry.OriginType == METOriginType::PurchaseOrder
+                     || metExciseRegisterEntry.OriginType == METOriginType::TransferOrder
+                    )
+                   && metExciseRegisterEntry.Quantity   > 0;
+        }
         return metExciseRegisterEntry;
     }
 
