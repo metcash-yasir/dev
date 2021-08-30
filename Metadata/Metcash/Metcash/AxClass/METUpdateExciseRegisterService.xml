@@ -75,7 +75,7 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
                     where metExciseRegisterEntry.Site           == InventSite.SiteId
                        && metExciseRegisterEntry.ItemId         == vendInvoiceTrans.ItemId
                        && metExciseRegisterEntry.OriginType     == METOriginType::PurchaseOrderReturn
-                       && metExciseRegisterEntry.OriginNumber   == vendInvoiceTrans.InvoiceId
+                       && metExciseRegisterEntry.OriginNumber   == vendInvoiceTrans.PurchID
         {
             this.createExciseRegisterEntry(METOriginType::PurchaseOrderReturn, vendInvoiceTrans.PurchID, vendInvoiceTrans.InvoiceId,vendInvoiceTrans.ItemId,vendInvoiceTrans.Qty,vendInvoiceTrans.PurchUnit,InventSite.SiteId,NoYes::Yes);//change qty sign for outgoing entry
         }
@@ -93,13 +93,18 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
     /// </summary>
     private void processRegisterEntryForTransfer()
     {
-        InventTransferTable transferTable;
-        InventTransferLine  transferLine;
+        InventTransferTable     transferTable;
+        InventTransferLine      transferLine;
+        METExciseRegisterEntry  metExciseRegisterEntry;
             
         while select transferTable
                     where transferTable.TransferStatus == InventTransferStatus::Received
-                join transferLine
+            join transferLine
                    where transferLine.TransferId == transferTable.TransferId
+            notexists join metExciseRegisterEntry
+                    where metExciseRegisterEntry.OriginType     == METOriginType::TransferOrder
+                       && metExciseRegisterEntry.OriginNumber   == transferLine.TransferId
+                       && metExciseRegisterEntry.ItemId         == transferLine.ItemId
         {
 
             InventSite      inventSiteFrom,inventSiteTo;
@@ -108,20 +113,38 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
             select firstonly InventSiteId from inventLocation
                     where inventLocation.InventLocationId == transferTable.InventLocationIdFrom
                 join SiteId,METBondedWarehouse from inventSiteFrom
-                    where inventSiteFrom.SiteId             == inventLocation.InventSiteId
-                       && inventSiteFrom.METBondedWarehouse == NoYes::Yes;
+                    where inventSiteFrom.SiteId             == inventLocation.InventSiteId;
 
             select firstonly InventSiteId from inventLocation
                     where inventLocation.InventLocationId == transferTable.InventLocationIdTo
                 join SiteId,METBondedWarehouse from inventSiteTo
-                    where inventSiteTo.SiteId               == inventLocation.InventSiteId
-                       && inventSiteTo.METBondedWarehouse   == NoYes::Yes;
+                    where inventSiteTo.SiteId               == inventLocation.InventSiteId;
 
-            if(inventSiteFrom.SiteId && inventSiteTo.SiteId && InventSiteFrom.SiteId != inventSiteTo.SiteId)
+            //if both From and To Sites are bonded sites, we dont want it to reflet on NAT30/40 reports, so make the entries transaction exempt to true
+            //if only From is bonded and to is not bonded, it should have impact on NAT30/40 report, set transaction exempt to false
+            //if only TO site is bonded, should never be the case
+
+            if(inventSiteFrom.METBondedWarehouse && inventSiteTo.METBondedWarehouse && InventSiteFrom.SiteId != inventSiteTo.SiteId)
             {
-                //Register for Receiving/Incoming Site
-                this.createExciseRegisterEntry(METOriginType::TransferOrder,transferLine.TransferId,'',transferLine.ItemId,transferLine.QtyReceived,transferLine.UnitId,inventSiteTo.SiteId,NoYes::No);
+                //Register for Outgoing Site, we can have multiple lines created for 1 transfer lines depending on settlement.
+                this.createExciseRegisterEntry(METOriginType::TransferOrder,transferLine.TransferId,'',transferLine.ItemId,- transferLine.QtyShipped,transferLine.UnitId,inventSiteFrom.SiteId,NoYes::Yes,NoYes::Yes);//make sign -ve of qty for outgoing entry
+                
+                //create incoming lines with same number of lines as outgoing and same lodgment details
+                METExciseRegisterEntry metExciseRegisterEntryTransferOrderOutgoing;
 
+                while select OriginNumber, ItemId, Quantity, ReceiptUnitOfMeasure, Lodgement 
+                    from  metExciseRegisterEntryTransferOrderOutgoing
+                    where metExciseRegisterEntryTransferOrderOutgoing.OriginType    == METOriginType::TransferOrder
+                       && metExciseRegisterEntryTransferOrderOutgoing.OriginNumber  == transferLine.TransferId
+                       && metExciseRegisterEntryTransferOrderOutgoing.ItemId        == transferLine.ItemId
+                       && metExciseRegisterEntryTransferOrderOutgoing.Site          == inventSiteFrom.SiteId
+                {
+                    //change qty(reverse sign) , site
+                    this.createExciseRegisterEntry(METOriginType::TransferOrder,metExciseRegisterEntryTransferOrderOutgoing.OriginNumber,'',metExciseRegisterEntryTransferOrderOutgoing.ItemId,- metExciseRegisterEntryTransferOrderOutgoing.Quantity,metExciseRegisterEntryTransferOrderOutgoing.ReceiptUnitOfMeasure,inventSiteTo.SiteId,NoYes::No,NoYes::Yes,metExciseRegisterEntryTransferOrderOutgoing.Lodgement);
+                }
+            }
+            else if(inventSiteFrom.METBondedWarehouse && ! inventSiteTo.METBondedWarehouse && InventSiteFrom.SiteId != inventSiteTo.SiteId)
+            {
                 //Register for Outgoing Site
                 this.createExciseRegisterEntry(METOriginType::TransferOrder,transferLine.TransferId,'',transferLine.ItemId,- transferLine.QtyShipped,transferLine.UnitId,inventSiteFrom.SiteId,NoYes::Yes);//make sign -ve of qty for outgoing entry
             }
@@ -186,7 +209,7 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
     /// <param name = "_transactionUnitId">Transaction Unit ID </param>
     /// <param name = "_siteId">Site Id</param>
     /// <param name = "_isOutgoingEntry">Is Incoming or outgoing entry</param>
-    private void createExciseRegisterEntry(METOriginType _metOriginType, METOriginNumber _metOriginId, METOriginDocumentNumber _metOriginDocumentNumber, ItemId _itemId, Qty _transactionQty,InventUnitId _transactionUnitId, InventSiteId _siteId, NoYesId _isOutgoingEntry)
+    private void createExciseRegisterEntry(METOriginType _metOriginType, METOriginNumber _metOriginId, METOriginDocumentNumber _metOriginDocumentNumber, ItemId _itemId, Qty _transactionQty,InventUnitId _transactionUnitId, InventSiteId _siteId, NoYesId _isOutgoingEntry,NoYesId _customerExempt= NoYes::No,METLodgement _metLodgement = '')
     {
         METExciseRegisterEntry metExciseRegisterEntry;
 
@@ -197,6 +220,7 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
         metExciseRegisterEntry.ReceiptUnitOfMeasure     = _transactionUnitId;
         metExciseRegisterEntry.ItemId                   = _itemId;
         metExciseRegisterEntry.Site                     = _siteId;
+        metExciseRegisterEntry.CustomerExempt           = _customerExempt;        
 
         metExciseRegisterEntry.ReceiptQuantity          = _transactionQty; //sales/outgoing entry will have -ve qty in register entry
 
@@ -217,8 +241,16 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
             //update Available Quantities
             metExciseRegisterEntry.setAvailableQty();
 
-            //find suitable lodgement number
-            metExciseRegisterEntry.Lodgement        = this.getLodgementDetailsForIncoming(_siteId,_itemId);
+            if(_metLodgement)
+            {
+                metExciseRegisterEntry.Lodgement = _metLodgement;
+            }
+            else
+            {
+                //find suitable lodgement number if not already assigned
+                metExciseRegisterEntry.Lodgement = this.getLodgementDetailsForIncoming(_siteId,_itemId);
+            }
+
             metExciseRegisterEntry.insert();
         }
     }
