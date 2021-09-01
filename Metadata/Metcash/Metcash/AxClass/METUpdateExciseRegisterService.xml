@@ -9,14 +9,20 @@
 /// </summary>
 class METUpdateExciseRegisterService extends SysOperationServiceBase
 {
-    str errorMessage,infologMessage;
-    
+    str                 errorMessage,infologMessage;
+    utcdatetime         fromDateTime,toDateTime;
+
+    //TODO Delete below variables after demo <start>
+    SalesId             salesId;
+    InventTransferId    transferId;
 }
 ]]></Declaration>
 		<Methods>
 			<Method>
 				<Name>processOperation</Name>
 				<Source><![CDATA[
+    //TODO Delete below variables after demo <end>
+    
     /// <summary>
     /// MPJ_5013_ExciseRegister
     /// Processes the Invoiced Sales order and creates entries in Excise Register accordingly
@@ -24,32 +30,84 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
     /// <param name = "_contract">METUpdateExciseRegisterContract class for Sales Id input</param>
     public void processOperation(METUpdateExciseRegisterContract _contract)
     {
-        SalesId salesId = _contract.parmSalesId();
+        VendParameters vendParameters = VendParameters::find();
 
-        
-        
+        salesId = _contract.parmSalesId();
+        transferId = _contract.parmTransferId();
+
+        fromDateTime = vendParameters.METExciseRegisterTransferRunDateTime;
+        toDateTime   = DateTimeUtil::utcNow();
+
+        //TODO Delete below code after demo <start>
+        if(transferId)
+        {
+            fromDateTime = utcDateTimeNull();
+        }
+        //TODO Delete code after demo <end>
+
         try
         {
             ttsbegin;
-            _contract.parmLastExecutionStartDateTime(DateTimeUtil::utcNow());
-
-            this.processRegisterEntryForPOReturns();
             
-            this.processExciseRegisterEntryForSO(salesId);
-
             this.processRegisterEntryForTransfer();
-            
 
+            if(!transferId)
+            {
+                vendParameters.selectForUpdate(true);
+                vendParameters.METExciseRegisterTransferRunDateTime = toDateTime;
+                vendParameters.update();
+            }
             ttscommit;
         }
         catch
         {
-            //If an error occurs, check if log header is available
-            this.getInfologMessage();
-            System.Exception ex = CLRInterop::getLastException();
-            errorMessage += ex.Message + ex.ToString();
-            info(errorMessage + infologMessage);
+            this.getErrorLog();
         }
+
+        fromDateTime = vendParameters.METExciseRegisterSORunDateTime;
+        toDateTime   = DateTimeUtil::utcNow();
+
+        //TODO Delete below code after demo
+        if(salesId)
+        {
+            fromDateTime = utcDateTimeNull();
+        }
+        //TODO Delete code after demo <end>
+
+        try
+        {
+            ttsbegin;
+            
+            this.processRegisterEntryForPOReturns();
+            this.processExciseRegisterEntryForSO();
+
+            if(!salesId)
+            {
+                vendParameters.selectForUpdate(true);
+                vendParameters.METExciseRegisterSORunDateTime = toDateTime;
+                vendParameters.update();
+            }
+            ttscommit;
+        }
+        catch
+        {
+            this.getErrorLog();
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getErrorLog</Name>
+				<Source><![CDATA[
+    private void getErrorLog()
+    {
+        //If an error occurs, check if log header is available
+        this.getInfologMessage();
+        System.Exception ex = CLRInterop::getLastException();
+        errorMessage += ex.Message + ex.ToString();
+        info(errorMessage + infologMessage);
     }
 
 ]]></Source>
@@ -65,19 +123,16 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
         METExciseRegisterEntry  metExciseRegisterEntry;
         
         while select InventDimId,Qty,PurchUnit,ItemId from vendInvoiceTrans
-                    where vendInvoiceTrans.Qty < 0
+                    where   vendInvoiceTrans.Qty < 0 
+                    &&      vendInvoiceTrans.CreatedDateTime >= fromDateTime
+                    &&      vendInvoiceTrans.CreatedDateTime <  toDateTime
                 join InventSiteId from inventDim
                     where inventDim.inventDimId == vendInvoiceTrans.InventDimId
                 join SiteId from InventSite
                     where InventSite.SiteId             == inventDim.InventSiteId
                        && InventSite.MetBondedWarehouse == NoYes::Yes
-                notexists join metExciseRegisterEntry
-                    where metExciseRegisterEntry.Site           == InventSite.SiteId
-                       && metExciseRegisterEntry.ItemId         == vendInvoiceTrans.ItemId
-                       && metExciseRegisterEntry.OriginType     == METOriginType::PurchaseOrderReturn
-                       && metExciseRegisterEntry.OriginNumber   == vendInvoiceTrans.PurchID
         {
-            this.createExciseRegisterEntry(METOriginType::PurchaseOrderReturn, vendInvoiceTrans.PurchID, vendInvoiceTrans.InvoiceId,vendInvoiceTrans.ItemId,vendInvoiceTrans.Qty,vendInvoiceTrans.PurchUnit,InventSite.SiteId,NoYes::Yes);//change qty sign for outgoing entry
+            this.createExciseRegisterEntry(METOriginType::PurchaseOrderReturn, vendInvoiceTrans.PurchID, vendInvoiceTrans.InvoiceId,vendInvoiceTrans.ItemId,vendInvoiceTrans.Qty,vendInvoiceTrans.PurchUnit,InventSite.SiteId,NoYes::Yes,NoYes::Yes);//change qty sign for outgoing entry
         }
 
 
@@ -99,14 +154,17 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
             
         while select transferTable
                     where transferTable.TransferStatus == InventTransferStatus::Received
+                      &&  ( transferId == '' || (transferId != '' && transferTable.TransferId == transferId)) //TODO Delete this after Demo
             join transferLine
                    where transferLine.TransferId == transferTable.TransferId
+                   &&    transferLine.ReceiveDate >= DateTimeUtil::date(fromDateTime) // we just have receive date and not time for receiving, so we will do a exists join as well
+                   &&    transferLine.receiveTransDateTime() < toDateTime
             notexists join metExciseRegisterEntry
-                    where metExciseRegisterEntry.OriginType     == METOriginType::TransferOrder
-                       && metExciseRegisterEntry.OriginNumber   == transferLine.TransferId
-                       && metExciseRegisterEntry.ItemId         == transferLine.ItemId
+                    where metExciseRegisterEntry.OriginType         == METOriginType::TransferOrder
+                       && metExciseRegisterEntry.OriginNumber       == transferLine.TransferId           //TrasferId should help in finding the duplicate records
+                       && metExciseRegisterEntry.ItemId             == transferLine.ItemId
+                       && metExciseRegisterEntry.CreatedDateTime    >= transferLine.receiveTransDateTime()//datetime filter to add performance by limiting records
         {
-
             InventSite      inventSiteFrom,inventSiteTo;
             InventLocation  inventLocation;
 
@@ -159,8 +217,7 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
     /// <summary>
     /// create Excise Register Entry for Sales Order invoice
     /// </summary>
-    /// <param name = "_salesId">Sales Id</param>
-    private void processExciseRegisterEntryForSO(SalesId _salesId)
+    private void processExciseRegisterEntryForSO()
     {
         InventSite             inventSite;
         CustInvoiceJour        custInvoiceJour;
@@ -168,7 +225,9 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
         InventDim              inventDim;
 
         while select SalesId, InvoiceId from custInvoiceJour
-                    where custInvoiceJour.SalesId == _salesId // compare previous end time of batch job
+                    where custInvoiceJour.CreatedDateTime >= fromDateTime
+                    &&    custInvoiceJour.CreatedDateTime <  toDateTime
+                    &&  ( salesId == '' || (salesId != '' && custInvoiceJour.SalesId == salesId)) //TODO Delete this after Demo
                 join InventDimId,Qty,SalesUnit,ItemId from custInvoiceTrans
                     where custInvoiceTrans.SalesId == custInvoiceJour.SalesId
                 join InventSiteId from inventDim
@@ -209,7 +268,9 @@ class METUpdateExciseRegisterService extends SysOperationServiceBase
     /// <param name = "_transactionUnitId">Transaction Unit ID </param>
     /// <param name = "_siteId">Site Id</param>
     /// <param name = "_isOutgoingEntry">Is Incoming or outgoing entry</param>
-    private void createExciseRegisterEntry(METOriginType _metOriginType, METOriginNumber _metOriginId, METOriginDocumentNumber _metOriginDocumentNumber, ItemId _itemId, Qty _transactionQty,InventUnitId _transactionUnitId, InventSiteId _siteId, NoYesId _isOutgoingEntry,NoYesId _customerExempt= NoYes::No,METLodgement _metLodgement = '')
+    /// <param name = "_customerExempt">Is transaction exempted from including in NAT30/40 report</param>
+    /// <param name = "_metLodgement">Lodgement Id if availablepo,</param>
+    private void createExciseRegisterEntry(METOriginType _metOriginType, METOriginNumber _metOriginId, METOriginDocumentNumber _metOriginDocumentNumber, ItemId _itemId, Qty _transactionQty,InventUnitId _transactionUnitId, InventSiteId _siteId, NoYesId _isOutgoingEntry,NoYesId _customerExempt = NoYes::No,METLodgement _metLodgement = '')
     {
         METExciseRegisterEntry metExciseRegisterEntry;
 
