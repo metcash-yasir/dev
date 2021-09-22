@@ -1,0 +1,425 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GUPPriceEngineJournalSearchEngine</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+internal class GUPPriceEngineJournalSearchEngine
+{
+    private static GUPPriceEngineJournalSearchEngine searchEngine;
+
+    private GUPPriceEngineJournalLineCache journalLineCache;
+    private GUPPriceEngineAttributeGroupPriorityCache priorityCache;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new (GUPPriceEngineJournalLineCache _lineCache, GUPPriceEngineAttributeGroupPriorityCache _priorityCache)
+    {
+        this.journalLineCache = _lineCache;
+        this.priorityCache = _priorityCache;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInstance</Name>
+				<Source><![CDATA[
+    public static GUPPriceEngineJournalSearchEngine getInstance()
+    {
+        if(searchEngine == null)
+        {
+            // TODO -- refresh only when needed.
+            GUPPriceEngineJournalLineCache journalLineCache = new GUPPriceEngineJournalLineCache();
+            journalLineCache.doRefresh();
+
+            GUPPriceEngineAttributeGroupPriorityCache priorityCache = new GUPPriceEngineAttributeGroupPriorityCache();
+            priorityCache.doRefresh();
+
+            GUPPriceEngineJournalSearchEngine engine = new GUPPriceEngineJournalSearchEngine(journalLineCache, priorityCache);
+            searchEngine = engine;
+        }
+        return searchEngine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doSearch</Name>
+				<Source><![CDATA[
+    public GUPPriceEnginePrematchObject doSearch(SalesTable _salesTable, SalesLine _salesLine)
+    {
+        // TODO use fixed value now.
+        GUPPriceComponent priceComponent = GUPPriceComponent::SalesTradeAgreement;
+        int64 priceComponentCode = priorityCache.getPriceComponentCodeByPriceComponent(priceComponent);
+
+        GUPPriceEnginePrematchObject prematchObject = new GUPPriceEnginePrematchObject(_salesTable, _salesLine);
+
+        // Filter by fromDate / toDate / InventDims.
+        // return list<GUPPriceEngineJournalLineAggregationObject>.
+        // A journal line contains exactly one header rule (for salesTable) and one line rule (for salesLine).
+        Set journalLineRecIdSet = new Set(Types::Int64);
+        List filteredAggregationList = this.filterJournalLineList(
+            _salesTable, 
+            _salesLine,
+            journalLineCache.parmJournalLineList(), 
+            journalLineRecIdSet, 
+            priceComponentCode, 
+            priorityCache);
+
+        prematchObject.parmTradeAgreementJournalLineList(filteredAggregationList);
+
+        // Key = field id, Value = GUPPriceEngineRelatedDataObject.
+        Map salesTableRelatedData = new Map(Types::String, Types::AnyType);
+        prematchObject.parmSalesTableRelatedDataMap(salesTableRelatedData);
+
+        Map salesLineRelatedData = new Map(Types::String, Types::AnyType);
+        prematchObject.parmSalesLineRelatedDataMap(salesLineRelatedData);
+
+        this.loadSalesData(_salesTable,
+            _salesLine,
+            journalLineRecIdSet,
+            journalLineCache.parmPricingAttributeDatasourceMap(),
+            salesTableRelatedData,
+            salesLineRelatedData);
+
+        return prematchObject;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>filterJournalLineList</Name>
+				<Source><![CDATA[
+    private List filterJournalLineList (SalesTable _salesTable, 
+        SalesLine _salesLine, 
+        List _allJournalLineList,
+        Set _journalLineRecIdSet, 
+        int64 _priceComponentCode, 
+        GUPPriceEngineAttributeGroupPriorityCache _priorityCache)
+    {
+        InventDim inventDim = _salesLine.inventDim();
+        PriceDate priceDate = _salesLine.priceDate();       // Need use this?
+        SalesPurchLineInterface salesPurchLineInterface = _salesLine.salesPurchLineInterface();
+
+        PriceDiscParameters parameters = PriceDiscParameters::construct();
+        parameters.initFromSalesPurchLineInterface(salesPurchLineInterface, inventDim);
+
+        PriceDisc priceDisc = PriceDisc::newFromPriceDiscParameters(parameters);
+
+        // Value = GUPTradeAgreementJournalLineAggregationObject.
+        Map competeJournalLineTempMap = new Map(Types::String, Types::AnyType);
+        ListEnumerator listEnumerator = _allJournalLineList.getEnumerator();
+
+        while (listEnumerator.moveNext())
+        {
+            GUPPriceEngineJournalLineObject journalLine = listEnumerator.current();
+
+            if (!this.journalLineValid(journalLine, parameters, inventDim))
+            {
+                continue;
+            }
+
+            // Stores compete journal lines in same object.
+            str attributeGroupKey = journalLine.parmAttributeGroupKey();
+
+            GUPPriceEngineJournalLineAggregationObject aggregation;
+            if (competeJournalLineTempMap.exists(attributeGroupKey))
+            {
+                aggregation = competeJournalLineTempMap.lookup(attributeGroupKey);
+            }
+            else
+            {
+                aggregation = new GUPPriceEngineJournalLineAggregationObject();
+                competeJournalLineTempMap.add(attributeGroupKey, aggregation);
+            }
+
+            // Record 'valid' journal lines.
+            _journalLineRecIdSet.add(journalLine.parmJournalLineRecId());
+            aggregation.addCompeteJournalLineAsSpecificLine(journalLine, 
+                this.getJournalLinePriority(journalLine, _priceComponentCode, _priorityCache),
+                this.getJournalLinePrice(journalLine, _salesLine));
+        }
+
+        
+        List filteredAggregationList = new List(Types::AnyType);
+        MapEnumerator mapEnumerator = competeJournalLineTempMap.getEnumerator();
+        while (mapEnumerator.moveNext())
+        {
+            GUPPriceEngineJournalLineAggregationObject aggregation = mapEnumerator.currentValue();
+
+            if (aggregation.parmLineCount() > 1)
+            {
+                // Sort compete lines by attribute priority, then by line price.
+                aggregation.sortJournalLineList();
+            }
+
+            filteredAggregationList.addEnd(mapEnumerator.currentValue());
+        }
+
+        
+        GUPListSorter listSorter = GUPListSorter::getInstance();
+        GUPComparatorJournalLineAggregationObject aggregationComparator = new GUPComparatorJournalLineAggregationObject();
+
+        filteredAggregationList = listSorter.sortList(filteredAggregationList, aggregationComparator);
+
+        return filteredAggregationList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>journalLineValid</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checking fixed parameters from PriceDiscTable.
+    /// Return true if current journal line may apply to given salesLine.
+    /// Customized pricing attribute is checked later.
+    /// </summary>
+    /// <param name = "_journalLine">PriceDiscTable data.</param>
+    /// <param name = "_parameters">SalesLine related data.</param>
+    /// <param name = "_inventDim">Invent Dimensions.</param>
+    /// <returns>True if journal line may apply to the salesLine.</returns>
+    private boolean journalLineValid (GUPPriceEngineJournalLineObject _journalLine,
+        PriceDiscParameters _parameters, 
+        InventDim _inventDim)
+    {
+        PriceDiscTable priceDisc = _journalLine.parmPriceDiscTable();
+        FromDate fromDate = priceDisc.FromDate;
+        ToDate toDate = priceDisc.ToDate;
+        AmountQty quantityAmountFrom = priceDisc.QuantityAmountFrom;
+        AmountQuantityTo quantityAmountTo = priceDisc.QuantityAmountTo;
+
+        if (!this.doesDateQualifyForFindingPriceAgreement(_parameters, fromDate, toDate)
+             || !this.doesQuantityQualifyForFindingPriceAgreement(_parameters, quantityAmountFrom, quantityAmountTo)
+             || !this.checkAdditionalQualificationForFindingPriceAgreement(_parameters, priceDisc))
+        {
+            return false;
+        }
+
+        return this.checkInventDims(_journalLine, _inventDim);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doesDateQualifyForFindingPriceAgreement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method will check and compare the date and can be overwritten to meet customized needs.
+    /// </summary>
+    /// <param name = "_parameters">Pre-build parameters from PriceDiscTable.</param>
+    /// <param name = "_fromDate">From date.</param>
+    /// <param name = "_toDate">To date.</param>
+    /// <returns>
+    /// True if it meets the date conditions; otherwise, false.
+    /// </returns>
+    protected boolean doesDateQualifyForFindingPriceAgreement(PriceDiscParameters _parameters, FromDate _fromDate, ToDate _toDate)
+    {
+        return ((_parameters.parmPriceDiscDate() >= _fromDate || !_fromDate)
+            && (_parameters.parmPriceDiscDate() <= _toDate || !_toDate));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doesQuantityQualifyForFindingPriceAgreement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method will check and compare the quantity and can be overwritten to meet customized needs.
+    /// </summary>
+    /// <param name = "_parameters">Pre-build parameters from PriceDiscTable.</param>
+    /// <param name = "_qtyFrom">A value of quantity.</param>
+    /// <param name = "_qtyTo">A value of quantity.</param>
+    /// <returns>
+    /// True if it meets the quantity conditions; otherwise, false.
+    /// </returns>
+    protected boolean doesQuantityQualifyForFindingPriceAgreement(PriceDiscParameters _parameters, 
+        AmountQty _qtyFrom, AmountQuantityTo _qtyTo)
+    {
+        Qty absQty = abs(_parameters.parmQty());
+
+        if (_parameters.parmUseRetailPricing())
+        {
+            absQty += abs(_parameters.parmRetailGroupQty());
+        }
+        return (_qtyFrom <= absQty && (_qtyTo > absQty || (_qtyTo == 0)));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAdditionalQualificationForFindingPriceAgreement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method will check additional conditions for PriceDisc for retail scenario, and can be overwritten to meet customized needs.
+    /// </summary>
+    /// <param name = "_parameters">Pre-build parameters from PriceDiscTable.</param>
+    /// <param name = "_priceDiscTable">The PriceDisc record to check.</param>
+    /// <returns>true if it meets retail condition; otherwise, false.</returns>
+    protected boolean checkAdditionalQualificationForFindingPriceAgreement(PriceDiscParameters _parameters, PriceDiscTable _priceDiscTable)
+    {
+        boolean additionalCheckResult = true;
+
+        if (_parameters.parmUseRetailPricing())
+        {
+            InventDim priceDiscDim = InventDim::find(_priceDiscTable.InventDimId);
+            //InventTableModule module = InventTableModule::find(_priceDiscTable.ItemRelation, ModuleInventPurchSales::Sales);
+
+            // Retail pricing engine will not apply the trade agreements if:
+            // both site and location are set;
+            if (priceDiscDim.InventSiteId && priceDiscDim.InventLocationId)
+            {
+                additionalCheckResult = false;
+            }
+        }
+
+        return additionalCheckResult;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkInventDims</Name>
+				<Source><![CDATA[
+    private boolean checkInventDims (GUPPriceEngineJournalLineObject _journalLine, InventDim _inventDim)
+    {
+        // Assume no extra filter is required.
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getJournalLinePriority</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get priority from cache by attribute group ids and component code.
+    /// Notice: attibute group id can be 0, indicates ALL headers / lines are allowed with this rule.  
+    /// </summary>
+    /// <param name = "_journalLine">Journal Line Object.</param>
+    /// <param name = "_priceComponentCode">Price Component code.</param>
+    /// <param name = "_priorityCache">Cache.</param>
+    /// <returns>Priority from selected component code type.</returns>
+    private int getJournalLinePriority (GUPPriceEngineJournalLineObject _journalLine, 
+        int64 _priceComponentCode,
+        GUPPriceEngineAttributeGroupPriorityCache _priorityCache)
+    {
+        int64 headerGroupId = (_journalLine.parmHeaderAttribute()) ? _journalLine.parmHeaderAttribute().parmPricingAttributeGroup().RecId : 0;
+        int64 lineGroupId = (_journalLine.parmLineAttribute()) ? _journalLine.parmLineAttribute().parmPricingAttributeGroup().RecId : 0;
+
+        return _priorityCache.getPriority(
+            headerGroupId,
+            lineGroupId,
+            _priceComponentCode);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getJournalLinePrice</Name>
+				<Source><![CDATA[
+    private real getJournalLinePrice (GUPPriceEngineJournalLineObject _journalLine, 
+        SalesLine _salesLine)
+    {
+        PriceDiscTable priceDiscTable = _journalLine.parmPriceDiscTable();
+        PriceConvertFactory priceConvertFactory = PriceConvertFactory::newItemPrice(
+            _salesLine.ItemId,
+            priceDiscTable.UnitId,
+            priceDiscTable.price(),
+            priceDiscTable.priceUnit(),
+            priceDiscTable.markup(),
+            priceDiscTable.priceQty(),
+            priceDiscTable.Currency);
+
+        priceConvertFactory.parmNewCurrencyCode(_salesLine.CurrencyCode);
+        priceConvertFactory.parmNewUnitId(_salesLine.SalesUnit);
+        // priceConvertFactory.parmInventDimId(); Required?
+        // priceConvertFactory.parmTransDate();   Required?
+                       
+        PriceConvert priceConvert = priceConvertFactory.priceConvert();
+
+        Price price = priceConvert.parmPrice();
+        return this.dealQuantityAndSmartRounding(price, _salesLine, priceDiscTable);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dealQuantityAndSmartRounding</Name>
+				<Source><![CDATA[
+    private real dealQuantityAndSmartRounding(Price _price, SalesLine _salesLine, PriceDiscTable _priceDiscTable)
+    {
+        // TODO smart rounding.
+        return _price * _salesLine.SalesQty / _priceDiscTable.priceQty();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadSalesData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Load all data related to an sales order / sales line, that may useful in rule matching calculations.
+    /// </summary>
+    /// <param name = "_salesTable">The chosen sales order.</param>
+    /// <param name = "_salesLine">The chosen sales line.</param>
+    /// <param name = "_journalRecIdSet">All journals satisfies from date / to date / inventDim filter.</param>
+    /// <param name = "_pricingAttributeDatasourceMap">A map of all datasources, and the relation between datasources and journals.</param>
+    /// <param name = "_salesTableRelatedData">Sales table related data.</param>
+    /// <param name = "_salesLineRelatedData">Sales line related data.</param>
+    private void loadSalesData (Common _salesTable, 
+        Common _salesLine,  
+        Set _journalRecIdSet,
+        Map _pricingAttributeDatasourceMap,
+        Map _salesTableRelatedData, 
+        Map _salesLineRelatedData)
+    {
+        MapEnumerator enumerator = _pricingAttributeDatasourceMap.getEnumerator();
+
+        // TODO concurrent.
+
+        while (enumerator.moveNext())
+        {
+            GUPPriceEngineDatasourceAggregationObject datasource = enumerator.currentValue();
+
+            // No valid lines for selected datasource (i.e. table), skip.
+            if (Set::intersection(datasource.parmJournalLineRecIdSet(), _journalRecIdSet).empty())
+            {
+                continue;
+            }
+
+            Common pricingObject = 
+                (datasource.parmSourceLevel() == GUPPricingAttributeSourceLevel::Header) ? 
+                _salesTable : 
+                _salesLine;
+
+            Map relatedDataMap = 
+                (datasource.parmSourceLevel() == GUPPricingAttributeSourceLevel::Header) ?
+                _salesTableRelatedData :
+                _salesLineRelatedData;
+            
+            GUPIPricingAttribute datasourceAttribute = datasource.parmDatasourceAttribute();
+
+            // Class-based attribute will only return one table record, joined from salesTable or salesLine.
+            if (classIdGet(datasourceAttribute) != classNum(GUPPricingAttributeEcoResAttribute))
+            {
+                Common tableRecord = datasourceAttribute.getRecord(pricingObject);
+                relatedDataMap.add(datasource.parmDatasourceId(), new GUPPriceEngineRelatedDataObject(tableRecord));
+            }
+            // EcoResAttribute return multiple lines, each has unique key as AttributeName + AttributeTypeName.
+            else 
+            {
+                GUPPricingAttributeEcoResAttribute ecoResAttribute = datasourceAttribute;
+                relatedDataMap.add(datasource.parmDatasourceId(), new GUPPriceEngineRelatedDataObject(null, ecoResAttribute.getTableRecordMap(pricingObject)));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
