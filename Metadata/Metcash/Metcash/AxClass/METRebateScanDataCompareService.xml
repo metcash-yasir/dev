@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METRebateScanDataCompareService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_5012_RebateProcess
+/// Service class to run the Scan data comparison
+/// </summary>
+class METRebateScanDataCompareService
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_5012_RebateProcess
+    /// Method to Compare Scan transaction with Supplier and sales order transaction.
+    /// </summary>
+    /// <param name = "_contract"> METRebateScanDataCompareContract </param>
+    public void processOperation(METRebateScanDataCompareContract _contract)
+    {
+        boolean useClaimProcess = TAMRebateParameters::find().UseClaimProcess;
+
+        Query                   query;        
+        QueryRun                queryRun;
+        QueryBuildDataSource    qbdsRebateTrans, qbdsRebateDateTrans, qbdsRebateDeal;
+        TAMRebateTrans          rebateTrans, rebateTransCompare;
+        TAMRebateDeal           rebateDealContract;
+        Qty                     supplierSOQty;
+        container               rebateTransRecId;
+
+        Set rebateTransIdSet    =   new Set(Types::String);
+        query                   =   new Query();
+        rebateDealContract      =   _contract.parmTAMRebateDeal();
+
+        qbdsRebateTrans = query.addDataSource(tableNum(TAMRebateTrans));
+        qbdsRebateTrans.addRange(fieldNum(TAMRebateTrans, METScanSupplier)).value(queryValue(METScanSupplier::Scan));
+        qbdsRebateDateTrans = qbdsRebateTrans.addDataSource(tableNum(TAMRebateDateTrans));
+        qbdsRebateDateTrans.relations(true);
+
+        qbdsRebateDeal = qbdsRebateDateTrans.addDataSource(tableNum(TAMRebateDeal));
+        qbdsRebateDeal.relations(true);
+        qbdsRebateDeal.addRange(fieldNum(TAMRebateDeal, RecId)).value(queryValue(rebateDealContract.RecId));
+        qbdsRebateDeal.addRange(fieldNum(TAMRebateDeal, METImportScan)).value(queryValue(NoYes::Yes));
+        qbdsRebateDeal.addRange(fieldNum(TAMRebateDeal, METImportSupplier)).value(queryValue(NoYes::Yes));
+
+        queryRun = new QueryRun(query);
+        while(queryRun.next())
+        {
+            supplierSOQty = 0;
+            rebateTrans = queryRun.get(tableNum(TAMRebateTrans));
+
+            select firstonly RebateQty, RecId from rebateTransCompare
+                where rebateTransCompare.RebateRefAccount == rebateTrans.RebateRefAccount
+                   && rebateTransCompare.RebateTransId == rebateTrans.RebateTransId
+                   && rebateTransCompare.RebateRefDate == rebateTrans.RebateRefDate
+                   && rebateTransCompare.ItemId == rebateTrans.ItemId
+                    && rebateTransCompare.METScanSupplier == METScanSupplier::SalesOrder;
+            supplierSOQty += rebateTransCompare.RebateQty;
+            rebateTransRecId += [rebateTransCompare.RecId];
+
+            select firstonly RebateQty, RecId from rebateTransCompare
+                where rebateTransCompare.RebateRefAccount == rebateTrans.RebateRefAccount
+                   && rebateTransCompare.RebateTransId == rebateTrans.RebateTransId
+                   && rebateTransCompare.RebateRefDate == rebateTrans.RebateRefDate
+                   && rebateTransCompare.ItemId == rebateTrans.ItemId
+                   && rebateTransCompare.METScanSupplier == METScanSupplier::Supplier;
+            supplierSOQty += rebateTransCompare.RebateQty;
+            rebateTransRecId += [rebateTransCompare.RecId];
+            
+            if((supplierSOQty + rebateTrans.METtoleranceQty) < rebateTrans.RebateQty)
+            {
+                this.updateRebateTrans(rebateTransRecId, NoYes::Yes);
+                this.updateRebateTrans([rebateTrans.RecId], NoYes::No);
+            }
+            else
+            {
+                this.updateRebateTrans([rebateTrans.RecId], NoYes::Yes);
+                this.updateRebateTrans(rebateTransRecId, NoYes::No);
+            }
+            rebateTransIdSet.add(rebateTrans.RebateTransId);
+        }
+        
+        SetEnumerator rebateTransIdEnumerator = rebateTransIdSet.getEnumerator();
+        while (rebateTransIdEnumerator.moveNext())
+        {
+            this.recalcRebateAmountStatic(rebateTransIdEnumerator.current(), useClaimProcess);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>recalcRebateAmountStatic</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method will recalculate the Rebate amount based on updated Claimed source transactions
+    /// </summary>
+    /// <param name = "_rebateTransId">Rebate transaction reference</param>
+    /// <param name = "_useClaimProcess">Based on this option claim process will be enabled</param>
+    protected void recalcRebateAmountStatic(TAMRebateTransId _rebateTransId, boolean _useClaimProcess)
+    {
+        TAMRebateDateTrans rebateDateTrans;
+    
+        ttsbegin;
+
+        select firstonly forUpdate rebateDateTrans
+            where rebateDateTrans.RebateTransId == _rebateTransId
+               && !rebateDateTrans.RebatePosted;
+    
+        if (rebateDateTrans)
+        {
+            TAMRebateTrans rebateTrans;
+    
+            select sum(CorrectedAmount) from rebateTrans
+                where rebateTrans.RebateTransId == _rebateTransId
+                   && (!_useClaimProcess
+                   ||  rebateDateTrans.RebateTransactionType != TAMRebateTransactionType::Rebate
+                   ||  rebateTrans.Claimed)
+                   && rebateTrans.CorrectedAmount;
+    
+            Amount totalAmount = rebateTrans.CorrectedAmount;
+    
+            select sum(RebateAmount) from rebateTrans
+                where rebateTrans.RebateTransId == _rebateTransId
+                   && (!_useClaimProcess
+                   ||  rebateDateTrans.RebateTransactionType != TAMRebateTransactionType::Rebate
+                   ||  rebateTrans.Claimed)
+                   && !rebateTrans.CorrectedAmount;
+    
+            totalAmount += rebateTrans.RebateAmount;
+    
+            if (rebateDateTrans.RebateAmount != totalAmount)
+            {
+                rebateDateTrans.RebateAmount = totalAmount;
+                rebateDateTrans.update();
+            }
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRebateTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Methood will update the transaction line as Claimed or Unclaimed
+    /// </summary>
+    /// <param name = "_rebateTransRecId">List of Rebate transaction reference RecIds</param>
+    /// <param name = "_claimed">boolean value to Claim or Unclaim</param>
+    protected void updateRebateTrans(Container  _rebateTransRecId, NoYes    _claimed)
+    {
+        Integer         RecIds;
+        TAMRebateTrans  rebateTransLoc;
+        RefRecId        rebateTransRec;
+        for(RecIds = 1; RecIds <= conLen(_rebateTransRecId); RecIds++)
+        {
+            rebateTransRec = conPeek(_rebateTransRecId, RecIds);
+            ttsbegin;
+            select forupdate firstonly rebateTransLoc where rebateTransLoc.RecId == rebateTransRec;
+            rebateTransLoc.Claimed = _claimed;
+            rebateTransLoc.modifiedField(fieldNum(TAMRebateTrans, Claimed));
+            rebateTransLoc.update(false);
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
