@@ -119,8 +119,10 @@ class METBankPaymAdviceReportGeneratorVend extends METBankPaymAdviceReportGenera
 				<Source><![CDATA[
     protected void populateBankPaymAdviceTempInvoiceInfo()
     {
-        TaxTrans            taxTrans;
-        MarkupTrans         markUpTrans;
+        TaxTrans                taxTrans;
+        MarkupTrans             markUpTrans;
+        METPayPricingCondition  metPricingCondition;
+        str                     metCondition;
 
         bankPaymAdviceTmp.Invoice = vendTransInvoice.Invoice;
         bankPaymAdviceTmp.InvoiceDate = vendTransInvoice.DocumentDate ? vendTransInvoice.DocumentDate : vendTransInvoice.TransDate;
@@ -137,39 +139,124 @@ class METBankPaymAdviceReportGeneratorVend extends METBankPaymAdviceReportGenera
         /// Reb GST = Charges Tax
         /// Net amount  = Gross invoice - Gross reb
         bankPaymAdviceTmp.METVoucher    = vendTransInvoice.Voucher;
-        bankPaymAdviceTmp.METGrossReb   =  -bankPaymAdviceTmp.CashDisc;
-        bankPaymAdviceTmp.METGrossInv   =  bankPaymAdviceTmp.AmountCur;
-
-        //Include -ve charges in the invoice amount if any. We need to show the charges in the GrossReb value in the report.
-        select sum(CalculatedAmount) from markUpTrans where markUpTrans.Voucher == vendTransInvoice.Voucher;
-
-        if (markUpTrans.CalculatedAmount < 0)
+        bankPaymAdviceTmp.METGrossReb   = abs(bankPaymAdviceTmp.CashDisc);
+        bankPaymAdviceTmp.METRebGST     = 0;
+        bankPaymAdviceTmp.METGrossInv   = 0;
+        bankPaymAdviceTmp.METInvGST     = 0;
+        
+        if (vendTransInvoice.JournalNum) //Vendor invoice journal
         {
-            bankPaymAdviceTmp.METGrossInv  +=  abs(markUpTrans.CalculatedAmount);
-            bankPaymAdviceTmp.METGrossReb  +=  abs(markUpTrans.CalculatedAmount);
-        }
-        bankPaymAdviceTmp.METGrossReb = -bankPaymAdviceTmp.METGrossReb;
+            ledgerJournalTrans      metJournalTrans;
+            ledgerJournalTrans      metJournalTransVend;
 
-        //Calculate invoice tax amount
-        select sum(TaxAmount), sum(TaxBaseAmount) from taxTrans
+            //Case: OffsetAcount specified
+            while select * from
+                metJournalTrans where metJournalTrans.JournalNum == vendTransInvoice.JournalNum
+                && metJournalTrans.Voucher == vendTransInvoice.Voucher
+                && metJournalTrans.AccountType == LedgerJournalACType::Vend
+                && metJournalTrans.OffsetLedgerDimension
+            {
+                select firstonly taxTrans
+                where taxTrans.JournalNum == vendTransInvoice.JournalNum
+                && taxTrans.Voucher == vendTransInvoice.Voucher
+                && taxTrans.SourceRecId == metJournalTrans.RecId
+                    && taxTrans.SourceTableId == tableNum(LedgerJournalTrans);
+
+                bankPaymAdviceTmp.METGrossInv   += abs(metJournalTrans.amount()) + abs(taxTrans.TaxAmount);
+                bankPaymAdviceTmp.METInvGST     += abs(taxTrans.TaxAmount);
+
+                bankPaymAdviceTmp.METGrossInv   = bankPaymAdviceTmp.AmountCur < 0 ? -bankPaymAdviceTmp.METGrossInv :  bankPaymAdviceTmp.METGrossInv;
+            }
+
+            //Case: With rebates via integrations
+            while select * from 
+                metJournalTrans where metJournalTrans.JournalNum == vendTransInvoice.JournalNum
+                && metJournalTrans.Voucher == vendTransInvoice.Voucher
+                && metJournalTrans.AccountType != LedgerJournalACType::Vend
+
+                exists join metJournalTransVend 
+                where metJournalTransVend.Voucher == metJournalTrans.Voucher
+                && metJournalTransVend.AccountType == LedgerJournalACType::Vend
+                && metJournalTransVend.JournalNum == vendTransInvoice.JournalNum
+            {
+                select firstonly AmountCurCredit, AmountCurDebit from metJournalTransVend
+                where metJournalTransVend.Voucher == metJournalTrans.Voucher
+                && metJournalTransVend.AccountType == LedgerJournalACType::Vend
+                    && metJournalTransVend.JournalNum == vendTransInvoice.JournalNum;
+
+                select firstonly taxTrans
+                where taxTrans.JournalNum == vendTransInvoice.JournalNum
+                && taxTrans.Voucher == vendTransInvoice.Voucher
+                && taxTrans.SourceRecId == metJournalTrans.RecId
+                    && taxTrans.SourceTableId == tableNum(LedgerJournalTrans);
+
+                metCondition = subStr(metJournalTrans.Txt, 1, 4);
+
+                select firstonly RecId from metPricingCondition where metPricingCondition.ConditionTypeId == metCondition;
+
+                if (metPricingCondition.RecId)
+                {
+                    bankPaymAdviceTmp.METGrossReb   += abs(metJournalTrans.amount()) + abs(taxTrans.TaxAmount);
+                    bankPaymAdviceTmp.METRebGST     += abs(taxTrans.TaxAmount);
+                }
+                else
+                {
+                    bankPaymAdviceTmp.METGrossInv   += metJournalTrans.amount() + taxTrans.TaxAmount;
+                    bankPaymAdviceTmp.METInvGST     += abs(taxTrans.TaxAmount);
+                }
+
+            }
+
+            if (bankPaymAdviceTmp.METGrossInv < 0)
+            {
+                bankPaymAdviceTmp.METInvGST     =  -bankPaymAdviceTmp.METInvGST;
+            }
+
+            bankPaymAdviceTmp.METGrossReb   = -bankPaymAdviceTmp.METGrossReb;
+            bankPaymAdviceTmp.METRebGST     = -bankPaymAdviceTmp.METRebGST;
+        }
+        else // Pending vendor invoices 
+        {
+            bankPaymAdviceTmp.METGrossInv   =  bankPaymAdviceTmp.AmountCur;
+            //Include -ve charges in the invoice amount if any. We need to show the charges in the GrossReb value in the report.
+            select sum(CalculatedAmount) from markUpTrans where markUpTrans.Voucher == vendTransInvoice.Voucher;
+
+            if (markUpTrans.CalculatedAmount < 0)
+            {
+                bankPaymAdviceTmp.METGrossInv  +=  abs(markUpTrans.CalculatedAmount);
+                bankPaymAdviceTmp.METGrossReb  +=  abs(markUpTrans.CalculatedAmount);
+            }
+            
+            bankPaymAdviceTmp.METGrossReb = -bankPaymAdviceTmp.METGrossReb;
+
+            //Calculate invoice tax amount
+            select sum(TaxAmount), sum(TaxBaseAmount) from taxTrans
                     where taxTrans.Voucher == vendTransInvoice.Voucher &&
                     taxTrans.TransDate == vendTransInvoice.TransDate &&
                     taxTrans.SourceTableId != tableNum(MarkupTrans);
-        if (taxTrans.TaxAmount)
-        {
-            bankPaymAdviceTmp.METInvGST     =   taxTrans.TaxAmount;
-        }
+            if (taxTrans.TaxAmount)
+            {
+                bankPaymAdviceTmp.METInvGST     =   taxTrans.TaxAmount;
+            }
 
-        //Calculate charges tax amount
-        select sum(TaxAmount), sum(TaxBaseAmount) from taxTrans
+            //Calculate charges tax amount
+            select sum(TaxAmount), sum(TaxBaseAmount) from taxTrans
                     where taxTrans.Voucher == vendTransInvoice.Voucher &&
                     taxTrans.TransDate == vendTransInvoice.TransDate &&
                     taxTrans.SourceTableId == tableNum(MarkupTrans);
 
-        if (taxTrans.TaxAmount)
-        {
-            bankPaymAdviceTmp.METRebGST = -taxTrans.TaxAmount;
+            if (taxTrans.TaxAmount < 0)
+            {
+                bankPaymAdviceTmp.METRebGST = taxTrans.TaxAmount;
+            }
+            else
+            {
+                bankPaymAdviceTmp.METInvGST += taxTrans.TaxAmount;
+            }
         }
+
+        bankPaymAdviceTmp.METGrossInv   = bankPaymAdviceTmp.METGrossInv == 0 ? bankPaymAdviceTmp.AmountCur :  bankPaymAdviceTmp.METGrossInv;
+        
         /// MPJ_2573_VendorRemittanceAdviceFormatChanges - END
     }
 
