@@ -10,9 +10,192 @@
 [ExtensionOf(tableStr(FreeTextInvoiceEntity))]
 public final class METFreeTextInvoiceEntity_Extension
 {
+
 }
 ]]></Declaration>
 		<Methods>
+			<Method>
+				<Name>preTargetProcessSetBased</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// CoC extension
+    /// </summary>
+    /// <param name = "_dmfDefinitionGroupExecution">_dmfDefinitionGroupExecution</param>
+    public static void preTargetProcessSetBased(DMFDefinitionGroupExecution _dmfDefinitionGroupExecution)
+    {
+        ttsbegin;
+
+        next preTargetProcessSetBased(_dmfDefinitionGroupExecution);
+
+        FreeTextInvoiceStaging staging;
+        while select forupdate staging
+            where   staging.DefinitionGroup     == _dmfDefinitionGroupExecution.DefinitionGroup
+            &&      staging.ExecutionId         == _dmfDefinitionGroupExecution.ExecutionId
+            &&      (staging.TransferStatus     == DMFTransferStatus::NotStarted || staging.TransferStatus == DMFTransferStatus::Validated)
+        {
+            boolean ok = true;
+
+            if(staging.METProjId && !ProjTable::exist(staging.METProjId))
+            {
+                error(strFmt("@MET:METProjectDoesNotExist", staging.METProjId));
+                ok = false;
+            }
+            if(staging.METProjCategoryId && !ProjCategory::exist(staging.METProjCategoryId))
+            {
+                error(strFmt("@MET:METProjectCategoryDoesNotExist", staging.METProjCategoryId));
+                ok = false;
+            }
+            if(staging.METReasonCode && !ReasonTable::exist(staging.METReasonCode))
+            {
+                error(strFmt("@MET:METReasonCodeDoesNotExist", staging.METReasonCode));
+                ok = false;
+            }
+
+            if(!ok)
+            {
+                staging.TransferStatus = DMFTransferStatus::Error;
+                staging.update();
+            }
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertFreeTextInvoiceLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// CoC extension
+    /// </summary>
+    /// <param name = "_dmfDefinitionGroupExecution">_dmfDefinitionGroupExecution</param>
+    /// <param name = "_sourceDocumentFTIMap">_sourceDocumentFTIMap</param>
+    /// <param name = "_dimCacheTmpLedgerAccount">_dimCacheTmpLedgerAccount</param>
+    /// <param name = "_dimCacheTmpDefaultDimension">_dimCacheTmpDefaultDimension</param>
+    protected static void insertFreeTextInvoiceLines(
+        DMFDefinitionGroupExecution _dmfDefinitionGroupExecution,
+        FreeTextInvoiceSourceDocumentHeaderStaging _sourceDocumentFTIMap,
+        DimensionDataEntitySFKCacheTmp _dimCacheTmpLedgerAccount,
+        DimensionDataEntitySFKCacheTmp _dimCacheTmpDefaultDimension)
+    {
+        next insertFreeTextInvoiceLines(
+            _dmfDefinitionGroupExecution,
+            _sourceDocumentFTIMap,
+            _dimCacheTmpLedgerAccount,
+            _dimCacheTmpDefaultDimension);
+    
+        // MPJ-9755
+        FreeTextInvoiceEntity::metUpdateInvoiceLinesFromProjectDetails(
+            _dmfDefinitionGroupExecution, 
+            _sourceDocumentFTIMap);    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metUpdateInvoiceLinesFromProjectDetails</Name>
+				<Source><![CDATA[
+    static private void metUpdateInvoiceLinesFromProjectDetails(
+        DMFDefinitionGroupExecution                 _definitionGroupExecution,
+        FreeTextInvoiceSourceDocumentHeaderStaging  _sourceDocumentFTIMap)
+    {
+        
+        // MPJ-9755
+        CustInvoiceTable        custInvoiceTable;
+        CustInvoiceLine         custInvoiceLine;
+        SourceDocumentLine      sourceDocumentLine;
+        ProjTable               projTable;
+        FreeTextInvoiceStaging  staging;
+        Set                     lineRecIDs = new Set(Types::Int64); // <CustInvoiceLine.RecID>
+
+        DimensionHierarchy      dimHierarchy;
+        DimensionHierarchyLevel dimHierarchyLevel;
+        container               defaultDimensionAttributes;
+        
+        ttsbegin;
+
+        // Find order of attributes applicable from the integration/entity hierarchy.
+        dimHierarchy = DimensionHierarchy::findByTypeAndName(DimensionHierarchyType::DataEntityDefaultDimensionFormat, 'Default dimensions integration');   // name is fixed, sys-defined.
+        if(dimHierarchy)
+        {
+            while select dimHierarchyLevel
+                order by Level
+                where   dimHierarchyLevel.DimensionHierarchy == dimHierarchy.RecId
+            {
+                DimensionAttribute attr = DimensionAttribute::find(dimHierarchyLevel.DimensionAttribute);
+                if(attr.Name != 'MainAccount')
+                {
+                    defaultDimensionAttributes += attr.Name;
+                }
+            }
+        }
+
+        while select forupdate custInvoiceLine
+        join custInvoiceTable
+            where   custInvoiceTable.RecId                      == custInvoiceLine.ParentRecId
+        join sourceDocumentLine
+            where   sourceDocumentLine.SourceDocumentHeader     == custInvoiceTable.SourceDocumentHeader
+        join staging
+            where   staging.DefinitionGroup                     == _definitionGroupExecution.DefinitionGroup
+            &&      staging.ExecutionId                         == _definitionGroupExecution.ExecutionId
+            &&      staging.LineNumber                          == custInvoiceLine.LineNum                        
+            &&      staging.METProjId                           != ''
+        outer join projTable
+            where   projTable.ProjId                            == staging.METProjId
+        exists join _sourceDocumentFTIMap
+            where _sourceDocumentFTIMap.SourceDocumentHeader    == sourceDocumentLine.SourceDocumentHeader
+        {
+            if(lineRecIDs.in(custInvoiceLine.RecId))
+            {
+                continue;
+            }
+            lineRecIDs.add(custInvoiceLine.RecId);
+            if(projTable)
+            {
+                DimensionAttributeValueSetStorage   dimStorageInvoiceLine, dimStorageProject;
+                DimensionAttribute                  dimAttribute;
+                DimensionValue                      currentValue, projectAttrValue;
+                int                                 attrIdx;
+
+                dimStorageInvoiceLine   = DimensionAttributeValueSetStorage::find(custInvoiceLine.DefaultDimension);
+                dimStorageProject       = DimensionAttributeValueSetStorage::find(projTable.DefaultDimension);
+
+                for(attrIdx = 1; attrIdx <= conLen(defaultDimensionAttributes); attrIdx++)
+                {
+                    dimAttribute        = DimensionAttribute::findByName(conPeek(defaultDimensionAttributes, attrIdx));
+                    currentValue        = dimStorageInvoiceLine.getDisplayValueByDimensionAttribute(dimAttribute.RecId);
+                    projectAttrValue    = dimStorageProject.getDisplayValueByDimensionAttribute(dimAttribute.RecId);
+
+                    if(projectAttrValue)
+                    {
+                        dimStorageInvoiceLine.addItem(DimensionAttributeValue::findByDimensionAttributeAndValue(dimAttribute, projectAttrValue, true, true));
+                    }
+                }
+
+                custInvoiceLine.DefaultDimension    = dimStorageInvoiceLine.save();
+                custInvoiceLine.ProjId              = staging.METProjId;
+                custInvoiceLine.ProjCategoryId      = staging.METProjCategoryId;
+
+                if(staging.METReasonCode)
+                {
+                    ReasonTableRef reasonRef;
+                    reasonRef.Reason        = staging.METReasonCode;
+                    reasonRef.ReasonComment = staging.METReasonComment;
+                    reasonRef.insert();
+
+                    custInvoiceLine.ReasonRefRecId = reasonRef.RecId;
+                }
+            }
+
+            custInvoiceLine.doUpdate();
+
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
 			<Method>
 				<Name>postLoad</Name>
 				<Source><![CDATA[
