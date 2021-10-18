@@ -15,6 +15,135 @@ public final class METFreeTextInvoiceEntity_Extension
 ]]></Declaration>
 		<Methods>
 			<Method>
+				<Name>preTargetProcessSetBased</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// CoC extension
+    /// </summary>
+    /// <param name = "_dmfDefinitionGroupExecution">_dmfDefinitionGroupExecution</param>
+    public static void preTargetProcessSetBased(DMFDefinitionGroupExecution _dmfDefinitionGroupExecution)
+    {
+        ttsbegin;
+
+        next preTargetProcessSetBased(_dmfDefinitionGroupExecution);
+
+        FreeTextInvoiceStaging staging;
+        while select forupdate staging
+            where   staging.DefinitionGroup     == _dmfDefinitionGroupExecution.DefinitionGroup
+            &&      staging.ExecutionId         == _dmfDefinitionGroupExecution.ExecutionId
+            &&      (staging.TransferStatus     == DMFTransferStatus::NotStarted || staging.TransferStatus == DMFTransferStatus::Validated)
+        {
+            boolean ok = true;
+
+            if(staging.METProjFundingSourceId)
+            {
+                if(staging.METProjFundingSourceID)
+                {
+                    ProjFundingSource fundingSource;
+                    select firstonly RecId from fundingSource
+                        order by RecId desc
+                        where   fundingSource.CustAccount       == staging.CustomerAccount
+                        &&      fundingSource.FundingSourceID   == staging.METProjFundingSourceID;
+
+                    if(!fundingSource.RecId)
+                    {
+                        error(strFmt("Project funding source '%1' does not exist for customer '%2'",
+                            staging.METProjFundingSourceId,
+                            staging.CustomerAccount));
+                        ok = false;
+                    }
+                }
+            }
+
+            if(!ok)
+            {
+                staging.TransferStatus = DMFTransferStatus::Error;
+                staging.update();
+            }
+        }
+
+        ttscommit;
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertFreeTextInvoiceHeaderV2</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// CoC extension
+    /// </summary>
+    /// <param name = "_dmfDefinitionGroupExecution">_dmfDefinitionGroupExecution</param>
+    /// <param name = "_sourceDocumentFTIMap">_sourceDocumentFTIMap</param>
+    /// <param name = "_dimCacheTmpHeaderDefaultDimension">_dimCacheTmpHeaderDefaultDimension</param>
+    protected static void insertFreeTextInvoiceHeaderV2(
+        DMFDefinitionGroupExecution _dmfDefinitionGroupExecution,
+        FreeTextInvoiceSourceDocumentHeaderStaging _sourceDocumentFTIMap,
+        DimensionDataEntitySFKCacheTmp _dimCacheTmpHeaderDefaultDimension)
+    {
+        next insertFreeTextInvoiceHeaderV2(
+            _dmfDefinitionGroupExecution,
+            _sourceDocumentFTIMap,
+            _dimCacheTmpHeaderDefaultDimension);
+
+        FreeTextInvoiceStaging  staging;
+        CustInvoiceTable        custInvoiceTable;
+        CustTable               custTable;
+        DictTable               dictTable = new DictTable(tableNum(CustInvoiceTable));
+        DictField               dictField;
+
+        FreeTextInvoiceEntity::skipTableMethods(custInvoiceTable, true);
+               
+        // Row-by-row update of header. No easy way to apply all logic in initFromCustTable
+        // without duplicating a large amount of logic with multiple set-based updates.
+        // Alternative is to update fields in staging table prior to insert.
+        while select forupdate custInvoiceTable
+        join staging
+            where   custInvoiceTable.InvoiceId      == staging.FreeTextNumber
+            &&      staging.DefinitionGroup         == _dmfDefinitionGroupExecution.DefinitionGroup
+            &&      staging.ExecutionId             == _dmfDefinitionGroupExecution.ExecutionId
+            &&      (staging.TransferStatus         == DMFTransferStatus::NotStarted || staging.TransferStatus == DMFTransferStatus::Validated)
+        join custTable
+            where   custTable.AccountNum            == custInvoiceTable.OrderAccount
+        {
+            custInvoiceTable.METImported = true;
+
+            // Determine fields that have already been populated.
+            Map populatedFieldsMap = new Map(Types::String, Types::AnyType);    // <fieldName, value>
+
+            int fieldIdx;
+            for(fieldIdx = 1; fieldIdx <= dictTable.fieldCnt(); fieldIdx++)
+            {
+                dictField = new DictField(tableNum(CustInvoiceTable), dictTable.fieldCnt2Id(fieldIdx));
+                if(dictField.arraySize() == 1 && custInvoiceTable.(dictField.id()))
+                {
+                    populatedFieldsMap.insert(dictField.name(), custInvoiceTable.(dictField.id()));
+                }
+            }
+
+            // Default initFromCust logic.
+            custInvoiceTable.initFromCustTable(custTable);
+
+            // Replace values that had already been populated.
+            MapEnumerator mapEnum = populatedFieldsMap.getEnumerator();
+            while(mapEnum.moveNext())
+            {
+                int fieldID = fieldName2Id(tableNum(CustInvoiceTable), mapEnum.currentKey());
+                custInvoiceTable.(fieldID) = mapEnum.currentValue();
+            }
+
+            // Update
+            if(!bufCmp(custInvoiceTable, custInvoiceTable.orig()))
+            {
+                custInvoiceTable.update();
+            }
+        }       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>insertFreeTextInvoiceLines</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -128,6 +257,18 @@ public final class METFreeTextInvoiceEntity_Extension
                 custInvoiceLine.ProjId              = staging.METProjId;
                 custInvoiceLine.ProjCategoryId      = staging.METProjCategoryId;
 
+                if(staging.METProjFundingSourceID)
+                {
+                    // ** Confirm relation for ProjFundingSource.. Contract ID?
+                    ProjFundingSource fundingSource;
+                    select firstonly RecId from fundingSource
+                        order by RecId desc
+                        where   fundingSource.CustAccount       == custInvoiceTable.InvoiceAccount
+                        &&      fundingSource.FundingSourceID   == staging.METProjFundingSourceID;
+
+                    custInvoiceLine.ProjFundingSource = fundingSource.RecID;
+                }
+
                 if(staging.METReasonCode)
                 {
                     ReasonTableRef reasonRef;
@@ -138,9 +279,7 @@ public final class METFreeTextInvoiceEntity_Extension
                     custInvoiceLine.ReasonRefRecId = reasonRef.RecId;
                 }
             }
-
             custInvoiceLine.doUpdate();
-
         }
         ttscommit;
     }
