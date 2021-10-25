@@ -9,6 +9,8 @@
 /// </summary>
 class METRebateExternalDataSourceService extends SysOperationServiceBase
 {    
+    protected Map unitCache;
+    
 }
 ]]></Declaration>
 		<Methods>
@@ -27,12 +29,16 @@ class METRebateExternalDataSourceService extends SysOperationServiceBase
         TAMRebateDate               rebateDate;
         TAMRebateDateTrans          rebateDateTrans;
         METRebateScanSupplierTable  scanSupplierData;
+        TAMRebateParameters         rebateParameters;
         TAMRebateTransactionType    transType;
         Qty                         toleranceQty;
 
         Query                       query;
         QueryRun                    queryRun;
         QueryBuildDataSource        qbdsRebateDeal, qbdsRebateTable, qbdsRebateScanSupplier;
+
+        unitCache = new Map(Types::String, Types::Int64);
+        rebateParameters = TAMRebateParameters::find();
 
         query = new Query();
         rebateDealContract  =   _contract.parmTAMRebateDeal();
@@ -60,7 +66,7 @@ class METRebateExternalDataSourceService extends SysOperationServiceBase
         {
             rebateTable         =   queryRun.get(tableNum(TAMRebateTable));
             scanSupplierData    =   queryRun.get(tableNum(METRebateScanSupplierTable));
-
+            
             select firstonly rebateDate where rebateDate.RebateId == rebateTable.RebateId
                                            && rebateDate.RebateFromDate <= scanSupplierData.TransactionDate
                                            && rebateDate.RebateToDate >= scanSupplierData.TransactionDate;
@@ -70,7 +76,7 @@ class METRebateExternalDataSourceService extends SysOperationServiceBase
 
                 if(rebateDateTrans.RebateFromDate <= scanSupplierData.TransactionDate && rebateDateTrans.RebateToDate >= scanSupplierData.TransactionDate)
                 {
-                    this.createTrans(rebateDateTrans, rebateDate, scanSupplierData, toleranceQty);
+                    this.createTrans(rebateDateTrans, rebateDate, scanSupplierData, toleranceQty, rebateTable.UnitId);
                 }
             }
         }
@@ -201,10 +207,12 @@ class METRebateExternalDataSourceService extends SysOperationServiceBase
     /// <param name = "_rebateDate">TAMRebateDate table</param>
     /// <param name = "_scanSupplierData">METScanSupplierData table</param>
     /// <param name = "_toleranceQty">Tolerance quantity from user interface</param>
+    /// <param name = "_rebateTableUnitId">Rebate table unit of measure</param>
     private void createTrans(TAMRebateDateTrans             _rebateDateTrans,
                              TAMRebateDate                  _rebateDate,
                              METRebateScanSupplierTable     _scanSupplierData,
-                             Qty                            _toleranceQty)
+                             Qty                            _toleranceQty,
+                             UnitOfMeasureSymbol            _rebateTableUnitId)
     {
         TAMRebateTrans          rebateTrans;
         CustTable               custTableLoc;
@@ -217,16 +225,8 @@ class METRebateExternalDataSourceService extends SysOperationServiceBase
             rebateTrans.RefCompanyId                =   _scanSupplierData.Company;
             rebateTrans.RebateRefDate               =   _scanSupplierData.TransactionDate;
             rebateTrans.ItemId                      =   _scanSupplierData.ItemId;
-            rebateTrans.RefUnitId                   =   _scanSupplierData.UnitOfMeasure;
-            rebateTrans.RebateQty                   =   _scanSupplierData.RebateQty;
-            rebateTrans.METScanSupplier             =   _scanSupplierData.IsScanSupplier;
-            rebateTrans.METtoleranceQty             =   _toleranceQty;
-            rebateTrans.RebateAmount                =   this.calcRebateAmount(_scanSupplierData.RebateQty, _rebateDate);
-            rebateTrans.PostingAmount               =   rebateTrans.RebateAmount;
-            rebateTrans.RebateTransId               =   _rebateDateTrans.RebateTransId;
-            rebateTrans.RebateId                    =   _rebateDateTrans.RebateId;
-            rebateTrans.CurrencyCode                =   _scanSupplierData.CurrencyCode;
-
+            rebateTrans.RefUnitId                   =   _rebateTableUnitId;
+                        
             if(_scanSupplierData.CustVendACType == CustVendACType::Cust)
             {
                 select firstonly InventSiteId, InventLocation
@@ -244,6 +244,29 @@ class METRebateExternalDataSourceService extends SysOperationServiceBase
                 inventDimLoc.InventLocationId           =   vendTableLoc.InventLocation;
             }
             rebateTrans.InventDimId                 =   InventDim::findOrCreate(inventDimLoc).inventDimId;
+
+            if (!_rebateTableUnitId || _rebateTableUnitId == _scanSupplierData.UnitOfMeasure)
+            {
+                rebateTrans.RebateQty               =   _scanSupplierData.RebateQty;
+            }
+            else
+            {
+                rebateTrans.RebateQty               =   EcoResProductUnitConverter::convertForReleasedProduct(rebateTrans.ItemId,
+                                                                                                              rebateTrans.InventDimId,
+                                                                                                              _scanSupplierData.RebateQty,
+                                                                                                              this.findUnitOfMeasureRecId(_scanSupplierData.UnitOfMeasure),
+                                                                                                              this.findUnitOfMeasureRecId(_rebateTableUnitId),
+                                                                                                              NoYes::Yes);
+            }
+
+            rebateTrans.METScanSupplier             =   _scanSupplierData.IsScanSupplier;
+            rebateTrans.METtoleranceQty             =   _toleranceQty;
+            rebateTrans.RebateAmount                =   this.calcRebateAmount(rebateTrans.RebateQty, _rebateDate);
+            rebateTrans.PostingAmount               =   rebateTrans.RebateAmount;
+            rebateTrans.RebateTransId               =   _rebateDateTrans.RebateTransId;
+            rebateTrans.RebateId                    =   _rebateDateTrans.RebateId;
+            rebateTrans.CurrencyCode                =   _scanSupplierData.CurrencyCode;
+
             if(rebateTrans.validateWrite())
             {
                 rebateTrans.insert();
@@ -254,6 +277,32 @@ class METRebateExternalDataSourceService extends SysOperationServiceBase
         {
             Info("@MET:METRebateInsertError");
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findUnitOfMeasureRecId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to get the unit of measure Record Id
+    /// </summary>
+    /// <param name = "_unit">Unit symbol of measure</param>
+    /// <returns>Record Id of the Unit symbol</returns>
+    protected UnitOfMeasureRecId findUnitOfMeasureRecId(UnitOfMeasureSymbol _unit)
+    {
+        UnitOfMeasureRecId unitOfMeasureRecId;
+        if (unitCache.exists(_unit))
+        {
+            unitOfMeasureRecId = unitCache.lookup(_unit);
+        }
+        else
+        {
+            unitOfMeasureRecId = UnitOfMeasure::unitOfMeasureIdBySymbol(_unit);
+            unitCache.insert(_unit, unitOfMeasureRecId);
+        }
+    
+        return unitOfMeasureRecId;
     }
 
 ]]></Source>
