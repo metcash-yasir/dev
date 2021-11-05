@@ -40,6 +40,29 @@ public final class RetailSalesOrderCalculatorGlobalUnifiedPricing_Extension
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>deleteMCRPriceHistory</Name>
+				<Source><![CDATA[
+    private void deleteMCRPriceHistory(SalesLine salesLine)
+    {
+        MCRPriceHistory priceHistory;
+        MCRPriceHistoryRef priceHistoryRef;
+
+        ttsbegin;
+
+        delete_from priceHistory
+            exists join priceHistoryRef
+            where priceHistory.RecId == priceHistoryRef.PriceHistoryRecId
+               && priceHistoryRef.mcrOrderLine2PriceHistoryRef == salesLine.mcrOrderLine2PriceHistoryRef;
+
+        delete_from priceHistoryRef
+            where priceHistoryRef.mcrOrderLine2PriceHistoryRef == salesLine.mcrOrderLine2PriceHistoryRef;
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>UpdateGUPPriceAdjustmentHistory</Name>
 				<Source><![CDATA[
     private void UpdateGUPPriceAdjustmentHistory(Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesTransaction crtSalesTransaction)
@@ -59,46 +82,102 @@ public final class RetailSalesOrderCalculatorGlobalUnifiedPricing_Extension
                 Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesLine crtSalesLine = enumeratorSalesLine.get_Current();
                 salesLine = SalesLine::findInventTransId(crtSalesLine.get_LineId());
 
-                // First delete all margin adjustment history
-                GUPMarginComponentAdjustmentHistory::deleteHistory(salesLine.RecId);
-
-                clrPriceLines = crtSalesLine.get_PriceLines();
-                enumeratorPriceLine = clrPriceLines.GetEnumerator();
-                while (enumeratorPriceLine.MoveNext())
+                if (salesLine.SalesStatus != SalesStatus::Invoiced && salesLine.SalesStatus != SalesStatus::Canceled)
                 {
-                    Microsoft.Dynamics.Commerce.Runtime.DataModel.PriceLine crtPriceLine = enumeratorPriceLine.get_Current();
+                    // First delete all margin adjustment history
+                    GUPMarginComponentAdjustmentHistory::deleteHistory(salesLine.RecId);
 
-                    if (crtPriceLine is Microsoft.Dynamics.Commerce.Runtime.DataModel.PriceAdjustmentPriceLine)
-                    //if (crtPriceLine is Microsoft.Dynamics.Commerce.Runtime.DataModel.GlobalUnifiedPricingAdjustmentPriceLine)
+                    // Second delete all trade agreement price history
+                    this.deleteMCRPriceHistory(salesLine);
+
+                    clrPriceLines = crtSalesLine.get_PriceLines();
+                    enumeratorPriceLine = clrPriceLines.GetEnumerator();
+                    while (enumeratorPriceLine.MoveNext())
                     {
-                        //Microsoft.Dynamics.Commerce.Runtime.DataModel.GlobalUnifiedPricingAdjustmentPriceLine adjustmentPriceLine = crtPriceLine as Microsoft.Dynamics.Commerce.Runtime.DataModel.GlobalUnifiedPricingAdjustmentPriceLine;
+                        Microsoft.Dynamics.Commerce.Runtime.DataModel.PriceLine crtPriceLine = enumeratorPriceLine.get_Current();
 
-                        RetailPeriodicDiscount  periodicDiscount;
-                        RetailPeriodicDiscountLine periodicDiscountLine;
-                        GUPPriceComponentCodeSetup marginComponentSetup;
-
-                        select firstonly marginComponentSetup
-                        order by marginComponentSetup.CalculationSequence
-                        join periodicDiscount
-                            where marginComponentSetup.PriceComponentCodeName == periodicDiscount.PriceComponentCodeName
-                        join periodicDiscountLine
-                        where periodicDiscount.OfferId == periodicDiscountLine.OfferId &&
-                            periodicDiscountLine.recId ==  crtPriceLine.get_RecordId() &&
-                            periodicDiscount.Status == RetailDisabledEnabled::Enabled &&
-                            periodicDiscount.IsGupDiscount == NoYes::Yes &&
-                            periodicDiscount.PeriodicDiscountType == RetailDiscountOfferTypeBase::Promotion;
-
-                        if (periodicDiscount)
+                        if (crtPriceLine is Microsoft.Dynamics.Commerce.Runtime.DataModel.TradeAgreementPriceLine)
                         {
-                            GUPMarginComponentAdjustmentHistory   marginComponentAdjustmentHistory;
-                            marginComponentAdjustmentHistory.clear();
-                            marginComponentAdjustmentHistory.SalesLine = salesLine.RecId;
-                            marginComponentAdjustmentHistory.MarginComponentCode = periodicDiscount.PriceComponentCodeName;
-                            marginComponentAdjustmentHistory.marginComponentAdjustment = periodicDiscount.OfferId;
-                            marginComponentAdjustmentHistory.CalculationSequence = marginComponentSetup.CalculationSequence;
-                            marginComponentAdjustmentHistory.Amount = crtPriceLine.get_Value();
-                            //marginComponentAdjustmentHistory.Amount = adjustmentPriceLine.get_AdjustedAmount();
-                            marginComponentAdjustmentHistory.insert();
+                            PriceDiscTable priceDiscTable = PriceDiscTable::findRecId(crtPriceLine.get_RecordId());
+
+                            if (priceDiscTable)
+                            {
+                                MCRPriceHistory mcrPriceHistory;
+                                Version         version;
+
+                                // Find the latest version of price history for the table and record.
+                                select firstonly mcrPriceHistory order by Version desc
+                                where mcrPriceHistory.RefRecId      == priceDiscTable.RecId
+                                   && mcrPriceHistory.RefTableId    == priceDiscTable.TableId;
+
+                                if (!mcrPriceHistory || !mcrPriceHistory.equal(priceDiscTable))
+                                {
+                                    version = mcrPriceHistory.Version + 1;
+
+                                    mcrPriceHistory.clear();
+
+                                    mcrPriceHistory.Version = version;
+                                    mcrPriceHistory.initFrom(priceDiscTable);
+
+                                    if (mcrPriceHistory.validateWrite())
+                                    {
+                                        mcrPriceHistory.insert();
+
+                                        MCRPriceHistoryRef priceHistoryRef;
+                                        priceHistoryRef.PriceHistoryRecId = mcrPriceHistory.RecId;
+                                        priceHistoryRef.MCROrderLine2PriceHistoryRef = salesLine.mcrOrderLine2PriceHistoryRef;
+                                        priceHistoryRef.insert();
+                                    }
+                                }
+                                else
+                                {
+                                    MCRPriceHistoryRef priceHistoryRef;
+
+                                    select firstonly priceHistoryRef
+                                    where priceHistoryRef.MCROrderLine2PriceHistoryRef == salesLine.mcrOrderLine2PriceHistoryRef
+                                       && priceHistoryRef.PriceHistoryRecId == mcrPriceHistory.RecId;
+
+                                    if (!priceHistoryRef)
+                                    {
+                                        priceHistoryRef.PriceHistoryRecId = mcrPriceHistory.RecId;
+                                        priceHistoryRef.MCROrderLine2PriceHistoryRef = salesLine.mcrOrderLine2PriceHistoryRef;
+                                        priceHistoryRef.insert();
+                                    }
+                                }
+                            }
+                        }
+
+                        if (crtPriceLine is Microsoft.Dynamics.Commerce.Runtime.DataModel.GlobalUnifiedPricingAdjustmentPriceLine)
+                        {
+                            Microsoft.Dynamics.Commerce.Runtime.DataModel.GlobalUnifiedPricingAdjustmentPriceLine adjustmentPriceLine = crtPriceLine as Microsoft.Dynamics.Commerce.Runtime.DataModel.GlobalUnifiedPricingAdjustmentPriceLine;
+
+                            RetailPeriodicDiscount  periodicDiscount;
+                            RetailPeriodicDiscountLine periodicDiscountLine;
+                            GUPPriceComponentCodeSetup marginComponentSetup;
+
+                            select firstonly marginComponentSetup
+                            order by marginComponentSetup.CalculationSequence
+                            join periodicDiscount
+                                where marginComponentSetup.PriceComponentCodeName == periodicDiscount.PriceComponentCodeName
+                            join periodicDiscountLine
+                            where periodicDiscount.OfferId == periodicDiscountLine.OfferId &&
+                                periodicDiscountLine.recId ==  crtPriceLine.get_RecordId() &&
+                                periodicDiscount.Status == RetailDisabledEnabled::Enabled &&
+                                periodicDiscount.IsGupDiscount == NoYes::Yes &&
+                                periodicDiscount.PeriodicDiscountType == RetailDiscountOfferTypeBase::Promotion;
+
+                            if (periodicDiscount)
+                            {
+                                GUPMarginComponentAdjustmentHistory   marginComponentAdjustmentHistory;
+                                marginComponentAdjustmentHistory.clear();
+                                marginComponentAdjustmentHistory.SalesLine = salesLine.RecId;
+                                marginComponentAdjustmentHistory.MarginComponentCode = periodicDiscount.PriceComponentCodeName;
+                                marginComponentAdjustmentHistory.marginComponentAdjustment = periodicDiscount.OfferId;
+                                marginComponentAdjustmentHistory.CalculationSequence = marginComponentSetup.CalculationSequence;
+                                //marginComponentAdjustmentHistory.Amount = crtPriceLine.get_Value();
+                                marginComponentAdjustmentHistory.Amount = adjustmentPriceLine.get_AdjustedAmount();
+                                marginComponentAdjustmentHistory.insert();
+                            }
                         }
                     }
                 }
