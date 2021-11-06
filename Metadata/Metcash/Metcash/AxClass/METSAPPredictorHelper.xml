@@ -10,7 +10,7 @@
 public class METSAPPredictorHelper
 {
     METSAPPredictorHelperContract   predictorHelperContract;
-
+    AmountCurDebCred                maxTolerance, minTolerance;
 }
 ]]></Declaration>
 		<Methods>
@@ -43,6 +43,7 @@ public class METSAPPredictorHelper
     {
         CustTransOpen               custTransOpenSettlement;
         boolean                     flag;
+        AmountCurDebCred            totalOpeningBalance, overdueBalance, totalCN, totalCurrentWeekCN, totalTwoConsecCN;
 
         flag = false;
         
@@ -55,32 +56,83 @@ public class METSAPPredictorHelper
             flag = true;
         }
         // End Step 1
-        
+
         // Start step 2 - Sum of all open items (total for account) – using grouping logic
-        if (_custTransOpen.AmountCur == -(this.getTotalCustOpenTransAmount(_custTable.AccountNum)) && flag == false)
+        // Step 2 Is payment > than OB + $1? If Yes - Leave payment unallocated. If No go to Step 3.
+        totalOpeningBalance = -(this.getTotalCustOpenTransAmount(_custTable.AccountNum));
+
+        if (_custTransOpen.AmountCur < totalOpeningBalance && flag == false)
+        {
+            flag = true;
+        }
+        // End step 2
+        
+        // Start step 3 - Is Payment = OB? If Yes - Clear open transactions/items. If No go to Step 4.
+
+        overdueBalance = -(this.GetTotalCustOpenTransAmountOverdue(_custTable.AccountNum));
+
+        if (_custTransOpen.AmountCur == overdueBalance && flag == false)
+        {
+            this.settleTransSumAllOpenItemsOverdue(_custTransOpen, _custTable);
+            flag = true;
+        }
+
+        if (_custTransOpen.AmountCur == totalOpeningBalance && flag == false)
         {
             this.settleTransSumAllOpenItems(_custTransOpen, _custTable);
             flag = true;
         }
-        // End step 2
-               
-        // Start step 3 - Sum of each statement period starting with the current period then work backwards.
-        if (flag == false)
+
+        // check credit notes + payment value is equal to the OB. If yes select all and settle.
+        totalCN = this.getTotalCreditNotes(_custTable.AccountNum);
+        totalCN = _custTransOpen.AmountCur + totalCN;
+
+        if (totalCN && totalCN == totalOpeningBalance)
         {
-            custTransOpenSettlement = this.getCustTransOpenByDate(_custTransOpen, _custTable, predictorHelperContract.getStartDateStep3(), predictorHelperContract.getEndDateStep3());
-                        
-            if (custTransOpenSettlement)
-            {
-                this.settleTransaction(_custTransOpen, _custTable, custTransOpenSettlement);
-                flag = true;
-            }
+            this.settleTransSumAllOpenItemsCreditNotes(_custTransOpen, _custTable);
         }
         // End step 3
-        
-        // Start step 4 - Sum of each statement period starting with current period then work forward.
+
+        // Start 
+        // step 4 Is Payment between +/- $1 of the OB? If Yes - Clear open transactions/items and auto write-off balance between +/- $1. If No go to Step 5.
+        // Depreciated for furture release
+        // End step 4
+
+        // Start step 5 - Is Payment = Current Period Due or any of the Previous Due Dates up to the Oldest Due Date  (excluding Collections status Disputed and Promise to pay)? 
+        // If Yes - Clear open transactions/items. If No go to Step 6.
+        // (ST 3 Sum of each statement period starting with the current period then work backwards)
+        if (flag == false)
+        {
+            custTransOpenSettlement = this.getCustTransOpenByDate(_custTransOpen.AmountCur, _custTable, predictorHelperContract.getStartDateStep5(), predictorHelperContract.getEndDateStep5());
+                        
+            if (custTransOpenSettlement)
+            {
+                this.settleTransaction(_custTransOpen, _custTable, custTransOpenSettlement);
+                flag = true;
+            }
+            else
+            {
+                // Check credit notes during the period + Payment = to any open invoice from newest to oldest
+                totalCN = this.getTotalCreditNotesCurrentPeriod(_custTable, predictorHelperContract.getStartDateStep5(), predictorHelperContract.getEndDateStep5());
+                totalCN = _custTransOpen.AmountCur + totalCN;
+
+                custTransOpenSettlement = this.getCustTransOpenByDate(totalCN, _custTable, predictorHelperContract.getStartDateStep5(), predictorHelperContract.getEndDateStep5());
+
+                if (totalCN == -(custTransOpenSettlement.AmountCur))
+                {
+                    this.settleTransactionByDateIncCN(_custTransOpen, _custTable, custTransOpenSettlement, predictorHelperContract.getStartDateStep5(), predictorHelperContract.getEndDateStep5());
+                    flag = true;
+                }
+            }
+        }
+        // End step 5
+            
+        // Start step 6 - Is Payment = + 1 Period Due after the Current Period Due or any of Future Periods up to the newest Future Due Date (excluding Collections status Disputed and Promise to pay)? 
+        // If Yes - Clear open transactions/items. If No go to Step 7.
+        // (ST 4 - Sum of each statement period starting with current period then work forward).
         if  (flag == false)
         {
-            custTransOpenSettlement = this.getCustTransOpenByDate(_custTransOpen, _custTable, predictorHelperContract.getStartDateStep4(), predictorHelperContract.getEndDateStep4());
+            custTransOpenSettlement = this.getCustTransOpenByDate(_custTransOpen.AmountCur, _custTable, predictorHelperContract.getStartDateStep6(), predictorHelperContract.getEndDateStep6());
                         
             if (custTransOpenSettlement)
             {
@@ -88,12 +140,14 @@ public class METSAPPredictorHelper
                 flag = true;
             }
         }
-        // End step 4
+        // End step 6
 
-        // Start step 5 - Sum of two consecutive periods starting with the most recent periods working backward.
+        // Start step 7 - Sum of two consecutive periods starting with Current Period Due working backwards (excluding Collections status Disputed and Promise to pay)? 
+        // If Yes - Clear open transactions/items. If No go to Step 8.
+        // (ST 5 - Sum of two consecutive periods starting with the most recent periods working backward).
         if  (flag == false)
         {
-            custTransOpenSettlement = this.getCustTransOpenByDate(_custTransOpen, _custTable, predictorHelperContract.getStartDateStep5(), predictorHelperContract.getEndDateStep5());
+            custTransOpenSettlement = this.getCustTransOpenByDate(_custTransOpen.AmountCur, _custTable, predictorHelperContract.getStartDateStep7(), predictorHelperContract.getEndDateStep7());
                         
             if (custTransOpenSettlement)
             {
@@ -103,19 +157,51 @@ public class METSAPPredictorHelper
             else
             {
                 //check total of invoices between 2 periods of all inoivces
-                if(_custTransOpen.AmountCur == -(this.getTotalCustOpenTransAmountByDate(_custTable.AccountNum, predictorHelperContract.getStartDateStep5(), predictorHelperContract.getEndDateStep3())))
+                if(_custTransOpen.AmountCur == -(this.getTotalCustOpenTransAmountByDate(_custTable.AccountNum, predictorHelperContract.getStartDateStep7(), predictorHelperContract.getEndDateStep5())))
                 {
-                    this.settleMultipleTransactionDate(_custTransOpen, _custTable, predictorHelperContract.getStartDateStep5(), predictorHelperContract.getEndDateStep3());
+                    this.settleMultipleTransactionDate(_custTransOpen, _custTable, predictorHelperContract.getStartDateStep7(), predictorHelperContract.getEndDateStep5());
+                    flag = true;
+                }
+            }
+
+            // Check Credit Notes + Payment = OB From 2 periods backworkds 
+            if (flag == false)
+            {
+                // Check credit notes during the period + Payment = to any open invoice from newest to oldest
+                totalCN = this.getTotalCreditNotesCurrentPeriod(_custTable, predictorHelperContract.getStartDateStep7(), predictorHelperContract.getEndDateStep7());
+                totalCN = _custTransOpen.AmountCur + totalCN;
+
+                custTransOpenSettlement = this.getCustTransOpenByDate(totalCN, _custTable, predictorHelperContract.getStartDateStep7(), predictorHelperContract.getEndDateStep7());
+
+                if (totalCN == -(custTransOpenSettlement.AmountCur))
+                {
+                    this.settleTransactionByDateIncCN(_custTransOpen, _custTable, custTransOpenSettlement, predictorHelperContract.getStartDateStep7(), predictorHelperContract.getEndDateStep7());
+                    flag = true;
+                }
+            }
+
+            // check credit notes + payment = 2 periods backwords + current period amount
+            if (flag == false)
+            {
+                // Check credit notes during the period + Payment = to any open invoice from newest to oldest
+                totalCN = this.getTotalCreditNotesCurrentPeriod(_custTable, predictorHelperContract.getStartDateStep7(), predictorHelperContract.getEndDateStep5());
+                totalCN = _custTransOpen.AmountCur + totalCN;
+
+                if (totalCN == -(this.getTotalCustOpenTransAmountByDate(_custTable.AccountNum, predictorHelperContract.getStartDateStep7(), predictorHelperContract.getEndDateStep5())))
+                {
+                    this.settleMultipleTransactionDateCN(_custTransOpen, _custTable, predictorHelperContract.getStartDateStep7(), predictorHelperContract.getEndDateStep5());
                     flag = true;
                 }
             }
         }
-        // End step 5
+        // End step 7
 
-        // Start step 6 - Sum of two consecutive periods starting with the most recent periods working forwards.
+        // Start step 8 - Sum of two consecutive periods starting with Current Period Due working forwards (excluding Collections status Disputed and Promise to pay)? 
+        // If Yes - Clear open transactions/items. If No go to Step 9.
+        // (ST 6 - Sum of two consecutive periods starting with the most recent periods working forwards).
         if  (flag == false)
         {
-            custTransOpenSettlement = this.getCustTransOpenByDate(_custTransOpen, _custTable, predictorHelperContract.getStartDateStep6(), predictorHelperContract.getEndDateStep6());
+            custTransOpenSettlement = this.getCustTransOpenByDate(_custTransOpen.AmountCur, _custTable, predictorHelperContract.getStartDateStep8(), predictorHelperContract.getEndDateStep8());
             
             if (custTransOpenSettlement)
             {
@@ -125,14 +211,23 @@ public class METSAPPredictorHelper
             else
             {
                 //check total of invoices between 2 periods of all inoivces
-                if(_custTransOpen.AmountCur == -(this.getTotalCustOpenTransAmountByDate(_custTable.AccountNum, predictorHelperContract.getStartDateStep4(), predictorHelperContract.getEndDateStep6())))
+                if(_custTransOpen.AmountCur == -(this.getTotalCustOpenTransAmountByDate(_custTable.AccountNum, predictorHelperContract.getStartDateStep6(), predictorHelperContract.getEndDateStep8())))
                 {
-                    this.settleMultipleTransactionDate(_custTransOpen, _custTable, predictorHelperContract.getStartDateStep4(), predictorHelperContract.getEndDateStep6());
+                    this.settleMultipleTransactionDate(_custTransOpen, _custTable, predictorHelperContract.getStartDateStep6(), predictorHelperContract.getEndDateStep8());
                     flag = true;
                 }
             }
         }
-        // End step 6
+        // End step 8
+        
+        // Sum of each period adding one period at a time starting from the oldest period and attempt to allocate after adding each period is summed. (excluding Collections status Disputed and Promise to pay)? 
+        // If Yes - Clear open transactions/items. If No go to Step 10.
+        // (ST 7) - Sum each period adding one period at a time starting from the oldest period and attempt to allocate after adding each period is summed.
+        if (flag == false)
+        {
+            this.settleFromPastOpenTrans(_custTransOpen, _custTable);
+        }
+        // End step 9
     }
 
 ]]></Source>
@@ -184,14 +279,14 @@ public class METSAPPredictorHelper
     /// </summary>
    public void weeklySetDates()
    {
-        predictorHelperContract.setStartDateStep3(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-2);
-        predictorHelperContract.setEndDateStep3(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-2);
-        predictorHelperContract.setStartDateStep4(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+5);
-        predictorHelperContract.setEndDateStep4(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+5);        
-        predictorHelperContract.setStartDateStep5(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-9);
-        predictorHelperContract.setEndDateStep5(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-9);
-        predictorHelperContract.setStartDateStep6(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+12);
-        predictorHelperContract.setEndDateStep6(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+12);
+        predictorHelperContract.setStartDateStep5(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone())));
+        predictorHelperContract.setEndDateStep5(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone())));
+        predictorHelperContract.setStartDateStep6(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+7);
+        predictorHelperContract.setEndDateStep6(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+7);        
+        predictorHelperContract.setStartDateStep7(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-14);
+        predictorHelperContract.setEndDateStep7(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-7);
+        predictorHelperContract.setStartDateStep8(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+14);
+        predictorHelperContract.setEndDateStep8(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+14);
    }
 
 ]]></Source>
@@ -205,14 +300,14 @@ public class METSAPPredictorHelper
    /// </summary>
     public void fortnightlySetDates()
     {
-        predictorHelperContract.setStartDateStep3(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-9);
-        predictorHelperContract.setEndDateStep3(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-2);
-        predictorHelperContract.setStartDateStep4(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+5);
-        predictorHelperContract.setEndDateStep4(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+12);
-        predictorHelperContract.setStartDateStep5(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-23);
-        predictorHelperContract.setEndDateStep5(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-16);
-        predictorHelperContract.setStartDateStep6(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+19);
-        predictorHelperContract.setEndDateStep6(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+26);
+        predictorHelperContract.setStartDateStep5(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-7);
+        predictorHelperContract.setEndDateStep5(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone())));
+        predictorHelperContract.setStartDateStep6(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+7);
+        predictorHelperContract.setEndDateStep6(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+14);
+        predictorHelperContract.setStartDateStep7(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-35);
+        predictorHelperContract.setEndDateStep7(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-14);
+        predictorHelperContract.setStartDateStep8(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+21);
+        predictorHelperContract.setEndDateStep8(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+28);
     }
 
 ]]></Source>
@@ -226,14 +321,14 @@ public class METSAPPredictorHelper
     /// </summary>
     public void monthlySetDates()
     {
-        predictorHelperContract.setStartDateStep3(dateStartMth(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone())));
-        predictorHelperContract.setEndDateStep3(dateStartMth(DatetimeUtil::Date(DateTimeUtil::addMonths(DateTimeUtil::newDateTime(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),0),1))));
-        predictorHelperContract.setStartDateStep4(dateStartMth(DatetimeUtil::Date(DateTimeUtil::addMonths(DateTimeUtil::newDateTime(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),0),1))));
-        predictorHelperContract.setEndDateStep4(dateStartMth(DatetimeUtil::Date(DateTimeUtil::addMonths(DateTimeUtil::newDateTime(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),0),2))));
-        predictorHelperContract.setStartDateStep5(dateStartMth(DatetimeUtil::Date(DateTimeUtil::addMonths(DateTimeUtil::newDateTime(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),0),-1))));
-        predictorHelperContract.setEndDateStep5(dateStartMth(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone())));
-        predictorHelperContract.setStartDateStep6(dateStartMth(DatetimeUtil::Date(DateTimeUtil::addMonths(DateTimeUtil::newDateTime(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),0),2))));
-        predictorHelperContract.setEndDateStep6(dateStartMth(DatetimeUtil::Date(DateTimeUtil::addMonths(DateTimeUtil::newDateTime(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),0),3))));
+        predictorHelperContract.setStartDateStep5(dateStartMth(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone())));
+        predictorHelperContract.setEndDateStep5(dateStartMth(DatetimeUtil::Date(DateTimeUtil::addMonths(DateTimeUtil::newDateTime(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),0),1))));
+        predictorHelperContract.setStartDateStep6(dateStartMth(DatetimeUtil::Date(DateTimeUtil::addMonths(DateTimeUtil::newDateTime(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),0),1))));
+        predictorHelperContract.setEndDateStep6(dateStartMth(DatetimeUtil::Date(DateTimeUtil::addMonths(DateTimeUtil::newDateTime(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),0),2))));
+        predictorHelperContract.setStartDateStep7(dateStartMth(DatetimeUtil::Date(DateTimeUtil::addMonths(DateTimeUtil::newDateTime(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),0),-2))));
+        predictorHelperContract.setEndDateStep7(dateStartMth(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone())));
+        predictorHelperContract.setStartDateStep8(dateStartMth(DatetimeUtil::Date(DateTimeUtil::addMonths(DateTimeUtil::newDateTime(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),0),2))));
+        predictorHelperContract.setEndDateStep8(dateStartMth(DatetimeUtil::Date(DateTimeUtil::addMonths(DateTimeUtil::newDateTime(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),0),3))));
     }
 
 ]]></Source>
@@ -247,14 +342,14 @@ public class METSAPPredictorHelper
     /// </summary>
     public void periodSetDates()
     {
-        predictorHelperContract.setStartDateStep3(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-30);
-        predictorHelperContract.setEndDateStep3(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-2);
-        predictorHelperContract.setStartDateStep4(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+5);
-        predictorHelperContract.setEndDateStep4(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+26);
-        predictorHelperContract.setStartDateStep5(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-51);
-        predictorHelperContract.setEndDateStep5(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-30);
-        predictorHelperContract.setStartDateStep6(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+33);
-        predictorHelperContract.setEndDateStep6(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+54);
+        predictorHelperContract.setStartDateStep5(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-21);
+        predictorHelperContract.setEndDateStep5(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone())));
+        predictorHelperContract.setStartDateStep6(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+7);
+        predictorHelperContract.setEndDateStep6(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+28);
+        predictorHelperContract.setStartDateStep7(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-77);
+        predictorHelperContract.setEndDateStep7(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))-28);
+        predictorHelperContract.setStartDateStep8(DateTimeUtil::getStartOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+35);
+        predictorHelperContract.setEndDateStep8(DateTimeUtil::getEndOfWeekDate(METConstants::preferredlocale, DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()))+56);
     }
 
 ]]></Source>
@@ -272,12 +367,12 @@ public class METSAPPredictorHelper
     /// <returns>Returns custtransopen record buffer</returns>
     public CustTransOpen getCustTransOpen(CustTransOpen _custTransOpen, CustTrans _custTrans, CustTable _custTable)
     {
-        CustTransOpen   custTransOpen;
-        CustTrans       custTrans;
-        CustDispute     custDispute;
-        SpecTrans       specTrans;
+        CustTransOpen           custTransOpen;
+        CustTrans               custTrans;
+        SpecTrans               specTrans;
+        CustVendDisputeStatus   disputeStatus;
 
-        select firstonly custTransOpen
+        while select custTransOpen
             where custTransOpen.AccountNum == _custTable.accountNum
                && custTransOpen.AmountCur == -(_custTransOpen.AmountCur)
             exists join custTrans
@@ -285,14 +380,17 @@ public class METSAPPredictorHelper
                    && custTrans.AccountNum == custTransOpen.AccountNum
                    && custTrans.TransType != LedgerTransType::Payment
                    && _custTrans.PaymReference == custTrans.Invoice
-            exists join custDispute
-                where custDispute.CustTrans == custTransOpen.RefRecId
-                   && custDispute.Status    != CustVendDisputeStatus::Disputed
-                   && custDispute.Status    != CustVendDisputeStatus::PromiseToPay
             notexists join specTrans
                 where specTrans.RefRecId    == custTransOpen.RecId
                    && specTrans.RefTableId  == tableName2Id(tableStr(CustTransOpen))
-                   && specTrans.RefCompany  == custTransOpen.DataAreaId;
+                   && specTrans.RefCompany  == custTransOpen.DataAreaId
+        {
+            disputeStatus = CustVendDisputeHelper::construct(custTrans.company(), tablenum(CustTrans), custTrans.RecId).parmStatus();
+            if (disputeStatus != CustVendDisputeStatus::Disputed || disputeStatus != CustVendDisputeStatus::PromiseToPay)
+            {
+                break;
+            }
+        }
 
         return custTransOpen;
     }
@@ -328,7 +426,7 @@ public class METSAPPredictorHelper
 				<Source><![CDATA[
     /// <summary>
     /// MPJ_3972_SAPPredictor - kscerri - 12/07/2021
-    /// Step 2 settelment & adding all transctions according to customer if these add up to the total payment amount
+    /// Step 3 settelment & adding all transctions according to customer if these add up to the total payment amount
     /// </summary>
     /// <param name = "_custTransOpen">CustTransOpen buffer</param>
     /// <param name = "_custTable">CustTable buffer</param>
@@ -337,8 +435,55 @@ public class METSAPPredictorHelper
         CustVendOpenTransManager    settleManager;
         CustTransOpen               custTransOpen;
         CustTrans                   custTrans;
-        CustDispute                 custDispute;
         SpecTrans                   specTrans;
+        CustVendDisputeStatus       disputeStatus;
+
+        settleManager = custVendOpenTransManager::construct(_custTable);
+        
+        // Customer payment marked
+        SettleManager.updateTransMarked(_custTransOpen, true);
+                
+        // Mark all open trans to match customer payment
+        while select custTransOpen
+            where custTransOpen.AccountNum == _custTable.AccountNum
+               && custTransOpen.AmountCur > 0
+        exists join custTrans
+            where custTrans.RecId == custTransOpen.RefRecId
+               && custTrans.AccountNum == custTransOpen.AccountNum
+               && custTrans.TransType != LedgerTransType::Payment
+        notexists join specTrans
+            where specTrans.RefRecId    == custTransOpen.RecId
+                && specTrans.RefTableId  == tableName2Id(tableStr(CustTransOpen))
+                && specTrans.RefCompany  == custTransOpen.DataAreaId
+        {
+            disputeStatus = CustVendDisputeHelper::construct(custTrans.company(), tablenum(CustTrans), custTrans.RecId).parmStatus();
+            if (disputeStatus != CustVendDisputeStatus::Disputed || disputeStatus != CustVendDisputeStatus::PromiseToPay)
+            {
+                SettleManager.updateTransMarked(custTransOpen, true);
+            }
+        }
+
+        SettleManager.settleMarkedTrans();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>settleTransSumAllOpenItemsCreditNotes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_3972_SAPPredictor - kscerri - 12/07/2021
+    /// Step 3 CreditNotes selection + total OB selected settled with payments
+    /// </summary>
+    /// <param name = "_custTransOpen">CustTransOpen buffer</param>
+    /// <param name = "_custTable">CustTable buffer</param>
+    public void settleTransSumAllOpenItemsCreditNotes(CustTransOpen _custTransOpen, CustTable _custTable)
+    {
+        CustVendOpenTransManager    settleManager;
+        CustTransOpen               custTransOpen;
+        CustTrans                   custTrans;
+        SpecTrans                   specTrans;
+        CustVendDisputeStatus       disputeStatus;
 
         settleManager = custVendOpenTransManager::construct(_custTable);
         
@@ -352,16 +497,68 @@ public class METSAPPredictorHelper
             where custTrans.RecId == custTransOpen.RefRecId
                && custTrans.AccountNum == custTransOpen.AccountNum
                && custTrans.TransType != LedgerTransType::Payment
-        exists join custDispute
-            where custDispute.CustTrans == custTransOpen.RefRecId
-                && custDispute.Status    != CustVendDisputeStatus::Disputed
-                && custDispute.Status    != CustVendDisputeStatus::PromiseToPay
         notexists join specTrans
             where specTrans.RefRecId    == custTransOpen.RecId
                 && specTrans.RefTableId  == tableName2Id(tableStr(CustTransOpen))
                 && specTrans.RefCompany  == custTransOpen.DataAreaId
         {
-            SettleManager.updateTransMarked(custTransOpen, true);
+            disputeStatus = CustVendDisputeHelper::construct(custTrans.company(), tablenum(CustTrans), custTrans.RecId).parmStatus();
+            if (disputeStatus != CustVendDisputeStatus::Disputed || disputeStatus != CustVendDisputeStatus::PromiseToPay)
+            {
+                SettleManager.updateTransMarked(custTransOpen, true);
+            }
+        }
+
+        SettleManager.settleMarkedTrans();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>settleTransSumAllOpenItemsOverdue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_3972_SAPPredictor - kscerri - 11/05/2021
+    /// Step 3 settelment & adding all transctions according to customer if these add up to the total payment amount
+    /// within the overdue amount
+    /// </summary>
+    /// <param name = "_custTransOpen">CustTransOpen buffer</param>
+    /// <param name = "_custTable">CustTable buffer</param>
+    public void settleTransSumAllOpenItemsOverdue(CustTransOpen _custTransOpen, CustTable _custTable)
+    {
+        CustVendOpenTransManager    settleManager;
+        CustTransOpen               custTransOpen;
+        CustTrans                   custTrans;
+        SpecTrans                   specTrans;
+        CustVendDisputeStatus       disputeStatus;
+
+        date            currentDate;
+        currentDate = systemDateGet();
+
+        settleManager = custVendOpenTransManager::construct(_custTable);
+        
+        // Customer payment marked
+        SettleManager.updateTransMarked(_custTransOpen, true);
+                
+        // Mark all open trans to match customer payment
+        while select custTransOpen
+            where custTransOpen.AccountNum == _custTable.AccountNum
+               && custTransOpen.AmountCur > 0
+        exists join custTrans
+            where custTrans.RecId == custTransOpen.RefRecId
+               && custTrans.AccountNum == custTransOpen.AccountNum
+               && custTrans.TransType != LedgerTransType::Payment
+               && custTrans.DueDate < currentDate
+        notexists join specTrans
+            where specTrans.RefRecId    == custTransOpen.RecId
+                && specTrans.RefTableId  == tableName2Id(tableStr(CustTransOpen))
+                && specTrans.RefCompany  == custTransOpen.DataAreaId
+        {
+            disputeStatus = CustVendDisputeHelper::construct(custTrans.company(), tablenum(CustTrans), custTrans.RecId).parmStatus();
+            if (disputeStatus != CustVendDisputeStatus::Disputed || disputeStatus != CustVendDisputeStatus::PromiseToPay)
+            {
+                SettleManager.updateTransMarked(custTransOpen, true);
+            }
         }
 
         SettleManager.settleMarkedTrans();
@@ -374,40 +571,139 @@ public class METSAPPredictorHelper
 				<Source><![CDATA[
     /// <summary>
     /// MPJ_3972_SAPPredictor - kscerri - 12/07/2021
-    /// Step 3, 4, 5 and 6 transaction return
+    /// Step 5, 6, 7 and 8 transaction return   ** TO REMOVE ** -->3, 4, 5 and 6 transaction return
     /// </summary>
     /// <param name = "_custTransOpen">CustTransOpen buffer</param>
     /// <param name = "_custTable">CustTable buffer</param>
     /// <param name = "_startDate">startDate</param>
     /// <param name = "_endDate">EndDate</param>
     /// <returns>CustTrans buffer</returns>
-    public custTransOpen getCustTransOpenByDate(CustTransOpen _custTransOpen, CustTable _custTable, date _startDate, date _endDate)
+    public custTransOpen getCustTransOpenByDate(AmountCurDebCred _amountCur, CustTable _custTable, date _startDate, date _endDate)
     {
-        CustTransOpen   custTransOpen;
-        CustTrans       custTrans;
-        CustDispute     custDispute;
-        SpecTrans       specTrans;
+        CustTransOpen               custTransOpen;
+        CustTrans                   custTrans;
+        SpecTrans                   specTrans;
+        CustVendDisputeStatus       disputeStatus;
 
-        select firstonly custTransOpen
+        while select custTransOpen
             order by custTransOpen.DueDate desc
                 where custTransOpen.DueDate >= _startDate
                    && custTransOpen.DueDate <= _endDate
-                   && custTransOpen.AmountCur == -(_custTransOpen.AmountCur)
+                   && custTransOpen.AmountCur == -(_amountCur)
                    && custTransOpen.AccountNum == _custTable.accountNum
             exists join custTrans
                 where custTrans.RecId == custTransOpen.RefRecId
                     && custTrans.AccountNum == custTransOpen.AccountNum
                     && custTrans.TransType != LedgerTransType::Payment
-            exists join custDispute
-                where custDispute.CustTrans == custTransOpen.RefRecId
-                   && custDispute.Status    != CustVendDisputeStatus::Disputed
-                   && custDispute.Status    != CustVendDisputeStatus::PromiseToPay
             notexists join specTrans
                 where specTrans.RefRecId    == custTransOpen.RecId
                    && specTrans.RefTableId  == tableName2Id(tableStr(CustTransOpen))
-                   && specTrans.RefCompany  == custTransOpen.DataAreaId;
+                   && specTrans.RefCompany  == custTransOpen.DataAreaId
+        {
+            disputeStatus = CustVendDisputeHelper::construct(custTrans.company(), tablenum(CustTrans), custTrans.RecId).parmStatus();
+            if (disputeStatus != CustVendDisputeStatus::Disputed || disputeStatus != CustVendDisputeStatus::PromiseToPay)
+            {
+                break;
+            }
+        }
 
         return custTransOpen;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTotalCreditNotesCurrentPeriod</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_3972_SAPPredictor - kscerri - 11/05/2021
+    /// STEP 5 - Returns total amount of credit notes without payment with date range.
+    /// </summary>
+    /// <param name = "_accountNum">account num</param>
+    /// <returns>total amount cur</returns>
+    public AmountCurDebCred getTotalCreditNotesCurrentPeriod(CustTable _custTable, date _startDate, date _endDate)
+    {
+        CustTransOpen           custTransOpen;
+        CustTrans               custTrans;
+        SpecTrans               specTrans;
+        CustVendDisputeStatus   disputeStatus;
+        AmountCurDebCred        amoundCurSum;
+
+        while select AmountCur from custTransOpen
+            order by custTransOpen.DueDate desc
+                where custTransOpen.DueDate >= _startDate
+                   && custTransOpen.DueDate <= _endDate
+                   && custTransOpen.AccountNum == _custTable.accountNum
+                   && custTransOpen.AmountCur < 0
+            exists join custTrans
+                where custTrans.RecId == custTransOpen.RefRecId
+                    && custTrans.AccountNum == custTransOpen.AccountNum
+                    && custTrans.TransType == LedgerTransType::Cust
+            notexists join specTrans
+                where specTrans.RefRecId    == custTransOpen.RecId
+                   && specTrans.RefTableId  == tableName2Id(tableStr(CustTransOpen))
+                   && specTrans.RefCompany  == custTransOpen.DataAreaId
+        {
+            disputeStatus = CustVendDisputeHelper::construct(custTrans.company(), tablenum(CustTrans), custTrans.RecId).parmStatus();
+            if (disputeStatus != CustVendDisputeStatus::Disputed || disputeStatus != CustVendDisputeStatus::PromiseToPay)
+            {
+                amoundCurSum = amoundCurSum + custTransOpen.AmountCur;
+            }
+        }
+
+        return amoundCurSum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>settleTransactionByDateIncCN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_3972_SAPPredictor - kscerri - 12/07/2021
+    /// Step 5 settelment with CN
+    /// </summary>
+    /// <param name = "_custTransOpen">Original Selection</param>
+    /// <param name = "_custTable">Customer record</param>
+    /// <param name = "_invoiceToSettle">debit/credit line to settle</param>
+    public void settleTransactionByDateIncCN(CustTransOpen _custTransOpen, CustTable _custTable, CustTransOpen _invoiceToSettle, date _startDate, date _endDate)
+    {
+        CustTransOpen               custTransOpen;
+        CustTrans                   custTrans;
+        SpecTrans                   specTrans;
+        CustVendDisputeStatus       disputeStatus;
+        CustVendOpenTransManager    settleManager;
+
+        settleManager = custVendOpenTransManager::construct(_custTable);
+
+        // Customer payment marked and open trans
+        SettleManager.updateTransMarked(_custTransOpen, true);
+        SettleManager.updateTransMarked(_invoiceToSettle, true);
+
+        // Marking credit notes
+        while select custTransOpen
+            order by custTransOpen.DueDate desc
+                where custTransOpen.DueDate >= _startDate
+                   && custTransOpen.DueDate <= _endDate
+                   && custTransOpen.AccountNum == _custTable.accountNum
+                   && custTransOpen.AmountCur < 0
+            exists join custTrans
+                where custTrans.RecId == custTransOpen.RefRecId
+                    && custTrans.AccountNum == custTransOpen.AccountNum
+                    && custTrans.TransType == LedgerTransType::Cust
+            notexists join specTrans
+                where specTrans.RefRecId    == custTransOpen.RecId
+                   && specTrans.RefTableId  == tableName2Id(tableStr(CustTransOpen))
+                   && specTrans.RefCompany  == custTransOpen.DataAreaId
+        {
+            disputeStatus = CustVendDisputeHelper::construct(custTrans.company(), tablenum(CustTrans), custTrans.RecId).parmStatus();
+            if (disputeStatus != CustVendDisputeStatus::Disputed || disputeStatus != CustVendDisputeStatus::PromiseToPay)
+            {
+                SettleManager.updateTransMarked(custTransOpen, true);
+            }
+        }
+
+        SettleManager.settleMarkedTrans();
     }
 
 ]]></Source>
@@ -417,7 +713,7 @@ public class METSAPPredictorHelper
 				<Source><![CDATA[
     /// <summary>
     /// MPJ_3972_SAPPredictor - kscerri - 12/07/2021
-    /// Step 5 and 6 - Settle multiple transactions backdated from the currenct system date
+    /// Step 7 and 8 - Settle multiple transactions backdated from the currenct system date
     /// </summary>
     /// <param name = "_custTransOpen">CusttransOpen buffer</param>
     /// <param name = "_custTable">custtable buffer</param>
@@ -428,8 +724,59 @@ public class METSAPPredictorHelper
         CustVendOpenTransManager    settleManager;
         CustTransOpen               custTransOpen;
         CustTrans                   custTrans;
-        CustDispute                 custDispute;
         SpecTrans                   specTrans;
+        CustVendDisputeStatus       disputeStatus;
+
+        settleManager = custVendOpenTransManager::construct(_custTable);
+        
+        // Customer payment marked
+        SettleManager.updateTransMarked(_custTransOpen, true);
+                
+        // Mark all open trans to match customer payment
+        while select custTransOpen
+            where custTransOpen.AccountNum == _custTable.AccountNum
+               && custTransOpen.DueDate >= _startDate
+               && custTransOpen.DueDate <= _endDate
+               && custTransOpen.AmountCur > 0
+            exists join custTrans
+                where custTrans.RecId == custTransOpen.RefRecId
+                   && custTrans.AccountNum == custTransOpen.AccountNum
+                   && custTrans.TransType != LedgerTransType::Payment
+            notexists join specTrans
+                where specTrans.RefRecId    == custTransOpen.RecId
+                   && specTrans.RefTableId  == tableName2Id(tableStr(CustTransOpen))
+                   && specTrans.RefCompany  == custTransOpen.DataAreaId
+        {
+            disputeStatus = CustVendDisputeHelper::construct(custTrans.company(), tablenum(CustTrans), custTrans.RecId).parmStatus();
+            if (disputeStatus != CustVendDisputeStatus::Disputed || disputeStatus != CustVendDisputeStatus::PromiseToPay)
+            {
+                SettleManager.updateTransMarked(custTransOpen, true);
+            }
+        }
+
+        SettleManager.settleMarkedTrans();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>settleMultipleTransactionDateCN</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_3972_SAPPredictor - kscerri - 12/07/2021
+    /// Step 7 - Settle multiple transactions backdated from the currenct system date including CN settlement
+    /// </summary>
+    /// <param name = "_custTransOpen">CusttransOpen buffer</param>
+    /// <param name = "_custTable">custtable buffer</param>
+    /// <param name = "_startDate">Previous Saturday date</param>
+    /// <param name = "_endDate">This Friday date</param>
+    public void settleMultipleTransactionDateCN(CustTransOpen _custTransOpen, CustTable _custTable, date _startDate, date _endDate)
+    {
+        CustVendOpenTransManager    settleManager;
+        CustTransOpen               custTransOpen;
+        CustTrans                   custTrans;
+        SpecTrans                   specTrans;
+        CustVendDisputeStatus       disputeStatus;
 
         settleManager = custVendOpenTransManager::construct(_custTable);
         
@@ -445,16 +792,16 @@ public class METSAPPredictorHelper
                 where custTrans.RecId == custTransOpen.RefRecId
                    && custTrans.AccountNum == custTransOpen.AccountNum
                    && custTrans.TransType != LedgerTransType::Payment
-            exists join custDispute
-                where custDispute.CustTrans == custTransOpen.RefRecId
-                   && custDispute.Status    != CustVendDisputeStatus::Disputed
-                   && custDispute.Status    != CustVendDisputeStatus::PromiseToPay
             notexists join specTrans
                 where specTrans.RefRecId    == custTransOpen.RecId
                    && specTrans.RefTableId  == tableName2Id(tableStr(CustTransOpen))
                    && specTrans.RefCompany  == custTransOpen.DataAreaId
         {
-            SettleManager.updateTransMarked(custTransOpen, true);
+            disputeStatus = CustVendDisputeHelper::construct(custTrans.company(), tablenum(CustTrans), custTrans.RecId).parmStatus();
+            if (disputeStatus != CustVendDisputeStatus::Disputed || disputeStatus != CustVendDisputeStatus::PromiseToPay)
+            {
+                SettleManager.updateTransMarked(custTransOpen, true);
+            }
         }
 
         SettleManager.settleMarkedTrans();
@@ -467,7 +814,7 @@ public class METSAPPredictorHelper
 				<Source><![CDATA[
     /// <summary>
     /// MPJ_3972_SAPPredictor - kscerri - 12/07/2021
-    /// Step 7 settle using past transactions
+    /// Step 9 settle using past transactions
     /// </summary>
     /// <param name = "_custTransOpen">CustTransOpen buffer</param>
     /// <param name = "_custTable">CustTable buffer</param>
@@ -477,8 +824,8 @@ public class METSAPPredictorHelper
         CustTransOpen               custTransOpen;
         CustTrans                   custTrans;
         AmountCurDebCred            settleAmount;
-        CustDispute                 custDispute;
         SpecTrans                   specTrans;
+        CustVendDisputeStatus       disputeStatus;
 
         settleManager = custVendOpenTransManager::construct(_custTable);
         
@@ -489,27 +836,28 @@ public class METSAPPredictorHelper
         while select custTransOpen
             order by custTransOpen.DueDate asc
                 where custTransOpen.AccountNum == _custTable.AccountNum
+                   && custTransOpen.AmountCur > 0
             join SettleAmountCur from custTrans
                 where custTrans.RecId == custTransOpen.RefRecId
                    && custTrans.AccountNum == custTransOpen.AccountNum
                    && custTrans.TransType != LedgerTransType::Payment
-            exists join custDispute
-                where custDispute.CustTrans == custTransOpen.RefRecId
-                   && custDispute.Status    != CustVendDisputeStatus::Disputed
-                   && custDispute.Status    != CustVendDisputeStatus::PromiseToPay
             notexists join specTrans
                 where specTrans.RefRecId    == custTransOpen.RecId
                    && specTrans.RefTableId  == tableName2Id(tableStr(CustTransOpen))
                    && specTrans.RefCompany  == custTransOpen.DataAreaId
         {
-            if (settleAmount <= -(_custTransOpen.AmountCur))
+            disputeStatus = CustVendDisputeHelper::construct(custTrans.company(), tablenum(CustTrans), custTrans.RecId).parmStatus();
+            if (disputeStatus != CustVendDisputeStatus::Disputed || disputeStatus != CustVendDisputeStatus::PromiseToPay)
             {
-                SettleManager.updateTransMarked(custTransOpen, true);
-                settleAmount = settleAmount + custTransOpen.AmountCur;
-            }
-            else
-            {
-                break;
+                if (settleAmount <= -(_custTransOpen.AmountCur))
+                {
+                    SettleManager.updateTransMarked(custTransOpen, true);
+                    settleAmount = settleAmount + custTransOpen.AmountCur;
+                }
+                else
+                {
+                    break;
+                }
             }
         }
 
@@ -529,27 +877,119 @@ public class METSAPPredictorHelper
     /// <returns>total amount cur</returns>
     public AmountCurDebCred getTotalCustOpenTransAmount(CustAccount _accountNum)
     {
-        CustTransOpen   custTransOpen;
-        CustTrans       custTrans;
-        CustDispute     custDispute;
-        SpecTrans       specTrans;
+        CustTransOpen           custTransOpen;
+        CustTrans               custTrans;
+        SpecTrans               specTrans;
+        CustVendDisputeStatus   disputeStatus;
+        AmountCurDebCred        amoundCurSum;
 
-        select sum(AmountCur) from custTransOpen
+        while select AmountCur from custTransOpen
             where custTransOpen.AccountNum == _accountNum
+               && custTransOpen.AmountCur > 0
             exists join custTrans
                 where custTrans.RecId == custTransOpen.RefRecId
                     && custTrans.AccountNum == custTransOpen.AccountNum
                     && custTrans.TransType != LedgerTransType::Payment
-            exists join custDispute
-                where custDispute.CustTrans == custTransOpen.RefRecId
-                   && custDispute.Status    != CustVendDisputeStatus::Disputed
-                   && custDispute.Status    != CustVendDisputeStatus::PromiseToPay
             notexists join specTrans
                 where specTrans.RefRecId    == custTransOpen.RecId
                    && specTrans.RefTableId  == tableName2Id(tableStr(CustTransOpen))
-                   && specTrans.RefCompany  == custTransOpen.DataAreaId;
+                   && specTrans.RefCompany  == custTransOpen.DataAreaId
+            {
+                disputeStatus = CustVendDisputeHelper::construct(custTrans.company(), tablenum(CustTrans), custTrans.RecId).parmStatus();
+                if (disputeStatus != CustVendDisputeStatus::Disputed || disputeStatus != CustVendDisputeStatus::PromiseToPay)
+                {
+                    amoundCurSum = amoundCurSum + custTransOpen.AmountCur;
+                }
+            }
 
-        return custTransOpen.AmountCur;
+        return amoundCurSum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTotalCreditNotes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_3972_SAPPredictor - kscerri - 11/05/2021
+    /// STEP 3 - Returns total amount of credit notes without payment with no date range.
+    /// </summary>
+    /// <param name = "_accountNum">account num</param>
+    /// <returns>total amount cur</returns>
+    public AmountCurDebCred getTotalCreditNotes(CustAccount _accountNum)
+    {
+        CustTransOpen           custTransOpen;
+        CustTrans               custTrans;
+        SpecTrans               specTrans;
+        CustVendDisputeStatus   disputeStatus;
+        AmountCurDebCred        amoundCurSum;
+
+        while select AmountCur from custTransOpen
+            where custTransOpen.AccountNum == _accountNum
+               && custTransOpen.AmountCur < 0
+            exists join custTrans
+                where custTrans.RecId == custTransOpen.RefRecId
+                    && custTrans.AccountNum == custTransOpen.AccountNum
+                    && custTrans.TransType == LedgerTransType::Cust
+            notexists join specTrans
+                where specTrans.RefRecId    == custTransOpen.RecId
+                   && specTrans.RefTableId  == tableName2Id(tableStr(CustTransOpen))
+                   && specTrans.RefCompany  == custTransOpen.DataAreaId
+        {
+            disputeStatus = CustVendDisputeHelper::construct(custTrans.company(), tablenum(CustTrans), custTrans.RecId).parmStatus();
+            if (disputeStatus != CustVendDisputeStatus::Disputed || disputeStatus != CustVendDisputeStatus::PromiseToPay)
+            {
+                amoundCurSum = amoundCurSum + custTransOpen.AmountCur;
+            }
+        }
+
+        return amoundCurSum;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GetTotalCustOpenTransAmountOverdue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_3972_SAPPredictor - kscerri - 12/07/2021
+    /// Returns total amount of open cust trans depending on customer acc which are over due (step 3)
+    /// </summary>
+    /// <param name = "_accountNum">account num</param>
+    /// <returns>total amount cur</returns>
+    public AmountCurDebCred GetTotalCustOpenTransAmountOverdue(CustAccount _accountNum)
+    {
+        CustTransOpen           custTransOpen;
+        CustTrans               custTrans;
+        SpecTrans               specTrans;
+        CustVendDisputeStatus   disputeStatus;
+        AmountCurDebCred        amoundCurSum;
+
+        date            currentDate;
+        currentDate = systemDateGet();
+
+
+        while select AmountCur from custTransOpen
+            where custTransOpen.AccountNum == _accountNum
+               && custTransOpen.AmountCur > 0
+            exists join custTrans
+                where custTrans.RecId == custTransOpen.RefRecId
+                    && custTrans.AccountNum == custTransOpen.AccountNum
+                    && custTrans.TransType != LedgerTransType::Payment
+                    && custTrans.DueDate < currentDate
+            notexists join specTrans
+                where specTrans.RefRecId    == custTransOpen.RecId
+                   && specTrans.RefTableId  == tableName2Id(tableStr(CustTransOpen))
+                   && specTrans.RefCompany  == custTransOpen.DataAreaId
+        {
+            disputeStatus = CustVendDisputeHelper::construct(custTrans.company(), tablenum(CustTrans), custTrans.RecId).parmStatus();
+            if (disputeStatus != CustVendDisputeStatus::Disputed || disputeStatus != CustVendDisputeStatus::PromiseToPay)
+            {
+                amoundCurSum = amoundCurSum + custTransOpen.AmountCur;
+            }
+        }
+
+        return amoundCurSum;
     }
 
 ]]></Source>
@@ -567,29 +1007,34 @@ public class METSAPPredictorHelper
     /// <returns>total amount for selected dates</returns>
     public AmountCurDebCred getTotalCustOpenTransAmountByDate(CustAccount _accountNum, date _startDate, date _endDate)
     {
-        CustTransOpen   custTransOpen;
-        CustTrans       custTrans;
-        CustDispute     custDispute;
-        SpecTrans       specTrans;
+        CustTransOpen           custTransOpen;
+        CustTrans               custTrans;
+        SpecTrans               specTrans;
+        CustVendDisputeStatus   disputeStatus;
+        AmountCurDebCred        amoundCurSum;
 
-        select sum(AmountCur) from custTransOpen
+        while select AmountCur from custTransOpen
             where custTransOpen.AccountNum  == _accountNum
                && custTransOpen.DueDate     >= _startDate
                && custTransOpen.DueDate     <= _endDate
+               && custTransOpen.AmountCur > 0
             exists join custTrans
                 where custTrans.RecId == custTransOpen.RefRecId
                    && custTrans.AccountNum == custTransOpen.AccountNum
                    && custTrans.TransType != LedgerTransType::Payment
-            exists join custDispute
-                where custDispute.CustTrans == custTransOpen.RefRecId
-                   && custDispute.Status    != CustVendDisputeStatus::Disputed
-                   && custDispute.Status    != CustVendDisputeStatus::PromiseToPay
             notexists join specTrans
                 where specTrans.RefRecId    == custTransOpen.RecId
                    && specTrans.RefTableId  == tableName2Id(tableStr(CustTransOpen))
-                   && specTrans.RefCompany  == custTransOpen.DataAreaId;
+                   && specTrans.RefCompany  == custTransOpen.DataAreaId
+        {
+            disputeStatus = CustVendDisputeHelper::construct(custTrans.company(), tablenum(CustTrans), custTrans.RecId).parmStatus();
+            if (disputeStatus != CustVendDisputeStatus::Disputed || disputeStatus != CustVendDisputeStatus::PromiseToPay)
+            {
+                amoundCurSum = amoundCurSum + custTransOpen.AmountCur;
+            }
+        }
 
-        return custTransOpen.AmountCur;
+        return amoundCurSum;
     }
 
 ]]></Source>
