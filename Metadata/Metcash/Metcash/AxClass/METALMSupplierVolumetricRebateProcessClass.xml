@@ -66,6 +66,7 @@ class METALMSupplierVolumetricRebateProcessClass
                 ttsbegin;
 
                 this.createPostCustFreeTextInvoice();
+                
 
                 if (header.Type == METALMSupplierVolumetricRebateType::SVR)
                 {
@@ -107,6 +108,7 @@ class METALMSupplierVolumetricRebateProcessClass
     public boolean validateCustVendLines()
     {
         VendInvoiceJour     vendInvoiceJour;
+        
         boolean  ret = true;
 
         if(!METALMSupplierVolumetricRebateHeader::hasCustLines(header.Number) ||
@@ -115,13 +117,33 @@ class METALMSupplierVolumetricRebateProcessClass
             ret =  checkFailed("@MET:NoALMLinesError");
         }
 
+        if(!header.CustLegalEntity)
+        {
+            ret = checkFailed("@MET:CustLegalEntityMustBeFilled");
+        }
+
+        if(header.CustLegalEntity && header.CustLegalEntity != curExt())
+        {
+            // Check if parameters are defined in Customer legal entity
+            VendParameters  vendParameters = VendParameters::findByCompany(header.CustLegalEntity);
+            if((header.Type == METALMSupplierVolumetricRebateType::SVR && 
+                (!vendParameters.METSVRFinancialDimension || !vendParameters.METSVRLedgerDimension))
+                || 
+                (header.Type == METALMSupplierVolumetricRebateType::RDA &&
+                (!vendParameters.METRDAFinancialDimension || !vendParameters.METRDALedgerDimension)))
+            {
+                ret = checkFailed(strFmt("@MET:ParametersNotDefinedInCustLE", header.CustLegalEntity));
+            }
+        }
+
         if (ret &&
             (header.totalCustAmount() - header.totalVendAmount()) != 0)
         {
             ret = checkFailed("@MET:ALMRebateBalanceError");
         }
 
-        if (!header.vendTable().checkInvoice(header.InvoiceId, header.DocumentDate))
+        if (ret && 
+            !header.vendTable().checkInvoice(header.InvoiceId, header.DocumentDate))
         {
             select maxof(InvoiceDate) from vendInvoiceJour
                     where vendInvoiceJour.InvoiceId == header.InvoiceId
@@ -130,7 +152,12 @@ class METALMSupplierVolumetricRebateProcessClass
             ret = checkFailed(strFmt("@SYS50887", header.InvoiceId, date2StrUsr(vendInvoiceJour.InvoiceDate, DateFlags::FormatAll)));
         }
 
-
+        // Check if Customer is valid
+        if(ret &&
+            !header.custTable().RecId)
+        {
+            ret = checkFailed(strFmt("@MET:CustAccNumValidation", header.CustomerAccount, header.CustLegalEntity));
+        }
         return ret;
     }
 
@@ -145,31 +172,41 @@ class METALMSupplierVolumetricRebateProcessClass
     /// </summary>
     public void createPostCustFreeTextInvoice()
     {
-        CustInvoiceTable custInvoiceTable;
-        CustInvoiceLine custInvoiceLine;
-        CustPostInvoice custPostInvoice;
-        
-        METALMSupplierVolumetricRebateLine custLine;
-        RecordInsertList custInvoiceLineList;
+        CustInvoiceTable                    custInvoiceTable;
+        CustInvoiceLine                     custInvoiceLine;
+        CustPostInvoice                     custPostInvoice;
+        VendParameters                      vendParameters = VendParameters::findByCompany(header.CustLegalEntity);
+        RecordInsertList                    custInvoiceLineList;
+        METALMSupplierVolumetricRebateLine  custLine;
 
         try
         {
-            //create header
-            custInvoiceTable.clear();
-            custInvoiceTable.initValue();
-            custInvoiceTable.OrderAccount = header.CustomerAccount;
-            custInvoiceTable.modifiedField(fieldNum(CustInvoiceTable, OrderAccount));
-            custInvoiceTable.InvoiceDate = header.DocumentDate;
-            custInvoiceTable.modifiedField(fieldNum(CustInvoiceTable, InvoiceDate));
-            custInvoiceTable.CurrencyCode = header.CurrencyCode;
-            custInvoiceTable.DefaultDimension = header.FinancialDimension;
-            custInvoiceTable.CustomerRef = strFmt("@MET:PlaceHolder", header.VendorAccount,header.InvoiceId);
-            custInvoiceTable.PurchOrderFormNum = header.Number;
-            custInvoiceTable.DueDate = header.CustDueDate;
-            custInvoiceTable.insert();
+            changecompany(header.CustLegalEntity)
+            {
+                    
+                //create header
+                custInvoiceTable.clear();
+                custInvoiceTable.initValue();
+                custInvoiceTable.OrderAccount = header.CustomerAccount;
+                custInvoiceTable.modifiedField(fieldNum(CustInvoiceTable, OrderAccount));
+                custInvoiceTable.InvoiceDate = header.DocumentDate;
+                custInvoiceTable.modifiedField(fieldNum(CustInvoiceTable, InvoiceDate));
+                custInvoiceTable.CurrencyCode = header.CurrencyCode;
+                if(header.Type  == METALMSupplierVolumetricRebateType::SVR)
+                {
+                    custInvoiceTable.DefaultDimension = vendParameters.METSVRFinancialDimension;
+                }
+                else
+                {
+                    custInvoiceTable.DefaultDimension = vendParameters.METRDAFinancialDimension;
+                }
+                custInvoiceTable.CustomerRef = strFmt("@MET:PlaceHolder", header.VendorAccount,header.InvoiceId);
+                custInvoiceTable.PurchOrderFormNum = header.Number;
+                custInvoiceTable.DueDate = header.CustDueDate;
+                custInvoiceTable.insert();
 
-            custInvoiceLineList = new RecordInsertList(tableNum(CustInvoiceLine));
-
+                custInvoiceLineList = new RecordInsertList(tableNum(CustInvoiceLine));
+            }
             LineNum  linenum = 0;
             // create lines
             while select custLine
@@ -177,42 +214,62 @@ class METALMSupplierVolumetricRebateProcessClass
                 && custLine.CustVend == CustVendACType::Cust
             {
                 linenum++;
-
-                custInvoiceLine.clear();
-                custInvoiceLine.initValue();
-                custInvoiceLine.LineNum = linenum;
-                custInvoiceLine.ParentRecId = custInvoiceTable.RecId;
-                custInvoiceLine.initFromCustInvoiceTable(custInvoiceTable);
-                custInvoiceLine.Description = custLine.Description;
-                custInvoiceLine.modifiedField(fieldNum(CustInvoiceLine, Description));
-                custInvoiceLine.LedgerDimension = custLine.LedgerDimension;
-                custInvoiceLine.DefaultDimension = custLine.FinancialDimension;
-                custInvoiceLine.TaxGroup = custLine.GSTGroup;
-                custInvoiceLine.TaxItemGroup = custLine.ItemGSTGroup;
-                custInvoiceLine.Quantity = header.Type == METALMSupplierVolumetricRebateType::SVR ? -1 : 1;
-                custInvoiceLine.modifiedField(fieldNum(CustInvoiceLine, Quantity));
-                custInvoiceLine.UnitPrice = custInvoiceLine.Quantity * custLine.Amount;
-                custInvoiceLine.modifiedField(fieldNum(CustInvoiceLine, UnitPrice));
-                if (custInvoiceLine.AmountCur > 0
-                    && custInvoiceLine.Quantity < 0 )
+                changecompany(header.CustLegalEntity)
                 {
-                    custInvoiceLine.AmountCur = -custInvoiceLine.AmountCur;
+                    
+                    custInvoiceLine.clear();
+                    custInvoiceLine.initValue();
+                    custInvoiceLine.LineNum = linenum;
+                    custInvoiceLine.ParentRecId = custInvoiceTable.RecId;
+                    custInvoiceLine.initFromCustInvoiceTable(custInvoiceTable);
+                    custInvoiceLine.Description = custLine.Description;
+                    custInvoiceLine.modifiedField(fieldNum(CustInvoiceLine, Description));
+                    custInvoiceLine.LedgerDimension     = custLine.LedgerDimension;
+                    custInvoiceLine.DefaultDimension    = custLine.FinancialDimension;
+
+                    if(header.CustLegalEntity != header.DataAreaId)
+                    {
+                        if(header.Type  == METALMSupplierVolumetricRebateType::SVR)
+                        {
+                            custInvoiceLine.LedgerDimension     = vendParameters.METSVRLedgerDimension;
+                            custInvoiceLine.DefaultDimension    = vendParameters.METSVRFinancialDimension;
+                        }
+                        else
+                        {
+                            custInvoiceLine.LedgerDimension     = vendParameters.METRDALedgerDimension;
+                            custInvoiceLine.DefaultDimension    = vendParameters.METRDAFinancialDimension;
+                        }
+                    }
+                    custInvoiceLine.TaxGroup = custLine.GSTGroup;
+                    custInvoiceLine.TaxItemGroup = custLine.ItemGSTGroup;
+                    custInvoiceLine.Quantity = header.Type == METALMSupplierVolumetricRebateType::SVR ? -1 : 1;
+                    custInvoiceLine.modifiedField(fieldNum(CustInvoiceLine, Quantity));
+                    custInvoiceLine.UnitPrice = custInvoiceLine.Quantity * custLine.Amount;
+                    custInvoiceLine.modifiedField(fieldNum(CustInvoiceLine, UnitPrice));
+                    if (custInvoiceLine.AmountCur > 0
+                        && custInvoiceLine.Quantity < 0 )
+                    {
+                        custInvoiceLine.AmountCur = -custInvoiceLine.AmountCur;
+                    }
+                    custInvoiceLineList.add(custInvoiceLine);
                 }
-                custInvoiceLineList.add(custInvoiceLine);
             }
-
-            //Insert CustInvoiceLines in DB;
-            custInvoiceLineList.insertDatabase();
-
+            changecompany(header.CustLegalEntity)
+            {
+                //Insert CustInvoiceLines in DB;
+                custInvoiceLineList.insertDatabase();
+            }
             // Attach note
             this.createAttachedNote(custInvoiceTable.RecId,
                 custInvoiceTable.TableId,
                 strFmtLB(strFmt("@MET:FTIVendorNotes", header.Number, header.VendorAccount, header.vendorName())));
-
-            // Post Invoice
-            custPostInvoice = new CustPostInvoice(custInvoiceTable);
-            custPostInvoice.run();
-
+                    
+            changecompany(header.CustLegalEntity)
+            {
+                // Post Invoice
+                custPostInvoice = new CustPostInvoice(custInvoiceTable);
+                custPostInvoice.run();
+            }
                                   
         }
 
@@ -532,17 +589,19 @@ class METALMSupplierVolumetricRebateProcessClass
     private void createAttachedNote(RefRecId _refRecId, RefTableId _refTableId, Notes _note)
     {
         DocuRef docuRef;
-
-        docuRef.clear();
-        docuRef.initValue();
-        docuRef.TypeId = 'Note';
-        docuRef.RefCompanyId = curext();
-        docuRef.RefRecId = _refRecId;
-        docuRef.RefTableId = _refTableId;
-        docuRef.Name = "@MET:ALMSupplierVolumetricRebate";
-        docuRef.Notes = _note;
-        docuRef.Restriction = DocuRestriction::External;
-        DocuRef.insert();
+        changecompany(header.CustLegalEntity)
+        {
+            docuRef.clear();
+            docuRef.initValue();
+            docuRef.TypeId = 'Note';
+            docuRef.RefCompanyId = header.CustLegalEntity;
+            docuRef.RefRecId = _refRecId;
+            docuRef.RefTableId = _refTableId;
+            docuRef.Name = "@MET:ALMSupplierVolumetricRebate";
+            docuRef.Notes = _note;
+            docuRef.Restriction = DocuRestriction::External;
+            DocuRef.insert();
+        }
     }
 
 ]]></Source>
@@ -563,10 +622,11 @@ class METALMSupplierVolumetricRebateProcessClass
         {
             sysInfologMessageStruct = new SysInfologMessageStruct(sysInfologEnumerator.currentMessage());
 
-            if (sysInfologEnumerator.currentException() == Exception::Error)
-            {
-                infologMessage += strfmt(sysInfologMessageStruct.message());
-            }
+            //if (sysInfologEnumerator.currentException() == Exception::Error
+            //    || sysInfologEnumerator.currentException() == Exception::Warning)
+            //{
+            //    infologMessage += strfmt(sysInfologMessageStruct.message());
+            //}
 
             infologMessage += strfmt(sysInfologMessageStruct.message());
         }
