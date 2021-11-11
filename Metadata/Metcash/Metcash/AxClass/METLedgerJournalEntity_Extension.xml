@@ -106,6 +106,15 @@ public final class METLedgerJournalEntity_Extension
                 }
             }
 
+            // Set ReverseDate in PostTargetProcess method to fix performance issues 
+            // if the voucher is set to manual and custom DMF allocate voucher at posting is set to true
+            LedgerJournalName   metLedgerJournalName = LedgerJournalName::find(this.JournalName);
+            if(metLedgerJournalName.METDMFVoucherAllocatedAtPosting == NoYes::Yes
+                && metLedgerJournalName.NewVoucher  == NewVoucher::Manually)
+            {
+                metLedgerJournalTrans.ReverseDate   = dateNull();
+                metLedgerJournalTrans.ReverseEntry  = NoYes::No;
+            }
             // Fix for intercomany LedgerDimension as the standard entity is not designed for this.
             if(metLedgerJournalTrans.AccountType   == LedgerJournalACType::Ledger && metLedgerJournalTrans.company != curExt())
             {
@@ -444,7 +453,7 @@ public final class METLedgerJournalEntity_Extension
 				<Name>postTargetProcess</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Post target process method to change the journal header field
+    /// Post target process method to change the journal header field and ReverseDate/Entry fields on lines
     /// </summary>
     /// <param name = "_dmfDefinitionGroupExecution">Type DefinitionGroupExecution</param>
     public static void postTargetProcess(DMFDefinitionGroupExecution _dmfDefinitionGroupExecution)
@@ -455,71 +464,90 @@ public final class METLedgerJournalEntity_Extension
         LedgerJournalName           metLedgerJournalName;
         LedgerJournalTrans          metLedgerJournalTransUpdate;
         TransDate                   metMinDate = dateNull();
-        try
-        {
-            while select JournalBatchNumber
-            from metStaging
-            group by metStaging.JournalBatchNumber
-            where metStaging.DefinitionGroup    == _dmfDefinitionGroupExecution.DefinitionGroup
-            && metStaging.ExecutionId           == _dmfDefinitionGroupExecution.ExecutionId
-            && metStaging.TransferStatus        == DMFTransferStatus::Completed
-            {
-                // Set voucher allocation of journal to true based on the journal setup
 
-                select metLedgerJournalTable
-                join TableId
-                from metLedgerJournalName
-                where metLedgerJournalTable.JournalNum == metStaging.JournalBatchNumber
-                && metLedgerJournalName.JournalName == metLedgerJournalTable.JournalName
-                && metLedgerJournalTable.VoucherAllocatedAtPosting == NoYes::No
-                && metLedgerJournalTable.Posted == NoYes::No
-                && metLedgerJournalName.METDMFVoucherAllocatedAtPosting == NoYes::Yes;
-                
-                if(metLedgerJournalTable.RecId)
+        // Check if processing of all records are completed
+        select firstonly RecId
+                from metStaging
+                where metStaging.DefinitionGroup    == _dmfDefinitionGroupExecution.DefinitionGroup
+                    && metStaging.ExecutionId       == _dmfDefinitionGroupExecution.ExecutionId
+                    && metStaging.TransferStatus    != DMFTransferStatus::Completed
+                    && metStaging.TransferStatus    != DMFTransferStatus::Duplicate
+                    && metStaging.TransferStatus    != DMFTransferStatus::Error;
+
+        if(!metStaging.RecId)
+        {
+            try
+            {
+                while select JournalBatchNumber
+                from metStaging
+                group by metStaging.JournalBatchNumber
+                where metStaging.DefinitionGroup    == _dmfDefinitionGroupExecution.DefinitionGroup
+                && metStaging.ExecutionId           == _dmfDefinitionGroupExecution.ExecutionId
+                && metStaging.TransferStatus        == DMFTransferStatus::Completed
                 {
-                    ttsbegin;
-                    metLedgerJournalTable.selectForUpdate(true);
-                    metLedgerJournalTable.VoucherAllocatedAtPosting = NoYes::Yes;
-                    metLedgerJournalTable.update();
-                    ttscommit;
+                    // Set voucher allocation of journal to true based on the journal setup
+
+                    select metLedgerJournalTable
+                    join TableId
+                    from metLedgerJournalName
+                    where metLedgerJournalTable.JournalNum == metStaging.JournalBatchNumber
+                    && metLedgerJournalName.JournalName == metLedgerJournalTable.JournalName
+                    && metLedgerJournalTable.VoucherAllocatedAtPosting == NoYes::No
+                    && metLedgerJournalTable.Posted == NoYes::No
+                    && metLedgerJournalName.METDMFVoucherAllocatedAtPosting == NoYes::Yes
+                    && metLedgerJournalName.NewVoucher  == NewVoucher::Manually;
+                
+                    if(metLedgerJournalTable.RecId)
+                    {
+                        ttsbegin;
+                        metLedgerJournalTable.selectForUpdate(true);
+                        metLedgerJournalTable.VoucherAllocatedAtPosting = NoYes::Yes;
+                        metLedgerJournalTable.update();
+                        ttscommit;
+                    }
+                
+                    // Reverse Date update on all journal lines
+                
+                    metLedgerJournalTransUpdate.skipAosValidation(true);
+                    metLedgerJournalTransUpdate.skipDatabaseLog(true);
+                    metLedgerJournalTransUpdate.skipDataMethods(true);
+                    metLedgerJournalTransUpdate.skipEvents(true);
+
+                    while select JournalBatchNumber, Voucher, ReverseDate, ReverseEntry
+                        from metStagingTrans
+                        group by JournalBatchNumber, Voucher, ReverseDate, ReverseEntry
+                        where metStagingTrans.JournalBatchNumber    == metStaging.JournalBatchNumber
+                            && metStagingTrans.DefinitionGroup      == _dmfDefinitionGroupExecution.DefinitionGroup
+                            && metStagingTrans.ExecutionId          == _dmfDefinitionGroupExecution.ExecutionId
+                            && metStagingTrans.ReverseDate          != metMinDate
+                        
+                    {
+                        update_recordset metLedgerJournalTransUpdate
+                        setting  ReverseEntry = metStagingTrans.ReverseEntry,
+                                 ReverseDate = metStagingTrans.ReverseDate
+                        where metLedgerJournalTransUpdate.JournalNum    == metStagingTrans.JournalBatchNumber
+                            && metLedgerJournalTransUpdate.Voucher      == metStagingTrans.Voucher
+                            && metLedgerJournalTransUpdate.ReverseDate  != metStagingTrans.ReverseDate;
+                    }
                 }
-                
-                // Reverse Date update on all journal lines
-                
-                metLedgerJournalTransUpdate.skipAosValidation(true);
-                metLedgerJournalTransUpdate.skipDatabaseLog(true);
-                metLedgerJournalTransUpdate.skipDataMethods(true);
-                metLedgerJournalTransUpdate.skipEvents(true);
 
-                update_recordset metLedgerJournalTransUpdate
-                setting  ReverseEntry = metStagingTrans.ReverseEntry,
-                         ReverseDate = metStagingTrans.ReverseDate
-                join metStagingTrans
-                where metLedgerJournalTransUpdate.JournalNum    == metStagingTrans.JournalBatchNumber
-                    && metLedgerJournalTransUpdate.Voucher      == metStagingTrans.Voucher
-                    && metLedgerJournalTransUpdate.ReverseDate  != metStagingTrans.ReverseDate
-                    && metStagingTrans.JournalBatchNumber       == metStaging.JournalBatchNumber
-                    && metStagingTrans.DefinitionGroup          == _dmfDefinitionGroupExecution.DefinitionGroup
-                    && metStagingTrans.ExecutionId              == _dmfDefinitionGroupExecution.ExecutionId
-                    && metStagingTrans.ReverseDate              != metMinDate;
             }
-
-        }
-        catch (Exception::Deadlock)
-        {
-            // retry on deadlock
-            retry;
-        }
-        catch (Exception::UpdateConflict)
-        {
-            // try to resolve update conflict
-            if (xSession::currentRetryCount() >= #RetryNum)
+            catch (Exception::Deadlock)
             {
-                throw Exception::UpdateConflictNotRecovered;
-            }
-            else
-            {
+                // retry on deadlock
                 retry;
+            }
+            catch (Exception::UpdateConflict)
+            {
+                // try to resolve update conflict
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
             }
         }
     }
