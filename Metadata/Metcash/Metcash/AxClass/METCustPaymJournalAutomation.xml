@@ -19,7 +19,7 @@ class METCustPaymJournalAutomation extends RunBaseBatch
 
     #define.CACHESCOPE('METCustPaymJournalAutomation')
 
-    #define.CurrentVersion(9)
+    #define.CurrentVersion(10)
     #localmacro.CurrentList
         allParameters
     #endmacro
@@ -66,8 +66,11 @@ class METCustPaymJournalAutomation extends RunBaseBatch
         str cacheKey = METCustPaymJournalAutomation::sessionFlagCacheKey();       
         try
         {
+            // See note in METERFormatMappingRunController_Extension
             classFactory.globalObjectCache().insert(#CACHESCOPE, [cacheKey], [true]);
 
+            // NB specifically requested that different stages run as separate transactions
+            // for error-checking/resolution.
             ttsbegin;
             this.createJournalHeader();
             this.generatePaymentProposal();
@@ -125,15 +128,65 @@ class METCustPaymJournalAutomation extends RunBaseBatch
         if(!isRunningOnBatch())
             return true;
 
-        if(journalAutomationParams.CalendarId)
+        if(journalAutomationParams.PaymCalendarName)
         {
-            var workCalendar = new WorkCalendarSched();
             var d = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
-            if(!workCalendar.isDateOpen(journalAutomationParams.CalendarId, d))
-                return checkFailed(strFmt(
-                "@MET:DDAutomationCancelForClosedCalendarDay",
-                d,
-                journalAutomationParams.CalendarId));
+            PaymCalendar cal = PaymCalendar::findByName(journalAutomationParams.PaymCalendarName);
+            if(cal)
+            {
+                boolean dayOpen;
+                switch(dayOfWk(d))
+                {
+                    case 1: 
+                        dayOpen = cal.IsMondayBusinessDay;
+                        break;
+                    case 2:
+                        dayOpen = cal.IsTuesdayBusinessDay;
+                        break;
+                    case 3:
+                        dayOpen = cal.IsWednesdayBusinessDay;
+                        break;
+                    case 4:
+                        dayOpen = cal.IsThursdayBusinessDay;
+                        break;
+                    case 5:
+                        dayOpen = cal.IsFridayBusinessDay;
+                        break;
+                    case 6:
+                        dayOpen = cal.IsSaturdayBusinessDay;
+                        break;
+                    case 7:
+                        dayOpen = cal.IsSundayBusinessDay;
+                        break;
+                }
+                PaymCalendarException calendarEx;
+                select firstonly calendarEx
+                    where   calendarEx.PaymCalendar     == cal.RecId
+                    &&      calendarEx.ExceptionDate    == d;
+                if(calendarEx)
+                {
+                    if(dayOpen && calendarEx.ExceptionType == PaymDayExceptionType::Remove)
+                    {
+                        // Day is normally open but a 'remove' exception exists.
+                        dayOpen = false;
+                    }
+                    if(!dayOpen && calendarEx.ExceptionType == PaymDayExceptionType::Add)
+                    {
+                        // Day is normally closed but an 'add' exception exists.
+                        dayOpen = true;
+                    }
+                } 
+
+                if(!dayOpen)
+                {
+                    return checkFailed(strFmt(
+                        "@MET:DDAutomationCancelForClosedCalendarDay",
+                        d,
+                        journalAutomationParams.PaymCalendarName));
+                }
+
+                return dayOpen;
+            }
         }
         return true;
     }
