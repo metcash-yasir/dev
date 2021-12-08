@@ -16,7 +16,6 @@ class METAMEXCustFreeTextInvService extends SysOperationServiceBase
     METCustTable                            metCustTable ;    
     LineNum                                 lineNum;
 
-    METAMEXBatchId                          batchId;
     LedgerDimensionAccount                  lineLedgerDimension;
 
     CustParameters                          parameters;
@@ -24,6 +23,102 @@ class METAMEXCustFreeTextInvService extends SysOperationServiceBase
 }
 ]]></Declaration>
 		<Methods>
+			<Method>
+				<Name>runOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the business logic
+    /// </summary>
+    /// <param name = "_contract"><c>METAMEXCustFreeTextInvContract</c> class instance</param>
+    private void runOperation(METAMEXCustFreeTextInvContract    _contract)
+    {
+        LedgerJournalTrans                  ledgerJournalTrans;
+        int                                 bundlesize, totalRecords, totalTasks, i, j, task;
+        List                                companyCustList      = new List(Types::Container);
+
+        if(!_contract.parmJournalId())
+        {
+            _contract.parmJournalId(CustParameters::find().METAMEXFreeTextInvJournal);
+        }
+    
+        LedgerJournalTable                  journalTable =   LedgerJournalTable::find(_contract.parmJournalId());
+
+        if (!journalTable ||
+            !journalTable.Posted ||
+            journalTable.JournalName != CustParameters::find().METAMEXJournalName)
+        {
+            throw error(strFmt("@MET:METAMEXJournalNotPostedError", journalTable.JournalNum));
+        }
+
+        totalTasks      =   _contract.parmTasks();
+        if (totalTasks <= 0)
+        {
+            totalTasks = 1;
+        }
+        task = 1;
+
+        while select count (RecId) from ledgerJournalTrans
+            group by Company, LedgerDimension
+            where ledgerJournalTrans.JournalNum == journalTable.JournalNum
+        {
+            totalrecords++;
+        }
+
+        bundleSize      =   real2int(roundUp((totalrecords / totalTasks), 1.0));
+        BatchHeader batchHeader = this.getCurrentBatchHeader();
+
+        if (batchHeader == null)
+        {
+            batchHeader = batchHeader::construct();
+        }
+        batchHeader.parmCaption(strFmt("@MET:METAMEXPostFreeTextInvoicesTask", journalTable.JournalNum));
+
+        while select crosscompany Company, LedgerDimension from ledgerJournalTrans
+            group by Company, LedgerDimension
+            where ledgerJournalTrans.JournalNum == journalTable.JournalNum &&
+            ledgerJournalTrans.DataAreaId == journalTable.DataAreaId
+
+            join DisplayValue from dimensionAttribute group by DisplayValue
+                where dimensionAttribute.RecId == ledgerJournalTrans.LedgerDimension 
+
+        {
+            select  crosscompany RecId from custInvoiceTable
+                where custInvoiceTable.METAMEXJournalId == journalTable.JournalNum &&
+                custInvoiceTable.DataAreaId == ledgerJournalTrans.Company &&
+                custInvoiceTable.OrderAccount == dimensionAttribute.DisplayValue;
+
+            if (custInvoiceTable)
+            {
+                continue;
+            }
+
+            i++;
+            j++;
+            companyCustList.addEnd([ledgerJournalTrans.Company, dimensionAttribute.DisplayValue]);
+            if (i  == bundleSize || j == totalRecords)
+            {
+                SysOperationServiceController createInvController = new SysOperationServiceController(
+                                                                classStr(METAMEXCustFreeTextInvService),
+                                                                methodStr(METAMEXCustFreeTextInvService, postInvoiceSubTask));
+                createInvController.parmDialogCaption(strFmt("@MET:METAMEXPostFreeTextInvoicesSubTask", task, journalTable.JournalNum));
+
+                METAMEXCustFreeTextInvContract invContract = createInvController.getDataContractObject() as METAMEXCustFreeTextInvContract;
+                invContract.parmJournalId(journalTable.JournalNum);
+                invContract.parmcompanyCustList(companyCustList);
+                invContract.parmDataArea(_contract.parmDataArea());
+
+                batchHeader.addRuntimeTask(createInvController, this.getCurrentBatchTask().RecId);
+                companyCustList = new List(Types::Container);
+                task++;
+                i = 0;
+            }
+
+        }
+        batchHeader.save();
+    }
+
+]]></Source>
+			</Method>
 			<Method>
 				<Name>postInvoiceSubTask</Name>
 				<Source><![CDATA[
@@ -36,7 +131,7 @@ class METAMEXCustFreeTextInvService extends SysOperationServiceBase
         #OCCRetryCount
 
         LedgerJournalTrans      ledgerJournalTrans;
-        MapEnumerator           companyCustMapEnum;
+        ListEnumerator          companyCustListEnum;
         METAmexCharge           chargeAmount;
         boolean                 hasError;
         container               companyCustCon;
@@ -44,15 +139,15 @@ class METAMEXCustFreeTextInvService extends SysOperationServiceBase
         str                     customer;
 
         parameters              = CustParameters::findByCompany(_contract.parmDataArea());
-        companyCustMapEnum      = _contract.getCompanyCustMap().getEnumerator();
+        companyCustListEnum      = _contract.parmcompanyCustList().getEnumerator();
         ledgerJournalTable      = LedgerJournalTable::find(_contract.parmJournalId());
 
-        while (companyCustMapEnum.moveNext())
+        while (companyCustListEnum.moveNext())
         {
             try
             {
                 ttsBegin;
-                companyCustCon = companyCustMapEnum.currentValue();
+                companyCustCon = companyCustListEnum.current();
                 company = conPeek(companyCustCon, 1);
                 customer = conPeek(companyCustCon, 2);
                 lineNum  = 0;           
@@ -81,7 +176,7 @@ class METAMEXCustFreeTextInvService extends SysOperationServiceBase
                         if (chargeAmount)
                         {
                             select * from custInvoiceTable
-                            where custInvoiceTable.InvoiceId == _contract.parmBatchId()
+                            where custInvoiceTable.METAMEXJournalId == _contract.parmJournalId()
                             && custInvoiceTable.OrderAccount == metCustTable.AccountNum
                             && custInvoiceTable.DataAreaId == company
                             && !custInvoiceTable.Posted;
@@ -90,7 +185,7 @@ class METAMEXCustFreeTextInvService extends SysOperationServiceBase
                             {
                                 custInvoiceTable = this.createInvoiceHeader(
                                                     CustTable::find(metCustTable.AccountNum),
-                                                    _contract.parmBatchId());
+                                                    _contract.parmJournalId());
                             }
                         }
                         else
@@ -180,11 +275,11 @@ class METAMEXCustFreeTextInvService extends SysOperationServiceBase
     /// <param name = "_batchId">Batch id from the parameters.</param>
     /// <returns><c>CustInvoiceTable</c> record.</returns>
     private CustInvoiceTable createInvoiceHeader(CustTable _custTable,
-                                                METAMEXBatchId _batchId)
+                                                JournalId  _metAMEXJournalId)
     {
         custInvoiceTable = this.initializeCustInvoiceTable(_custTable);
         custInvoiceTable.InclTax = NoYes::No;
-        custInvoiceTable.InvoiceId = _batchId;
+        custInvoiceTable.METAMEXJournalId = _metAMEXJournalId;
         custInvoiceTable.setListCode();
         custInvoiceTable.PaymMode = parameters.METAMEXChargePaymMode;
         custInvoiceTable.insert();
