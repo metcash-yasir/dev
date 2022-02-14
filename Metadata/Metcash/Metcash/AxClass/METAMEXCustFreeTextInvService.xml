@@ -37,87 +37,117 @@ class METAMEXCustFreeTextInvService extends SysOperationServiceBase
         List                                companyCustList      = new List(Types::Container);
         date                                cutoffDate = mkDate(18,12,2021);
         date                                journalPostedDate;
+        METAMEXProcessFTI                   adhocFTI = _contract.parmProcessAdhocFTI();
+        JournalId                           journalNumber;
+        LedgerJournalTable                  journalTable;
 
-        if(!_contract.parmJournalId())
+        if(!_contract.parmJournalId() && !adhocFTI)
         {
             _contract.parmJournalId(CustParameters::find().METAMEXFreeTextInvJournal);
         }
-    
-        LedgerJournalTable                  journalTable =   LedgerJournalTable::find(_contract.parmJournalId());
-        journalPostedDate   = DateTimeUtil::date(journalTable.PostedDateTime);
 
-        if (!journalTable ||
-            !journalTable.Posted ||
-            journalPostedDate < cutoffDate ||
-            journalTable.JournalName != CustParameters::find().METAMEXJournalName)
-        {
-            throw error(strFmt("@MET:METAMEXJournalNotPostedError", journalTable.JournalNum));
-        }
+        journalNumber = _contract.parmJournalId();
 
-        totalTasks      =   _contract.parmTasks();
-        if (totalTasks <= 0)
-        {
-            totalTasks = 1;
-        }
-        task = 1;
-
-        while select count (RecId) from ledgerJournalTrans
-            group by Company, LedgerDimension
-            where ledgerJournalTrans.JournalNum == journalTable.JournalNum
-        {
-            totalrecords++;
-        }
-
-        bundleSize      =   real2int(roundUp((totalrecords / totalTasks), 1.0));
         BatchHeader batchHeader = this.getCurrentBatchHeader();
 
         if (batchHeader == null)
         {
             batchHeader = batchHeader::construct();
         }
-        batchHeader.parmCaption("@MET:AMEXFreeTextInvServiceBatchDesc");
 
-        while select crosscompany Company, LedgerDimension from ledgerJournalTrans
+        if (adhocFTI)
+        {
+            batchHeader.parmCaption("@MET:BatchJobAdhocFTI");
+        }
+        else
+        {
+            batchHeader.parmCaption("@MET:AMEXFreeTextInvServiceBatchDesc");
+        }
+    
+        while select journalTable
+            where (journalNumber && journalTable.JournalNum == journalNumber) ||
+            (adhocFTI && journalTable.METAMEXProcessFTI)
+        {
+            journalPostedDate   = DateTimeUtil::date(journalTable.PostedDateTime);
+
+            if (!journalTable ||
+            !journalTable.Posted ||
+            journalPostedDate < cutoffDate ||
+            journalTable.JournalName != CustParameters::find().METAMEXJournalName)
+            {
+                warning(strFmt("@MET:METAMEXJournalNotPostedError", journalTable.JournalNum));
+                continue;
+            }
+
+            totalTasks      =   _contract.parmTasks();
+            if (totalTasks <= 0)
+            {
+                totalTasks = 1;
+            }
+            task = 1;
+            j = 0; i = 0;totalrecords = 0;
+
+            while select count (RecId) from ledgerJournalTrans
+            group by Company, LedgerDimension
+            where ledgerJournalTrans.JournalNum == journalTable.JournalNum
+            {
+                totalrecords++;
+            }
+
+            bundleSize      =   real2int(roundUp((totalrecords / totalTasks), 1.0));
+
+            while select crosscompany Company, LedgerDimension from ledgerJournalTrans
             group by Company, LedgerDimension
             where ledgerJournalTrans.JournalNum == journalTable.JournalNum &&
             ledgerJournalTrans.DataAreaId == journalTable.DataAreaId &&
             !ledgerJournalTrans.AmountCurDebit
 
             join DisplayValue from dimensionAttribute group by DisplayValue
-                where dimensionAttribute.RecId == ledgerJournalTrans.LedgerDimension 
+                where dimensionAttribute.RecId == ledgerJournalTrans.LedgerDimension
 
-        {
-            select  crosscompany RecId from custInvoiceTable
+            {
+                select  crosscompany RecId from custInvoiceTable
                 where custInvoiceTable.METAMEXJournalId == journalTable.JournalNum &&
                 custInvoiceTable.DataAreaId == ledgerJournalTrans.Company &&
                 custInvoiceTable.OrderAccount == dimensionAttribute.DisplayValue;
 
-            if (custInvoiceTable)
-            {
-                continue;
-            }
+                if (custInvoiceTable)
+                {
+                    continue;
+                }
 
-            i++;
-            j++;
-            companyCustList.addEnd([ledgerJournalTrans.Company, dimensionAttribute.DisplayValue]);
-            if (i  == bundleSize || j == totalRecords)
-            {
-                SysOperationServiceController createInvController = new SysOperationServiceController(
+                i++;
+                j++;
+                companyCustList.addEnd([ledgerJournalTrans.Company, dimensionAttribute.DisplayValue]);
+                if (i  == bundleSize || j == totalRecords)
+                {
+                    SysOperationServiceController createInvController = new SysOperationServiceController(
                                                                 classStr(METAMEXCustFreeTextInvService),
                                                                 methodStr(METAMEXCustFreeTextInvService, postInvoiceSubTask));
-                createInvController.parmDialogCaption(strFmt("@MET:METAMEXPostFreeTextInvoicesSubTask", task, journalTable.JournalNum));
+                    createInvController.parmDialogCaption(strFmt("@MET:METAMEXPostFreeTextInvoicesSubTask", task, journalTable.JournalNum));
 
-                METAMEXCustFreeTextInvContract invContract = createInvController.getDataContractObject() as METAMEXCustFreeTextInvContract;
-                invContract.parmJournalId(journalTable.JournalNum);
-                invContract.parmcompanyCustList(companyCustList);
-                invContract.parmDataArea(_contract.parmDataArea());
+                    METAMEXCustFreeTextInvContract invContract = createInvController.getDataContractObject() as METAMEXCustFreeTextInvContract;
+                    invContract.parmJournalId(journalTable.JournalNum);
+                    invContract.parmcompanyCustList(companyCustList);
+                    invContract.parmDataArea(_contract.parmDataArea());
 
-                batchHeader.addRuntimeTask(createInvController, this.getCurrentBatchTask().RecId);
-                companyCustList = new List(Types::Container);
-                task++;
-                i = 0;
+                    batchHeader.addRuntimeTask(createInvController, this.getCurrentBatchTask().RecId);
+                    companyCustList = new List(Types::Container);
+                    task++;
+                    i = 0;
+                }
+
             }
 
+            //unflag journal for Adhoc job
+            if (adhocFTI)
+            {
+                ttsbegin;
+                journalTable.selectForUpdate(true);
+                journalTable.METAMEXProcessFTI = NoYes::No;
+                journalTable.doUpdate();
+                ttscommit;
+            }
         }
         batchHeader.save();
     }
