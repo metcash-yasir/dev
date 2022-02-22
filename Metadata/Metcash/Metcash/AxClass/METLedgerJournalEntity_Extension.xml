@@ -12,6 +12,7 @@ public final class METLedgerJournalEntity_Extension
 {
     #OCCRetryCount
 
+
 }
 ]]></Declaration>
 		<Methods>
@@ -332,12 +333,14 @@ public final class METLedgerJournalEntity_Extension
     {
         LedgerJournalTrans          metLedgerJournalTrans;
         LedgerJournalEntityStaging  metStaging;
+        ReasonTable                 metReasonTable;
+        ReasonTableRef              metReasonTableRef;
 
         select firstonly METCompany 
             from  metStaging
-            where metStaging.DefinitionGroup == _dmfDefinitionGroupExecution.DefinitionGroup
-                && metStaging.ExecutionId == _dmfDefinitionGroupExecution.ExecutionId
-                && (metStaging.TransferStatus == DMFTransferStatus::NotStarted
+            where metStaging.DefinitionGroup    == _dmfDefinitionGroupExecution.DefinitionGroup
+                && metStaging.ExecutionId       == _dmfDefinitionGroupExecution.ExecutionId
+                && (metStaging.TransferStatus   == DMFTransferStatus::NotStarted
                     || metStaging.TransferStatus == DMFTransferStatus::Validated);
 
         if(metStaging.METCompany)
@@ -351,21 +354,21 @@ public final class METLedgerJournalEntity_Extension
                                 CashDiscBaseDate    = metStaging.METCashDiscBaseDate,
                                 CashDiscBaseDays    = metStaging.METCashDiscBaseDays
                 join metStaging
-                    where metStaging.DefinitionGroup == _dmfDefinitionGroupExecution.DefinitionGroup
-                        && metStaging.ExecutionId == _dmfDefinitionGroupExecution.ExecutionId
-                        && (metStaging.TransferStatus == DMFTransferStatus::NotStarted
-                            || metStaging.TransferStatus == DMFTransferStatus::Validated)
+                    where metStaging.DefinitionGroup    == _dmfDefinitionGroupExecution.DefinitionGroup
+                        && metStaging.ExecutionId       == _dmfDefinitionGroupExecution.ExecutionId
+                        && (metStaging.TransferStatus   == DMFTransferStatus::NotStarted
+                           || metStaging.TransferStatus == DMFTransferStatus::Validated)
                         && metStaging.JournalBatchNumber == metLedgerJournalTrans.JournalNum
-                        && metStaging.LineNumber == metLedgerJournalTrans.LineNum;
+                        && metStaging.LineNumber        == metLedgerJournalTrans.LineNum;
 
             // Fix for intercomany LedgerDimension as the standard entity is not designed for this.
             while select forupdate metLedgerJournalTrans
                 join    metStaging
-                    where metStaging.DefinitionGroup == _dmfDefinitionGroupExecution.DefinitionGroup
-                        && metStaging.ExecutionId == _dmfDefinitionGroupExecution.ExecutionId
-                        && metStaging.TransferStatus == DMFTransferStatus::NotStarted
+                    where metStaging.DefinitionGroup    == _dmfDefinitionGroupExecution.DefinitionGroup
+                        && metStaging.ExecutionId       == _dmfDefinitionGroupExecution.ExecutionId
+                        && metStaging.TransferStatus    == DMFTransferStatus::NotStarted
                         && metStaging.JournalBatchNumber == metLedgerJournalTrans.JournalNum
-                        && metStaging.LineNumber == metLedgerJournalTrans.LineNum
+                        && metStaging.LineNumber        == metLedgerJournalTrans.LineNum
                         && metLedgerJournalTrans.AccountType   == LedgerJournalACType::Ledger 
                         && metLedgerJournalTrans.company != curExt()
             {
@@ -391,6 +394,53 @@ public final class METLedgerJournalEntity_Extension
                 // In case of failure, AccountDisplayValue gets stored in Dynamics and user has to fix it manually
             }
         }
+
+        //MPJ_17670_ReasonCode DCP 22/02/2022
+        //populate Reason Code on journal line
+        //Validate Reason code exists in ReasonTable, then delete / create a ReasonTableRef record
+        ttsbegin;
+        while select forupdate metLedgerJournalTrans
+            
+            join    metStaging
+            where   metStaging.DefinitionGroup      == _dmfDefinitionGroupExecution.DefinitionGroup
+            &&      metStaging.ExecutionId          == _dmfDefinitionGroupExecution.ExecutionId
+            &&      metStaging.TransferStatus       == DMFTransferStatus::NotStarted
+            &&      metStaging.JournalBatchNumber   == metLedgerJournalTrans.JournalNum
+            &&      metStaging.LineNumber           == metLedgerJournalTrans.LineNum
+            &&      metStaging.METReasonCode
+
+            join    metReasonTable
+            where   metReasonTable.Reason       == metStaging.METReasonCode
+            &&      metReasonTable.Ledger       == NoYes::Yes
+        {
+            delete_from metReasonTableRef
+                where metReasonTableRef.RecId   == metLedgerJournalTrans.ReasonRefRecID;
+
+            metReasonTableRef.clear();
+            metReasonTableRef.Reason        = metReasonTable.Reason;
+            metReasonTableRef.ReasonComment = metReasonTable.Description;
+            metReasonTableRef.insert();
+
+            metLedgerJournalTrans.ReasonRefRecID = metReasonTableRef.RecId;
+            metLedgerJournalTrans.doUpdate();
+
+        }
+        ttscommit;
+
+        ttsbegin;
+        update_recordset metLedgerJournalTrans
+            setting ReasonRefRecID  = metReasonTableRef.RecId
+         
+            join metStaging
+            where   metStaging.DefinitionGroup      == _dmfDefinitionGroupExecution.DefinitionGroup
+            &&      metStaging.ExecutionId          == _dmfDefinitionGroupExecution.ExecutionId
+            &&      metStaging.TransferStatus       == DMFTransferStatus::NotStarted
+            &&      metStaging.JournalBatchNumber   == metLedgerJournalTrans.JournalNum
+            &&      metStaging.LineNumber           == metLedgerJournalTrans.LineNum
+
+            join    firstonly metReasonTableRef
+            where   metReasonTableRef.Reason        == metStaging.METReasonCode;
+        ttscommit;
     }
 
 ]]></Source>
@@ -401,6 +451,7 @@ public final class METLedgerJournalEntity_Extension
     /// <summary>
     /// MPJ_3173_Veera Actual sales tax amount
     /// populating METGSTAmount
+    /// populate values for Virtual Fields on Export
     /// </summary>
     public void postLoad()
     {
@@ -576,6 +627,40 @@ public final class METLedgerJournalEntity_Extension
                 }
             }
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMETReasonCode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_17670_ReasonCode DCP 22/02/2022
+    /// Computed column to select reason code
+    /// </summary>
+    /// <returns>Reason code</returns>
+    private static server str getMETReasonCode()
+    {
+        str reasonRefRecID;
+        str reasonCode;
+        
+        //table to select from
+        SysDictTable      ReasonTableRef = new SysDictTable(tableNum(ReasonTableRef));
+
+        
+        //reasonRefRecID is the field from the Entity
+        reasonRefRecID = SysComputedColumn::returnField(dataentityviewstr(LedgerJournalEntity),
+                                                        dataEntityDataSourceStr(LedgerJournalEntity, LedgerJournalTrans),
+                                                        fieldStr(LedgerJournalTrans, reasonRefRecID));
+        
+        //select top 1 reasonCode from ReasonTableRef where recid = reasonRefRecID
+        reasonCode = strFmt(@"SELECT TOP 1 %1 FROM %2 WHERE %2.%3 = %4",
+                            ReasonTableRef.fieldName(fieldNum(ReasonTableRef,Reason), DbBackend::Sql),
+                            ReasonTableRef.name(DbBackend::Sql),
+                            ReasonTableRef.fieldName(fieldNum(ReasonTableRef,RecId), DbBackend::Sql),
+                            reasonRefRecID);
+
+        return reasonCode;
     }
 
 ]]></Source>
