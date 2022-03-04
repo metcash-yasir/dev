@@ -1,0 +1,239 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GUPRetailPricingSimulator_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[ExtensionOf(classStr(RetailPricingSimulator))]
+public final class GUPRetailPricingSimulator_Extension
+{
+    #OCCRetryCount
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>initTradeAgreement</Name>
+				<Source><![CDATA[
+    protected RetailPricingSimulatorPriceDiscTable initTradeAgreement(
+        Microsoft.Dynamics.Commerce.Runtime.DataModel.TradeAgreement _tradeAgreementConsidered)
+    {
+        RetailPricingSimulatorPriceDiscTable tradeAgreement = next initTradeAgreement(_tradeAgreementConsidered);
+
+        if (FeatureStateProvider::isFeatureEnabled(GUPGlobalEnableFeature::instance()))
+        {
+            RefRecId priceDiscTableRecId = _tradeAgreementConsidered.RecordId;
+            PriceDiscTable priceDiscTable = PriceDiscTable::findRecId(priceDiscTableRecId);
+            if (priceDiscTable.RecId)
+            {
+                tradeAgreement.PriceApplyAdjustment = priceDiscTable.PriceApplyAdjustment;
+                tradeAgreement.UnitAppliesToAll = priceDiscTable.UnitAppliesToAll;
+                tradeAgreement.PriceComponentCombination = priceDiscTable.PriceComponentCombination;
+                tradeAgreement.PricingRuleHeader = priceDiscTable.PricingRuleHeader;
+                tradeAgreement.PricingRuleLine = priceDiscTable.PricingRuleLine;
+                tradeAgreement.PriceDiscTableRecId = priceDiscTableRecId;
+            }
+        }
+        return tradeAgreement;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldSkipCreateCRTSalesLine</Name>
+				<Source><![CDATA[
+    protected boolean shouldSkipCreateCRTSalesLine(RetailPricingSimulatorSalesLine _psSalesLine)
+    {
+        boolean ret = next  shouldSkipCreateCRTSalesLine(_psSalesLine);
+
+        if (!ret 
+            && FeatureStateProvider::isFeatureEnabled(GUPGlobalEnableFeature::instance())
+            && _psSalesLine.IsFreeItemLine)
+        {
+            ret = true;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculatePricesAndDiscounts</Name>
+				<Source><![CDATA[
+    public void calculatePricesAndDiscounts()
+    {
+        next calculatePricesAndDiscounts();
+        
+        if (FeatureStateProvider::isFeatureEnabled(GUPGlobalEnableFeature::instance()))
+        {
+            this.calculateFreeItem();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateFreeItem</Name>
+				<Source><![CDATA[
+    private void calculateFreeItem()
+    {
+        try
+        {
+            if (crtSalesTransaction)
+            {
+                this.updateCRTSalesLineNetAmount();
+                GUPAttributeBasedPricingDataManager attributeBasedPricingManager = new GUPAttributeBasedPricingDataManager(retailChannelTable.RecId, this.getTransactionIdString(), tempOrderItem, true);
+                CLRObject clrFreeItemLines =  Microsoft.Dynamics.Commerce.Runtime.Services.AttributeBasedPricingEngine.FreeItemCalculator::CalculateFreeItems(
+                    attributeBasedPricingManager,
+                    crtSalesTransaction,
+                    currencyAndRoundingHelper,
+                    channelCurrency,
+                    dateTimeOffset);
+                this.updateFreeItemLinesInDbTable(clrFreeItemLines);
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateCRTSalesLineNetAmount</Name>
+				<Source><![CDATA[
+    private void updateCRTSalesLineNetAmount()
+    {
+        if (GUPParameters::find().FreeItemCalculationBase == GUPFreeItemCalculationBase::DiscountedPrice)
+        {
+            CLRObject clrSalesLines, enumeratorSalesLine;
+            clrSalesLines = crtSalesTransaction.get_SalesLines();
+
+            Microsoft.Dynamics.Commerce.Runtime.DataModel.SalesLine crtSalesLine;
+            RetailPricingSimulatorSalesLine psSalesLine;
+            while select psSalesLine
+                where psSalesLine.RetailPricingSimulatorSalesTransaction == salesTransactionId
+            {
+                enumeratorSalesLine = clrSalesLines.GetEnumerator();
+                while (enumeratorSalesLine.MoveNext())
+                {
+                    crtSalesLine = enumeratorSalesLine.get_Current();
+                    if (crtSalesLine.get_LineId() == psSalesLine.LineNum)
+                    {
+                        crtSalesLine.NetAmount = psSalesLine.SalesPrice;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateFreeItemLinesInDbTable</Name>
+				<Source><![CDATA[
+    private void updateFreeItemLinesInDbTable(CLRObject _clrFreeItemLines)
+    {
+        ttsbegin;
+
+        // delete those sales lines for free item but not exist in free item discount now.
+        GUPFreeItemLine gupFreeItemLine;
+        RetailPricingSimulatorSalesLine psSalesLine;
+        delete_from psSalesLine
+            where psSalesLine.IsFreeItemLine == NoYes::Yes
+                && psSalesLine.RetailPricingSimulatorSalesTransaction == salesTransactionId
+            notexists join gupFreeItemLine
+                where gupFreeItemLine.RecId == psSalesLine.GUPFreeItemLineRecId;
+
+        // delete those sales lines for free item which is disabled.
+        GUPFreeItemDiscount freeItemDiscount;
+        delete_from psSalesLine
+            exists join gupFreeItemLine
+                where gupFreeItemLine.RecId == psSalesLine.GUPFreeItemLineRecId
+            exists join freeItemDiscount
+                where freeItemDiscount.OfferId == gupFreeItemLine.FreeItemId
+                    && freeItemDiscount.Status == RetailDisabledEnabled::Disabled
+                    && psSalesLine.RetailPricingSimulatorSalesTransaction == salesTransactionId;
+
+        // delete those sales lines for free item whose item id is changed
+        InventTable inventTable;
+        delete_from psSalesLine
+            exists join gupFreeItemLine
+                where gupFreeItemLine.RecId == psSalesLine.GUPFreeItemLineRecId
+            exists join inventTable
+            exists join freeItemDiscount
+                where freeItemDiscount.OfferId == gupFreeItemLine.FreeItemId
+                    && freeItemDiscount.Status == RetailDisabledEnabled::Enabled
+                    && psSalesLine.RetailPricingSimulatorSalesTransaction == salesTransactionId
+                    && psSalesLine.IsFreeItemLine == NoYes::Yes
+                    && psSalesLine.DisplayProductNumber != inventTable.ItemId;
+
+        CLRObject enumeratorFreeItemLines = _clrFreeItemLines.GetEnumerator();
+        TmpRecIdFilter tmpRecIdFilter;
+        while (enumeratorFreeItemLines.MoveNext())
+        {
+            Microsoft.Dynamics.Commerce.Runtime.DataModel.AttributeBasedPricing.FreeItemLine crtFreeItemLine = enumeratorFreeItemLines.get_Current();
+            gupFreeItemLine = GUPFreeItemLine::findByCRTFreeItemLine(crtFreeItemLine);
+                
+            tmpRecIdFilter.RefRecId = gupFreeItemLine.RecId;
+            tmpRecIdFilter.insert();
+
+            select firstonly psSalesLine
+                where psSalesLine.RetailPricingSimulatorSalesTransaction == salesTransactionId
+                    && psSalesLine.IsFreeItemLine == NoYes::Yes
+                    && psSalesLine.GUPFreeItemLineRecId == gupFreeItemLine.RecId;
+            if (psSalesLine.RecId)
+            {
+                if (psSalesLine.updateFromCRTFreeItemLine(crtFreeItemLine, gupFreeItemLine))
+                {
+                    psSalesLine.selectForUpdate(true);
+                    psSalesLine.update();
+                }
+            }
+            else
+            {
+                psSalesLine.clear();
+                psSalesLine.RetailPricingSimulatorSalesTransaction = salesTransactionId;
+                psSalesLine.initFromFreeItemLine(crtFreeItemLine, gupFreeItemLine);
+                psSalesLine.insert();
+            }
+        }
+
+        delete_from psSalesLine
+                where psSalesLine.RetailPricingSimulatorSalesTransaction == salesTransactionId
+                    && psSalesLine.IsFreeItemLine == NoYes::Yes
+                notexists join tmpRecIdFilter
+                    where tmpRecIdFilter.RefRecId == psSalesLine.GUPFreeItemLineRecId;
+
+        RetailPricingSimulatorDiscount pricingSimulatorDiscount;
+        RetailPeriodicDiscount retailPeriodicDiscount;
+        RefRecId currentSalesTransactionId = salesTransactionId;
+        NoYes selected = NoYes::Yes;
+        
+        insert_recordset pricingSimulatorDiscount
+            (OfferId, Selected, RetailPricingSimulatorTransactionId, 
+            Name, ConcurrencyMode, PeriodicDiscountType, Status, PricingPriorityNumber)
+            select FreeItemId, selected, currentSalesTransactionId from gupFreeItemLine
+                join Name, ConcurrencyMode, PeriodicDiscountType, Status, PricingPriorityNumber from retailPeriodicDiscount
+                    where retailPeriodicDiscount.OfferId == gupFreeItemLine.FreeItemId
+                join tmpRecIdFilter
+                group by gupFreeItemLine.FreeItemId, retailPeriodicDiscount.Name, retailPeriodicDiscount.ConcurrencyMode, retailPeriodicDiscount.PeriodicDiscountType, retailPeriodicDiscount.Status, retailPeriodicDiscount.PricingPriorityNumber
+                where tmpRecIdFilter.RefRecId == gupFreeItemLine.RecId;
+           
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
