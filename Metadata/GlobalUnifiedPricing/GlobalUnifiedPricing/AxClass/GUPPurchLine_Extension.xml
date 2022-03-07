@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GUPPurchLine_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[ExtensionOf(tableStr(PurchLine))]
+final class GUPPurchLine_Extension
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>insert</Name>
+				<Source><![CDATA[
+    public void insert(
+        boolean     dropInvent,
+        boolean     findMarkup,
+        boolean     updatePurchTableDistributions,
+        boolean     _skipPurchTableUpdate,
+        boolean     _skipInterCompanyCalcDisc)
+    {
+        next insert(dropInvent, findMarkup, updatePurchTableDistributions, _skipPurchTableUpdate, _skipInterCompanyCalcDisc);
+
+        if (FeatureStateProvider::isFeatureEnabled(GUPGlobalEnableFeature::instance()))
+        {
+            this.updateMarkupTrans();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>update</Name>
+				<Source><![CDATA[
+    public void update(boolean  dropInvent,
+                       boolean  updateOrderLineOfDeliverySchedule,
+                       boolean  updatePurchTableDropShipStatus)
+    {
+        if (FeatureStateProvider::isFeatureEnabled(GUPGlobalEnableFeature::instance()))
+        {
+            this.updateMarkupTrans();
+        }
+
+        next update(dropInvent, updateOrderLineOfDeliverySchedule, updatePurchTableDropShipStatus);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMarkupTrans</Name>
+				<Source><![CDATA[
+    private void updateMarkupTrans()
+    {
+        RefRecId origItemBasePriceRecId = this.findOrigItemBasePriceRecId(this.TableId, this.RecId);
+
+        if (origItemBasePriceRecId != this.ItemBasePriceRecId)
+        {
+            this.deleteMarkupTrans(origItemBasePriceRecId);
+            this.insertMarkupTrans(this.ItemBasePriceRecId);
+        }
+        else if (this.orig().PurchUnit != this.PurchUnit)
+        {
+            MarkupTrans markupTrans;
+
+            markupTrans.selectForUpdate(true);
+
+            GUPItemBasePrice itemBasePrice = GUPItemBasePrice::findRecId(origItemBasePriceRecId);
+            PriceConvertFactory priceConvertFactory = PriceConvertFactory::newItemPrice(
+                itemBasePrice.ItemId,
+                this.orig().PurchUnit,
+                0,
+                1,
+                itemBasePrice.Markup,
+                itemBasePrice.PriceQty,
+                '');
+
+            priceConvertFactory.parmNewUnitId(this.PurchUnit);
+
+            while select markupTrans
+                where markupTrans.TransTableId == this.TableId &&
+                      markupTrans.TransRecId == this.RecId &&
+                      markupTrans.ItemBasePriceRecId == origItemBasePriceRecId
+            {
+                priceConvertFactory.parmPrice(markupTrans.Value);
+                PriceConvert priceConvert = priceConvertFactory.priceConvert();
+                markupTrans.Value = priceConvert.parmPrice();
+                markupTrans.doUpdate();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteMarkupTrans</Name>
+				<Source><![CDATA[
+    private void deleteMarkupTrans(RefRecId _itemBasePriceRecId)
+    {
+        if (!_itemBasePriceRecId)
+        {
+            return;
+        }
+
+        MarkupTrans markupTrans;
+
+        delete_from markupTrans
+            where markupTrans.TransTableId == this.TableId &&
+                  markupTrans.TransRecId == this.RecId &&
+                  markupTrans.ItemBasePriceRecId == _itemBasePriceRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertMarkupTrans</Name>
+				<Source><![CDATA[
+    private void insertMarkupTrans(RecId _itemBasePriceRecId)
+    {
+        if (!_itemBasePriceRecId)
+        {
+            return;
+        }
+
+        PriceDiscPolicyCheckPolicy checkPolicy = PriceDiscPolicyCheckPolicy::newFromParm(this);
+        boolean mustUpdatePriceUnit = checkPolicy.mustUpdatePolicyField(PriceDiscPolicyField::newPriceDiscResultsField(fieldNum(PriceDiscResultFields, PriceUnit)));
+        if (!mustUpdatePriceUnit && this.PriceUnit != 1)
+        {
+            return;
+        }
+
+        GUPItemBasePrice itemBasePrice = GUPItemBasePrice::findRecId(_itemBasePriceRecId);
+
+        PriceConvertFactory priceConvertFactory = PriceConvertFactory::newItemPrice(
+            itemBasePrice.ItemId,
+            '',
+            0,
+            1,
+            itemBasePrice.Markup,
+            itemBasePrice.PriceQty,
+            Ledger::accountingCurrency(CompanyInfo::current()));
+
+        priceConvertFactory.parmNewCurrencyCode(this.CurrencyCode);
+        priceConvertFactory.parmNewUnitId(this.PurchUnit);
+
+        GUPCalcChargeCode chargeCode;
+
+        while select chargeCode
+            where chargeCode.PriceCalcId == itemBasePrice.PriceCalcId &&
+                  chargeCode.VersionId == itemBasePrice.VersionId &&
+                  chargeCode.FromDate == itemBasePrice.FromDate &&
+                  chargeCode.ToDate == itemBasePrice.ToDate &&
+                  chargeCode.ItemId == itemBasePrice.ItemId &&
+                  chargeCode.InventDimId == itemBasePrice.InventDimId
+        {
+            priceConvertFactory.parmUnitId(chargeCode.UnitId);
+            priceConvertFactory.parmPrice(chargeCode.Value);
+            PriceConvert priceConvert = priceConvertFactory.priceConvert();
+
+            MarkupTrans markupTrans;
+            markupTrans.initFromPurchLine(this);
+            markupTrans.MarkupCode = chargeCode.ChargeCode;
+            markupTrans.Value = priceConvert.parmPrice();
+            markupTrans.ItemBasePriceRecId = this.ItemBasePriceRecId;
+            markupTrans.MarkupCategory = MarkupCategory::Pcs;
+            markupTrans.LineNum = MarkupTrans::lastLineNum(markupTrans.TransTableId, markupTrans.TransRecId) + 1;
+            markupTrans.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findOrigItemBasePriceRecId</Name>
+				<Source><![CDATA[
+    private RefRecId findOrigItemBasePriceRecId(TableId _tableId, RecId _recId)
+    {
+        MarkupTrans markupTrans;
+
+        select firstonly markupTrans
+            where markupTrans.TransTableId == _tableId &&
+                  markupTrans.TransRecId == _recId &&
+                  !markupTrans.IsDeleted &&
+                  markupTrans.ItemBasePriceRecId != 0;
+
+        return markupTrans.ItemBasePriceRecId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
