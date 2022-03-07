@@ -1,0 +1,699 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>GUPRetailPeriodicDiscountTable_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[ExtensionOf(tableStr(RetailPeriodicDiscount))]
+internal final class GUPRetailPeriodicDiscountTable_Extension
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>isGupDiscountTable</Name>
+				<Source><![CDATA[
+    public boolean isGupDiscountTable()
+    {
+        return FeatureStateProvider::isFeatureEnabled(GUPGlobalEnableFeature::instance()) &&
+               ( this is RetailDiscountOffer       ||
+                 this is RetailDiscountMixAndMatch ||
+                 this is RetailDiscountMultibuy    ||
+                 this is RetailDiscountThreshold   ||
+                 this is GUPFreeItemDiscount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validatePostingSetup</Name>
+				<Source><![CDATA[
+    public boolean validatePostingSetup()
+    {
+        boolean ret = true;
+
+        RetailPeriodicDiscountLine discountLine;
+        GUPPeriodicDiscountAllocation lineAllocation;
+        GUPPeriodicDiscountClaimDistribution lineClaim;
+
+        if (this is RetailDiscountOffer && this.PeriodicDiscountType != RetailDiscountOfferTypeBase::Promotion)
+        {
+            RetailDiscountLineOffer discountOfferLine;
+
+            select firstonly RecId from discountOfferLine
+                where discountOfferLine.OfferId == this.OfferId
+                    && discountOfferLine.discountMethod == RetailDiscountOfferLineDiscMethodBase::Price
+                exists join lineAllocation
+                    where lineAllocation.OfferId == this.OfferId
+                        && lineAllocation.LineNum == discountOfferLine.LineNum;
+
+            if (discountOfferLine.RecId)
+            {
+                return checkFailed("@GlobalUnifiedPricing:DiscountWithFixedUnitPriceCannotHavePostingSetup");
+            }
+            
+            select firstonly RecId from discountOfferLine
+                where discountOfferLine.OfferId == this.OfferId
+                    && discountOfferLine.discountMethod == RetailDiscountOfferLineDiscMethodBase::Price
+                exists join lineClaim
+                    where lineClaim.OfferId == this.OfferId
+                        && lineClaim.LineNum == discountOfferLine.LineNum;
+
+            if (discountOfferLine.RecId)
+            {
+                return checkFailed("@GlobalUnifiedPricing:DiscountWithFixedUnitPriceCannotHavePostingSetup");
+            }
+
+            while select discountMethod, discAmount, discPct, LineNum from discountOfferLine
+                where discountOfferLine.OfferId == this.OfferId
+                    && discountOfferLine.discountMethod != RetailDiscountOfferLineDiscMethodBase::Price
+            {
+                ret = ret && this.checkDiscountOfferLineTotalAmount(discountOfferLine);
+                if (!ret)
+                {
+                    break;
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkDiscountOfferLineTotalAmount</Name>
+				<Source><![CDATA[
+    protected boolean checkDiscountOfferLineTotalAmount(RetailDiscountLineOffer _discountOfferLine)
+    {
+        GUPPeriodicDiscountAllocation lineAllocation;
+        GUPPeriodicDiscountClaimDistribution lineClaim;
+        Amount total = 0.0;
+
+        if (_discountOfferLine.discountMethod == RetailDiscountOfferLineDiscMethodBase::AmountOff)
+        {
+            total = _discountOfferLine.discAmount;
+        }
+        else if (_discountOfferLine.discountMethod == RetailDiscountOfferLineDiscMethodBase::PercentOff)
+        {
+            total = _discountOfferLine.discPct;
+        }
+
+        select sum(DiscountPercentOrValue) from lineClaim
+            where lineClaim.OfferId == this.OfferId
+                && lineClaim.LineNum == _discountOfferLine.LineNum;
+
+        select sum(DiscountPercentOrValue) from lineAllocation
+            where lineAllocation.OfferId == this.OfferId
+                && lineAllocation.LineNum == _discountOfferLine.LineNum;
+
+        if (lineClaim.DiscountPercentOrValue + lineAllocation.DiscountPercentOrValue > total && total >= 0)
+        {
+            return checkFailed("@GlobalUnifiedPricing:TotalAllocationExceedsDiscountAmount");
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateFreeItemDiscountSetup</Name>
+				<Source><![CDATA[
+    public boolean validateFreeItemDiscountSetup()
+    {
+        boolean ret = true;
+
+        if (this is GUPFreeItemDiscount)
+        {
+            GUPFreeItemDiscountLine discountLine;
+
+            select firstonly discountLine
+                where discountLine.UnitOfMeasure == 0
+                    && discountLine.OfferId == this.OfferId;
+
+            if (discountLine)
+            {
+                ret = false;
+            }
+            else
+            {
+                while select count(RecId) from discountLine
+                    group by FreeItemGroup
+                    where discountLine.OfferId == this.OfferId
+                       && max(discountLine.UnitOfMeasure) != min(discountLine.UnitOfMeasure)
+                {
+                    if (discountLine.RecId)
+                    {
+                        ret = false;
+                        break;
+                    }
+                }
+            }
+
+            if (!ret)
+            {
+                return checkFailed("@GlobalUnifiedPricing:GUPFreeItemDiscountSetupValidation");
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateEnable</Name>
+				<Source><![CDATA[
+    public boolean validateEnable()
+    {
+        boolean ret = next validateEnable();
+
+        if (FeatureStateProvider::isFeatureEnabled(GUPGlobalEnableFeature::instance()))
+        {
+            if (this.Status == RetailDisabledEnabled::Enabled && this.isGupDiscountTable())
+            {
+                ret = ret && 
+                      this.validatePostingSetup() && 
+                      this.validateFreeItemDiscountSetup() &&
+                      this.validateUnitOfMeasure() &&
+                      this.validateDiscPctForRetailDiscountLineThresholdApplying() &&
+                      this.validateTierConfiguration();
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>delete</Name>
+				<Source><![CDATA[
+    public void delete()
+    {
+        ttsbegin;
+
+        if (FeatureStateProvider::isFeatureEnabled(GUPGlobalEnableFeature::instance()) &&
+            this.HeaderPricingRule)
+        {
+            GUPPricingRule::find(this.HeaderPricingRule, true).delete();
+        }
+
+        next delete();
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setPricingRuleReference</Name>
+				<Source><![CDATA[
+    public void setPricingRuleReference(FieldId _pricingRuleFieldId, RefRecId _pricingRuleRecID)
+    {
+        ttsbegin;
+
+        this.selectForUpdate(true);
+        this.(_pricingRuleFieldId) = _pricingRuleRecID;
+
+        this.update();
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>gupPriceComponentCode</Name>
+				<Source><![CDATA[
+    public GUPPriceComponentCode gupPriceComponentCode()
+    {
+        return GUPPriceComponentCode::findByName(this.PriceComponentCodeName);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>PriCompDescription</Name>
+				<Source><![CDATA[
+    public display Description PriCompDescription()
+    {
+        return this.gupPriceComponentCode().Description;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copy</Name>
+				<Source><![CDATA[
+    public void copy(RetailPeriodicDiscount _original)
+    {   
+        this.copyDiscountOfferInfo(_original);
+
+        // GUPPeriodicDiscount fields
+        this.PriceComponentType					=   _original.PriceComponentType;
+        this.HeaderPricingRule					=   GUPPricingRule::find(_original.HeaderPricingRule).copy().RecId;
+        this.HeaderPricingGroupCode				=   _original.HeaderPricingGroupCode;
+        this.PriceComponentCodeName				=   _original.PriceComponentCodeName;
+        this.IsGupDiscount						=   _original.IsGupDiscount;
+        this.DiscountVendorClaimGroupName		=  _original.DiscountVendorClaimGroupName;
+        this.PrintDescriptionOnFiscalReceipt	=  _original.PrintDescriptionOnFiscalReceipt;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copyRetailPeriodicDiscount</Name>
+				<Source><![CDATA[
+    public void copyRetailPeriodicDiscount()
+    {
+        RetailPeriodicDiscount retailPeriodicDiscountNew;
+        Num newOfferId = '';
+        boolean isRetailThresholdDiscount;
+
+        if (this is RetailDiscountOffer)
+        {
+            RetailDiscountOffer discountOfferNew;
+            RetailDiscountOffer discountOfferOrigin = this;
+
+            if (discountOfferOrigin.PeriodicDiscountType == RetailDiscountOfferTypeBase::Promotion)
+            {
+                if (GUPParameters::numRefMarginComponentPriceAdjustmentId().NumberSequenceId)
+                {
+                    newOfferId = NumberSeq::newGetNum(GUPParameters::numRefMarginComponentPriceAdjustmentId()).num();
+                }
+                else
+                {
+                    newOfferId = this.getJournalNumFromDialog(discountOfferOrigin.OfferId);
+                }
+
+                discountOfferNew.IsTierConfigurationEnabled = discountOfferOrigin.IsTierConfigurationEnabled;
+                discountOfferNew.TierPriceAdjustmentMethod = discountOfferOrigin.TierPriceAdjustmentMethod;
+
+                GUPTierPriceAdjustmentLine tierPriceAdjustmentLine, tierPriceAdjustmentLineNew;
+                while select tierPriceAdjustmentLine
+                        where tierPriceAdjustmentLine.OfferId == discountOfferOrigin.OfferId
+                {
+                    tierPriceAdjustmentLineNew.clear();
+                    tierPriceAdjustmentLineNew.data(tierPriceAdjustmentLine);
+                    tierPriceAdjustmentLineNew.OfferId = newOfferId;
+                    tierPriceAdjustmentLineNew.insert();
+                }
+            }
+            else if (discountOfferOrigin.PeriodicDiscountType == RetailDiscountOfferTypeBase::DiscountOffer ||
+                    discountOfferOrigin.PeriodicDiscountType == RetailDiscountOfferTypeBase::DiscountOfferLineQuantityLimit)
+            {
+                if (GUPParameters::numRefOfferId().NumberSequenceId)
+                {
+                    newOfferId = NumberSeq::newGetNum(GUPParameters::numRefOfferId()).num();
+                }
+                else
+                {
+                    newOfferId = this.getJournalNumFromDialog(discountOfferOrigin.OfferId);
+                }
+            }
+
+            if (!newOfferId)
+            {
+                return;
+            }
+
+            discountOfferNew.DiscOnPOS = discountOfferOrigin.DiscOnPOS;
+            discountOfferNew.QuantityLimit = discountOfferOrigin.QuantityLimit;
+            retailPeriodicDiscountNew = discountOfferNew;
+        }
+        else if (this is RetailDiscountMultibuy)
+        {
+            RetailDiscountMultibuy discountMultibuyNew;
+            RetailDiscountMultibuy discountMultibuyOrigin = this;
+
+            if (GUPParameters::numRefMultibuyDiscountId().NumberSequenceId)
+            {
+                newOfferId = NumberSeq::newGetNum(GUPParameters::numRefMultibuyDiscountId()).num();
+            }
+            else
+            {
+                newOfferId = this.getJournalNumFromDialog(discountMultibuyOrigin.OfferId);
+            }
+
+            if (!newOfferId)
+            {
+                return;
+            }
+
+            discountMultibuyNew.MultibuyDiscountType = discountMultibuyOrigin.MultibuyDiscountType;
+            retailPeriodicDiscountNew = discountMultibuyNew;
+
+            RetailMultibuyDiscountLine rboRBOMultibuyDiscountLine, rboRBOMultibuyDiscountLineNew;
+
+            while select rboRBOMultibuyDiscountLine
+                where rboRBOMultibuyDiscountLine.MultibuyId == discountMultibuyOrigin.OfferId
+            {
+                rboRBOMultibuyDiscountLineNew.clear();
+                rboRBOMultibuyDiscountLineNew.data(rboRBOMultibuyDiscountLine);
+                rboRBOMultibuyDiscountLineNew.MultibuyId = newOfferId;
+                rboRBOMultibuyDiscountLineNew.insert();
+            }
+        }
+        else if (this is RetailDiscountMixAndMatch)
+        {
+            RetailDiscountMixAndMatch discountMixAndMatchNew;
+            RetailDiscountMixAndMatch discountMixAndMatchOrigin = this;
+
+            if (GUPParameters::numRefMixAndMatchId().NumberSequenceId)
+            {
+                newOfferId = NumberSeq::newGetNum(GUPParameters::numRefMixAndMatchId()).num();
+            }
+            else
+            {
+                newOfferId = this.getJournalNumFromDialog(discountMixAndMatchOrigin.OfferId);
+            }
+
+            if (!newOfferId)
+            {
+                return;
+            }
+
+            discountMixAndMatchNew.NumberOfTimesApplicable          = discountMixAndMatchOrigin.NumberOfTimesApplicable;
+            discountMixAndMatchNew.MixAndMatchDiscountType          = discountMixAndMatchOrigin.MixAndMatchDiscountType;
+            discountMixAndMatchNew.DealPriceValue                   = discountMixAndMatchOrigin.DealPriceValue;
+            discountMixAndMatchNew.DiscountAmountValue              = discountMixAndMatchOrigin.DiscountAmountValue;
+            discountMixAndMatchNew.NoOfLeastExpensiveLines          = discountMixAndMatchOrigin.NoOfLeastExpensiveLines;
+            discountMixAndMatchNew.LeastExpensiveMode               = discountMixAndMatchOrigin.LeastExpensiveMode;
+            discountMixAndMatchNew.MixAndMatchCountNonDiscountItems = discountMixAndMatchOrigin.MixAndMatchCountNonDiscountItems;
+            discountMixAndMatchNew.GeneratesBundleId                = discountMixAndMatchOrigin.GeneratesBundleId;
+            retailPeriodicDiscountNew = discountMixAndMatchNew;
+
+            RetailMixAndMatchLineGroups mixAndMatchLineGroup, mixAndMatchLineGroupNew;
+
+            while select mixAndMatchLineGroup
+                where mixAndMatchLineGroup.mixAndMatchId == discountMixAndMatchOrigin.OfferId
+            {
+                mixAndMatchLineGroupNew.clear();
+                mixAndMatchLineGroupNew.data(mixAndMatchLineGroup);
+                mixAndMatchLineGroupNew.initValue();
+                mixAndMatchLineGroupNew.mixAndMatchId = newOfferId;
+                mixAndMatchLineGroupNew.insert();
+            }
+        }
+        else if (this is RetailDiscountThreshold)
+        {
+            isRetailThresholdDiscount = true;
+            RetailDiscountThreshold discountThresholdNew;
+            RetailDiscountThreshold discountThresholdOrigin = this;
+
+            if (GUPParameters::numRefThresholdDiscountId().NumberSequenceId)
+            {
+                newOfferId = NumberSeq::newGetNum(GUPParameters::numRefThresholdDiscountId()).num();
+            }
+            else
+            {
+                newOfferId = this.getJournalNumFromDialog(discountThresholdOrigin.OfferId);
+            }
+
+            if (!newOfferId)
+            {
+                return;
+            }
+
+            discountThresholdNew.CountNonDiscountItems = discountThresholdOrigin.CountNonDiscountItems;
+            retailPeriodicDiscountNew = discountThresholdNew;
+
+            RetailDiscountThresholdTiers retailThresholdDiscountTiers, retailThresholdDiscountTiersNew;
+
+            retailPeriodicDiscountNew.OfferId = newOfferId;
+            retailPeriodicDiscountNew.copy(this);
+            while select retailThresholdDiscountTiers
+                where retailThresholdDiscountTiers.OfferId == discountThresholdOrigin.OfferId
+            {
+                retailThresholdDiscountTiersNew.clear();
+                retailThresholdDiscountTiersNew.data(retailThresholdDiscountTiers);
+                retailThresholdDiscountTiersNew.OfferId = newOfferId;
+                retailThresholdDiscountTiersNew.insert();
+                this.copyRetailPeriodicDiscountLinesThreshold(newOfferId, retailThresholdDiscountTiersNew.RecId, retailThresholdDiscountTiers.RecId);
+            }
+            retailPeriodicDiscountNew.copyRetailPeriodicDiscountLines(this, newOfferId);
+        }
+
+		else if (this is GUPFreeItemDiscount)
+        {
+            GUPFreeItemDiscount		freeItemDiscountNew;
+            GUPFreeItemDiscount		freeItemDiscountOrigin = this;
+            
+			if (GUPParameters::numRefThresholdDiscountId().NumberSequenceId)
+            {
+                newOfferId = NumberSeq::newGetNum(GUPParameters::numRefFreeItemDiscountId()).num();
+            }
+            else
+            {
+                newOfferId = this.getJournalNumFromDialog(freeItemDiscountOrigin.OfferId);
+            }
+
+            if (!newOfferId)
+            {
+                return;
+            }
+            retailPeriodicDiscountNew = freeItemDiscountNew;
+            retailPeriodicDiscountNew.OfferId = newOfferId;
+           
+            GUPFreeItemDiscountTiers	freeItemDiscountTiers, freeItemDiscountTiersNew;
+            while select freeItemDiscountTiers
+                where freeItemDiscountTiers.FreeItemId == freeItemDiscountOrigin.OfferId
+            {
+                freeItemDiscountTiersNew.clear();
+                freeItemDiscountTiersNew.data(freeItemDiscountTiers);
+                freeItemDiscountTiersNew.FreeItemId = newOfferId;
+                freeItemDiscountTiersNew.insert();
+            }
+        }
+
+        if (!isRetailThresholdDiscount)
+        {
+            retailPeriodicDiscountNew.OfferId = newOfferId;
+            retailPeriodicDiscountNew.copy(this);
+			retailPeriodicDiscountNew.copyRetailPeriodicDiscountLines(this, newOfferId);
+        }
+        retailPeriodicDiscountNew.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copyRetailPeriodicDiscountLinesThreshold</Name>
+				<Source><![CDATA[
+    private void copyRetailPeriodicDiscountLinesThreshold(Num _newOfferId, RefRecid  _retailDiscountThresholdTiersNew, 
+		RefRecId	_retailDiscountThresholdTiersOrigin)
+    {
+        RetailPeriodicDiscountLine				periodicDiscountLine;
+        RetailDiscountLineThresholdApplying		retailDiscountLineThresholdApplyingOrig, retailDiscountLineThresholdApplyingNew;
+        
+        while select retailDiscountLineThresholdApplyingOrig where retailDiscountLineThresholdApplyingOrig.Tier == _retailDiscountThresholdTiersOrigin
+        {
+            retailDiscountLineThresholdApplyingNew.data(retailDiscountLineThresholdApplyingOrig);
+            retailDiscountLineThresholdApplyingNew.initValue();
+            retailDiscountLineThresholdApplyingNew.Tier	= _retailDiscountThresholdTiersNew;
+            periodicDiscountLine = retailDiscountLineThresholdApplyingNew;
+            periodicDiscountLine.copyRetailPeriodicThresholdDiscountlines(false, periodicDiscountLine, _newOfferId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ledgerAccountPeriodicDisc</Name>
+				<Source><![CDATA[
+    public static LedgerDimensionDefaultAccount ledgerAccountPeriodicDisc(RetailDiscountOfferId _offerId, DiscAmount _periodicDiscAmount, ItemId _itemId, RetailItemGroupId _itemGroupId, CustAccount _custAccount)
+    {
+        LedgerDimensionDefaultAccount defaultAccount = next ledgerAccountPeriodicDisc(_offerId, _periodicDiscAmount, _itemId, _itemGroupId, _custAccount);
+ 
+        if (FeatureStateProvider::isFeatureEnabled(GUPGlobalEnableFeature::instance()))
+        {
+            RetailPeriodicDiscount periodicDiscount = RetailPeriodicDiscount::findByOfferId(_offerId);
+            RetailParameters postingRetailSetup = RetailParameters::find();
+        
+            if (!defaultAccount && postingRetailSetup.LedgerAccountType == RetailBookingLedgerAccountTypeBase::Periodic && periodicDiscount.PeriodicDiscountType == RetailDiscountOfferTypeBase::FreeItem)
+            {
+                defaultAccount = postingRetailSetup.FreeItemLedgerDimension;
+            }
+        }
+ 
+        return defaultAccount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>discountLineMissingMessage</Name>
+				<Source><![CDATA[
+    protected str discountLineMissingMessage()
+    {
+        str ret = next discountLineMissingMessage();
+
+        if (FeatureStateProvider::isFeatureEnabled(GUPGlobalEnableFeature::instance()) 
+            && this.PeriodicDiscountType == RetailDiscountOfferTypeBase::Promotion
+            && this.PriceComponentCodeName)
+        {
+            ret = "@GlobalUnifiedPricing:PriceAdjustmentLineMissing";
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copyRetailPeriodicDiscountLines</Name>
+				<Source><![CDATA[
+    private void copyRetailPeriodicDiscountLines(RetailPeriodicDiscount origDiscountOffer, Num newOfferId)
+    {
+        RetailPeriodicDiscountLine gupPeriodicDiscountLineOrig;
+        RetailDiscountLineThresholdApplying	retailDiscountLineThresholdApplying;
+
+        while select gupPeriodicDiscountLineOrig
+            where gupPeriodicDiscountLineOrig.OfferId == origDiscountOffer.OfferId
+            notexists join retailDiscountLineThresholdApplying where retailDiscountLineThresholdApplying.RecId == gupPeriodicDiscountLineOrig.RecId
+        {
+            gupPeriodicDiscountLineOrig.copyRetailPeriodicDiscountLine(false, newOfferId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getJournalNumFromDialog</Name>
+				<Source><![CDATA[
+    private GUPAgreementId getJournalNumFromDialog(GUPAgreementId _AgreementId)
+    {
+        Args				args = new Args();
+        GUPAgreementId		agreementId;
+ 
+        args.parm(_AgreementId);
+        args.record(this);
+        args.name(formstr(GUPJournalIdDialog));
+
+        FormRun	formRun = classFactory.formRunClass(Args);
+
+        formRun.init();
+        formRun.run();
+        formRun.wait();
+
+        if (formRun.closedOk())
+        {
+            agreementId = formRun.getJourId();
+        }
+
+        return agreementId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isValidTierConfigurationValue</Name>
+				<Source><![CDATA[
+    private boolean isValidTierConfigurationValue(
+        RetailPriceDiscPct _lowestValue,
+        GUPTierPriceAdjustmentLine _tierPriceAdjustmentLine)
+    {
+        return _tierPriceAdjustmentLine.PriceDiscPct <= _lowestValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateUnitOfMeasure</Name>
+				<Source><![CDATA[
+    private boolean validateUnitOfMeasure()
+    {
+        if (this is RetailDiscountMixAndMatch ||
+            this is RetailDiscountMultibuy)
+        {
+            RetailPeriodicDiscountLine retailPeriodicDiscountLine;
+
+            select firstonly RecId from retailPeriodicDiscountLine
+                where retailPeriodicDiscountLine.OfferId == this.OfferId &&
+                      retailPeriodicDiscountLine.LineType == RetailDiscountLineIncludeExcludeTypeBase::Include &&
+                      retailPeriodicDiscountLine.UnitOfMeasure == 0;
+
+            if (retailPeriodicDiscountLine.RecId)
+            {
+                return checkFailed(strFmt("@MCR38340", fieldstr(RetailPeriodicDiscountLine, UnitOfMeasure)));
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateDiscPctForRetailDiscountLineThresholdApplying</Name>
+				<Source><![CDATA[
+    private boolean validateDiscPctForRetailDiscountLineThresholdApplying()
+    {
+        if (this is RetailDiscountThreshold)
+        {
+            RetailDiscountLineThresholdApplying retailDiscountLineThresholdApplying;
+
+            select firstonly RecId from retailDiscountLineThresholdApplying
+                where retailDiscountLineThresholdApplying.OfferId == this.OfferId &&
+                      retailDiscountLineThresholdApplying.IsDiscountApplyingLine == NoYes::Yes &&
+                      retailDiscountLineThresholdApplying.LineType == RetailDiscountLineIncludeExcludeTypeBase::Include &&
+                      retailDiscountLineThresholdApplying.ThresholdLineDiscountMethod == RetailDiscountThresholdLineDiscountMethodBase::DiscountPercent &&
+                      (retailDiscountLineThresholdApplying.DiscountPercentOrValue <= 0 ||
+                       retailDiscountLineThresholdApplying.DiscountPercentOrValue > 100);
+
+            if (retailDiscountLineThresholdApplying.RecId)
+            {
+                return checkFailed("@Retail:DiscountPctNotZero");
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateTierConfiguration</Name>
+				<Source><![CDATA[
+    private boolean validateTierConfiguration()
+    {
+        if (this is RetailDiscountOffer)
+        {
+            RetailDiscountOffer discountOffer = this as RetailDiscountOffer;
+
+            if (discountOffer.IsTierConfigurationEnabled == NoYes::Yes)
+            {
+                GUPTierPriceAdjustmentLine tierPriceAdjustmentLine;
+                RetailPriceDiscPct         lowestValue = 0.00;
+                boolean isFirst = true;
+
+                while select PriceDiscPct from tierPriceAdjustmentLine
+                        order by tierPriceAdjustmentLine.QtyLowest
+                        where tierPriceAdjustmentLine.OfferId == this.OfferId
+                {
+                    if (isFirst)
+                    {
+                        isFirst = false;
+                    }
+                    else
+                    {
+                        if (!this.isValidTierConfigurationValue(lowestValue, tierPriceAdjustmentLine))
+                        {
+                            Message::Add(MessageSeverity::Warning, "@GlobalUnifiedPricing:GUPTierPriceAdjustmentLinePriceIncrease");
+                            return false;
+                        }
+                    }
+
+                    lowestValue = tierPriceAdjustmentLine.PriceDiscPct;
+                }
+            }
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
