@@ -1,0 +1,319 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METAMEXMoveRejectedLinesService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_3338_AMEXCustomerPaymentProcessing - vpotula
+/// This is the services class for executing the AMEX rejected payment lines process.
+/// </summary>
+class METAMEXMoveRejectedLinesService extends SysOperationServiceBase
+{
+    CustParameters  custParameters;
+    METAMEXAction   action;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>runOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Service operation to set the batch tasks for posting journal and creating free text invoices.
+    /// </summary>
+    /// <param name = "_contract"><c>METAMEXMoveRejectedLinesContract</c></param>
+    /// <returns><c>METAMEXMoveRejectedLinesResponse</c></returns>
+    // [AifCollectionTypeAttribute('return', Types::Class, classStr(METAMEXMoveRejectedLinesResponse))]
+    public METAMEXMoveRejectedLinesResponse runOperation(METAMEXMoveRejectedLinesContract _contract)
+    {      
+         
+        METAMEXMoveRejectedLinesResponse    response = new METAMEXMoveRejectedLinesResponse();
+
+        changecompany(_contract.parmDataArea())
+        {
+            custParameters = CustParameters::find();
+            if (this.validate(_contract, response).parmSuccess())
+            {
+                try
+                {
+                    BatchHeader batchHeader = BatchHeader::getCurrentBatchHeader();
+
+                    if (batchHeader == null)
+                    {
+                        batchHeader = batchHeader::construct();
+                    }
+                    batchHeader.parmCaption("@MET:AMEXMoveRejectedLinesMenuItemAction");
+                    
+                    //Add Batch task to Remove/Delete payments lines and post journal 
+                    // create new controller for posting journal
+                    SysOperationServiceController rejectLinescontroller = this.moveRejectedLinesController(_contract);
+                    batchHeader.addTask(rejectLinescontroller);
+
+                    batchHeader.save();
+
+                    response.parmSuccess(true);
+                    response.parmMessage(strfmt("@MET:METAMEXRejectLinesBatchSuccessMsg",_contract.parmPrevJournalNum()));
+                    info(response.parmMessage());
+                }
+                catch (Exception::CLRError)
+                {
+                    System.Exception interopException = CLRInterop::getLastException();
+
+                    response.parmSuccess(false);
+                    response.parmMessage(interopException.ToString());
+                }
+            }
+            else
+            {
+                info(response.parmMessage());
+            }
+        }
+
+        return response;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validating the data contract parameters.
+    /// </summary>
+    /// <param name = "_request"><c>METAMEXMoveRejectedLinesContract</c> class instance.</param>
+    /// <param name = "_response"><c>METAMEXMoveRejectedLinesResponse</c> class instance</param>
+    /// <returns><c>METAMEXMoveRejectedLinesResponse</c> class instance.</returns>
+    private  METAMEXMoveRejectedLinesResponse validate(
+                    METAMEXMoveRejectedLinesContract _request, 
+                    METAMEXMoveRejectedLinesResponse _response)
+    {
+        LedgerJournalTable journalTable =   LedgerJournalTable::find(_request.parmPrevJournalNum());
+
+        _response.parmSuccess(true);
+
+        if (!journalTable)
+        {
+            _response.parmSuccess(false);
+            _response.parmMessage(strFmt("@SYS21496", _request.parmPrevJournalNum()));
+        }
+        else if(journalTable.Posted)
+        {
+            _response.parmSuccess(false);
+            _response.parmMessage(strFmt("@MET:METAMEXJournalAlreadyPostedError", journalTable.JournalNum));
+        }
+
+        return _response;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>moveRejectedLinesTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method does the job to remove/delete rejected lines and post the journal.
+    /// </summary>
+    /// <param name = "_contract"><c>METAMEXMoveRejectedLinesContract</c> class instance.</param>
+    private void moveRejectedLinesTask(METAMEXMoveRejectedLinesContract _contract)
+    {
+        LedgerJournalTable  journalTable    =   LedgerJournalTable::find(_contract.parmPrevJournalNum());
+        LedgerJournalTrans  ledgerJournalTrans;
+        #OCCRetryCount
+        try
+        {
+            if (!journalTable)
+            {
+                return;
+            }
+
+            custParameters  = CustParameters::find(true);
+
+            ttsbegin;
+            if(_contract.parmPrevJournalNum() == custParameters.METAMEXPaymJournalNum)
+            {
+                custParameters.METAMEXIsAdhocJournal = NoYes::No;
+            }
+            else
+            {
+                custParameters.METAMEXIsAdhocJournal = NoYes::Yes;
+
+                //Update Adhoc journal to process FTI's
+                if (journalTable)
+                {
+                    journalTable.selectForUpdate(true);
+                    journalTable.METAMEXProcessFTI = NoYes::Yes;
+                    journalTable.doUpdate();
+                }
+            }
+
+            custParameters.doUpdate();
+
+            // Amex approved acknowledgement file updates all the approved customer payment journal lines from Payment status Sent to Received
+            // Update the remaining payment journal lines with Sent Payment status to Rejected
+            
+            update_recordset ledgerJournalTrans 
+                setting PaymentStatus = CustVendPaymStatus::Rejected
+                where ledgerJournalTrans.JournalNum == journalTable.JournalNum
+                && ledgerJournalTrans.PaymentStatus != CustVendPaymStatus::Confirmed;
+
+            ttscommit;
+
+            if(journalTable.OriginalJournalNum)
+            {
+                action = METAMEXAction::Delete;
+                ttsbegin;
+                delete_from ledgerJournalTrans where
+                ledgerJournalTrans.JournalNum == journalTable.JournalNum
+                && ledgerJournalTrans.PaymentStatus == CustVendPaymStatus::Rejected;
+                ttscommit;
+
+                ttsbegin;
+                if (journalTable.numOfLines() > 0)
+                {
+                    LedgerJournalPost::post(journalTable, tableNum(LedgerJournalTable), NoYes::No, true, false);
+                }
+                else if(journalTable)
+                {
+                    error(strFmt("@MET:AMEXJournalDeleteError", journalTable.JournalNum));
+                    journalTable.selectForUpdate(true);
+                    journalTable.delete();
+                }
+                ttscommit;
+
+            }
+            else
+            {
+                action = METAMEXAction::Remove;
+                LedgerJournalPost::post(journalTable, tableNum(LedgerJournalTable), NoYes::Yes, true, false);
+            }
+
+            this.updateJournal(_contract.parmJournalDesc(), _contract.parmPrevJournalNum());
+      
+        }
+
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update new <c>LedgerJournalTable</c> record.
+    /// </summary>
+    /// <param name = "_name">Journal description.</param>
+    /// <param name = "_prevJournalId">Previous journal number.</param>
+    private void updateJournal(Name _name, JournalId    _prevJournalId)
+    {
+        custParameters  = CustParameters::find();
+        LedgerJournalTable newJournalTable;
+
+        if(custParameters.METAMEXIsAdhocJournal)
+        {
+            select forupdate newJournalTable
+                where newJournalTable.OriginalJournalNum == _prevJournalId
+                    && newJournalTable.Posted != NoYes::No;
+
+            if (newJournalTable && _name)
+            {
+                ttsbegin;
+                newJournalTable.Name = _name;
+                newJournalTable.doUpdate();
+                ttscommit;
+            }
+        }
+        else
+        {
+            newJournalTable = LedgerJournalTable::find(custParameters.METAMEXPaymJournalNum, true);
+            if (newJournalTable && !newJournalTable.Posted)
+            {
+                ttsbegin;
+                if (_name)
+                {
+                    newJournalTable.Name = _name;
+                }
+                newJournalTable.SystemBlocked = NoYes::Yes;
+                newJournalTable.doUpdate();
+                ttscommit;
+            }
+
+            //Update freetextinvoice journal
+            if (_prevJournalId)
+            {
+                CustParameters::METUpdateAMEXFreeTextInvJournalNum(_prevJournalId);
+            }
+            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>moveRejectedLinesController</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Prepares the instance of the <c>METAMEXMoveRejectedLinesService</c> class to execute the
+    /// <c>moveRejectedLines</c> method in parallel.
+    /// </summary>
+    /// <param name = "_contract"><c>METAMEXMoveRejectedLinesContract</c></param>
+    /// <returns>
+    /// An instance of the <c>SysOperationServiceController</c> class
+    /// </returns>
+    /// <remarks>
+    /// This method uses the Sys Operations Framework to enable the parallel processing.
+    /// </remarks>
+    private SysOperationServiceController moveRejectedLinesController(METAMEXMoveRejectedLinesContract _contract)
+    {
+        SysOperationServiceController controller = new SysOperationServiceController(
+                                                    classStr(METAMEXMoveRejectedLinesService),
+                                                    methodStr(METAMEXMoveRejectedLinesService, moveRejectedLinesTask),
+                                                    SysOperationExecutionMode::Synchronous);
+
+        controller.parmDialogCaption(strFmt("@MET:METAMEXMovePaymentLinesPostTask", action,_contract.parmPrevJournalNum()));
+
+        METAMEXMoveRejectedLinesContract contract = controller.getDataContractObject() as METAMEXMoveRejectedLinesContract;
+
+        contract.parmBatchId(_contract.parmBatchId());
+        contract.parmPrevJournalNum(_contract.parmPrevJournalNum());
+        contract.parmJournalDesc(_contract.parmJournalDesc());
+        contract.parmTasks(_contract.parmTasks());
+
+        return controller;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

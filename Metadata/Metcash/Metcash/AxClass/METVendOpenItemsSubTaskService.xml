@@ -55,42 +55,74 @@ public class METVendOpenItemsSubTaskService
                 from VendTransOpen
                     where VendTransOpen.RecId == enumerator.current()
                 join Invoice,
-                    approved,
+                    AccountNum,
+                    Approved,
                     PaymMode,
                     CurrencyCode,
                     DocumentDate,
                     JournalNum,
                     DocumentNum,
                     RecId,
+                    Voucher,
                     TransDate,
-                    DataAreaId
+                    DefaultDimension,
+                    DataAreaId,
+                    InvoiceReleaseDate
                 from vendTrans
                     where vendTrans.Recid == vendTransOpen.RefRecID
+                    && VendTrans.PaymMode   == vendParameters.METpayPaymMode
                 join AccountNum
                 from vendTable
                     where vendTable.AccountNum == vendTransOpen.AccountNum
                 notexists join onHoldHistory
                     where onHoldHistory.VendAccount == VendTable.AccountNum
-                        && (onHoldHistory.onHold == CustVendorBlocked::All
-                        || onHoldHistory.onHold == CustVendorBlocked::Payment)
-                        && VendTrans.approved   == NoYes::Yes
-                    && VendTrans.PaymMode   == vendParameters.METpayPaymMode;
-            
+                        && onHoldHistory.onHold == CustVendorBlocked::All // Removed Payment (MPJ-15347)
+                        // && VendTrans.approved   == NoYes::Yes  Including open items that are not approved (logic explained in initFromVendorTransaction method)
+                    ;
+                
+
                 if (VendTransOpen && VendTrans && vendTable)
                 {
-                    metVendOpenItems = METVendOpenItems::find(vendTransOpen.RecId,
-                                                        vendTransOpen.AccountNum,
-                                                        vendTrans.Invoice,
-                                                        vendTransOpen.DataAreaId);
-                    if (!metVendOpenItems)
+                    LedgerJournalTrans  journalTrans;
+                    boolean             relatedJournalTransExists;
+                    while select crosscompany journalTrans
+                        where journalTrans.Voucher == vendTrans.Voucher &&
+                        journalTrans.JournalNum == vendTrans.JournalNum &&
+                        (journalTrans.AccountType == LedgerJournalACType::Ledger ||
+                        (journalTrans.AccountType == LedgerJournalACType::Vend && journalTrans.OffsetLedgerDimension) ||
+                        (journalTrans.AccountType == LedgerJournalACType::Project))
                     {
-                        this.insertRecord(metVendOpenItems, vendTransOpen, vendTrans);
+                        relatedJournalTransExists = true;
+                        metVendOpenItems = METVendOpenItems::findByRefRecId(vendTransOpen.RecId, journalTrans.RecId);
+                        if (!metVendOpenItems)
+                        {
+                            this.insertRecord(metVendOpenItems, vendTransOpen, vendTrans, journalTrans);
+                        }
+                        else if (metVendOpenItems)
+                        {
+                            this.updateRecord(metVendOpenItems, vendTransOpen, vendTrans, journalTrans);
+                        }
                     }
-                    else if (metVendOpenItems
-                                && metVendOpenItems.AckStatus != METAckStatus::Approved)
+                    if(!relatedJournalTransExists)
                     {
-                        this.updateRecord(metVendOpenItems, vendTransOpen, vendTrans);
+                        VendInvoiceJour     vendInvoiceJour;
+
+                        changecompany(vendTrans.DataAreaId)
+                        {
+                            vendInvoiceJour = vendTrans.vendInvoiceJour();
+                        }
+                        
+                        metVendOpenItems = METVendOpenItems::findByRefRecId(vendTransOpen.RecId, vendInvoiceJour.RecId);
+                        if (!metVendOpenItems)
+                        {
+                            this.insertRecord(metVendOpenItems, vendTransOpen, vendTrans, null, vendInvoiceJour);
+                        }
+                        else if (metVendOpenItems)
+                        {
+                            this.updateRecord(metVendOpenItems, vendTransOpen, vendTrans, null, vendInvoiceJour);
+                        }
                     }
+    
                 }
             }
         }
@@ -146,35 +178,55 @@ public class METVendOpenItemsSubTaskService
     /// <param name = "_metVendOpenItems">metVendOpenItems table</param>
     /// <param name = "_vendTransOpen">vendtransopen table</param>
     /// <param name = "_vendTrans">vendtrans table</param>
-    private void initFromVendorTransaction(METVendOpenItems _metVendOpenItems, VendTransOpen _vendTransOpen, VendTrans _vendTrans)
+    /// <param name = "_journalTrans"><c>ledgerJournalTrans</c> table</param>
+    /// <param name = "_vendInvoiceJour">VendInvoiceJour table</param>
+    private void initFromVendorTransaction(METVendOpenItems _metVendOpenItems,
+                                         VendTransOpen      _vendTransOpen,
+                                         VendTrans          _vendTrans,
+                                         LedgerJournalTrans _journalTrans = null,
+                                         VendInvoiceJour    _vendInvoiceJour = null)
     {
         LedgerJournalTable  ledgerJournalTable;
-        LedgerJournalTrans  ledgerJournalTrans;        
-        
-        changecompany(_vendTransOpen.DataAreaId)
+        if(_journalTrans)
         {
-            ledgerJournalTable  = LedgerJournalTable::find(_vendTrans.JournalNum);
-            select firstonly1 Txt,OffsetTxt from ledgerJournalTrans
-            where ledgerJournalTrans.VendTransId   == _vendTrans.RecId;
+            ledgerJournalTable  = _journalTrans.ledgerJournalTable();
         }
-
-        _metVendOpenItems.AmountCur              = _vendTransOpen.AmountCur;
-        _metVendOpenItems.DueDate                = _vendTransOpen.DueDate;        
-        _metVendOpenItems.JournalName            = ledgerJournalTable.JournalName;
-        _metVendOpenItems.DefaultDimension       = _vendTrans.DefaultDimension;
-        _metVendOpenItems.GSTAmount              = this.calculateGSTAmount(_vendTrans);
-        _metVendOpenItems.Currency               = _vendTrans.CurrencyCode;
-        _metVendOpenItems.DocumentDate           = _vendTrans.DocumentDate;
-        _metVendOpenItems.InvoiceDate            = _vendTransOpen.TransDate;        
-        _metVendOpenItems.AckStatus              = METAckStatus::Blank;
-        _metVendOpenItems.RecordStatus           = METRecordStatus::New;
-        _metVendOpenItems.JournalType            = ledgerJournalTable.JournalType;
-        _metVendOpenItems.Document               = _vendTrans.DocumentNum;
-        _metVendOpenItems.CompanyCode            = _vendTransOpen.DataAreaId;
-        _metVendOpenItems.JournalBatchNumber     = _vendTrans.JournalNum;
-        _metVendOpenItems.Description            = ledgerJournalTrans.Txt;
-        _metVendOpenItems.OffsetTransactionText  = ledgerJournalTrans.OffsetTxt;          
-
+        _metVendOpenItems.AccountNum            = _vendTransOpen.AccountNum;
+        _metVendOpenItems.Invoice               = _vendTrans.Invoice;
+        if(_journalTrans)
+        {
+            _metVendOpenItems.AmountCur             = _journalTrans.amount();
+            if(_journalTrans.AccountType == LedgerJournalACType::Vend && _journalTrans.OffsetLedgerDimension)
+            {
+                _metVendOpenItems.AmountCur         = _metVendOpenItems.AmountCur * -1;
+            }
+            
+            _metVendOpenItems.GSTAmount             = this.calculateGSTAmount(_journalTrans);
+            if(ledgerJournalTable.LedgerJournalInclTax)
+            {
+                _metVendOpenItems.AmountCur         -= _metVendOpenItems.GSTAmount;
+            }
+            _metVendOpenItems.JournalName           = ledgerJournalTable.JournalName;
+            _metVendOpenItems.JournalType           = ledgerJournalTable.JournalType;
+            _metVendOpenItems.Description           = _journalTrans.Txt;
+            _metVendOpenItems.OffsetTransactionText = _journalTrans.OffsetTxt;
+        }
+        else if(_vendInvoiceJour)
+        {
+            _metVendOpenItems.AmountCur             = _vendInvoiceJour.InvoiceAmount - _vendInvoiceJour.SumTax;
+            _metVendOpenItems.GSTAmount             = _vendInvoiceJour.SumTax;
+            _metVendOpenItems.Description           = _vendInvoiceJour.Description;
+        }
+        _metVendOpenItems.DueDate               = _vendTransOpen.DueDate;        
+        _metVendOpenItems.DefaultDimension      = _vendTrans.DefaultDimension;
+        _metVendOpenItems.Currency              = _vendTrans.CurrencyCode;
+        _metVendOpenItems.DocumentDate          = _vendTrans.DocumentDate;
+        _metVendOpenItems.TransDate             = _vendTransOpen.TransDate;
+        _metVendOpenItems.Document              = _vendTrans.DocumentNum;
+        _metVendOpenItems.CompanyCode           = _vendTransOpen.DataAreaId;
+        _metVendOpenItems.JournalBatchNumber    = _vendTrans.JournalNum;
+        _metVendOpenItems.Approved              = _vendTrans.Approved;
+        _metVendOpenItems.InvoiceReleaseDate    = _vendTrans.InvoiceReleaseDate;
     }
 
 ]]></Source>
@@ -189,14 +241,28 @@ public class METVendOpenItemsSubTaskService
     /// <param name = "_metVendOpenItems">metVendOpenItems table</param>
     /// <param name = "_vendTransOpen">vendtransopen table</param>
     /// <param name = "_vendTrans">vendtrans table</param>
-    public void insertRecord(METVendOpenItems _metVendOpenItems, VendTransOpen _vendTransOpen, VendTrans _vendTrans)
+    /// <param name = "_journalTrans"><c>ledgerJournalTrans</c> table</param>
+    /// <param name = "_vendInvoiceJour">VendInvoiceJour table</param>
+    public void insertRecord(METVendOpenItems   _metVendOpenItems, 
+                             VendTransOpen      _vendTransOpen,
+                             VendTrans          _vendTrans,
+                             LedgerJournalTrans _journalTrans = null,
+                             VendInvoiceJour    _vendInvoiceJour = null)
     {        
-        this.initFromVendorTransaction(_metVendOpenItems, _vendTransOpen, _vendTrans);
+        this.initFromVendorTransaction(_metVendOpenItems, _vendTransOpen, _vendTrans, _journalTrans, _vendInvoiceJour);
 
-        _metVendOpenItems.AccountNum            = _vendTransOpen.AccountNum;
-        _metVendOpenItems.Invoice               = _vendTrans.Invoice;
-        _metVendOpenItems.VendTransOpenRecId    = _vendTransOpen.RecId;
-        _metVendOpenItems.AckStatus             = METAckStatus::Blank;
+        if(_journalTrans)
+        {
+            _metVendOpenItems.LedgerJournalTransRecId   = _journalTrans.RecId;
+        }
+        else
+        {
+            _metVendOpenItems.LedgerJournalTransRecId   = _vendInvoiceJour.RecId;
+        }
+        _metVendOpenItems.VendTransOpenRecId        = _vendTransOpen.RecId;
+        _metVendOpenItems.AckStatus                 = METAckStatus::Blank;
+        _metVendOpenItems.RecordStatus              = METRecordStatus::New;
+        
         ttsbegin;       
         _metVendOpenItems.insert();
         ttscommit;
@@ -214,15 +280,54 @@ public class METVendOpenItemsSubTaskService
     /// <param name = "_metVendOpenItems">metVendOpenItems table</param>
     /// <param name = "_vendTransOpen">vendtransopen table</param>
     /// <param name = "_vendTrans">vendtrans table</param>
-    public void updateRecord(METVendOpenItems _metVendOpenItems, VendTransOpen _vendTransOpen, VendTrans _vendTrans)
+    /// <param name = "_journalTrans"><c>ledgerJournalTrans</c> table</param>
+    /// <param name = "_vendInvoiceJour">VendInvoiceJour table</param>
+    public void updateRecord(METVendOpenItems   _metVendOpenItems,
+                             VendTransOpen      _vendTransOpen,
+                             VendTrans          _vendTrans,
+                             LedgerJournalTrans _journalTrans= null,
+                             VendInvoiceJour    _vendInvoiceJour = null)
     {
-        this.initFromVendorTransaction(_metVendOpenItems, _vendTransOpen, _vendTrans);
-
-        ttsbegin;
-        _metVendOpenItems.selectForUpdate(true);   
-        _metVendOpenItems.AckStatus = METAckStatus::Blank;
-        _metVendOpenItems.update();
-        ttscommit;
+        // Ignore the record if Approved = No & AckStatus = Rejected
+        if((_vendTrans.Approved == NoYes::Yes && _metVendOpenItems.AckStatus == METAckStatus::Rejected)
+            || _metVendOpenItems.AckStatus == METAckStatus::Approved
+            || _metVendOpenItems.AckStatus == METAckStatus::Blank)
+        {
+            if(_metVendOpenItems.AckStatus == METAckStatus::Rejected)
+            {
+                _metVendOpenItems.AckStatus = METAckStatus::Blank;
+            }
+            this.initFromVendorTransaction(_metVendOpenItems, _vendTransOpen, _vendTrans, _journalTrans, _vendInvoiceJour);
+            
+            if(_metVendOpenItems.orig().AckStatus != _metVendOpenItems.AckStatus
+                || _metVendOpenItems.orig().AmountCur != _metVendOpenItems.AmountCur
+                || _metVendOpenItems.orig().DueDate != _metVendOpenItems.DueDate
+                || _metVendOpenItems.orig().JournalName != _metVendOpenItems.JournalName
+                || _metVendOpenItems.orig().DefaultDimension != _metVendOpenItems.DefaultDimension
+                || _metVendOpenItems.orig().GSTAmount != _metVendOpenItems.GSTAmount
+                || _metVendOpenItems.orig().Currency != _metVendOpenItems.Currency
+                || _metVendOpenItems.orig().DocumentDate != _metVendOpenItems.DocumentDate
+                || _metVendOpenItems.orig().TransDate != _metVendOpenItems.TransDate
+                || _metVendOpenItems.orig().JournalType != _metVendOpenItems.JournalType
+                || _metVendOpenItems.orig().Document != _metVendOpenItems.Document
+                || _metVendOpenItems.orig().CompanyCode != _metVendOpenItems.CompanyCode
+                || _metVendOpenItems.orig().JournalBatchNumber != _metVendOpenItems.JournalBatchNumber
+                || _metVendOpenItems.orig().Description != _metVendOpenItems.Description
+                || _metVendOpenItems.orig().OffsetTransactionText != _metVendOpenItems.OffsetTransactionText
+                || _metVendOpenItems.orig().Approved != _metVendOpenItems.Approved
+                || _metVendOpenItems.orig().InvoiceReleaseDate != _metVendOpenItems.InvoiceReleaseDate
+                || _metVendOpenItems.orig().Invoice != _metVendOpenItems.Invoice
+                || _metVendOpenItems.orig().AccountNum != _metVendOpenItems.AccountNum)
+            {
+                ttsbegin;
+                _metVendOpenItems.selectForUpdate(true);
+                
+                _metVendOpenItems.AckStatus = METAckStatus::Blank;
+                _metVendOpenItems.RecordStatus  = METRecordStatus::New;
+                _metVendOpenItems.update();
+                ttscommit;
+            }
+        }
     }
 
 ]]></Source>
@@ -234,19 +339,21 @@ public class METVendOpenItemsSubTaskService
     /// MPJ_5046_MetpayInterfaces 11/06/2021
     /// Method to return the GST Amount
     /// </summary>
-    /// <param name = "_vendTrans">vendtrans table</param>
+    /// <param name = "_journalTrans"><c>LedgerJournalTrans</c> table</param>
     /// <returns>Tax amount</returns>
-    public TaxAmountCur calculateGSTAmount(VendTrans _vendTrans)
+    public TaxAmountCur calculateGSTAmount(LedgerJournalTrans _journalTrans)
     {
         TaxAmountCur GSTAmount;
         TaxTrans taxTrans;
-        changecompany(_vendTrans.DataAreaId)
+        changecompany(_journalTrans.DataAreaId)
         {
             select sum(SourceRegulateAmountCur) from taxTrans
-                where taxTrans.Voucher == _vendTrans.Voucher
-                && taxTrans.TransDate == _vendTrans.TransDate;
+                where taxTrans.Voucher == _journalTrans.Voucher
+                && taxTrans.TransDate == _journalTrans.TransDate
+                && taxTrans.SourceTableId == _journalTrans.TableId 
+                && taxTrans.SourceRecId == _journalTrans.RecId;
 
-            GSTAmount = -taxTrans.SourceRegulateAmountCur;
+            GSTAmount = taxTrans.SourceRegulateAmountCur;
         }
         return GSTAmount;
     }

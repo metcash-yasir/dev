@@ -10,7 +10,6 @@
 public class METVendCrossDocFeeService extends SysOperationServiceBase
 {
     LedgerJournalTable      journalHeader;
-    RecordInsertList        ledgerJournalTransList;
     str                     errorMessage;
     public str              infologMessage;
 
@@ -30,7 +29,7 @@ public class METVendCrossDocFeeService extends SysOperationServiceBase
     public void processOperation(METVendCrossDocFeeContract _dataContract)
     {
         METVendCrossDocFees             metVendCrossDocFee;
-        VendTrans                       vendtrans;
+        VendTrans                       vendTrans;
         boolean                         flag;
         LedgerJournalId                 journalId;
         LedgerJournalCheckPost          ledgerJournalCheckPost;
@@ -47,10 +46,12 @@ public class METVendCrossDocFeeService extends SysOperationServiceBase
 
             this.validateLines();
 
+            
             while select metVendCrossDocFee
-                join vendtrans
-                    where vendtrans.Invoice == metVendCrossDocFee.Invoice  
-                && metVendCrossDocFee.RecordStatus ==  METRecordStatus::New                    
+                join Invoice from vendTrans
+                    where vendTrans.AccountNum  == metVendCrossDocFee.AccountNum 
+                        && metVendCrossDocFee.RecordStatus ==  METRecordStatus::New  
+                        && metVendCrossDocFee.Invoice == vendTrans.Invoice + METConstants::crossDocInvoiceSuffix
             {
                 if (flag)
                 {
@@ -65,16 +66,28 @@ public class METVendCrossDocFeeService extends SysOperationServiceBase
 
             if (journalHeader)
             {
-                ledgerJournalTransList.insertDatabase();
+                LedgerJournalTrans  ledgerJournalTransCount;
+                select count(RecId) from ledgerJournalTransCount
+                    where ledgerJournalTransCount.JournalNum == journalHeader.JournalNum;
 
-                //Validating the journal
-                ledgerJournalCheckPost = ledgerJournalCheckPost::newLedgerJournalTable(journalHeader, NoYes::Yes);
-                if (ledgerJournalCheckPost.validate())
+                if(ledgerJournalTransCount.RecId)
                 {
-                    //Posting the journal
-                    ledgerJournalCheckPost.runOperation();
+                    //Validating the journal
+                    ledgerJournalCheckPost = ledgerJournalCheckPost::newLedgerJournalTable(journalHeader, NoYes::Yes);
+                    if (ledgerJournalCheckPost.validate())
+                    {
+                        //Posting the journal
+                        ledgerJournalCheckPost.runOperation();
+                    }
+                }
+                else    
+                {
+                    ttsbegin;
+                    journalHeader.delete();
+                    ttscommit;
                 }
             }
+            
         }
         catch(Exception::CLRError)
         {
@@ -94,7 +107,7 @@ public class METVendCrossDocFeeService extends SysOperationServiceBase
 				<Name>validateLines</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Validates vendor & tax information
+    /// Validate Vendor and tax information.
     /// </summary>
     private void validateLines()
     {
@@ -199,11 +212,6 @@ public class METVendCrossDocFeeService extends SysOperationServiceBase
 
         try
         {
-            if(!ledgerJournalTransList)
-            {
-                ledgerJournalTransList = new RecordInsertList(ledgerJournalTrans.TableId);
-            }
-
             numberseq = NumberSeq::newGetVoucherFromCode(NumberSequenceTable::find(ledgerJournalName.NumberSequenceTable).NumberSequence);
             voucherNum = numberseq.voucher();
 
@@ -221,26 +229,30 @@ public class METVendCrossDocFeeService extends SysOperationServiceBase
             ledgerJournalTrans.OffsetTxt            =   _metVendCrossDocFees.LineDescription;
             ledgerJournalTrans.TaxGroup             =   _metVendCrossDocFees.SalesTaxGroup;
             ledgerJournalTrans.TaxItemGroup         =   _metVendCrossDocFees.SalesTaxItemGroup;
-            ledgerJournalTrans.Invoice              =   _metVendCrossDocFees.Invoice + 'x';
+            ledgerJournalTrans.Invoice              =   _metVendCrossDocFees.Invoice;
             ledgerJournalTrans.DocumentDate         =   _metVendCrossDocFees.InvoiceDate;
+            ledgerJournalTrans.DocumentNum          =   _metVendCrossDocFees.Invoice;
   
             DimensionDynamicAccount ledgerAccount = LedgerDefaultAccountHelper::getDefaultAccountFromMainAccountRecId(MainAccount::findByMainAccountId(mainAccount).RecId);
             if(_metVendCrossDocFees.OffsetDefaultDimensionDisplayValue)
             {
-                DefaultDimensionIntegrationValues ledgerString = _metVendCrossDocFees.OffsetDefaultDimensionDisplayValue;
-                LedgerAccountDimensionResolver dimResolver = LedgerAccountDimensionResolver::newResolver(ledgerString);
-                ledgerAccount = dimResolver.resolve();
+                DefaultDimensionIntegrationValues   ledgerString = _metVendCrossDocFees.OffsetDefaultDimensionDisplayValue;
+                LedgerAccountDimensionResolver      ledgerAccountDimResolver = LedgerAccountDimensionResolver::newResolver(ledgerString);
+                ledgerAccount = ledgerAccountDimResolver.resolve();
+
+                DimensionDefaultResolver            dimDefaultResolver = DimensionDefaultResolver::newResolver(subStr(ledgerString, strLen(mainAccount) + 2, strLen(ledgerString)));
+                ledgerJournalTrans.DefaultDimension = dimDefaultResolver.resolve();
             }
 
             ledgerJournalTrans.OffsetLedgerDimension = ledgerAccount;
 
             if (_metVendCrossDocFees.Balance > 0)
             {
-                ledgerJournalTrans.AmountCurCredit    =   _metVendCrossDocFees.Balance;
+                ledgerJournalTrans.AmountCurDebit     =   _metVendCrossDocFees.Balance;
             }
             else
             {
-                ledgerJournalTrans.AmountCurDebit     =   _metVendCrossDocFees.Balance;
+                ledgerJournalTrans.AmountCurCredit    =   _metVendCrossDocFees.Balance;
                 ledgerJournalTrans.Payment            =   METVendTable::getCreditPaymId(_metVendCrossDocFees.AccountNum);
             }        
 
@@ -250,14 +262,16 @@ public class METVendCrossDocFeeService extends SysOperationServiceBase
 
             ledgerJournalTrans.SkipBlockedForManualEntryCheck  = true;
             ledgerJournalTrans.defaultRow();
+            
+            ttsbegin;
+
             if (_metVendCrossDocFees.Balance != 0)
             {
-                ledgerJournalTransList.add(ledgerJournalTrans);
+                ledgerJournalTrans.insert();
             }
 
             numberseq.used();
             
-            ttsbegin;
             _metVendCrossDocFees.selectForUpdate(true);
             _metVendCrossDocFees.RecordStatus = METRecordStatus::Processed;
             _metVendCrossDocFees.update();

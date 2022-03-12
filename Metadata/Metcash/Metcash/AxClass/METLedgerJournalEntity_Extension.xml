@@ -10,17 +10,447 @@
 [ExtensionOf(tableStr(LedgerJournalEntity))]
 public final class METLedgerJournalEntity_Extension
 {
-
+    #OCCRetryCount
 
 }
 ]]></Declaration>
 		<Methods>
+			<Method>
+				<Name>mapEntityToDataSource</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Maps the entity to the backing datasources.
+    /// </summary>
+    /// <param name = "entityCtx">The context of the entity.</param>
+    /// <param name = "dataSourceCtx">The context of the datasource being mapped.</param>
+    public void mapEntityToDataSource(DataEntityRuntimeContext entityCtx, DataEntityDataSourceRuntimeContext dataSourceCtx)
+    {
+        if (entityCtx.getDatabaseOperation() == DataEntityDatabaseOperation::Insert
+            || entityCtx.getDatabaseOperation() == DataEntityDatabaseOperation::Update)
+        {
+            // When editing through the entity, always delay tax calculation to avoid
+            // a O(n^2) tax calculation while importing multiple lines. The journal will
+            // automatically calculate taxes later at posting time or when necessary.
+            this.DelayTaxCalculation = NoYes::Yes;
+
+            switch (dataSourceCtx.name())
+            {
+                case dataEntityDataSourceStr(LedgerJournalEntity, LedgerJournalTable):
+                    try
+                    {
+                        dataSourceCtx.setBuffer(LedgerJournalEntityBase::findOrCreateLedgerJournalHeader(this));
+                    }
+                    catch (Exception::Deadlock)
+                    {
+                        // retry on deadlock
+                        retry;
+                    }
+                    catch (Exception::UpdateConflict)
+                    {
+                        // try to resolve update conflict
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            throw Exception::UpdateConflictNotRecovered;
+                        }
+                        else
+                        {
+                            retry;
+                        }
+                    }
+                    catch(Exception::DuplicateKeyException)
+                    {
+                        // retry in case of a duplicate key conflict
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            throw Exception::DuplicateKeyExceptionNotRecovered;
+                        }
+                        else
+                        {
+                            retry;
+                        }
+                    }
+                    break;
+            }
+        }
+        next mapEntityToDataSource(entityCtx, dataSourceCtx);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertEntityDataSource</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Insert entity datasource method
+    /// </summary>
+    /// <param name = "_entityCtx">Type DataEntityRuntimeContext</param>
+    /// <param name = "_dataSourceCtx">Type DataEntityDataSourceRuntimeContext</param>
+    /// <returns>Boolean value</returns>
+    public boolean insertEntityDataSource(DataEntityRuntimeContext _entityCtx, DataEntityDataSourceRuntimeContext _dataSourceCtx)
+    {
+        boolean ret = true;
+        if (_dataSourceCtx.name() == dataEntityDataSourceStr(LedgerJournalEntity, LedgerJournalTrans))
+        {
+            LedgerJournalTrans metLedgerJournalTrans = _dataSourceCtx.getBuffer();
+            
+            // Calculat date if it is minimum value
+            if(metLedgerJournalTrans.Due == dateNull())
+            {
+                if(metLedgerJournalTrans.CashDiscBaseDate == dateNull())
+                {
+                    metLedgerJournalTrans.modifiedField(fieldNum(LedgerJournalTrans, Payment));
+                }
+                else
+                {
+                    metLedgerJournalTrans.modifiedField(fieldNum(LedgerJournalTrans, CashDiscBaseDate));
+                }
+            }
+
+            // Set ReverseDate in PostTargetProcess method to fix performance issues 
+            // if the voucher is set to manual and custom DMF allocate voucher at posting is set to true
+            LedgerJournalName   metLedgerJournalName = LedgerJournalName::find(this.JournalName);
+            if(metLedgerJournalName.METDMFVoucherAllocatedAtPosting == NoYes::Yes
+                && metLedgerJournalName.NewVoucher  == NewVoucher::Manually)
+            {
+                metLedgerJournalTrans.ReverseDate   = dateNull();
+                metLedgerJournalTrans.ReverseEntry  = NoYes::No;
+            }
+            // Fix for intercomany LedgerDimension as the standard entity is not designed for this.
+            if(metLedgerJournalTrans.AccountType   == LedgerJournalACType::Ledger && metLedgerJournalTrans.company != curExt())
+            {
+                RefRecId    metLedgerDimensionRecId;
+                try
+                {
+                    changecompany(metLedgerJournalTrans.Company)
+                    {
+                        LedgerAccountDimensionResolver metLedgerAccountDimensionResolver = LedgerAccountDimensionResolver::newResolver(this.AccountDisplayValue);
+                        metLedgerDimensionRecId = metLedgerAccountDimensionResolver.resolve();
+                    }
+                    if(metLedgerDimensionRecId)
+                    {
+                        metLedgerJournalTrans.LedgerDimension = metLedgerDimensionRecId;
+                    }
+                }
+                catch // In case of failure, AccountDisplayValue gets stored in Dynamics and user has to fix it manually
+                {
+                } 
+            }
+        }
+        ret = next insertEntityDataSource(_entityCtx, _dataSourceCtx);
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateEntityDataSource</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update entity datasource
+    /// </summary>
+    /// <param name = "_entityCtx">Type DataEntityRuntimeContext</param>
+    /// <param name = "_dataSourceCtx">Type DataEntityDataSourceRuntimeContext</param>
+    /// <returns>Boolean value</returns>
+    public boolean updateEntityDataSource(DataEntityRuntimeContext _entityCtx, DataEntityDataSourceRuntimeContext _dataSourceCtx)
+    {
+        boolean ret;
+        switch (_dataSourceCtx.name())
+        {
+            case dataEntityDataSourceStr(LedgerJournalEntity, LedgerJournalTrans):
+                LedgerJournalTrans metLedgerJournalTrans = _dataSourceCtx.getBuffer();
+                
+                // Calculat date if it is minimum value
+                if(metLedgerJournalTrans.Due == dateNull())
+                {
+                    if(metLedgerJournalTrans.CashDiscBaseDate == dateNull())
+                    {
+                        metLedgerJournalTrans.modifiedField(fieldNum(LedgerJournalTrans, Payment));
+                    }
+                    else
+                    {
+                        metLedgerJournalTrans.modifiedField(fieldNum(LedgerJournalTrans, CashDiscBaseDate));
+                    }
+                }
+
+                // Fix for intercomany LedgerDimension as the standard entity is not designed for this.
+                if(metLedgerJournalTrans.AccountType   == LedgerJournalACType::Ledger && metLedgerJournalTrans.company != curExt())
+                {
+                    RefRecId    metLedgerDimensionRecId;
+                    try
+                    {
+                        changecompany(metLedgerJournalTrans.Company)
+                        {
+                            LedgerAccountDimensionResolver metLedgerAccountDimensionResolver = LedgerAccountDimensionResolver::newResolver(this.AccountDisplayValue);
+                            metLedgerDimensionRecId = metLedgerAccountDimensionResolver.resolve();
+                        }
+                        if(metLedgerDimensionRecId)
+                        {
+                            metLedgerJournalTrans.LedgerDimension = metLedgerDimensionRecId;
+                        }
+                    }
+                    catch
+                    {
+                    }
+                    // In case of failure, AccountDisplayValue gets stored in Dynamics and user has to fix it manually
+                }
+
+                break;
+        }
+        ret = next updateEntityDataSource(_entityCtx, _dataSourceCtx);
+        
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateExistingJournalLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates existing journal lines with any changes from staging.
+    /// </summary>
+    /// <param name = "_dmfDefinitionGroupExecution">
+    /// The definition group.
+    /// </param>
+    /// <param name = "_dimCacheTmp">
+    /// The <c>DimensionDataEntitySFKCacheTmp</c> instance which contains resolved dynamic dimensions.
+    /// </param>
+    /// <param name = "_dimCacheTmpRef">
+    /// The <c>DimensionDataEntitySFKCacheTmp</c> instance which contains resolved dynamic dimensions.
+    /// </param>
+    /// <param name = "_defaultDimCacheTmp">
+    /// The <c>DimensionDataEntitySFKCacheTmp</c> instance which contains resolved default dimensions.
+    /// </param>
+    /// <param name = "_defaultDimCacheTmpRef">
+    /// The <c>DimensionDataEntitySFKCacheTmp</c> instance which contains resolved default dimensions.
+    /// </param>
+    /// <param name = "_delayTaxCalculation">
+    /// Determines whether to delay tax calculation.
+    /// </param>
+    /// <returns>
+    /// The number of journal lines updated.
+    /// </returns>
+    protected static int64 updateExistingJournalLines(DMFDefinitionGroupExecution _dmfDefinitionGroupExecution,
+        DimensionDataEntitySFKCacheTmp _dimCacheTmp,
+        DimensionDataEntitySFKCacheTmp _dimCacheTmpRef,
+        DimensionDataEntitySFKCacheTmp _defaultDimCacheTmp,
+        DimensionDataEntitySFKCacheTmp _defaultDimCacheTmpRef,
+        boolean _delayTaxCalculation)
+    {
+
+        LedgerJournalEntity::metUpdateCustomFields(_dmfDefinitionGroupExecution);
+
+        return next updateExistingJournalLines(_dmfDefinitionGroupExecution,
+                                                _dimCacheTmp,
+                                                _dimCacheTmpRef,
+                                                _defaultDimCacheTmp,
+                                                _defaultDimCacheTmpRef,
+            _delayTaxCalculation);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournalLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates new journal lines from the staging table.
+    /// </summary>
+    /// <param name = "_dmfDefinitionGroupExecution">
+    /// The definition group.
+    /// </param>
+    /// <param name = "_dimCacheTmp">
+    /// The <c>DimensionDataEntitySFKCacheTmp</c> instance which contains resolved dynamic dimensions.
+    /// </param>
+    /// <param name = "_dimCacheTmpRef">
+    /// The <c>DimensionDataEntitySFKCacheTmp</c> instance which contains resolved dynamic dimensions.
+    /// </param>
+    /// <param name = "_defaultDimCacheTmp">
+    /// The <c>DimensionDataEntitySFKCacheTmp</c> instance which contains resolved default dimensions.
+    /// </param>
+    /// <param name = "_defaultDimCacheTmpRef">
+    /// The <c>DimensionDataEntitySFKCacheTmp</c> instance which contains resolved default dimensions.
+    /// </param>
+    /// <param name = "_delayTaxCalculation">
+    /// Determines whether to delay tax calculation.
+    /// </param>
+    /// <returns>
+    /// The number of journal lines created.
+    /// </returns>
+    /// <remarks>
+    /// Using Chain of Command, an update_recordset can be used to set extension field values for
+    /// new journal lines created by this method. Typically the return value would not need to be modified.
+    /// Use this pattern to copy extension fields from the source LedgerJournalEntityStaging table
+    /// to the target LedgerJournalTrans table using an update_recordset statement.
+    /// All update_recordset statements should contain the following where clause to restrict to
+    /// the current session.
+    /// update_recordset ledgerJounalTrans
+    ///     setting MyLineField = staging.MyLineField
+    /// join staging
+    ///     where staging.JournalBatchNumber == ledgerJournalTrans.JournalNum
+    ///         && staging.LineNumber == ledgerJournalTrans.LineNum
+    ///         && staging.DefinitionGroup == _dmfDefinitionGroupExecution.DefinitionGroup
+    ///         && staging.ExecutionId == _dmfDefinitionGroupExecution.ExecutionId
+    ///         && staging.TransferStatus == DMFTransferStatus::NotStarted
+    /// </remarks>
+    protected static int64 createJournalLines(
+        DMFDefinitionGroupExecution _dmfDefinitionGroupExecution,
+        DimensionDataEntitySFKCacheTmp _dimCacheTmp,
+        DimensionDataEntitySFKCacheTmp _dimCacheTmpRef,
+        DimensionDataEntitySFKCacheTmp _defaultDimCacheTmp,
+        DimensionDataEntitySFKCacheTmp _defaultDimCacheTmpRef,
+        boolean _delayTaxCalculation)
+    {
+        
+        int64   metRowCount = next createJournalLines(
+                                 _dmfDefinitionGroupExecution,
+                                 _dimCacheTmp,
+                                 _dimCacheTmpRef,
+                                 _defaultDimCacheTmp,
+                                 _defaultDimCacheTmpRef,
+                                 _delayTaxCalculation);
+        
+        LedgerJournalEntity::metUpdateCustomFields(_dmfDefinitionGroupExecution);
+
+        return metRowCount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metUpdateCustomFields</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update custom fields if Set-based processing is set to true
+    /// </summary>
+    /// <param name = "_dmfDefinitionGroupExecution">
+    /// The definition group.
+    /// </param>
+    private static void metUpdateCustomFields(DMFDefinitionGroupExecution _dmfDefinitionGroupExecution)
+    {
+        LedgerJournalTrans          metLedgerJournalTrans;
+        LedgerJournalEntityStaging  metStaging;
+        ReasonTable                 metReasonTable;
+        ReasonTableRef              metReasonTableRef;
+
+        select firstonly METCompany 
+            from  metStaging
+            where metStaging.DefinitionGroup    == _dmfDefinitionGroupExecution.DefinitionGroup
+                && metStaging.ExecutionId       == _dmfDefinitionGroupExecution.ExecutionId
+                && (metStaging.TransferStatus   == DMFTransferStatus::NotStarted
+                    || metStaging.TransferStatus == DMFTransferStatus::Validated);
+
+        if(metStaging.METCompany)
+        {
+            metLedgerJournalTrans.skipDataMethods(true);
+            update_recordset metLedgerJournalTrans setting
+                                Company     = metStaging.METCompany,
+                                Payment     = metStaging.METPayment,
+                                ReleaseDate = metStaging.METReleaseDate,
+                                ReleaseDateComment = metStaging.METReleaseDateComment,
+                                CashDiscBaseDate    = metStaging.METCashDiscBaseDate,
+                                CashDiscBaseDays    = metStaging.METCashDiscBaseDays
+                join metStaging
+                    where metStaging.DefinitionGroup    == _dmfDefinitionGroupExecution.DefinitionGroup
+                        && metStaging.ExecutionId       == _dmfDefinitionGroupExecution.ExecutionId
+                        && (metStaging.TransferStatus   == DMFTransferStatus::NotStarted
+                           || metStaging.TransferStatus == DMFTransferStatus::Validated)
+                        && metStaging.JournalBatchNumber == metLedgerJournalTrans.JournalNum
+                        && metStaging.LineNumber        == metLedgerJournalTrans.LineNum;
+
+            // Fix for intercomany LedgerDimension as the standard entity is not designed for this.
+            while select forupdate metLedgerJournalTrans
+                join    metStaging
+                    where metStaging.DefinitionGroup    == _dmfDefinitionGroupExecution.DefinitionGroup
+                        && metStaging.ExecutionId       == _dmfDefinitionGroupExecution.ExecutionId
+                        && metStaging.TransferStatus    == DMFTransferStatus::NotStarted
+                        && metStaging.JournalBatchNumber == metLedgerJournalTrans.JournalNum
+                        && metStaging.LineNumber        == metLedgerJournalTrans.LineNum
+                        && metLedgerJournalTrans.AccountType   == LedgerJournalACType::Ledger 
+                        && metLedgerJournalTrans.company != curExt()
+            {
+                RefRecId    metLedgerDimensionRecId;
+                try
+                {
+                    changecompany(metLedgerJournalTrans.Company)
+                    {
+                        LedgerAccountDimensionResolver metLedgerAccountDimensionResolver = LedgerAccountDimensionResolver::newResolver(metStaging.AccountDisplayValue);
+                        metLedgerDimensionRecId = metLedgerAccountDimensionResolver.resolve();
+                    }
+                    if(metLedgerDimensionRecId && metLedgerJournalTrans.LedgerDimension != metLedgerDimensionRecId)
+                    {
+                        ttsbegin;
+                        metLedgerJournalTrans.LedgerDimension = metLedgerDimensionRecId;
+                        metLedgerJournalTrans.doUpdate(); // Bypass update method for Set based operations
+                        ttscommit;
+                    }
+                }
+                catch
+                {
+                }
+                // In case of failure, AccountDisplayValue gets stored in Dynamics and user has to fix it manually
+            }
+        }
+
+        //MPJ_17670_ReasonCode DCP 22/02/2022
+        //populate Reason Code on journal line
+        //Validate Reason code exists in ReasonTable, then delete / create a ReasonTableRef record
+        ttsbegin;
+        while select forupdate metLedgerJournalTrans
+            
+            join    metStaging
+            where   metStaging.DefinitionGroup      == _dmfDefinitionGroupExecution.DefinitionGroup
+            &&      metStaging.ExecutionId          == _dmfDefinitionGroupExecution.ExecutionId
+            &&      metStaging.TransferStatus       == DMFTransferStatus::NotStarted
+            &&      metStaging.JournalBatchNumber   == metLedgerJournalTrans.JournalNum
+            &&      metStaging.LineNumber           == metLedgerJournalTrans.LineNum
+            &&      metStaging.METReasonCode
+
+            join    metReasonTable
+            where   metReasonTable.Reason       == metStaging.METReasonCode
+            &&      metReasonTable.Ledger       == NoYes::Yes
+        {
+            delete_from metReasonTableRef
+                where metReasonTableRef.RecId   == metLedgerJournalTrans.ReasonRefRecID;
+
+            metReasonTableRef.clear();
+            metReasonTableRef.Reason        = metReasonTable.Reason;
+            metReasonTableRef.ReasonComment = metReasonTable.Description;
+            metReasonTableRef.insert();
+
+            metLedgerJournalTrans.ReasonRefRecID = metReasonTableRef.RecId;
+            metLedgerJournalTrans.doUpdate();
+
+        }
+        ttscommit;
+
+        ttsbegin;
+        update_recordset metLedgerJournalTrans
+            setting ReasonRefRecID  = metReasonTableRef.RecId
+         
+            join metStaging
+            where   metStaging.DefinitionGroup      == _dmfDefinitionGroupExecution.DefinitionGroup
+            &&      metStaging.ExecutionId          == _dmfDefinitionGroupExecution.ExecutionId
+            &&      metStaging.TransferStatus       == DMFTransferStatus::NotStarted
+            &&      metStaging.JournalBatchNumber   == metLedgerJournalTrans.JournalNum
+            &&      metStaging.LineNumber           == metLedgerJournalTrans.LineNum
+
+            join    firstonly metReasonTableRef
+            where   metReasonTableRef.Reason        == metStaging.METReasonCode;
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
 			<Method>
 				<Name>postLoad</Name>
 				<Source><![CDATA[
     /// <summary>
     /// MPJ_3173_Veera Actual sales tax amount
     /// populating METGSTAmount
+    /// populate values for Virtual Fields on Export
     /// </summary>
     public void postLoad()
     {
@@ -40,14 +470,196 @@ public final class METLedgerJournalEntity_Extension
     /// <returns>Actual sales tax amount</returns>
     public TaxRegulationAmountCur getMETGSTAmount()
     {
-        TaxTrans taxTrans;
+        TaxAmount taxAmount = 0;
+        
+        changecompany(this.DataAreaId)
+        {
+            taxAmount   = Tax::taxTotalVoucherDateRecId(this.Voucher, this.TransDate, this.METLedgerJournalTransRecId);
+        }
 
-        select sum(SOURCEREGULATEAMOUNTCUR) from taxTrans
-         where taxTrans.SourceRecID == this.METLedgerJournalTransRecId
-         && taxTrans.SourceTableId == tableNum(LedgerJournalTrans)
-         && taxTrans.voucher == this.Voucher;
+        return abs(taxAmount);
+    }
 
-        return taxTrans.SOURCEREGULATEAMOUNTCUR;
+]]></Source>
+			</Method>
+			<Method>
+				<Name>persistEntity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Skip validation of Voucher field based on the journal setup
+    /// </summary>
+    /// <param name = "_entityCtx">Type DataEntityRuntimeContext</param>
+    public void persistEntity(DataEntityRuntimeContext _entityCtx)
+    {
+        if(LedgerJournalName::find(this.JournalName).METDMFVoucherAllocatedAtPosting == NoYes::Yes)
+        {
+            // Skip validation of Voucher field to allow manual vouchers.
+            this.skipDataSourceValidateField(fieldNum(LedgerJournalEntity, Voucher), true);
+        }
+        next persistEntity(_entityCtx);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postTargetProcess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Post target process method to change the journal header field and ReverseDate/Entry fields on lines
+    /// </summary>
+    /// <param name = "_dmfDefinitionGroupExecution">Type DefinitionGroupExecution</param>
+    public static void postTargetProcess(DMFDefinitionGroupExecution _dmfDefinitionGroupExecution)
+    {
+        
+        LedgerJournalEntityStaging  metStaging, metStagingError, metStagingTrans;
+        LedgerJournalTable          metLedgerJournalTable;
+        LedgerJournalName           metLedgerJournalName;
+        LedgerJournalTrans          metLedgerJournalTransUpdate;
+        TransDate                   metMinDate = dateNull();
+
+        // Check if processing of all records are completed
+        select firstonly RecId
+                from metStaging
+                where metStaging.DefinitionGroup    == _dmfDefinitionGroupExecution.DefinitionGroup
+                    && metStaging.ExecutionId       == _dmfDefinitionGroupExecution.ExecutionId
+                    && metStaging.TransferStatus    != DMFTransferStatus::Completed
+                    && metStaging.TransferStatus    != DMFTransferStatus::Duplicate
+                    && metStaging.TransferStatus    != DMFTransferStatus::Error;
+
+        if(!metStaging.RecId)
+        {
+            try
+            {
+                while select JournalBatchNumber
+                from metStaging
+                group by metStaging.JournalBatchNumber
+                where metStaging.DefinitionGroup    == _dmfDefinitionGroupExecution.DefinitionGroup
+                && metStaging.ExecutionId           == _dmfDefinitionGroupExecution.ExecutionId
+                && metStaging.TransferStatus        == DMFTransferStatus::Completed
+                {
+                    // Set voucher allocation of journal to true based on the journal setup
+                    select firstonly metLedgerJournalTable
+                    join TableId
+                    from metLedgerJournalName
+                    where metLedgerJournalTable.JournalNum == metStaging.JournalBatchNumber
+                    && metLedgerJournalName.JournalName == metLedgerJournalTable.JournalName
+                    && metLedgerJournalTable.VoucherAllocatedAtPosting == NoYes::No
+                    && metLedgerJournalTable.Posted == NoYes::No
+                    && metLedgerJournalName.METDMFVoucherAllocatedAtPosting == NoYes::Yes
+                    && metLedgerJournalName.NewVoucher  == NewVoucher::Manually;
+                
+                    if(metLedgerJournalTable.RecId)
+                    {
+                        ttsbegin;
+                        metLedgerJournalTable.selectForUpdate(true);
+                        metLedgerJournalTable.VoucherAllocatedAtPosting = NoYes::Yes;
+                        metLedgerJournalTable.update();
+                        ttscommit;
+                    }
+                
+                    // Reverse Date update on all journal lines
+                
+                    metLedgerJournalTransUpdate.skipAosValidation(true);
+                    metLedgerJournalTransUpdate.skipDatabaseLog(true);
+                    metLedgerJournalTransUpdate.skipDataMethods(true);
+                    metLedgerJournalTransUpdate.skipEvents(true);
+
+                    while select JournalBatchNumber, Voucher, ReverseDate, ReverseEntry
+                        from metStagingTrans
+                        group by JournalBatchNumber, Voucher, ReverseDate, ReverseEntry
+                        where metStagingTrans.JournalBatchNumber    == metStaging.JournalBatchNumber
+                            && metStagingTrans.DefinitionGroup      == _dmfDefinitionGroupExecution.DefinitionGroup
+                            && metStagingTrans.ExecutionId          == _dmfDefinitionGroupExecution.ExecutionId
+                            && metStagingTrans.ReverseDate          != metMinDate
+                        
+                    {
+                        update_recordset metLedgerJournalTransUpdate
+                        setting  ReverseEntry = metStagingTrans.ReverseEntry,
+                                 ReverseDate = metStagingTrans.ReverseDate
+                        where metLedgerJournalTransUpdate.JournalNum    == metStagingTrans.JournalBatchNumber
+                            && metLedgerJournalTransUpdate.Voucher      == metStagingTrans.Voucher
+                            && metLedgerJournalTransUpdate.ReverseDate  != metStagingTrans.ReverseDate;
+                    }
+
+                    // Approve journal if "ApproveActive" flag on the journal name setup is true
+                    // and all records are successfully imported for the journal
+                    
+                    metLedgerJournalTable   = LedgerJournalTable::find(metStaging.JournalBatchNumber);
+
+                    if(!metLedgerJournalTable.Approver && LedgerJournalName::find(metLedgerJournalTable.JournalName).ApproveActive)
+                    {
+                            select firstonly RecId
+                            from metStagingError
+                            where metStagingError.DefinitionGroup    == _dmfDefinitionGroupExecution.DefinitionGroup
+                                && metStagingError.ExecutionId       == _dmfDefinitionGroupExecution.ExecutionId
+                                && metStagingError.JournalBatchNumber   == metStaging.JournalBatchNumber
+                                && metStagingError.TransferStatus    == DMFTransferStatus::Error;
+                        
+                        if(!metStagingError.RecId)
+                        {
+                            metLedgerJournalTable.selectForUpdate(true);
+                            ttsbegin;
+                            metLedgerJournalTable.markReportAsReady();
+                            metLedgerJournalTable.markApproved();
+                            metLedgerJournalTable.update();
+                            ttscommit;
+                        }
+                    }
+                }
+
+            }
+            catch (Exception::Deadlock)
+            {
+                // retry on deadlock
+                retry;
+            }
+            catch (Exception::UpdateConflict)
+            {
+                // try to resolve update conflict
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMETReasonCode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_17670_ReasonCode DCP 22/02/2022
+    /// Computed column to select reason code
+    /// </summary>
+    /// <returns>Reason code</returns>
+    private static server str getMETReasonCode()
+    {
+        str reasonRefRecID;
+        str reasonCode;
+        
+        //table to select from
+        SysDictTable      ReasonTableRef = new SysDictTable(tableNum(ReasonTableRef));
+
+        
+        //reasonRefRecID is the field from the Entity
+        reasonRefRecID = SysComputedColumn::returnField(dataentityviewstr(LedgerJournalEntity),
+                                                        dataEntityDataSourceStr(LedgerJournalEntity, LedgerJournalTrans),
+                                                        fieldStr(LedgerJournalTrans, reasonRefRecID));
+        
+        //select top 1 reasonCode from ReasonTableRef where recid = reasonRefRecID
+        reasonCode = strFmt(@"SELECT TOP 1 %1 FROM %2 WHERE %2.%3 = %4",
+                            ReasonTableRef.fieldName(fieldNum(ReasonTableRef,Reason), DbBackend::Sql),
+                            ReasonTableRef.name(DbBackend::Sql),
+                            ReasonTableRef.fieldName(fieldNum(ReasonTableRef,RecId), DbBackend::Sql),
+                            reasonRefRecID);
+
+        return reasonCode;
     }
 
 ]]></Source>

@@ -1,0 +1,655 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METALMSupplierVolumetricRebateProcessClass</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ-5904, GVivanco, 26Jun2021
+/// The <c>METALMSupplierVolumetricRebateProcessClass</c> implements the methods
+/// to process the ALM Supplier Volumetric Rebates
+/// </summary>
+class METALMSupplierVolumetricRebateProcessClass
+{
+    METALMSupplierVolumetricRebateHeader header;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ-5904, GVivanco, 26Jun2021
+    /// Runs the class with the specified arguments.
+    /// </summary>
+    /// <param name = "_args">The specified arguments.</param>
+    public static void main(Args _args)
+    {
+        METALMSupplierVolumetricRebateProcessClass processor;
+        Object calleform;
+        FormDataSource fds;
+
+        if (_args.dataset() == tableNum(METALMSupplierVolumetricRebateHeader))
+        {      
+            calleform = _args.caller();
+            fds = FormDataUtil::getFormDataSource(_args.record());
+
+            processor = new METALMSupplierVolumetricRebateProcessClass();
+            processor.processRebate(_args.record());
+
+            if(calleform && fds)
+            {
+                fds.refresh();
+                fds.research(true);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processRebate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ-5904, GVivanco, 26Jun2021
+    /// Processes the ALM Supplier Volumetric Rebates
+    /// </summary>
+    /// <param name = "_header">ALMSupplierVolumetricRebateHeader record</param>
+    public void processRebate(METALMSupplierVolumetricRebateHeader _header)
+    {     
+        header = _header;
+
+        try
+        {
+            if (this.validateCustVendLines())
+            {
+                ttsbegin;
+
+                this.createPostCustFreeTextInvoice();
+                
+
+                if (header.Type == METALMSupplierVolumetricRebateType::SVR)
+                {
+                    this.createPostVendInvoiceJournal();
+                }
+                else if (header.Type == METALMSupplierVolumetricRebateType::RDA)
+                {
+                    this.createSubmitPendingVendInvoice();
+                }
+
+                this.updateHeaderStatus();
+
+                ttscommit;
+            }
+            else
+            {
+                error("@MET:ALMSVRProcessError");
+            }
+        }
+        catch
+        {
+            error(this.getInfologMessage());
+
+            throw error("@MET:ALMSVRProcessError");
+        }
+                     
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateCustVendLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ-5904, GVivanco, 23Jul2021
+    /// Validates that ALM Supplier volumetric rebate has both Customer and Vendor lines
+    /// </summary>
+    /// <returns>true if the rebate has both customer and vendor lines, false otherwise</returns>
+    public boolean validateCustVendLines()
+    {
+        VendInvoiceJour     vendInvoiceJour;
+        
+        boolean  ret = true;
+
+        if(!METALMSupplierVolumetricRebateHeader::hasCustLines(header.Number) ||
+            !METALMSupplierVolumetricRebateHeader::hasVendLines(header.Number))
+        {
+            ret =  checkFailed("@MET:NoALMLinesError");
+        }
+
+        if(!header.CustLegalEntity)
+        {
+            ret = checkFailed("@MET:CustLegalEntityMustBeFilled");
+        }
+
+        if(header.CustLegalEntity && header.CustLegalEntity != curExt())
+        {
+            // Check if parameters are defined in Customer legal entity
+            VendParameters  vendParameters = VendParameters::findByCompany(header.CustLegalEntity);
+            if((header.Type == METALMSupplierVolumetricRebateType::SVR && 
+                (!vendParameters.METSVRFinancialDimension || !vendParameters.METSVRLedgerDimension))
+                || 
+                (header.Type == METALMSupplierVolumetricRebateType::RDA &&
+                (!vendParameters.METRDAFinancialDimension || !vendParameters.METRDALedgerDimension)))
+            {
+                ret = checkFailed(strFmt("@MET:ParametersNotDefinedInCustLE", header.CustLegalEntity));
+            }
+        }
+
+        if (ret &&
+            (header.totalCustAmount() - header.totalVendAmount()) != 0)
+        {
+            ret = checkFailed("@MET:ALMRebateBalanceError");
+        }
+
+        if (ret && 
+            !header.vendTable().checkInvoice(header.InvoiceId, header.DocumentDate))
+        {
+            select maxof(InvoiceDate) from vendInvoiceJour
+                    where vendInvoiceJour.InvoiceId == header.InvoiceId
+                    && vendInvoiceJour.InvoiceAccount == header.VendorAccount;
+
+            ret = checkFailed(strFmt("@SYS50887", header.InvoiceId, date2StrUsr(vendInvoiceJour.InvoiceDate, DateFlags::FormatAll)));
+        }
+
+        // Check if Customer is valid
+        if(ret &&
+            !header.custTable().RecId)
+        {
+            ret = checkFailed(strFmt("@MET:CustAccNumValidation", header.CustomerAccount, header.CustLegalEntity));
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPostCustFreeTextInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ-5904, GVivanco, 23Jul2021
+    /// Creates and posts a Customer free text invoice from the ALM Supplier volumetric rebate
+    /// </summary>
+    public void createPostCustFreeTextInvoice()
+    {
+        CustInvoiceTable                    custInvoiceTable;
+        CustInvoiceLine                     custInvoiceLine;
+        CustPostInvoice                     custPostInvoice;
+        VendParameters                      vendParameters = VendParameters::findByCompany(header.CustLegalEntity);
+        RecordInsertList                    custInvoiceLineList;
+        METALMSupplierVolumetricRebateLine  custLine;
+
+        try
+        {
+            changecompany(header.CustLegalEntity)
+            {
+                    
+                //create header
+                custInvoiceTable.clear();
+                custInvoiceTable.initValue();
+                custInvoiceTable.OrderAccount = header.CustomerAccount;
+                custInvoiceTable.modifiedField(fieldNum(CustInvoiceTable, OrderAccount));
+                custInvoiceTable.DocumentDate = header.DocumentDate;
+                custInvoiceTable.InvoiceDate = header.TransactionDate;
+                custInvoiceTable.modifiedField(fieldNum(CustInvoiceTable, InvoiceDate));
+                custInvoiceTable.CurrencyCode = header.CurrencyCode;
+                if(header.Type  == METALMSupplierVolumetricRebateType::SVR)
+                {
+                    custInvoiceTable.DefaultDimension = vendParameters.METSVRFinancialDimension;
+                }
+                else
+                {
+                    custInvoiceTable.DefaultDimension = vendParameters.METRDAFinancialDimension;
+                }
+                custInvoiceTable.CustomerRef = strFmt("@MET:PlaceHolder", header.VendorAccount,header.InvoiceId);
+                custInvoiceTable.PurchOrderFormNum = header.Number;
+                custInvoiceTable.DueDate = header.CustDueDate;
+                if (custInvoiceTable.DueDate < header.TransactionDate)
+                {
+                    custInvoiceTable.DueDate = header.TransactionDate;
+                }
+                custInvoiceTable.insert();
+
+                custInvoiceLineList = new RecordInsertList(tableNum(CustInvoiceLine));
+            }
+            LineNum  linenum = 0;
+            // create lines
+            while select custLine
+                where custLine.ALMSupplierVolumetricRebateNumber == header.Number
+                && custLine.CustVend == CustVendACType::Cust
+            {
+                linenum++;
+                changecompany(header.CustLegalEntity)
+                {
+                    
+                    custInvoiceLine.clear();
+                    custInvoiceLine.initValue();
+                    custInvoiceLine.LineNum = linenum;
+                    custInvoiceLine.ParentRecId = custInvoiceTable.RecId;
+                    custInvoiceLine.initFromCustInvoiceTable(custInvoiceTable);
+                    custInvoiceLine.Description = custLine.Description;
+                    custInvoiceLine.modifiedField(fieldNum(CustInvoiceLine, Description));
+                    custInvoiceLine.LedgerDimension     = custLine.LedgerDimension;
+                    custInvoiceLine.DefaultDimension    = custLine.FinancialDimension;
+
+                    if(header.CustLegalEntity != header.DataAreaId)
+                    {
+                        if(header.Type  == METALMSupplierVolumetricRebateType::SVR)
+                        {
+                            custInvoiceLine.LedgerDimension     = vendParameters.METSVRLedgerDimension;
+                            custInvoiceLine.DefaultDimension    = vendParameters.METSVRFinancialDimension;
+                        }
+                        else
+                        {
+                            custInvoiceLine.LedgerDimension     = vendParameters.METRDALedgerDimension;
+                            custInvoiceLine.DefaultDimension    = vendParameters.METRDAFinancialDimension;
+                        }
+                    }
+                    custInvoiceLine.TaxGroup = custLine.GSTGroup;
+                    custInvoiceLine.TaxItemGroup = custLine.ItemGSTGroup;
+                    custInvoiceLine.Quantity = header.Type == METALMSupplierVolumetricRebateType::SVR ? -1 : 1;
+                    custInvoiceLine.modifiedField(fieldNum(CustInvoiceLine, Quantity));
+                    custInvoiceLine.UnitPrice = custInvoiceLine.Quantity * custLine.Amount;
+                    custInvoiceLine.modifiedField(fieldNum(CustInvoiceLine, UnitPrice));
+                    if (custInvoiceLine.AmountCur > 0
+                        && custInvoiceLine.Quantity < 0 )
+                    {
+                        custInvoiceLine.AmountCur = -custInvoiceLine.AmountCur;
+                    }
+                    custInvoiceLineList.add(custInvoiceLine);
+                }
+            }
+            changecompany(header.CustLegalEntity)
+            {
+                //Insert CustInvoiceLines in DB;
+                custInvoiceLineList.insertDatabase();
+            }
+            // Attach note
+            this.createAttachedNote(custInvoiceTable.RecId,
+                custInvoiceTable.TableId,
+                strFmtLB(strFmt("@MET:FTIVendorNotes", header.Number, header.VendorAccount, header.vendorName())));
+                                              
+        }
+
+        catch
+        {
+            error(this.getInfologMessage());
+            throw error("@MET:CustomerFreeTextInvoiceError");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPostVendInvoiceJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ-5904, GVivanco, 23Jul2021
+    /// Creates and posts a Vendor invoice Journal from the ALM Supplier Volumetric Rebate
+    /// </summary>
+    public void createPostVendInvoiceJournal()
+    {
+        LedgerJournalCheckPost jourCheckPost;
+        LedgerJournalTable vendInvJourTable;
+        LedgerJournalTrans vendInvJourTrans;
+        Voucher voucher;
+        
+        METALMSupplierVolumetricRebateLine vendLine;
+        RecordInsertList vendInvoiceJourLineList;
+
+        try
+        {
+            // create journal header
+            vendInvJourTable.clear();
+            vendInvJourTable.initValue();
+            vendInvJourTable.initFromLedgerJournalName(VendParameters::find().METLedgerJournalNameIdVendInvoice);   
+            vendInvJourTable.CurrencyCode = header.CurrencyCode;
+            vendInvJourTable.modifiedField(fieldNum(LedgerJournalTable, CurrencyCode));
+            vendInvJourTable.DefaultDimension = header.FinancialDimension;
+            vendInvJourTable.JournalNum = JournalTableData::newTable(vendInvJourTable).nextJournalId();
+            vendInvJourTable.insert();
+        
+            vendInvoiceJourLineList = new RecordInsertList(tableNum(LedgerJournalTrans));
+           
+            // create vendor line
+            this.createJournalLine(vendInvJourTrans,
+                vendInvJourTable.JournalNum,
+                voucher,
+                LedgerJournalACType::Vend,
+                LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(header.VendorAccount, LedgerJournalACType::Vend),
+                header.Reference,
+                0,
+                METALMSupplierVolumetricRebateLine::totalVendAmount(header.Number),
+                header.FinancialDimension);
+
+            vendInvoiceJourLineList.add(vendInvJourTrans);
+
+            voucher = vendInvJourTrans.Voucher;
+
+            // create ledger lines
+            while select vendLine
+                where vendLine.ALMSupplierVolumetricRebateNumber == header.Number
+                && vendLine.CustVend == CustVendACType::Vend
+            {
+                this.createJournalLine(vendInvJourTrans,
+                    vendInvJourTable.JournalNum,
+                    voucher,
+                    LedgerJournalACType::Ledger,
+                    LedgerDimensionFacade::ServiceCreateLedgerDimension(vendLine.LedgerDimension, vendLine.FinancialDimension),
+                    vendLine.Description,
+                    vendLine.Amount,
+                    0,
+                    vendLine.FinancialDimension,
+                    vendLine.GSTGroup,
+                    vendLine.ItemGSTGroup);
+          
+                vendInvoiceJourLineList.add(vendInvJourTrans);                
+            }
+
+            // Insert VendInvoiceJourLines in DB;
+            vendInvoiceJourLineList.insertDatabase();
+
+            // Post Vendor Innvoice Journal
+            jourCheckPost = LedgerJournalCheckPost::newLedgerJournalTable(vendInvJourTable, NoYes::Yes);
+            jourCheckPost.runOperation();
+
+            // Attach note
+            this.createAttachedNote(vendInvJourTable.RecId,
+                vendInvJourTable.TableId,
+                strFmtLB(strFmt("@MET:FTICustomerNotes", header.Number, header.CustomerAccount, header.customerName())));
+
+        }
+
+        catch
+        {
+            error(this.getInfologMessage());
+            throw error("@MET:VendorInvoiceJournalError");
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSubmitPendingVendInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ-5904, GVivanco, 23Jul2021
+    /// Creates and submits to workflow a Vendor pending invoice from a ALM Supplier volumetric Rebate
+    /// </summary>
+    public void createSubmitPendingVendInvoice()
+    {
+        VendInvoiceInfoTable    invoiceInfoTable;
+        VendInvoiceInfoSubTable invoiceInfoSubtable;
+        VendInvoiceInfoLine     invoiceInfoLine;
+
+        METALMSupplierVolumetricRebateLine vendLine;
+        RecordInsertList invoiceInfoLineList;
+
+        PurchParmUpdate purchParmUpdate;
+        PurchFormletterParmData purchFormletterParmData;
+        
+        purchFormletterParmData = PurchFormletterParmData::newData(DocumentStatus::Invoice, VersioningUpdateType::Initial);
+        purchFormletterParmData.init();
+        purchFormletterParmData.parmOnlyCreateParmUpdate(true);
+        purchFormletterParmData.createData(false);
+        purchParmUpdate = purchFormletterParmData.parmParmUpdate();
+
+        try
+        {
+            // create vendInvoiceInfoTable record
+            invoiceInfoTable.clear();
+            invoiceInfoTable.initValue();
+            invoiceInfoTable.ParmId = purchParmUpdate.ParmId;
+            invoiceInfoTable.DocumentOrigin = DocumentOrigin::Manual;
+            invoiceInfoTable.OrderAccount = header.VendorAccount;
+            invoiceInfoTable.modifiedField(fieldNum(VendInvoiceInfoTable, OrderAccount));
+            invoiceInfoTable.InvoiceAccount = header.VendorAccount;
+            invoiceInfoTable.modifiedField(fieldNum(VendInvoiceInfoTable, InvoiceAccount));
+            invoiceInfoTable.Num = header.InvoiceId;
+            invoiceInfoTable.ListCode = Listcode::IncludeNot;
+            invoiceInfoTable.Description = header.Reference;
+            invoiceInfoTable.VendInvoiceSaveStatus = VendInvoiceSaveStatus::Pending;
+            invoiceInfoTable.Hold = NoYes::No;
+            invoiceInfoTable.CurrencyCode = header.CurrencyCode;
+            invoiceInfoTable.modifiedField(fieldNum(VendInvoiceInfoTable, CurrencyCode));
+            invoiceInfoTable.ParmJobStatus = ParmJobStatus::Waiting;
+            invoiceInfoTable.Approved = NoYes::Yes;
+            invoiceInfoTable.BatchAdministration = NoYes::No;
+            invoiceInfoTable.LastMatchVariance = LastMatchVarianceOptions::OK;
+            invoiceInfoTable.Ordering = DocumentStatus::Invoice;
+            invoiceInfoTable.DocumentDate = header.DocumentDate;
+            invoiceInfoTable.modifiedField(fieldNum(VendInvoiceInfoTable, DocumentDate));
+            invoiceInfoTable.TransDate = header.TransactionDate;
+            invoiceInfoTable.modifiedField(fieldNum(VendInvoiceInfoTable, TransDate));
+            invoiceInfoTable.RequestStatus = VendInvoiceRequestStatus::Draft;
+            invoiceInfoTable.SettleVoucher = SettlementType::None;
+            invoiceInfoTable.LastMatchVariance = LastMatchVarianceOptions::Unknown;
+            invoiceInfoTable.DefaultDimension = header.FinancialDimension;
+            invoiceInfoTable.PurchName = header.vendTable().name();
+            invoiceInfoTable.RemittanceLocation = VendTable::getDefaultRemittanceLocation(header.VendorAccount);
+            invoiceInfoTable.Payment = header.vendTable().PaymTermId;
+            invoiceInfoTable.FixedDueDate = header.VendDueDate;
+            invoiceInfoTable.PaymMode   = header.vendTable().PaymMode;
+            invoiceInfoTable.METSkipWorkflowApproval = NoYes::Yes;
+            invoiceInfoTable.insert();
+
+            // create vendInvoiceInfoSubTable record
+            invoiceInfoSubtable.clear();
+            invoiceInfoSubtable.initValue();
+            invoiceInfoSubtable.defaultRow();
+            invoiceInfoSubtable.TableRefId = invoiceInfoTable.TableRefId;
+            invoiceInfoSubtable.ParmId = invoiceInfoTable.ParmId;
+            invoiceInfoSubtable.PurchName = invoiceInfoTable.PurchName;
+            invoiceInfoSubtable.insert();
+        
+            invoiceInfoLineList = new RecordInsertList(tableNum(VendInvoiceInfoLine));
+
+            // create vendInvoiceInfoLine records
+            while select vendLine
+                where vendLine.ALMSupplierVolumetricRebateNumber == header.Number
+                && vendLine.CustVend == CustVendACType::Vend
+            {
+                invoiceInfoLine.clear();
+                invoiceInfoLine.initValue();
+                invoiceInfoLine.ParmId = invoiceInfoTable.ParmId;
+                invoiceInfoLine.TableRefId = invoiceInfoTable.TableRefId;
+                invoiceInfoLine.DeliveryName = invoiceInfoTable.DeliveryName;
+                invoiceInfoLine.currencyCode = invoiceInfoTable.CurrencyCode;
+                invoiceInfoLine.InvoiceAccount = invoiceInfoTable.InvoiceAccount;
+                invoiceInfoLine.OrderAccount = invoiceInfoTable.OrderAccount;
+                invoiceInfoLine.DocumentOrigin = invoiceInfoTable.DocumentOrigin;
+                invoiceInfoLine.ReceiveNow = 1;
+                invoiceInfoLine.PriceUnit = 1;
+                invoiceInfoLine.InventDimId = InventDim::inventDimIdBlank();
+                invoiceInfoLine.ProcurementCategory = vendLine.ProcurementCategory;
+                invoiceInfoLine.purchPrice = vendLine.Amount;
+                invoiceInfoLine.modifiedField(fieldNum(VendInvoiceInfoLine, PurchPrice));
+                invoiceInfoLine.DefaultDimension = vendLine.FinancialDimension;
+                invoiceInfoLine.LineType = PurchInvoiceLineType::Standard;
+                invoiceInfoLine.RequestStatus = VendInvoiceRequestStatus::Draft;
+                invoiceInfoline.TaxGroup = vendLine.GSTGroup;
+                invoiceInfoLine.TaxItemGroup = vendLine.ItemGSTGroup;
+
+                invoiceInfoLineList.add(invoiceInfoLine);
+            }
+
+            // Insert list in database
+            invoiceInfoLineList.insertDatabase();
+
+            // Submit the Vendor Invoice Header to Workflow
+            VendInvoiceHeaderWorkflow::submitToWorkflow(invoiceInfoTable, 
+                strFmt("@SYS53179", "@MET:ALMSupplierVolumetricRebate", header.Number, header.Reference));
+
+            // Attach Note
+            this.createAttachedNote(invoiceInfoTable.RecId,
+                invoiceInfoTable.TableId,
+                strFmtLB(strFmt("@MET:FTICustomerNotes", header.Number, header.CustomerAccount, header.customerName())));
+
+            invoiceInfoTable.reread();
+        }
+
+        catch
+        {
+            error(this.getInfologMessage());
+            throw Error("@MET:VendorPendingInvoiceError");
+        }    
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournalLine</Name>
+				<Source><![CDATA[
+    // MPJ-5904, GVivanco, 23Jul2021
+    // Creates a LedgerJournalLine with the parameters values 
+    private void createJournalLine( LedgerJournalTrans _journalLine,
+                                    LedgerJournalId _journalNum,
+                                    Voucher _voucher,
+                                    LedgerJournalACType _type,
+                                    DimensionDynamicAccount _ledgerDimension,
+                                    LedgerJournalTransTxt _txt,
+                                    AmountCurCredit _creditAmount,
+                                    AmountCurDebit _debitAmount,
+                                    LedgerDimensionValueSet _defaultDimension,
+                                    TaxGroupJournal _taxGroup = '',
+                                    TaxGroupJournal _itemTaxGroup = '')
+    {
+        LedgerJournalEngine engine = new LedgerJournalEngine();      
+
+        _journalLine.clear();
+        _journalLine.initValue();
+      
+        if ( System.String::IsNullOrEmpty(_voucher) )
+        {
+            engine.ledgerJournalTable(LedgerJournalTable::find(_journalNum));
+            engine.initValue(_journalLine);
+        }
+        else
+        {
+            _journalLine.JournalNum = _journalNum;
+            _journalLine.Voucher = _voucher;
+        }
+
+        if ( header.TransactionDate != _journalLine.TransDate )
+        {
+            _journalLine.TransDate = header.TransactionDate;
+            _journalLine.modifiedField(fieldNum(LedgerJournalTrans, TransDate));
+        }      
+
+        if ( _type != _journalLine.AccountType )
+        {
+            _journalLine.AccountType = _type;
+            _journalLine.modifiedField(fieldNum(LedgerJournalTrans, AccountType));
+        }
+        _journalLine.DocumentNum = header.InvoiceId;
+        _journalLine.LedgerDimension = _ledgerDimension;
+        _journalLine.modifiedField(fieldNum(LedgerJournalTrans, LedgerDimension));
+        engine.accountModified(_journalLine);
+        _journalLine.DocumentDate = header.DocumentDate;
+        _journalLine.Invoice = header.InvoiceId;
+        _journalLine.modifiedField(fieldNum(LedgerJournalTrans, Invoice));
+        _journalLine.Txt = strfmt('%1-%2',header.Reference, header.Number);
+        _journalLine.AmountCurCredit = _creditAmount;
+        _journalLine.modifiedField(fieldNum(LedgerJournalTrans, AmountCurCredit));
+        _journalLine.AmountCurDebit = _debitAmount;
+        _journalLine.modifiedField(fieldNum(LedgerJournalTrans, AmountCurDebit));
+        _journalLine.DefaultDimension = _defaultDimension;
+        _journalLine.Approver = HcmWorkerLookup::currentWorker();
+        _journalLine.Approved = NoYes::Yes;
+        _journalLine.Due = header.VendDueDate;   
+
+        if ( header.CurrencyCode != _journalLine.CurrencyCode)
+        {
+            _journalLine.CurrencyCode = header.CurrencyCode;
+            _journalLine.modifiedField(fieldNum(LedgerJournalTrans, CurrencyCode));
+        }
+
+        if ( _taxGroup && _taxGroup != _journalLine.TaxGroup )
+        {
+            _journalLine.TaxGroup = _taxGroup;
+            _journalLine.modifiedField(fieldNum(LedgerJournalTrans, TaxGroup));
+        }
+
+        if ( _itemTaxGroup && _itemTaxGroup != _journalLine.TaxItemGroup )
+        {
+            _journalLine.TaxItemGroup = _itemTaxGroup;
+            _journalLine.modifiedField(fieldNum(LedgerJournalTrans, TaxItemGroup));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAttachedNote</Name>
+				<Source><![CDATA[
+    // MPJ-5904, GVivanco, 23Jul2021
+    // Creates a Note attachment with the parameters values
+    private void createAttachedNote(RefRecId _refRecId, RefTableId _refTableId, Notes _note)
+    {
+        DocuRef docuRef;
+        changecompany(header.CustLegalEntity)
+        {
+            docuRef.clear();
+            docuRef.initValue();
+            docuRef.TypeId = 'Note';
+            docuRef.RefCompanyId = header.CustLegalEntity;
+            docuRef.RefRecId = _refRecId;
+            docuRef.RefTableId = _refTableId;
+            docuRef.Name = "@MET:ALMSupplierVolumetricRebate";
+            docuRef.Notes = _note;
+            docuRef.Restriction = DocuRestriction::External;
+            DocuRef.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInfologMessage</Name>
+				<Source><![CDATA[
+    // MPJ-5904, GVivanco, 23Jul2021
+    // Gets and returns the contents of the infolog
+    private str getInfologMessage()
+    {
+        SysInfologEnumerator sysInfologEnumerator;
+        SysInfologMessageStruct sysInfologMessageStruct;
+        str infologMessage;
+        sysInfologEnumerator = SysInfologEnumerator::newData(infolog.infologData());
+
+        while (sysInfologEnumerator.moveNext())
+        {
+            sysInfologMessageStruct = new SysInfologMessageStruct(sysInfologEnumerator.currentMessage());
+
+            //if (sysInfologEnumerator.currentException() == Exception::Error
+            //    || sysInfologEnumerator.currentException() == Exception::Warning)
+            //{
+            //    infologMessage += strfmt(sysInfologMessageStruct.message());
+            //}
+
+            infologMessage += strfmt(sysInfologMessageStruct.message());
+        }
+
+        return infologMessage;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateHeaderStatus</Name>
+				<Source><![CDATA[
+    // MPJ-5904, GVivanco, 23Jul2021
+    // Updates the ALM Supplier Volumetric Rebate header status to Processed
+    private void updateHeaderStatus()
+    {
+        header.selectForUpdate(true);
+        header.Status = METALMSupplierVolumetricRebateStatus::Processed;
+        header.doUpdate();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
