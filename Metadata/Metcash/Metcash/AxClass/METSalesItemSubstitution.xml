@@ -4,28 +4,51 @@
 	<SourceCode>
 		<Declaration><![CDATA[
 /// <summary>
-/// MPJ-21310   DEVOPS 34618
+/// MPJ-21310 DEVOPS 34618
+/// Responsible for dealing with item substitution logic.
 /// </summary>
 class METSalesItemSubstitution
 {
     // ***** WIP *****
 
-    // - Lot ID not available at point of validation. Need a better way to 
-    //   link log entries to individual lines. Create tmp guid, assign to 
-    //   log records, and to salesLine (tmpSubstitutionID etc). At point
-    //   of inserting record, copy lot ID into matching log entries.
+    SalesLine                               salesLine;
+    InventDim                               inventDim;
+    SalesTable                              salesTable;
 
-    SalesLine   salesLine;
-    InventDim   inventDim;
-    SalesTable  salesTable;
-    boolean     interactive;  
-    boolean     verboseLogging = true;  // ** Configuration setting
-
-    
+    METSalesItemSubstitutionEventSource     eventSource;
+    boolean                                 interactive;  
+    boolean                                 verboseLogging;    
 
 }
 ]]></Declaration>
 		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public boolean run()
+    {
+        boolean ret;
+
+        this.verboseLogging = CustParameters::find().METSubstitutionVerboseLogging;            
+
+        switch(this.eventSource)
+        {
+            case METSalesItemSubstitutionEventSource::Creation:
+                ret = this.checkSalesLineAtCreation();
+                break;
+            case METSalesItemSubstitutionEventSource::Reservation:
+                ret = true;
+                break;
+            default:
+                throw error(strFmt("Unknown substitution event source '%1' in %2",
+                    this.eventSource,
+                    funcName()));
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
 			<Method>
 				<Name>checkSalesLineAtCreation</Name>
 				<Source><![CDATA[
@@ -36,7 +59,7 @@ class METSalesItemSubstitution
     /// <param name = "_salesLine">_salesLine</param>
     /// <param name = "_interactive">Whether this is being used from the UI. False if coming from a service/batch process, etc</param>
     /// <returns>Validation result</returns>
-    public boolean checkSalesLineAtCreation()
+    protected boolean checkSalesLineAtCreation()
     {
         boolean                                 ret = true;
 
@@ -49,18 +72,30 @@ class METSalesItemSubstitution
         {
             if(interactive)
             {
-                return (Box::yesNo(_msg, DialogButton::No) == DialogButton::Yes);
+                boolean promptRet = (Box::yesNo(_msg, DialogButton::No) == DialogButton::Yes);
+                this.verboseInfo(ret ? 
+                    'User confirmed replacement' : 
+                    'User cancelled replacement');
+                return promptRet;
             }
-            return true;
+            else
+            {
+                this.verboseInfo('Replacement accepted without prompt');
+                return true;
+            }
         }
         
-        salesLine.METSubstitutionTempLogReference = newguid();
-
         if(!salesLine.metSubstitutionsActive())
         {
             // Subs not applicable to this line. 
             return true;
         }
+
+        // At this point sales line has no RecID / Lot ID, but we're still 
+        // recording verbose log entries against it. Use a temporary identifier
+        // against the log records then switch the reference over to lot ID 
+        // when the record is eventually saved.
+        salesLine.METSubstitutionTempLogReference = newGuid();
 
         select firstonly parentChild
             where   parentChild.InventSiteId    == salesTable.InventSiteId
@@ -68,6 +103,10 @@ class METSalesItemSubstitution
 
         if(parentChild)
         {
+            this.verboseInfo(strFmt('Parent/child relationship exists for child item %1 (Parent item %2)', 
+                parentChild.ChildItemID,
+                parentChild.ParentItemID));            
+
             if(yesNoPrompt(strFmt("Replace child item number %1 with Parent item number %2?",
                 parentChild.ChildItemID,
                 parentChild.ParentItemID)))
@@ -89,6 +128,8 @@ class METSalesItemSubstitution
         }
         else
         {
+            this.verboseInfo(strFmt('No Parent/child relationship exists for item %1', salesLine.ItemId));
+
             select firstonly itemSub
                 order by AccountCode asc
                 where   itemSub.ItemId              == salesLine.ItemId
@@ -104,6 +145,8 @@ class METSalesItemSubstitution
                 );
             if(itemSub)
             {
+                this.verboseInfo(strFmt('"Always" item substitution exists for item %1', salesLine.ItemId));
+
                 if(yesNoPrompt(strFmt("Replace ordered item number %1 with substitute item number %2?",
                     parentChild.ChildItemID,
                     parentChild.ParentItemID)))
@@ -131,11 +174,80 @@ class METSalesItemSubstitution
             if(itemReplaced)
             {
                 // Substitution occurred
-                SalesLine::modifySalesQty(salesLine, inventDim);
                 salesLine.itemIdChanged();
+
+                this.updateQuantity();
+               
+                // ** TODO "Product number" not refreshing
+
+                this.verboseInfo(strFmt('Item "%1" replaced with "%2"', 
+                    salesLine.METSubstituteOriginalItemID,
+                    salesLine.METSubstituteReplacementItemID));                
             }
         }
         return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateQuantity</Name>
+				<Source><![CDATA[
+    protected boolean updateQuantity()
+    {
+        boolean             ret                     = true;
+        InventTable         originalItem            = InventTable::find(salesLine.METSubstituteOriginalItemID);
+        InventTableModule   originalItemInvent      = originalItem.inventTableModuleInvent();
+        InventTable         replacementItem         = InventTable::find(salesLine.METSubstituteReplacementItemID);
+        InventTableModule   replacementItemInvent   = replacementItem.inventTableModuleInvent();    
+        InventTableModule   replacementItemSales    = replacementItem.inventTableModuleSales();
+
+        this.verboseInfo(strFmt('Original item ordered quantity %1 of sales unit %2',
+            salesLine.SalesQty,
+            salesLine.SalesUnit));
+
+        this.verboseInfo(strFmt('Original item ordered quantity %1 in inventory unit %2',
+            salesLine.QtyOrdered,
+            originalItemInvent.UnitId));
+
+        this.verboseInfo(strFmt('Replacement item %1 has inventory unit %2, sales unit %3',
+            replacementItem.ItemId,
+            replacementItemInvent.UnitId,
+            replacementItemSales.UnitId));
+
+        if(originalItemInvent.UnitId == replacementItemInvent.UnitID)
+        {
+            Qty replacementQty = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+                replacementItem.ItemId,
+                InventDim::findOrCreate(inventDim).inventDimId,
+                salesLine.QtyOrdered,
+                replacementItemInvent.UnitId,
+                replacementItemSales.UnitId,
+                true,
+                true);
+
+            salesLine.SalesQty  = replacementQty;
+            salesLine.SalesUnit = replacementItemSales.UnitId;  
+          
+            SalesLine::modifySalesQty(salesLine, inventDim);
+
+            this.verboseInfo(strFmt('Conversion to %1 (%2) sales quantity',
+                salesLine.SalesQty,
+                salesLine.SalesUnit));
+            this.verboseInfo(strFmt('Inventory quantity updated to %1 (%2) inventory quantity',
+                salesLine.QtyOrdered,
+                replacementItemInvent.UnitId));
+        }
+        else
+        {
+            // How to handle this scenario? (Item A and B don't have common inventory unit).
+            this.verboseInfo(strFmt('Item %1 and %2 have different inventory units (%3 and %4). Unable to convert.',
+                originalItem.ItemId,
+                replacementItem.ItemId,
+                originalItemInvent.UnitId,
+                replacementItemInvent.UnitId));
+        }
+        return ret;       
     }
 
 ]]></Source>
@@ -167,15 +279,34 @@ class METSalesItemSubstitution
     /// <summary>
     /// Constructor
     /// </summary>
-    public void new(
+    private void new(
         SalesLine       _salesLine,
-        InventDim       _inventDim,
-        boolean         _interactive = true)
+        InventDim       _inventDim)
     {
         salesLine       = _salesLine;
         inventDim       = _inventDim;
         salesTable      = salesLine.salesTable();
-        interactive     = _interactive;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    static public METSalesItemSubstitution construct(
+        SalesLine                               _salesLine,
+        InventDim                               _inventDim,
+        METSalesItemSubstitutionEventSource     _eventSource,
+        boolean                                 _interactive = true)
+    {
+        METSalesItemSubstitution sub = new METSalesItemSubstitution(
+            _salesLine,
+            _inventDim);
+    
+        sub.eventSource     = _eventSource;
+        sub.interactive     = _interactive;
+
+        return sub;
     }
 
 ]]></Source>
@@ -192,9 +323,11 @@ class METSalesItemSubstitution
     public static void SalesLine_onInserted(Common sender, DataEventArgs e)
     {
         SalesLine salesLine = sender;
+
         METSalesItemSubstitutionVerboseLog::assignLotIDFromTempReference(
+            salesLine.SalesId,
             salesLine.METSubstitutionTempLogReference, 
-            salesLine.InventTransId);
+            salesLine.InventTransId);        
     }
 
 ]]></Source>
