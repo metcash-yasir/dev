@@ -12,10 +12,16 @@ class METSalesItemSubstitution
     // ***** WIP *****
 
     // NB messages for the 'verbose' log will not be labelled as they're intended
-    // for internal/debugging use only, and used to help document the code.
+    // for internal debugging/documentation use only.
     
     // - If an 'Always' sub was applied, should we check for the other types
     //   at point of reservation?
+    // - Check result of item/site specific settings
+    // - Data entity
+    // - Labels and BP
+    // - Qty conversion for line copy/replacement not picking up correct unit(s).
+    // - Prompt when updating date-effective substitute entry 
+    // - Cleanup job on verbose log entries
 
     SalesLine                               salesLine;
     METSalesLine                            metSalesLine;
@@ -25,6 +31,7 @@ class METSalesItemSubstitution
     METSalesItemSubstitutionEventSource     eventSource;
     boolean                                 interactive;  
     boolean                                 verboseLogging;
+    UserConnection                          verboseLogConnection;
     METSalesItemSubstitutionAccountRelation substitutionGroup;
     boolean                                 itemReplaced;
 
@@ -35,6 +42,10 @@ class METSalesItemSubstitution
 			<Method>
 				<Name>run</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Perform substitute checks/replacements.
+    /// </summary>
+    /// <returns>True if validation result is ok. (Not necessarily whether a replacement was made)</returns>
     public boolean run()
     {
         boolean ret;
@@ -53,17 +64,35 @@ class METSalesItemSubstitution
 
         if(CustParameters::find().METSubstitutionVerboseLogging)
         {
-            this.verboseLogging                                 = true;
-            metSalesLine.SubstitutionVerboseLogReference        = newGuid();
+            this.verboseLogging         = true;
+            this.verboseLogConnection   = new UserConnection();
+            if(!metSalesLine.SubstitutionVerboseLogReference)
+            {
+                metSalesLine.SubstitutionVerboseLogReference = newGuid();
+            }
         }
 
         // *** tbd, may define a separate 'substitution group'. For now 
         // we're using the customer group.
         substitutionGroup = salesTable.custTable_CustAccount().CustGroup;   
 
-        ttsbegin;
+        this.verboseInfo(funcName(), strFmt('Checking for substitutes, event source %1', this.eventSource));
+        this.verboseInfo(funcName(), strFmt('Item %1, Inventory site %2',
+            salesLine.ItemId, 
+            salesTable.InventSiteId));
 
-        this.verboseInfo(strFmt('Event source is %1', this.eventSource));        
+        if(this.checkNoAlternativeExists())
+        {
+            this.verboseInfo(funcName(), strFmt('"%1" entry exists. No further substitute checks will be made.',
+                METSalesItemSubstitutionCode::NoAlternative));
+            return true;
+        }
+        else
+        {
+            this.verboseInfo(funcName(), 'No matching (No alternative) entry exists');
+        }
+
+        ttsbegin;
 
         switch(this.eventSource)
         {
@@ -88,15 +117,43 @@ class METSalesItemSubstitution
                
                 // ** TODO "Product number" not refreshing on form.
 
-                this.verboseInfo(strFmt('Item "%1" replaced with "%2"',
+                this.verboseInfo(funcName(), strFmt('Item "%1" replaced with "%2"',
                     metSalesLine.SubstituteOriginalItemID,
                     metSalesLine.SubstituteReplacementItemID));
+            }
+            else
+            {
+                this.verboseInfo(funcName(), 'No replacement has been made');
             }
         }
 
         ttscommit;
 
         return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkNoAlternativeExists</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if any "No alternative" entries exist.
+    /// </summary>
+    /// <returns>Result</returns>
+    protected boolean checkNoAlternativeExists()
+    {
+        METSalesItemSubstitute noAltSub = this.findSalesItemSubstitute(
+            salesLine.ItemId, 
+            METSalesItemSubstitutionCode::NoAlternative);
+
+        if(noAltSub)
+        {
+            this.verboseInfo(funcName(), strFmt('(%1) entry exists',
+                noAltSub));
+            return true;            
+        }
+        return false;
     }
 
 ]]></Source>
@@ -114,7 +171,7 @@ class METSalesItemSubstitution
 
         if(!salesLine.selectForUpdate())
         {
-            throw error(strFmt("Sales line must be selected for update"));
+            throw error("Sales line must be selected for update");
         }
 
         if(!salesLine.InventTransId)
@@ -123,7 +180,7 @@ class METSalesItemSubstitution
                 funcName()));
         }
 
-        this.verboseInfo(strFmt('Checking line item %1 (Lot ID %2)',
+        this.verboseInfo(funcName(), strFmt('Checking line item %1 (Lot ID %2)',
             salesLine.ItemId,
             salesLine.InventTransId));
 
@@ -132,7 +189,7 @@ class METSalesItemSubstitution
             // Sub already applied.
             // TODO confirm whether reservation checks should be made in addition
             // to any replacements made at the point of line creation.
-            this.verboseInfo("Line has already had replacements applied");
+            this.verboseInfo(funcName(), 'Line has already had replacements applied');
             return true;
         }
 
@@ -140,7 +197,7 @@ class METSalesItemSubstitution
         if(onHandQty < salesLine.QtyOrdered)
         {
             // Insufficient qty ("OOS")
-            this.verboseInfo(strFmt('On-hand qty of %1 is less than ordered quantity of %2',
+            this.verboseInfo(funcName(), strFmt('On-hand qty of %1 is less than ordered quantity of %2',
                 onHandQty,
                 salesLine.QtyOrdered));
             
@@ -149,13 +206,13 @@ class METSalesItemSubstitution
                 METSalesItemSubstitutionCode::Never);
             if(itemSubNever)
             {
-                this.verboseInfo('"Never" substitution entry found');
-                this.updateSalesFromSalesItemSubstitute(itemSubNever);
-                itemReplaced = true;
+                this.verboseInfo(funcName(), '"Never" substitution entry found');
+                this.updateSalesLineFromSalesItemSubstitute(itemSubNever, false);                
+                itemReplaced = false;
             }
             else
             {
-                this.verboseInfo('"Never" substitution not found');
+                this.verboseInfo(funcName(), '"Never" substitution not found');
                 
                 // Check 4
                 METSalesItemSubstitute itemSub;
@@ -166,7 +223,7 @@ class METSalesItemSubstitution
 
                 if(!itemSub)
                 {
-                    this.verboseInfo('"Replacement" substitute not found');
+                    this.verboseInfo(funcName(), '"Replacement" substitute not found');
                     itemSub = this.findSalesItemSubstitute(
                         salesLine.ItemId,
                         METSalesItemSubstitutionCode::OutOfStock);
@@ -174,7 +231,7 @@ class METSalesItemSubstitution
                 
                 if(itemSub)
                 {
-                    this.verboseInfo(strFmt('Replacement / Out of stock substitute found (%1)',
+                    this.verboseInfo(funcName(), strFmt('Replacement / Out of stock substitute found (%1)',
                         itemSub.description()));                   
 
                     Qty replacementItemOnHand = this.queryOnHandQty(
@@ -184,13 +241,14 @@ class METSalesItemSubstitution
                     // Assuming same inventory unit.. (EA) TODO confirm, what if different and no conversion?                    
                     if(replacementItemOnHand >= salesLine.QtyOrdered)
                     {
-                        this.verboseInfo(strFmt('Replacement item on-hand is sufficient for ordered quantity'));
+                        this.verboseInfo(funcName(), 'Replacement item on-hand is sufficient for ordered quantity');
+                        this.updateSalesLineFromSalesItemSubstitute(itemSub);
 
-
+                        itemReplaced = true;
                     }
                     else
                     {
-                        this.verboseInfo(strFmt('Replacement item on-hand is not sufficient for ordered quantity'));
+                        this.verboseInfo(funcName(), 'Replacement item on-hand is not sufficient for ordered quantity');
 
                         // Check 6 - *** Spec refers to InventTransID = null but
                         // this will never be the case.
@@ -198,40 +256,44 @@ class METSalesItemSubstitution
                         // Check 7
                         if(itemSub.OrderOriginalItem)
                         {
-                            this.verboseInfo('Order original item set on substitute entry');
+                            this.verboseInfo(funcName(), 'Order original item set on substitute entry');
                             // "Order original item" applies. Do not replace item but mark
                             // sub details on line.
                             metSalesLine.SubstituteReplacementItemID    = itemSub.SubstituteItemId;
                             metSalesLine.SubstitutionCode               = itemSub.SubstitutionCode;
+
+                            itemReplaced = false;
                         }
                         else
                         {
-                            this.verboseInfo('Order original item is not set on substitute entry');
+                            this.verboseInfo(funcName(), 'Order original item is not set on substitute entry');
+                            this.updateSalesLineFromSalesItemSubstitute(itemSub);
                             this.copyToNewLine(itemSub.SubstituteItemId);
+                            
+                            itemReplaced = true;
                         }                        
                     }
                 }
                 else
                 {
-                    this.verboseInfo('No "Replacement" or "Out of stock" substitutions found');
+                    this.verboseInfo(funcName(), 'No "Replacement" or "Out of stock" substitutions found');
                     metSalesLine.SubstitutionCode = METSalesItemSubstitutionCode::OutOfStock;   // ** Confirm..
-                }
-                
-
+                }                
             }
         }
         else
         {
             // Enough stock of ordered item. No further action required.
-            this.verboseInfo(strFmt('On-hand qty of %1 is sufficient for ordered quantity of %2',
+            this.verboseInfo(funcName(), strFmt('On-hand qty of %1 is sufficient for ordered quantity of %2',
                 onHandQty,
                 salesLine.QtyOrdered));            
         }
 
         if(!bufCmp(salesLine, salesLine.orig()))
-        {
             salesLine.update();
-        }
+
+        if(!bufCmp(metSalesLine,  metSalesLine.orig()))
+            metSalesLine.update();
 
         return ret;
     }
@@ -241,25 +303,45 @@ class METSalesItemSubstitution
 			<Method>
 				<Name>copyToNewLine</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Copy sales line to new line with specified item id.
+    /// </summary>
+    /// <param name = "_newItemId">_newItemId</param>
+    /// <returns>New sales order line</returns>
     protected SalesLine copyToNewLine(ItemId _newItemId)
     {
+        this.verboseInfo(funcName(), strFmt('Copying to new line with item %1',
+            _newItemId));
+
         SalesLine newLine;
 
+        this.updateQuantity();
+
+        newLine.initFromSalesTable(salesTable);
         newLine.initFromSalesLine(salesLine, true, true, true);
-        newLine.ItemId = _newItemId;
+        newLine.ItemId = _newItemId;        
         newLine.itemIdChanged();
 
         newLine.insert();
 
         METSalesLine metNewLine = metSalesLine.data();
-        metNewLine.SalesLine                        = newLine.RecId;
+        metNewLine.SalesLine = newLine.RecId;
         metNewLine.insert();
 
-        guid _logReference;
-        metSalesLine.SubstitutionVerboseLogReference = _logReference;
-        //salesLine.delete();   // ****
+        guid logReference;
+        metSalesLine.SubstitutionVerboseLogReference = logReference;  
+        metSalesLine.update();
+        
+        this.verboseInfo(funcName(), strFmt('Order line (Item %1, Lot ID %2) has been copied and replaced by (Item %3, Lot ID %4)',
+            salesLine.ItemId,
+            salesLine.InventTransId,
+            newLine.ItemId,
+            newLine.InventTransId));
+        
+        salesLine.delete();   
 
         salesLine       = newLine;
+        inventDim       = salesLine.inventDim();
         metSalesLine    = metNewLine;
 
         return newLine;
@@ -270,26 +352,51 @@ class METSalesItemSubstitution
 			<Method>
 				<Name>queryOnHandQty</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Find on-hand quantity for specified item
+    /// </summary>
+    /// <param name = "_itemID">_itemID</param>
+    /// <param name = "_inventDim">_inventDim</param>
+    /// <returns>On-hand quantity</returns>
     protected Qty queryOnHandQty(ItemId _itemID, InventDim _inventDim)
     {
         InventDimParm   onHandDimParm;
         onHandDimParm.initFromInventDim(inventDim);
         InventOnhand    onHand = InventOnhand::newItemDim(_itemId, _inventDim, onHandDimParm);
         Qty             onHandQty;
+        boolean         checkTestOnHandQtyTable = true; // **** This is temporary, for testing/debugging only
 
-        this.verboseInfo(strFmt('Checking on-hand for item %1',
+        this.verboseInfo(funcName(), strFmt('Checking on-hand for item %1',
             _itemID));
-            
+         
+        if(checkTestOnHandQtyTable)
+        {
+            METSalesItemSubstituteTestOnHand testOnHand = METSalesItemSubstituteTestOnHand::find(
+                _inventDim.InventSiteId, 
+                _itemID);
+            if(testOnHand)
+            {
+                str msg = strFmt('** Using testing on-hand quantity of %1 for %2-%3',
+                    testOnHand.QtyOnHand,
+                    _itemID,
+                    _inventDim.InventSiteId);
+                this.verboseInfo(funcName(), msg);
+                warning(msg);
+
+                return testOnHand.QtyOnHand;
+            }
+        }
+
         if(CustParameters::find().METSubstitutionIncludeOnOrderInventory)
         {
             onHandQty = onHand.availOrdered(true);
-            this.verboseInfo(strFmt('On-hand quantity including on-order is %1',
+            this.verboseInfo(funcName(), strFmt('On-hand quantity including on-order is %1',
                 onHandQty));
         }
         else
         {
             onHandQty = onHand.availPhysical();
-            this.verboseInfo(strFmt('On-hand quantity (physical only) is %1',
+            this.verboseInfo(funcName(), strFmt('On-hand quantity (physical only) is %1',
                 onHandQty));
         }
         return onHandQty;
@@ -303,8 +410,7 @@ class METSalesItemSubstitution
     /// <summary>
     /// Perform substitution checks/updates at point of order line entry. Relates to
     /// the "Always" substitution code or a "Parent/child" relationship.
-    /// </summary>
-    /// <param name = "_salesLine">_salesLine</param>
+    /// </summary>    
     /// <returns>Validation result</returns>
     protected boolean checkSalesLineAtCreation()
     {
@@ -319,7 +425,7 @@ class METSalesItemSubstitution
 
         if(parentChild)
         {
-            this.verboseInfo(strFmt('Parent/child relationship exists for child item %1 (Parent item %2)', 
+            this.verboseInfo(funcName(), strFmt('Parent/child relationship exists for child item %1 (Parent item %2)',
                 parentChild.ChildItemID,
                 parentChild.ParentItemID));            
 
@@ -345,7 +451,7 @@ class METSalesItemSubstitution
         }
         else
         {
-            this.verboseInfo(strFmt('No Parent/child relationship exists for item %1', salesLine.ItemId));
+            this.verboseInfo(funcName(), strFmt('No Parent/child relationship exists for item %1', salesLine.ItemId));
 
             itemSub = this.findSalesItemSubstitute(
                 salesLine.ItemId, 
@@ -353,13 +459,13 @@ class METSalesItemSubstitution
 
             if(itemSub)
             {
-                this.verboseInfo(strFmt('"Always" item substitution exists for item %1', salesLine.ItemId));
+                this.verboseInfo(funcName(), strFmt('"Always" item substitution exists for item %1', salesLine.ItemId));
 
                 if(this.yesNoPrompt(strFmt("Replace ordered item number %1 with substitute item number %2?",
                     itemSub.ItemId,
                     itemSub.SubstituteItemId)))
                 {
-                    this.updateSalesFromSalesItemSubstitute(itemSub);
+                    this.updateSalesLineFromSalesItemSubstitute(itemSub);
                     itemReplaced = true;                    
                 }
                 else
@@ -370,7 +476,7 @@ class METSalesItemSubstitution
             }
             else
             {
-                this.verboseInfo('No matching substitute found with "Always" code');
+                this.verboseInfo(funcName(), 'No matching substitute found with "Always" code');
             }
         }
         return ret;
@@ -381,11 +487,17 @@ class METSalesItemSubstitution
 			<Method>
 				<Name>findSalesItemSubstitute</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Find valid item substitute for specified item/code
+    /// </summary>
+    /// <param name = "_itemID">_itemID</param>
+    /// <param name = "_subCode">_subCode</param>
+    /// <returns>Matching entry or null</returns>
     protected METSalesItemSubstitute findSalesItemSubstitute(
         ItemId                              _itemID,
         METSalesItemSubstitutionCode        _subCode)  
     {
-        this.verboseInfo(strFmt('Searching for substitute for item %1 (%2)',
+        this.verboseInfo(funcName(), strFmt('Searching for substitute for item %1 (%2)',
             _itemID,
             _subCode));
 
@@ -409,11 +521,21 @@ class METSalesItemSubstitution
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>updateSalesFromSalesItemSubstitute</Name>
+				<Name>updateSalesLineFromSalesItemSubstitute</Name>
 				<Source><![CDATA[
-    protected void updateSalesFromSalesItemSubstitute(METSalesItemSubstitute _itemSub)
+    /// <summary>
+    /// Update substitute fields on sales line buffer
+    /// </summary>
+    /// <param name = "_itemSub">_itemSub</param>
+    /// <param name = "_setSalesLineItemID">_setSalesLineItemID</param>
+    protected void updateSalesLineFromSalesItemSubstitute(
+        METSalesItemSubstitute          _itemSub,
+        boolean                         _setSalesLineItemID = true)
     {
-        salesLine.ItemId                             = _itemSub.SubstituteItemId;
+        if(_setSalesLineItemID)
+        {
+            salesLine.ItemId = _itemSub.SubstituteItemId;
+        }
         metSalesLine.SubstituteOriginalItemID        = _itemSub.ItemId;
         metSalesLine.SubstituteReplacementItemID     = _itemSub.SubstituteItemId;
         metSalesLine.SubstituteParentItemID          = '';
@@ -430,7 +552,7 @@ class METSalesItemSubstitution
     /// <summary>
     /// Check and update quantity/unit if required.
     /// </summary>
-    /// <returns></returns>
+    /// <returns>Validation result</returns>
     protected boolean updateQuantity()
     {
         boolean             ret                     = true;
@@ -440,15 +562,17 @@ class METSalesItemSubstitution
         InventTableModule   replacementItemInvent   = replacementItem.inventTableModuleInvent();    
         InventTableModule   replacementItemSales    = replacementItem.inventTableModuleSales();
 
-        this.verboseInfo(strFmt('Original item ordered quantity %1 of sales unit %2',
+        this.verboseInfo(funcName(), strFmt('Original %1 item ordered quantity %2 of sales unit %3',
+            originalItem.ItemId,
             salesLine.SalesQty,
             salesLine.SalesUnit));
 
-        this.verboseInfo(strFmt('Original item ordered quantity %1 in inventory unit %2',
+        this.verboseInfo(funcName(), strFmt('Original %1 item ordered quantity %2 of inventory unit %3',
+            originalItem.ItemId,
             salesLine.QtyOrdered,
             originalItemInvent.UnitId));
 
-        this.verboseInfo(strFmt('Replacement item %1 has inventory unit %2, sales unit %3',
+        this.verboseInfo(funcName(), strFmt('Replacement item %1 has inventory unit %2, sales unit %3',
             replacementItem.ItemId,
             replacementItemInvent.UnitId,
             replacementItemSales.UnitId));
@@ -469,21 +593,22 @@ class METSalesItemSubstitution
           
             SalesLine::modifySalesQty(salesLine, inventDim);
 
-            this.verboseInfo(strFmt('Conversion to %1 (%2) sales quantity',
+            this.verboseInfo(funcName(), strFmt('Conversion to %1 (%2) sales quantity',
                 salesLine.SalesQty,
                 salesLine.SalesUnit));
-            this.verboseInfo(strFmt('Inventory quantity updated to %1 (%2)',
+            this.verboseInfo(funcName(), strFmt('Inventory quantity updated to %1 (%2)',
                 salesLine.QtyOrdered,
                 replacementItemInvent.UnitId));
         }
         else
         {
             // How to handle this scenario? (Item A and B don't have common inventory unit).
-            this.verboseInfo(strFmt('Item %1 and %2 have different inventory units (%3 and %4). Unable to convert.',
+            this.verboseInfo(funcName(), strFmt('Item %1 and %2 have different inventory units (%3 and %4). Unable to convert.',
                 originalItem.ItemId,
                 replacementItem.ItemId,
                 originalItemInvent.UnitId,
                 replacementItemInvent.UnitId));
+            ret = false;
         }
         return ret;       
     }
@@ -496,15 +621,24 @@ class METSalesItemSubstitution
     /// <summary>
     /// Add verbose info to the log.
     /// </summary>
+    /// <param name = "_func">_func</param>
     /// <param name = "_msg">_msg</param>
-    private void verboseInfo(str _msg)
+    private void verboseInfo(str _func, str _msg)
     {
         if(this.verboseLogging)
         {
-            METSalesItemSubstitutionVerboseLog verboseLog;
-            verboseLog.SalesId         = salesTable.SalesId;
-            verboseLog.Message         = _msg;
+            METSalesItemSubstitutionVerboseLog  verboseLog;
+
+            verboseLog.SalesId          = salesTable.SalesId;
+            verboseLog.EventSource      = this.eventSource;
+            verboseLog.Message          = _msg;
+            verboseLog.Function         = subStr(_func, strFind(_func, '.', 1, 999) + 1, 999);
             verboseLog.LogReference     = metSalesLine.SubstitutionVerboseLogReference;
+
+            if(this.verboseLogConnection)
+            {
+                verboseLog.setConnection(this.verboseLogConnection);
+            }
             verboseLog.insert();
         }
     }
@@ -518,21 +652,21 @@ class METSalesItemSubstitution
     /// Prompt message with yes/no confirmation. If non-interactive, assume a 'Yes'
     /// response. (eg via backend service/batch).
     /// </summary>
-    /// <param name = "_msg"></param>
-    /// <returns></returns>
+    /// <param name = "_msg">_msg</param>
+    /// <returns>Result</returns>
     protected boolean yesNoPrompt(str _msg)
     {
         if(interactive)
         {
             boolean promptRet = (Box::yesNo(_msg, DialogButton::No) == DialogButton::Yes);
-            this.verboseInfo(promptRet ?
+            this.verboseInfo(funcName(), promptRet ?
                 'User confirmed replacement' :
                 'User cancelled replacement');
             return promptRet;
         }
         else
         {
-            this.verboseInfo('Replacement accepted without prompt (non-interactive)');
+            this.verboseInfo(funcName(), 'Replacement accepted without prompt (non-interactive)');
             return true;
         }
     }
@@ -545,7 +679,10 @@ class METSalesItemSubstitution
     /// <summary>
     /// Constructor
     /// </summary>
-    private void new(
+    /// <param name = "_salesLine">_salesLine</param>
+    /// <param name = "_metSalesLine">_metSalesLine</param>
+    /// <param name = "_inventDim">_inventDim</param>
+    protected void new(
         SalesLine       _salesLine,
         METSalesLine    _metSalesLine,
         InventDim       _inventDim)
@@ -561,6 +698,15 @@ class METSalesItemSubstitution
 			<Method>
 				<Name>construct</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// construct
+    /// </summary>
+    /// <param name = "_salesLine">_salesLine</param>
+    /// <param name = "_metSalesLine">_metSalesLine</param>
+    /// <param name = "_inventDim">_inventDim</param>
+    /// <param name = "_eventSource">_eventSource</param>
+    /// <param name = "_interactive">_interactive</param>
+    /// <returns>New instance</returns>
     static public METSalesItemSubstitution construct(
         SalesLine                               _salesLine,
         METSalesLine                            _metSalesLine,
