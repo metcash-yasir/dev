@@ -22,9 +22,11 @@ class METSalesItemSubstitution
     // - Qty conversion for line copy/replacement not picking up correct unit(s).
     // - Prompt when updating date-effective substitute entry 
     // - Cleanup job on verbose log entries
+    // - Check item/site settings
 
     SalesLine                               salesLine;
-    METSalesLine                            metSalesLine;
+    METSalesLine                            metSalesLine
+        ;
     InventDim                               inventDim;
     SalesTable                              salesTable;
 
@@ -34,6 +36,7 @@ class METSalesItemSubstitution
     UserConnection                          verboseLogConnection;
     METSalesItemSubstitutionAccountRelation substitutionGroup;
     boolean                                 itemReplaced;
+    boolean                                 lineCopiedToNewLine;
 
 
 }
@@ -77,9 +80,13 @@ class METSalesItemSubstitution
         substitutionGroup = salesTable.custTable_CustAccount().CustGroup;   
 
         this.verboseInfo(funcName(), strFmt('Checking for substitutes, event source %1', this.eventSource));
-        this.verboseInfo(funcName(), strFmt('Item %1, Inventory site %2',
+        this.verboseInfo(funcName(), strFmt('Item %1, Inventory site %2, Quantity %3 %4',
             salesLine.ItemId, 
-            salesTable.InventSiteId));
+            salesTable.InventSiteId,
+            salesLine.SalesQty,
+            salesLine.SalesUnit));
+
+        inventDim.InventSiteId = salesTable.InventSiteId;
 
         if(this.checkNoAlternativeExists())
         {
@@ -90,22 +97,22 @@ class METSalesItemSubstitution
         else
         {
             this.verboseInfo(funcName(), 'No matching (No alternative) entry exists');
-        }
 
-        ttsbegin;
+            ttsbegin;
 
-        switch(this.eventSource)
-        {
-            case METSalesItemSubstitutionEventSource::Creation:
-                ret = this.checkSalesLineAtCreation();
-                break;
-            case METSalesItemSubstitutionEventSource::Reservation:
-                ret = this.checkSalesLineAtReservation();
-                break;
-            default:
+            switch(this.eventSource)
+            {
+                case METSalesItemSubstitutionEventSource::Creation:
+                    ret = this.checkSalesLineAtCreation();
+                    break;
+                case METSalesItemSubstitutionEventSource::Reservation:
+                    ret = this.checkSalesLineAtReservation();
+                    break;
+                default:
                 throw error(strFmt("Unknown substitution event source '%1' in %2",
                     this.eventSource,
                     funcName()));
+            }           
         }
 
         if(ret)
@@ -113,13 +120,20 @@ class METSalesItemSubstitution
             if(itemReplaced)
             {
                 salesLine.itemIdChanged();
-                this.updateQuantity();
+                if(!this.lineCopiedToNewLine)
+                {
+                    this.updateQuantity();
+                }
                
                 // ** TODO "Product number" not refreshing on form.
 
-                this.verboseInfo(funcName(), strFmt('Item "%1" replaced with "%2"',
+                this.verboseInfo(funcName(), strFmt('Item "%1" replaced with "%2". New quantity is %3 %4 (%5 %6)',
                     metSalesLine.SubstituteOriginalItemID,
-                    metSalesLine.SubstituteReplacementItemID));
+                    metSalesLine.SubstituteReplacementItemID,
+                    salesLine.SalesQty,
+                    salesLine.SalesUnit,
+                    salesLine.QtyOrdered,
+                    salesLine.inventTable().inventTableModuleInvent().UnitId));
             }
             else
             {
@@ -174,12 +188,6 @@ class METSalesItemSubstitution
             throw error("Sales line must be selected for update");
         }
 
-        if(!salesLine.InventTransId)
-        {
-            throw error(strFmt("%1 can only be called when the sales order line has already been saved",
-                funcName()));
-        }
-
         this.verboseInfo(funcName(), strFmt('Checking line item %1 (Lot ID %2)',
             salesLine.ItemId,
             salesLine.InventTransId));
@@ -197,9 +205,10 @@ class METSalesItemSubstitution
         if(onHandQty < salesLine.QtyOrdered)
         {
             // Insufficient qty ("OOS")
-            this.verboseInfo(funcName(), strFmt('On-hand qty of %1 is less than ordered quantity of %2',
+            this.verboseInfo(funcName(), strFmt('On-hand qty of %1 is less than ordered quantity of %2 for item %3',
                 onHandQty,
-                salesLine.QtyOrdered));
+                salesLine.QtyOrdered,
+                salesLine.ItemId));
             
             METSalesItemSubstitute itemSubNever = this.findSalesItemSubstitute(
                 salesLine.ItemId, 
@@ -268,7 +277,11 @@ class METSalesItemSubstitution
                         {
                             this.verboseInfo(funcName(), 'Order original item is not set on substitute entry');
                             this.updateSalesLineFromSalesItemSubstitute(itemSub);
-                            this.copyToNewLine(itemSub.SubstituteItemId);
+                            if(salesLine.InventTransId)
+                            {
+                                this.verboseInfo(funcName(), strFmt('Copying line, original Lot ID %1', salesLine.InventTransId));
+                                this.copyToNewLine(itemSub.SubstituteItemId);
+                            }
                             
                             itemReplaced = true;
                         }                        
@@ -290,10 +303,14 @@ class METSalesItemSubstitution
         }
 
         if(!bufCmp(salesLine, salesLine.orig()))
+        {
             salesLine.update();
+        }
 
         if(!bufCmp(metSalesLine,  metSalesLine.orig()))
+        {
             metSalesLine.update();
+        }
 
         return ret;
     }
@@ -321,7 +338,6 @@ class METSalesItemSubstitution
         newLine.initFromSalesLine(salesLine, true, true, true);
         newLine.ItemId = _newItemId;        
         newLine.itemIdChanged();
-
         newLine.insert();
 
         METSalesLine metNewLine = metSalesLine.data();
@@ -343,6 +359,8 @@ class METSalesItemSubstitution
         salesLine       = newLine;
         inventDim       = salesLine.inventDim();
         metSalesLine    = metNewLine;
+
+        this.lineCopiedToNewLine = true;
 
         return newLine;
     }
@@ -560,22 +578,19 @@ class METSalesItemSubstitution
         InventTableModule   originalItemInvent      = originalItem.inventTableModuleInvent();
         InventTable         replacementItem         = InventTable::find(metSalesLine.SubstituteReplacementItemID);
         InventTableModule   replacementItemInvent   = replacementItem.inventTableModuleInvent();    
-        InventTableModule   replacementItemSales    = replacementItem.inventTableModuleSales();
-
-        this.verboseInfo(funcName(), strFmt('Original %1 item ordered quantity %2 of sales unit %3',
+        UnitOfMeasureSymbol replacementSalesUnit    = this.getItemSalesUnit(replacementItem.ItemId);
+        
+        this.verboseInfo(funcName(), strFmt('Original %1 item ordered %2 %3 (%4 %5)',
             originalItem.ItemId,
             salesLine.SalesQty,
-            salesLine.SalesUnit));
-
-        this.verboseInfo(funcName(), strFmt('Original %1 item ordered quantity %2 of inventory unit %3',
-            originalItem.ItemId,
+            salesLine.SalesUnit,
             salesLine.QtyOrdered,
             originalItemInvent.UnitId));
 
         this.verboseInfo(funcName(), strFmt('Replacement item %1 has inventory unit %2, sales unit %3',
             replacementItem.ItemId,
             replacementItemInvent.UnitId,
-            replacementItemSales.UnitId));
+            replacementSalesUnit));
 
         if(originalItemInvent.UnitId == replacementItemInvent.UnitID)
         {
@@ -584,25 +599,44 @@ class METSalesItemSubstitution
                 InventDim::findOrCreate(inventDim).inventDimId,
                 salesLine.QtyOrdered,
                 replacementItemInvent.UnitId,
-                replacementItemSales.UnitId,
+                replacementSalesUnit,
                 true,
                 true);
 
-            salesLine.SalesQty  = replacementQty;
-            salesLine.SalesUnit = replacementItemSales.UnitId;  
-          
-            SalesLine::modifySalesQty(salesLine, inventDim);
+            if(replacementQty == 0)
+            {
+                replacementQty = 1; // ** 
+            }
 
-            this.verboseInfo(funcName(), strFmt('Conversion to %1 (%2) sales quantity',
+            salesLine.SalesQty  = replacementQty;
+            salesLine.SalesUnit = replacementSalesUnit;
+        
+            this.verboseInfo(funcName(), strFmt('Initial conversion to %1 %2',
                 salesLine.SalesQty,
-                salesLine.SalesUnit));
-            this.verboseInfo(funcName(), strFmt('Inventory quantity updated to %1 (%2)',
+                salesLine.SalesUnit));            
+        
+            // TODO min/max/etc is not working correctly with the site/item specific
+            // settings mod. When it is, logic should not be replicated here. Ordinarily
+            // it will be called via modifySalesQty below.
+            this.applyMinMaxMultiple();
+
+            salesLine.METSkipMinMaxMultipleCheck = true;
+            SalesLine::modifySalesQty(
+                salesLine, 
+                inventDim, 
+                true, 
+                false);
+            salesLine.METSkipMinMaxMultipleCheck = false;
+
+            this.verboseInfo(funcName(), strFmt('Final conversion to %1 %2 (%3 %4)',
+                salesLine.SalesQty,
+                salesLine.SalesUnit,
                 salesLine.QtyOrdered,
-                replacementItemInvent.UnitId));
+                replacementItemInvent.UnitId));            
         }
         else
         {
-            // How to handle this scenario? (Item A and B don't have common inventory unit).
+            // How to handle this scenario? (Item A and B don't have common inventory unit). Attempt conversion? Pending test scenarios.
             this.verboseInfo(funcName(), strFmt('Item %1 and %2 have different inventory units (%3 and %4). Unable to convert.',
                 originalItem.ItemId,
                 replacementItem.ItemId,
@@ -611,6 +645,88 @@ class METSalesItemSubstitution
             ret = false;
         }
         return ret;       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyMinMaxMultiple</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Apply min/max/multiple logic to sales order line. 
+    /// TODO, pending completion of site-specific sales unit mod.
+    /// </summary>
+    protected void applyMinMaxMultiple()
+    {
+        InventItemSalesSetup salesSetup = this.findInventItemSalesSetup(salesLine.ItemId);
+        if(salesSetup)
+        {            
+            if(salesSetup.LowestQty && salesLine.SalesQty < salesSetup.LowestQty)
+            {
+                salesLine.SalesQty = salesSetup.LowestQty;
+            }
+            if(salesSetup.HighestQty && salesLine.SalesQty > salesSetup.HighestQty)
+            {
+                salesLine.SalesQty = salesSetup.HighestQty;
+            }
+            if(salesSetup.MultipleQty)
+            {
+                int salesQtyInt = real2int(salesLine.SalesQty);
+                int multQtyInt  = real2int(salesSetup.MultipleQty);
+                if(salesQtyInt mod multQtyInt)
+                {
+                    salesQtyInt         = ((salesQtyInt / multQtyInt) + 1) * multQtyInt;
+                    salesLine.SalesQty  = salesQtyInt;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getItemSalesUnit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Find sales unit for specified item.
+    /// </summary>
+    /// <param name = "_itemID">_itemID</param>
+    /// <returns>Sales unit</returns>
+    protected UnitOfMeasureSymbol getItemSalesUnit(ItemId _itemID)
+    {
+        InventItemSalesSetup salesSetup = this.findInventItemSalesSetup(_itemID);
+        if(salesSetup && salesSetup.METSalesUnit)
+        {
+            this.verboseInfo(funcName(), strFmt('Site-specific sales unit found for item %1 (%2)',
+                _itemID,
+                salesTable.InventSiteId));
+            return salesSetup.METSalesUnit;
+        }
+        this.verboseInfo(funcName(), strFmt('No site-specific sales unit found for item %1 (%2)',
+            _itemID,
+            salesTable.InventSiteId));
+        return InventTableModule::find(_itemID, ModuleInventPurchSales::Sales).UnitId; 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findInventItemSalesSetup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Find site/item specific settings.
+    /// </summary>
+    /// <param name = "_itemID">_itemID</param>
+    /// <returns>InventItemSalesSetup</returns>
+    protected InventItemSalesSetup findInventItemSalesSetup(ItemId _itemID)
+    {
+        InventDim siteDim;
+        siteDim.InventSiteID    = this.salesTable.InventSiteId;
+        siteDim                 = InventDim::findOrCreate(siteDim);
+        InventItemSalesSetup salesSetup = InventItemSalesSetup::find(
+            _itemID,
+            siteDim.inventDimId);
+        return salesSetup;
     }
 
 ]]></Source>
