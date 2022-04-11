@@ -25,45 +25,49 @@ class METRebateExcludeForPaymentService extends SysOperationServiceBase
     {
         TAMRebateDeal               rebateDealContract;
         TAMRebateTrans              rebateTrans;
-        TAMRebateDateTrans          rebateDateTrans;
-
-        TAMRebateTransId            transIdGlobal, transIdLocal;
         
         Query                       query;
         QueryRun                    queryRun;
-        QueryBuildDataSource        qbdsRebateTrans, qbdsRebateDateTrans, qbdsRebateGroupLink, qbdsInventTable;
+        QueryBuildDataSource        qbdsRebateTrans, qbdsRebateGroupLink, qbdsInventTable, qbdsRebateTable;
 
         const Amount rebateAmountMultiplier = 0.0;
-        Set rebateTransIdSet    =   new Set(Types::String);
-        boolean useClaimProcess = TAMRebateParameters::find().UseClaimProcess;
 
         query = new Query();
         rebateDealContract  =   _contract.parmTAMRebateDeal();
 
-        qbdsRebateDateTrans = query.addDataSource(tableNum(TAMRebateDateTrans));
-        qbdsRebateDateTrans.addRange(fieldNum(TAMRebateDateTrans, RebateDeal)).value(queryValue(rebateDealContract.RecId));
+        qbdsRebateTrans = query.addDataSource(tableNum(TAMRebateTrans));
+        qbdsRebateTrans.addSortField(fieldNum(TAMRebateTrans, RebateId), SortOrder::Ascending);
 
-        qbdsRebateTrans = qbdsRebateDateTrans.addDataSource(tableNum(TAMRebateTrans));
-        qbdsRebateTrans.relations(true);
-        qbdsRebateTrans.addSortField(fieldNum(TAMRebateTrans, RebateTransId), SortOrder::Ascending);
-
+        qbdsRebateTable = qbdsRebateTrans.addDataSource(tableNum(TAMRebateTable));
+        qbdsRebateTable.relations(false);
+        qbdsRebateTable.fetchMode(QueryFetchMode::One2One);
+        qbdsRebateTable.addLink(fieldNum(TAMRebateTrans, RebateId), fieldNum(TAMRebateTable, RebateId));
+        qbdsRebateTable.addRange(fieldNum(TAMRebateTable, RebateDeal)).value(SysQuery::value(rebateDealContract.RecId));       
+       
         qbdsInventTable = qbdsRebateTrans.addDataSource(tableNum(InventTable));
         qbdsInventTable.relations(false);
+        qbdsInventTable.fetchMode(QueryFetchMode::One2One);
         qbdsInventTable.addLink(fieldNum(TAMRebateTrans, ItemId), fieldNum(InventTable, ItemId));
 
-        qbdsRebateGroupLink = qbdsInventTable.addDataSource(tableNum(TAMRebateGroupLink));
-        qbdsRebateGroupLink.relations(true);
-        qbdsRebateGroupLink.addRange(fieldnum(TAMRebateGroupLink, METExcludeForPayment)).value(strFmt('(%1.%2 = %3)',
+        qbdsRebateGroupLink = qbdsRebateTable.addDataSource(tableNum(TAMRebateGroupLink));
+        qbdsRebateGroupLink.relations(false);
+        qbdsRebateGroupLink.fetchMode(QueryFetchMode::One2One);
+        qbdsRebateGroupLink.addLink(fieldNum(TAMRebateTable, ItemRelation), fieldNum(TAMRebateGroupLink,RebateGroupId));
+        qbdsRebateGroupLink.addRange(fieldNum(TAMRebateGroupLink, ModuleInventCustVend)).value(enum2Str(ModuleInventCustVend::Invent));
+        qbdsRebateGroupLink.addRange(fieldnum(TAMRebateGroupLink, METExcludeForPayment)).value(enum2Str(NoYes::Yes));
+        qbdsRebateGroupLink.addRange(fieldnum(TAMRebateGroupLink,RefRecId)).value(strFmt('((%1.%2 = %3.%4) && (%1.%5 = %3.%6))',
             qbdsRebateGroupLink.name(),
-            fieldStr(TAMRebateGroupLink, METExcludeForPayment),
-            enum2Int(NoYes::Yes)));
+            fieldStr(TAMRebateGroupLink, RefRecId),
+            qbdsInventTable.name(),
+            fieldStr(InventTable, RecId),
+            fieldStr(TAMRebateGroupLink, RefTableId),
+            fieldStr(InventTable, TableId)));
 
         queryRun = new QueryRun(query);
 
         while(queryRun.next())
         {
             rebateTrans     =   queryRun.get(tableNum(TAMRebateTrans));
-            rebateDateTrans =   queryRun.get(tableNum(TAMRebateDateTrans));
 
             try
             {
@@ -75,15 +79,9 @@ class METRebateExcludeForPaymentService extends SysOperationServiceBase
                 if(rebateTrans.validateWrite())
                 {
                     rebateTrans.update(true);
-                    transIdLocal = rebateTrans.RebateTransId;
-                    if(transIdGlobal != transIdLocal || !transIdGlobal)
-                    {
-                        transIdGlobal = transIdLocal;
-                        rebateTransIdSet.add(transIdGlobal);
-                    }
                 }
                 ttscommit;
-            }            
+            }
             catch(Exception::UpdateConflict)
             {
                 Info("@MET:METExcludeUpdateConflict", rebateTrans.ItemId);
@@ -109,90 +107,7 @@ class METRebateExcludeForPaymentService extends SysOperationServiceBase
                 Info("@MET:METRebateError");
             }
         }
-        SetEnumerator rebateTransIdEnumerator = rebateTransIdSet.getEnumerator();
-        while (rebateTransIdEnumerator.moveNext())
-        {
-            this.recalcRebateAmountStatic(rebateTransIdEnumerator.current(), useClaimProcess);
-        }
-    }
 
-]]></Source>
-			</Method>
-			<Method>
-				<Name>recalcRebateAmountStatic</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Method will recalculate the Rebate amount based on updated Un-Claimed source transactions
-    /// </summary>
-    /// <param name = "_rebateTransId">Rebate transaction reference</param>
-    /// <param name = "_useClaimProcess">Based on this option claim process will be enabled</param>
-    protected void recalcRebateAmountStatic(TAMRebateTransId _rebateTransId, boolean _useClaimProcess)
-    {
-        TAMRebateDateTrans rebateDateTrans;
-    
-        try
-        {
-            ttsbegin;
-            select firstonly forUpdate rebateDateTrans
-                where rebateDateTrans.RebateTransId == _rebateTransId
-                   && !rebateDateTrans.RebatePosted;
-    
-            if (rebateDateTrans)
-            {
-                TAMRebateTrans rebateTrans;
-    
-                select sum(CorrectedAmount) from rebateTrans
-                    where rebateTrans.RebateTransId == _rebateTransId
-                       && (!_useClaimProcess
-                       ||  rebateDateTrans.RebateTransactionType != TAMRebateTransactionType::Rebate
-                       ||  rebateTrans.Claimed)
-                       && rebateTrans.CorrectedAmount;
-    
-                Amount totalAmount = rebateTrans.CorrectedAmount;
-    
-                select sum(RebateAmount) from rebateTrans
-                    where rebateTrans.RebateTransId == _rebateTransId
-                       && (!_useClaimProcess
-                       ||  rebateDateTrans.RebateTransactionType != TAMRebateTransactionType::Rebate
-                       ||  rebateTrans.Claimed)
-                       && !rebateTrans.CorrectedAmount;
-    
-                totalAmount += rebateTrans.RebateAmount;
-    
-                if (rebateDateTrans.RebateAmount != totalAmount)
-                {
-                    rebateDateTrans.RebateAmount = totalAmount;
-                    if(rebateDateTrans.validateWrite())
-                    {
-                        rebateDateTrans.update();
-                    }
-                }
-            }
-            ttscommit;
-        }
-        catch(Exception::UpdateConflict)
-        {
-            throw Exception::UpdateConflictNotRecovered;
-        }
-        catch(Exception::Deadlock)
-        {
-            if (xSession::currentRetryCount() >= RetryNum)
-            {
-                throw Exception::UpdateConflictNotRecovered;
-            }
-            retry;
-        }
-        catch(Exception::CLRError)
-        {
-            System.Exception netExcepn;
-            info("@MET:METRebateCLRException");
-            netExcepn = CLRInterop::getLastException();
-            info(netExcepn.ToString());
-        }
-        catch(Exception::Error)
-        {
-            Info("@MET:METRebateError");
-        }
     }
 
 ]]></Source>
