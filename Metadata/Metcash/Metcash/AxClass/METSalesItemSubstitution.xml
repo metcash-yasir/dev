@@ -8,35 +8,23 @@
 /// Responsible for dealing with item substitution logic.
 /// </summary>
 class METSalesItemSubstitution
-{
-    // ***** WIP *****
+{        
+    // TODO prompt when interactive
 
-    // NB messages for the 'verbose' log will not be labelled as they're intended
-    // for internal debugging/documentation use only.
-    
-    // - If an 'Always' sub was applied, should we check for the other types
-    //   at point of reservation?
-    // - Check result of item/site specific settings
-    // - Data entity
-    // - Labels and BP
-    // - Qty conversion for line copy/replacement not picking up correct unit(s).
-    // - Prompt when updating date-effective substitute entry 
-    // - Cleanup job on verbose log entries
-    // - Check item/site settings
+    #define.MAXSUBLEVELS(10)
 
     SalesLine                               salesLine;
     METSalesLine                            metSalesLine;
     InventDim                               inventDim;
     SalesTable                              salesTable;
 
-    METSalesItemSubstitutionEventSource     eventSource;
     boolean                                 interactive;  
     boolean                                 verboseLogging;
     UserConnection                          verboseLogConnection;
     METSalesItemSubstitutionAccountRelation substitutionGroup;
-    boolean                                 itemReplaced;
-    boolean                                 lineCopiedToNewLine;
 
+    boolean                                 runCreationTimeChecks;      // Checks at time of line creation
+    boolean                                 runReservationTimeChecks;   // Checks at time of line reservation
 
 }
 ]]></Declaration>
@@ -74,12 +62,12 @@ class METSalesItemSubstitution
             }
         }
 
-        // *** tbd, may define a separate 'substitution group'. For now 
-        // we're using the customer group.
-        substitutionGroup = salesTable.custTable_CustAccount().CustGroup;   
+        this.verboseInfo(funcName(), strFmt('Sales order %1, Lot ID \"%2\", RecID %3',
+            salesLine.SalesId,
+            salesLine.InventTransId,
+            salesLine.RecId));
 
-        this.verboseInfo(funcName(), strFmt('Checking for substitutes, event source %1', this.eventSource));
-        this.verboseInfo(funcName(), strFmt('Item %1, Inventory site %2, Quantity %3 %4',
+        this.verboseInfo(funcName(), strFmt('Requested item %1, Inventory site %2, Quantity %3 %4',
             salesLine.ItemId, 
             salesTable.InventSiteId,
             salesLine.SalesQty,
@@ -87,59 +75,233 @@ class METSalesItemSubstitution
 
         inventDim.InventSiteId = salesTable.InventSiteId;
 
-        if(this.checkNoAlternativeExists())
+        // *** tbd, may define a separate 'substitution group'. For now
+        // we're using the customer group.
+        substitutionGroup = salesTable.custTable_CustAccount().CustGroup;
+        
+        this.verboseInfo(funcName(), strFmt('Customer account %1, group %2',
+            salesLine.CustAccount,
+            substitutionGroup));
+
+        this.verboseInfo(funcName(), strFmt('runCreationTimeChecks: %1',      this.runCreationTimeChecks));
+        this.verboseInfo(funcName(), strFmt('runReservationTimeChecks: %1',   this.runReservationTimeChecks));
+
+
+        // ****************************
+
+        METSalesItemSubstitutionParentChild matchingParentChild;
+        METSalesItemSubstitute              matchingItemSub;
+        date                                today = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+
+        boolean     continueSearch      = true;
+        ItemId      currentSearchItemID = salesLine.ItemId;
+        container   itemsSearched;
+        int         searchDepth         = 0;
+        int         maxSearchDepth      = min(InventParameters::find().METSalesSubstituteMaxLevels, #MAXSUBLEVELS);
+
+        if(!maxSearchDepth)
         {
-            this.verboseInfo(funcName(), strFmt('"%1" entry exists. No further substitute checks will be made.',
-                METSalesItemSubstitutionCode::NoAlternative));
-            return true;
+            maxSearchDepth = #MAXSUBLEVELS;
+        }
+
+        while(continueSearch)
+        {
+            this.verboseInfo(funcName(), strFmt('** Searching substitutes for %1 **', currentSearchItemID));
+
+            searchDepth++;
+            if(conFind(itemsSearched, currentSearchItemID))
+            {
+                throw error(strFmt('Substitute loop encountered: %1',
+                    con2Str(itemsSearched)));
+            }
+            itemsSearched += currentSearchItemID;
+            if(searchDepth > maxSearchDepth)
+            {
+                throw error(strFmt('Maximum search depth of %1 exceeded: %2',
+                    maxSearchDepth,
+                    con2Str(itemsSearched)));
+            }
+
+            METSalesItemSubstitutionParentChild parentChild = this.searchParentChild(currentSearchItemID);
+            if(parentChild)
+            {
+                currentSearchItemID = parentChild.ParentItemID;
+                matchingParentChild = parentChild;
+            }
+
+            METSalesItemSubstitute itemSub;
+
+            if(this.runCreationTimeChecks)
+            {
+                this.verboseInfo(funcName(), 'Searching for creation-time substitutes', searchDepth == 1);
+
+                select firstonly validtimestate(today) itemSub
+                    order by AccountCode asc
+                    where   itemSub.ItemId              == currentSearchItemID
+                    &&      itemSub.InventSiteId        == salesTable.InventSiteId
+                    &&      itemSub.SubstitutionCode    == METSalesItemSubstitutionCode::Always
+                    &&  (   // table/group/all match
+                        (itemSub.AccountCode == METSalesItemSubstitutionAccountCodeType::Table &&
+                            itemSub.AccountRelation == salesTable.CustAccount)
+                    ||  (itemSub.AccountCode == METSalesItemSubstitutionAccountCodeType::GroupId &&
+                            itemSub.AccountRelation == substitutionGroup)
+                    ||  (itemSub.AccountCode == METSalesItemSubstitutionAccountCodeType::All &&
+                            itemSub.AccountRelation == '')
+                    );
+            }
+
+            if(itemSub)
+            {
+                this.verboseInfo(funcName(), strFmt('"Always" substitution found: %1', itemSub.description()));
+
+                currentSearchItemID     = itemSub.SubstituteItemID;
+                matchingItemSub         = itemSub;
+                matchingParentChild     = null;
+            }            
+            else
+            {                
+                this.verboseInfo(funcName(), '"Always" substitution not found');
+
+                if(this.runReservationTimeChecks)
+                {
+                    this.verboseInfo(funcName(), 'Searching for reservation-time substitutes', searchDepth == 1);
+
+                    Qty         qtyOnHand                   = this.queryOnHandQty(currentSearchItemID, inventDim);
+                    boolean     itemHasSufficientQtyOnHand  = qtyOnHand >= salesLine.QtyOrdered;
+
+                    this.verboseInfo(funcName(), strFmt('Item %1 has %2 on-hand (%3)',
+                        currentSearchItemID,
+                        qtyOnHand,
+                        itemHasSufficientQtyOnHand ? 'Sufficient for order quantity' : 'Insufficient for order quantity'));
+
+                    select firstonly validtimestate(today) itemSub
+                        order by AccountCode asc
+                        where   itemSub.ItemId              == currentSearchItemID
+                        &&      itemSub.InventSiteId        == salesTable.InventSiteId
+                        &&      itemSub.SubstitutionCode    != METSalesItemSubstitutionCode::Always
+                        &&  (   // table/group/all match
+                            (itemSub.AccountCode == METSalesItemSubstitutionAccountCodeType::Table &&
+                                itemSub.AccountRelation == salesTable.CustAccount)
+                        ||  (itemSub.AccountCode == METSalesItemSubstitutionAccountCodeType::GroupId &&
+                                itemSub.AccountRelation == substitutionGroup)
+                        ||  (itemSub.AccountCode == METSalesItemSubstitutionAccountCodeType::All &&
+                                itemSub.AccountRelation == '')
+                        );
+
+                    if(itemSub)
+                    {
+                        this.verboseInfo(funcName(), strFmt('Substitute found: %1', itemSub.description()));
+
+                        matchingParentChild = null;
+                            
+                        switch(itemSub.SubstitutionCode)
+                        {
+                            case METSalesItemSubstitutionCode::Never:
+                            case METSalesItemSubstitutionCode::NoAlternative:
+                                continueSearch  = false;
+                                matchingItemSub = itemSub;
+                                break;
+                            case METSalesItemSubstitutionCode::OutOfStock:
+                            case METSalesItemSubstitutionCode::Replacement: // same as oos?
+
+                                if(itemHasSufficientQtyOnHand)
+                                {
+                                    continueSearch  = false;
+                                    matchingItemSub = null;
+                                }
+                                else
+                                {
+                                    currentSearchItemID = itemSub.SubstituteItemId;
+                                    matchingItemSub     = itemSub;
+                                }
+
+                                break;
+                            default:
+                            throw error(strFmt("Unexpected substitution code '%1' in %2",
+                                itemSub.SubstitutionCode,
+                                funcName()));
+                        }
+                    }
+                    else
+                    {
+                        this.verboseInfo(funcName(), 'No substitute found');
+                    }
+                }   
+                if(!itemSub)
+                {
+                    continueSearch = false;
+                }
+            }
+        }   // main search loop
+
+        ttsbegin;
+        
+        if(matchingItemSub || matchingParentChild)
+        {
+            boolean replaceItem = true;
+            if(matchingItemSub)
+            {
+                this.verboseInfo(funcName(), strFmt('Final matching subtitute: %1', matchingItemSub.description()));
+
+                metSalesLine.SubstituteOriginalItemID        = salesLine.ItemId;
+                metSalesLine.SubstituteReplacementItemID     = matchingItemSub.SubstituteItemId;
+                metSalesLine.SubstituteParentItemID          = '';
+                metSalesLine.SubstitutionType                = METSalesItemSubstitutionType::SubstitutionCode;
+                metSalesLine.SubstitutionCode                = matchingItemSub.SubstitutionCode;
+                metSalesLine.SubstitutionSetupRefRecID       = matchingItemSub.RecId;
+
+                switch(metSalesLine.SubstitutionCode)
+                {
+                    case METSalesItemSubstitutionCode::Never:
+                    case METSalesItemSubstitutionCode::NoAlternative:
+                        replaceItem = false;
+                        break;
+                }
+            }
+            else
+            {
+                this.verboseInfo(funcName(), 'No matching substitute entry found');
+
+                if(matchingParentChild)
+                {
+                    this.verboseInfo(funcName(), strFmt('Final matching parent/item: %1', matchingParentChild.description()));
+
+                    metSalesLine.SubstituteOriginalItemID       = salesLine.ItemId;
+                    metSalesLine.SubstituteReplacementItemID    = matchingParentChild.ParentItemID;
+                    metSalesLine.SubstituteParentItemID         = matchingParentChild.ParentItemID;
+                    metSalesLine.SubstitutionType               = METSalesItemSubstitutionType::ParentChild;
+                    metSalesLine.SubstitutionCode               = METSalesItemSubstitutionCode::None;
+                    metSalesLine.SubstitutionSetupRefRecID      = matchingParentChild.RecId;
+                }
+            }
+
+            if(metSalesLine.SubstituteReplacementItemID != salesLine.ItemId)
+            {
+                if(replaceItem)
+                {
+                    this.verboseInfo(funcName(), strFmt('Item %1 replaced with %2',
+                        salesLine.ItemId,
+                        metSalesLine.SubstituteReplacementItemID));
+                    if(salesLine.RecId)
+                    {
+                        this.copyToNewLine(metSalesLine.SubstituteReplacementItemID);
+                    }
+
+                    salesLine.ItemId = metSalesLine.SubstituteReplacementItemID;
+                    salesLine.itemIdChanged();
+
+                    this.updateQuantity();
+                }
+                //salesLine.update();
+                //metSalesLine.update();
+            }
         }
         else
         {
-            this.verboseInfo(funcName(), 'No matching (No alternative) entry exists');
-
-            ttsbegin;
-
-            switch(this.eventSource)
-            {
-                case METSalesItemSubstitutionEventSource::Creation:
-                    ret = this.checkSalesLineAtCreation();
-                    break;
-                case METSalesItemSubstitutionEventSource::Reservation:
-                    ret = this.checkSalesLineAtReservation();
-                    break;
-                default:
-                throw error(strFmt("@MET:SubUnknownEventSource",
-                    this.eventSource,
-                    funcName()));
-            } 
-          
-            if(ret)
-            {
-                if(itemReplaced)
-                {
-                    salesLine.itemIdChanged();
-                    if(!this.lineCopiedToNewLine)
-                    {
-                        this.updateQuantity();
-                    }
-               
-                    // ** TODO "Product number" not refreshing on form.
-
-                    this.verboseInfo(funcName(), strFmt('Item "%1" replaced with "%2". New quantity is %3 %4 (%5 %6)',
-                    metSalesLine.SubstituteOriginalItemID,
-                    metSalesLine.SubstituteReplacementItemID,
-                    salesLine.SalesQty,
-                    salesLine.SalesUnit,
-                    salesLine.QtyOrdered,
-                    salesLine.inventTable().inventTableModuleInvent().UnitId));
-                }
-                else
-                {
-                    this.verboseInfo(funcName(), 'No replacement has been made');
-                }
-            }
-            ttscommit;
+            this.verboseInfo(funcName(), 'No matching substitute or parent/child record found. No substitute made');
         }
+
+        ttscommit;
         
         return true;
     }
@@ -147,176 +309,32 @@ class METSalesItemSubstitution
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>checkNoAlternativeExists</Name>
+				<Name>searchParentChild</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Check if any "No alternative" entries exist.
-    /// </summary>
-    /// <returns>Result</returns>
-    protected boolean checkNoAlternativeExists()
+    protected METSalesItemSubstitutionParentChild searchParentChild(ItemId _itemID)
     {
-        METSalesItemSubstitute noAltSub = this.findSalesItemSubstitute(
-            salesLine.ItemId, 
-            METSalesItemSubstitutionCode::NoAlternative);
+        this.verboseInfo(funcName(), strFmt('Searching parent/child relationship for child item %1',
+            _itemID));
 
-        if(noAltSub)
+        METSalesItemSubstitutionParentChild parentChild;        
+        select firstonly parentChild
+            where   parentChild.InventSiteId    == salesTable.InventSiteId
+            &&      parentChild.ChildItemID     == _itemID;
+
+        if(parentChild)
         {
-            this.verboseInfo(funcName(), strFmt('(%1) entry exists',
-                noAltSub));
-            return true;            
-        }
-        return false;
-    }
+            this.verboseInfo(funcName(), strFmt('Parent/child relationship exists for child item %1 (Parent item %2)',
+                parentChild.ChildItemID,
+                parentChild.ParentItemID));
 
-]]></Source>
-			</Method>
-			<Method>
-				<Name>checkSalesLineAtReservation</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Check / apply substitutes at point of order line reservation
-    /// </summary>
-    /// <returns>Validation result.</returns>
-    protected boolean checkSalesLineAtReservation()
-    {
-        boolean ret = true;
-
-        salesLine.selectForUpdate(true);
-
-        this.verboseInfo(funcName(), strFmt('Checking line item %1 (Lot ID %2)',
-            salesLine.ItemId,
-            salesLine.InventTransId));
-
-        if(metSalesLine.SubstitutionType != METSalesItemSubstitutionType::None)
-        {
-            // Sub already applied.
-            // TODO confirm whether reservation checks should be made in addition
-            // to any replacements made at the point of line creation.
-            this.verboseInfo(funcName(), 'Line has already had replacements applied');
-            return true;
-        }
-
-        Qty onHandQty = this.queryOnHandQty(salesLine.ItemId, inventDim);
-        if(onHandQty < salesLine.QtyOrdered)
-        {
-            // Insufficient qty ("OOS")
-            this.verboseInfo(funcName(), strFmt('On-hand qty of %1 is less than ordered quantity of %2 for item %3',
-                onHandQty,
-                salesLine.QtyOrdered,
-                salesLine.ItemId));
-            
-            METSalesItemSubstitute itemSubNever = this.findSalesItemSubstitute(
-                salesLine.ItemId, 
-                METSalesItemSubstitutionCode::Never);
-            if(itemSubNever)
-            {
-                this.verboseInfo(funcName(), '"Never" substitution entry found');
-                this.updateSalesLineFromSalesItemSubstitute(itemSubNever, false);                
-                itemReplaced = false;
-            }
-            else
-            {
-                this.verboseInfo(funcName(), '"Never" substitution not found');
-                
-                // Check 4
-                METSalesItemSubstitute itemSub;
-
-                itemSub = this.findSalesItemSubstitute(
-                    salesLine.ItemId,
-                    METSalesItemSubstitutionCode::Replacement);
-
-                if(!itemSub)
-                {
-                    this.verboseInfo(funcName(), '"Replacement" substitute not found');
-                    itemSub = this.findSalesItemSubstitute(
-                        salesLine.ItemId,
-                        METSalesItemSubstitutionCode::OutOfStock);
-                }
-                
-                if(itemSub)
-                {
-                    this.verboseInfo(funcName(), strFmt('Replacement / Out of stock substitute found (%1)',
-                        itemSub.description()));                   
-
-                    Qty replacementItemOnHand = this.queryOnHandQty(
-                        itemSub.SubstituteItemID, 
-                        inventDim);
-                   
-                    // Assuming same inventory unit.. (EA) TODO confirm, what if different and no conversion?                    
-                    if(replacementItemOnHand >= salesLine.QtyOrdered)
-                    {
-                        this.verboseInfo(funcName(), 'Replacement item on-hand is sufficient for ordered quantity');
-                        this.updateSalesLineFromSalesItemSubstitute(itemSub);
-                        if(salesLine.InventTransId)
-                        {
-                            this.verboseInfo(funcName(), strFmt('Copying line, original Lot ID %1, using item %2', 
-                                salesLine.InventTransId,
-                                itemSub.SubstituteItemID));
-                            this.copyToNewLine(itemSub.SubstituteItemId);
-                        }
-
-                        itemReplaced = true;
-                    }
-                    else
-                    {
-                        this.verboseInfo(funcName(), 'Replacement item on-hand is not sufficient for ordered quantity');
-
-                        // Check 6 - *** Spec refers to InventTransID = null but
-                        // this will never be the case.
-
-                        // Check 7
-                        if(itemSub.OrderOriginalItem)
-                        {
-                            this.verboseInfo(funcName(), 'Order original item set on substitute entry');
-                            // "Order original item" applies. Do not replace item but mark
-                            // sub details on line.
-                            metSalesLine.SubstituteReplacementItemID    = itemSub.SubstituteItemId;
-                            metSalesLine.SubstitutionCode               = itemSub.SubstitutionCode;
-
-                            itemReplaced = false;
-                        }
-                        else
-                        {
-                            this.verboseInfo(funcName(), 'Order original item is not set on substitute entry');
-                            this.updateSalesLineFromSalesItemSubstitute(itemSub);
-                            if(salesLine.InventTransId)
-                            {
-                                this.verboseInfo(funcName(), strFmt('Copying line, original Lot ID %1, using item %2',
-                                    salesLine.InventTransId,
-                                    itemSub.SubstituteItemID));
-                                this.copyToNewLine(itemSub.SubstituteItemId);
-                            }
-                            
-                            itemReplaced = true;
-                        }                        
-                    }
-                }
-                else
-                {
-                    this.verboseInfo(funcName(), 'No "Replacement" or "Out of stock" substitutions found');
-                    metSalesLine.SubstitutionCode = METSalesItemSubstitutionCode::OutOfStock;   // ** Confirm..
-                }                
-            }
+            return parentChild;
         }
         else
         {
-            // Enough stock of ordered item. No further action required.
-            this.verboseInfo(funcName(), strFmt('On-hand qty of %1 is sufficient for ordered quantity of %2',
-                onHandQty,
-                salesLine.QtyOrdered));            
+            this.verboseInfo(funcName(), strFmt('Parent/child relationship does not exist for child item %1',
+                _itemID));
         }
-
-        if(!bufCmp(salesLine, salesLine.orig()))
-        {
-            salesLine.update();
-        }
-
-        if(!bufCmp(metSalesLine,  metSalesLine.orig()))
-        {
-            metSalesLine.update();
-        }
-
-        return ret;
+        return null;
     }
 
 ]]></Source>
@@ -364,8 +382,6 @@ class METSalesItemSubstitution
         inventDim       = salesLine.inventDim();
         metSalesLine    = metNewLine;
 
-        this.lineCopiedToNewLine = true;
-
         return newLine;
     }
 
@@ -387,10 +403,7 @@ class METSalesItemSubstitution
         InventOnhand    onHand = InventOnhand::newItemDim(_itemId, _inventDim, onHandDimParm);
         Qty             onHandQty;
         boolean         checkTestOnHandQtyTable = true; // **** This is temporary, for testing/debugging only
-
-        this.verboseInfo(funcName(), strFmt('Checking on-hand for item %1',
-            _itemID));
-         
+        
         if(checkTestOnHandQtyTable)
         {
             METSalesItemSubstituteTestOnHand testOnHand = METSalesItemSubstituteTestOnHand::find(
@@ -422,148 +435,6 @@ class METSalesItemSubstitution
                 onHandQty));
         }
         return onHandQty;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>checkSalesLineAtCreation</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Perform substitution checks/updates at point of order line entry. Relates to
-    /// the "Always" substitution code or a "Parent/child" relationship.
-    /// </summary>    
-    /// <returns>Validation result</returns>
-    protected boolean checkSalesLineAtCreation()
-    {
-        boolean                                 ret = true;
-
-        METSalesItemSubstitute                  itemSub;
-        METSalesItemSubstitutionParentChild     parentChild;
-        
-        select firstonly parentChild
-            where   parentChild.InventSiteId    == salesTable.InventSiteId
-            &&      parentChild.ChildItemID     == salesLine.ItemId;
-
-        if(parentChild)
-        {
-            this.verboseInfo(funcName(), strFmt('Parent/child relationship exists for child item %1 (Parent item %2)',
-                parentChild.ChildItemID,
-                parentChild.ParentItemID));            
-
-            if(this.yesNoPrompt(strFmt("@MET:SubReplacePromptParentChild",
-                parentChild.ChildItemID,
-                parentChild.ParentItemID)))
-            {
-                salesLine.ItemId                            = parentChild.ParentItemID;
-                metSalesLine.SubstituteOriginalItemID       = parentChild.ChildItemID;
-                metSalesLine.SubstituteReplacementItemID    = parentChild.ParentItemID;
-                metSalesLine.SubstituteParentItemID         = parentChild.ParentItemID; // *** Needed separately?
-                metSalesLine.SubstitutionType               = METSalesItemSubstitutionType::ParentChild;
-                metSalesLine.SubstitutionCode               = METSalesItemSubstitutionCode::None;
-                metSalesLine.SubstitutionSetupRefRecID      = parentChild.RecId;
-
-                itemReplaced = true;                                
-            }
-            else
-            {
-                // Prompted for replacement based on parent/child but user cancelled updated.
-                ret = checkFailed(strfmt("@MET:SubCannotSelectParentChild", salesLine.ItemId));
-            }
-        }
-        else
-        {
-            this.verboseInfo(funcName(), strFmt('No Parent/child relationship exists for item %1', salesLine.ItemId));
-
-            itemSub = this.findSalesItemSubstitute(
-                salesLine.ItemId, 
-                METSalesItemSubstitutionCode::Always);
-
-            if(itemSub)
-            {
-                this.verboseInfo(funcName(), strFmt('"Always" item substitution exists for item %1', salesLine.ItemId));
-
-                if(this.yesNoPrompt(strFmt("@MET:SubReplacePromptSubCode",
-                    itemSub.ItemId,
-                    itemSub.SubstituteItemId)))
-                {
-                    this.updateSalesLineFromSalesItemSubstitute(itemSub);
-                    itemReplaced = true;                    
-                }
-                else
-                {
-                    // Prompted for replacement based on 'Always' substitution but user did not confirm.
-                    ret = checkFailed(strFmt("@MET:SubCannotSelectSubCode", salesLine.ItemId));
-                }
-            }
-            else
-            {
-                this.verboseInfo(funcName(), 'No matching substitute found with "Always" code');
-            }
-        }
-        return ret;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>findSalesItemSubstitute</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Find valid item substitute for specified item/code
-    /// </summary>
-    /// <param name = "_itemID">_itemID</param>
-    /// <param name = "_subCode">_subCode</param>
-    /// <returns>Matching entry or null</returns>
-    protected METSalesItemSubstitute findSalesItemSubstitute(
-        ItemId                              _itemID,
-        METSalesItemSubstitutionCode        _subCode)  
-    {
-        this.verboseInfo(funcName(), strFmt('Searching for substitute for item %1 (%2)',
-            _itemID,
-            _subCode));
-
-        METSalesItemSubstitute itemSub;
-        select firstonly itemSub
-            order by AccountCode asc
-            where   itemSub.ItemId              == _itemID
-            &&      itemSub.InventSiteId        == salesTable.InventSiteId
-            &&      itemSub.SubstitutionCode    == _subCode
-            &&  (   // table/group/all match
-                (itemSub.AccountCode == METSalesItemSubstitutionAccountCodeType::Table &&
-                    itemSub.AccountRelation == salesTable.CustAccount)
-            ||  (itemSub.AccountCode == METSalesItemSubstitutionAccountCodeType::GroupId &&
-                    itemSub.AccountRelation == substitutionGroup)
-            ||  (itemSub.AccountCode == METSalesItemSubstitutionAccountCodeType::All &&
-                    itemSub.AccountRelation == '')
-            );
-        return itemSub;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>updateSalesLineFromSalesItemSubstitute</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Update substitute fields on sales line buffer
-    /// </summary>
-    /// <param name = "_itemSub">_itemSub</param>
-    /// <param name = "_setSalesLineItemID">_setSalesLineItemID</param>
-    protected void updateSalesLineFromSalesItemSubstitute(
-        METSalesItemSubstitute          _itemSub,
-        boolean                         _setSalesLineItemID = true)
-    {
-        if(_setSalesLineItemID)
-        {
-            salesLine.ItemId = _itemSub.SubstituteItemId;
-        }
-        metSalesLine.SubstituteOriginalItemID        = _itemSub.ItemId;
-        metSalesLine.SubstituteReplacementItemID     = _itemSub.SubstituteItemId;
-        metSalesLine.SubstituteParentItemID          = '';
-        metSalesLine.SubstitutionType                = METSalesItemSubstitutionType::SubstitutionCode;
-        metSalesLine.SubstitutionCode                = _itemSub.SubstitutionCode;
-        metSalesLine.SubstitutionSetupRefRecID       = _itemSub.RecId;
     }
 
 ]]></Source>
@@ -632,11 +503,12 @@ class METSalesItemSubstitution
                 false);
             salesLine.METSkipMinMaxMultipleCheck = false;
 
-            this.verboseInfo(funcName(), strFmt('Final conversion to %1 %2 (%3 %4)',
+            this.verboseInfo(funcName(), strFmt('Final conversion to %1 %2 (sales), %3 %4 (inventory) of item %5',
                 salesLine.SalesQty,
                 salesLine.SalesUnit,
                 salesLine.QtyOrdered,
-                replacementItemInvent.UnitId));            
+                replacementItemInvent.UnitId,
+                salesLine.ItemId));            
         }
         else
         {
@@ -665,16 +537,22 @@ class METSalesItemSubstitution
         InventItemSalesSetup salesSetup = this.findInventItemSalesSetup(salesLine.ItemId);
         if(salesSetup)
         {            
+            this.verboseInfo(funcName(), strFmt('Item/site setup found for item %1, site "%2"',
+                salesLine.ItemId,
+                salesSetup.inventSiteId()));
             if(salesSetup.LowestQty && salesLine.SalesQty < salesSetup.LowestQty)
             {
+                this.verboseInfo(funcName(), strFmt('Quantity updated to minimum %1', salesSetup.LowestQty));
                 salesLine.SalesQty = salesSetup.LowestQty;
             }
             if(salesSetup.HighestQty && salesLine.SalesQty > salesSetup.HighestQty)
             {
+                this.verboseInfo(funcName(), strFmt('Quantity updated to maximum %1', salesSetup.highestQty));
                 salesLine.SalesQty = salesSetup.HighestQty;
             }
             if(salesSetup.MultipleQty)
             {
+                // TODO apply rounding
                 int salesQtyInt = real2int(salesLine.SalesQty);
                 int multQtyInt  = real2int(salesSetup.MultipleQty);
                 if(salesQtyInt mod multQtyInt)
@@ -730,6 +608,10 @@ class METSalesItemSubstitution
         InventItemSalesSetup salesSetup = InventItemSalesSetup::find(
             _itemID,
             siteDim.inventDimId);
+        if(!salesSetup)
+        {
+            salesSetup = InventItemSalesSetup::findDefault(_itemID);                
+        }
         return salesSetup;
     }
 
@@ -738,19 +620,19 @@ class METSalesItemSubstitution
 			<Method>
 				<Name>verboseInfo</Name>
 				<Source><![CDATA[
-    /// <summary>
+    /// <summary>jh
     /// Add verbose info to the log.
     /// </summary>
     /// <param name = "_func">_func</param>
     /// <param name = "_msg">_msg</param>
-    private void verboseInfo(str _func, str _msg)
+    /// <param name = "_condition">_condition</param>
+    private void verboseInfo(str _func, str _msg, boolean _condition = true)
     {
-        if(this.verboseLogging)
+        if(this.verboseLogging && _condition)
         {
             METSalesItemSubstitutionVerboseLog  verboseLog;
 
             verboseLog.SalesId          = salesTable.SalesId;
-            verboseLog.EventSource      = this.eventSource;
             verboseLog.Message          = _msg;
             verboseLog.Function         = subStr(_func, strFind(_func, '.', 1, 999) + 1, 999);
             verboseLog.LogReference     = metSalesLine.SubstitutionVerboseLogReference;
@@ -816,6 +698,60 @@ class METSalesItemSubstitution
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>runSalesLineCreationFromForm</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Run substitute checks from UI.
+    /// </summary>
+    /// <param name = "_salesLine">_salesLine</param>
+    /// <param name = "_metSalesLine">_metSalesLine</param>
+    /// <param name = "_inventDim">_inventDim</param>
+    /// <returns></returns>
+    static public boolean runSalesLineCreationFromForm(
+        SalesLine       _salesLine,
+        METSalesLine    _metSalesLine,
+        InventDim       _inventDim)
+    {
+        var sub = METSalesItemSubstitution::construct(
+            _salesLine,
+            _metSalesLine,
+            _inventDim);
+        sub.runCreationTimeChecks       = true;
+        sub.interactive                 = true;
+        sub.runReservationTimeChecks    = (_salesLine.Reservation == ItemReservation::Automatic);
+        return sub.run();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>constructForReservation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct and init instance for use with reservation-time sub check.
+    /// </summary>
+    /// <param name = "_salesLine">_salesLine</param>
+    /// <param name = "_metSalesLine">_metSalesLine</param>
+    /// <param name = "_inventDim">_inventDim</param>
+    /// <returns>Instance</returns>
+    static public METSalesItemSubstitution constructForReservation(
+        SalesLine       _salesLine,
+        METSalesLine    _metSalesLine,
+        InventDim       _inventDim)
+    {
+        var sub = METSalesItemSubstitution::construct(
+            _salesLine,
+            _metSalesLine,
+            _inventDim);
+        sub.runCreationTimeChecks       = false;
+        sub.runReservationTimeChecks    = true;
+        sub.interactive                 = true;
+        return sub;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>construct</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -827,21 +763,15 @@ class METSalesItemSubstitution
     /// <param name = "_eventSource">_eventSource</param>
     /// <param name = "_interactive">_interactive</param>
     /// <returns>New instance</returns>
-    static public METSalesItemSubstitution construct(
+    static private METSalesItemSubstitution construct(
         SalesLine                               _salesLine,
         METSalesLine                            _metSalesLine,
-        InventDim                               _inventDim,
-        METSalesItemSubstitutionEventSource     _eventSource,
-        boolean                                 _interactive = true)
+        InventDim                               _inventDim)
     {
         METSalesItemSubstitution sub = new METSalesItemSubstitution(
             _salesLine,
             _metSalesLine,
             _inventDim);
-    
-        sub.eventSource     = _eventSource;
-        sub.interactive     = _interactive;
-
         return sub;
     }
 
