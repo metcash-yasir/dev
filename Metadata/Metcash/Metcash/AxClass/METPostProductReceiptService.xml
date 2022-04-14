@@ -1,0 +1,391 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPostProductReceiptService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_21713_METPostProductReceiptsEntity
+/// This class posts packing slips for purchase orders as per the data in METPOReceipts entity.
+/// </summary>
+class METPostProductReceiptService extends SysOperationServiceBase
+{
+    List         purchLineList = new List(Types::Record);
+    str          errorMessage;
+    str          infologMessage;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the business logic
+    /// </summary>
+    public void processLines()
+    {
+        METPOReceipt    metPOReceipt, metPOReceiptLoc;
+        PurchLine       purchLine;
+        PackingSlipId   packingSlipIdCur, packingSlipIdNew;
+        utcdatetime     productReceiptDate;
+        boolean         isPostingSuccessful;
+        
+        try
+        {
+            ttsbegin;
+
+            while select forupdate metPOReceipt
+                group by PurchaseOrderNumber, OrderVendorAccountNumber, ProductReceiptDate, PackingSlipId, ProductNumber, ReceivedPurchaseQuantity, ReceivedInventoryQuantity
+                where metPOReceipt.Processed == NoYes::No
+                   && metPOReceipt.Error == NoYes::Yes
+            {
+
+                if((packingSlipIdCur != metPOReceipt.PackingSlipId) &&  packingSlipIdCur) //Check if new PO receipt
+                {
+                    select metPOReceiptLoc
+                        where metPOReceiptLoc.PackingSlipId == packingSlipIdCur
+                            && metPOReceiptLoc.ProductReceiptDate == productReceiptDate;
+                        
+                    isPostingSuccessful = this.postProductReceipt(metPOReceiptLoc);
+                    this.updatePOReceiptLines(isPostingSuccessful, metPOReceiptLoc);
+                    this.clearLinesFromList(purchLineList);
+                }
+
+                packingSlipIdCur = metPOReceipt.PackingSlipId;
+                productReceiptDate = metPOReceipt.ProductReceiptDate;
+
+                purchLine = this.getPurchLine(metPOReceipt);
+
+                if(purchLine.RecId && !metPOReceipt.Error)
+                {
+                    this.addPOLinesToList(purchLine);  //add lines to list
+                }
+            }
+            if(packingSlipIdCur)  //Check if new PO receipt
+            {
+                select metPOReceiptLoc
+                            where metPOReceiptLoc.PackingSlipId == packingSlipIdCur
+                               && metPOReceiptLoc.ProductReceiptDate == productReceiptDate;
+                        
+                isPostingSuccessful = this.postProductReceipt(metPOReceiptLoc);
+                this.updatePOReceiptLines(isPostingSuccessful, metPOReceiptLoc);
+                this.clearLinesFromList(purchLineList);
+            }
+
+            metPOReceipt.doUpdate();
+
+            ttscommit;
+
+        }
+        catch(Exception::Error)
+        {
+            errorMessage    = '';
+
+            //If an error occurs, check if log header is available
+            this.getInfologMessage();
+            System.Exception ex = CLRInterop::getLastException();
+            errorMessage += ex.Message + ex.ToString();
+            
+            this.updateLogLine(errorMessage, infologMessage, metPOReceipt);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearLinesFromList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes purchase lines from the purchaseLineList.
+    /// </summary>
+    /// <param name = "_purchLineList">purchase line list.</param>
+    public void clearLinesFromList(List _purchLineList)
+    {
+        ListIterator    listIterator = new ListIterator(_purchLineList);
+
+        while(listIterator.more())
+        {
+            listIterator.delete();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addPOLinesToList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds purchase lines to the purchaseLineList.
+    /// </summary>
+    /// <param name = "_purchLine">purchase line record.</param>
+    /// <param name = "_metAMEXJournalId">AMEX journal id.</param>
+    /// <returns>purchase lines list.</returns>
+
+    public List addPOLinesToList(PurchLine _purchLine)
+    {
+        
+        purchLineList.addEnd(_purchLine);
+
+        return purchLineList; 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePOReceiptLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// updates the metPOReceipt records based on the PO receipts posting
+    /// </summary>
+    /// <param name = "_isPostingSuccessful"></param>
+    /// <param name = "_metPOReceipt"></param>
+    public void updatePOReceiptLines(boolean _isPostingSuccessful, METPOReceipt _metPOReceipt)
+    {
+        METPOReceipt metPOReceiptLoc;
+
+        ttsbegin;
+        if(_isPostingSuccessful)
+        {
+            delete_from metPOReceiptLoc
+                where metPOReceiptLoc.PackingSlipId == _metPOReceipt.PackingSlipId
+                    && metPOReceiptLoc.ProductReceiptDate == _metPOReceipt.ProductReceiptDate;
+
+        }
+        else
+        {
+            while select forupdate metPOReceiptLoc
+                where metPOReceiptLoc.PackingSlipId == _metPOReceipt.PackingSlipId
+                   && metPOReceiptLoc.ProductReceiptDate == _metPOReceipt.ProductReceiptDate
+            {
+                metPOReceiptLoc.Error = NoYes::Yes;
+                metPOReceiptLoc.ErrorMessage = "Posting PO receipt failed";
+                metPOReceiptLoc.doUpdate();
+            }
+        }
+        ttscommit;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPurchLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to identify the purchase line against which the quantity will be recieved
+    /// </summary>
+    /// <param name = "_metPOReceipt">metPOReceipt buffer</param>
+    /// <returns>purchase line that matches the criteria</returns>
+    public PurchLine getPurchLine(METPOReceipt _metPOReceipt)
+    {
+        PurchLine purchLine, purchLineCount, purchLineToSplit;
+        PurchQty  qtyToSplit, purchqty;
+
+        select count(RecId) from purchLineCount
+            where purchLineCount.PurchId == _metPOReceipt.PurchaseOrderNumber
+                    && purchLineCount.ItemId == _metPOReceipt.ProductNumber;
+
+        if(purchLineCount.RecId >= 1)
+        {
+            select firstonly purchLine
+                    where purchLine.PurchId == _metPOReceipt.PurchaseOrderNumber
+                        && purchLine.ItemId == _metPOReceipt.ProductNumber;
+
+            if((_metPOReceipt.ReceivedInventoryQuantity ==0) && (_metPOReceipt.ReceivedPurchaseQuantity == 0)) // If both quantities are zero
+            {
+                purchLine.PurchReceivedNow = 0; 
+                purchLine.modifiedField(fieldNum(PurchLine, PurchReceivedNow));
+
+                _metPOReceipt.Error = NoYes::No;
+
+                return purchLine;
+            }
+            
+            if(_metPOReceipt.ReceivedInventoryQuantity) //Convert inventory quantity to purchase quantity
+            {
+                UnitOfMeasureRecId toUnitOfMeasure  = UnitOfMeasure::unitOfMeasureIdBySymbol('ea');
+                UnitOfMeasureRecId fromUnitOfMeasure  = UnitOfMeasure::unitOfMeasureIdBySymbol(purchLine.PurchUnit);
+                EcoResProductUnitConverter ecoResProductUnitConverter = EcoResProductUnitConverter::newForReleasedProduct(purchLine.ItemId, purchLine.InventDimId, fromUnitOfMeasure, toUnitOfMeasure, false, true);
+                boolean conversionOk    = ecoResProductUnitConverter.canValueBeConverted();
+                if (! conversionOk)
+                {
+                    _metPOReceipt.Error = NoYes::Yes;
+                    _metPOReceipt.ErrorMessage = strFmt("@MET:ProductUnitConversionValidation", purchLine.ItemId, purchLine.PurchUnit);
+
+                    return purchLine;
+                }
+
+                purchqty = ecoResProductUnitConverter.convertValue(_metPOReceipt.ReceivedInventoryQuantity);
+            }
+            else if (_metPOReceipt.ReceivedPurchaseQuantity)
+            {
+                purchqty = _metPOReceipt.ReceivedPurchaseQuantity;
+            }
+
+            if(purchLine.PurchQty >= purchqty) //Check if quantities match
+            {
+                purchLine.PurchReceivedNow = purchqty;
+                purchLine.modifiedField(fieldNum(PurchLine, PurchReceivedNow));
+
+                _metPOReceipt.Error = NoYes::No;
+
+                return purchLine;
+            }
+            else
+            {
+                if(purchLineCount.RecId > 1)  //try to split the lines
+                {
+                    qtyToSplit = purchqty - purchLine.PurchQty;
+
+                    select firstonly RecId from purchLineToSplit
+                        where purchLineToSplit.PurchId == _metPOReceipt.PurchaseOrderNumber
+                            && purchLineToSplit.ItemId == _metPOReceipt.ProductNumber
+                            && purchLineToSplit.PurchQty >= qtyToSplit
+                            && purchLineToSplit.LineNumber != purchLine.LineNumber;
+
+                    if(purchLineToSplit.RecId)
+                    {
+                        ttsbegin;
+                        purchLineToSplit.selectForUpdate(true);
+                        purchLineToSplit.RemainPurchPhysical = qtyToSplit;
+                        purchLineToSplit.modifiedField(fieldNum(PurchLine, RemainPurchPhysical));
+                        purchLineToSplit.update();
+                        ttscommit;
+
+                        purchLine.PurchReceivedNow = purchqty;
+                        purchLine.modifiedField(fieldNum(PurchLine, PurchReceivedNow));
+
+                        _metPOReceipt.Error = NoYes::No;
+
+                        return purchLine;
+                    }
+
+                }
+                else if((purchLineCount.RecId == 1))
+                {
+                    if (purchLine.OverDeliveryPct > 0) //Check if overdelivery is allowed
+                    {
+                        Qty maxReceivedQty = purchLine.PurchQty * (1 + purchLine.OverDeliveryPct / 100);
+
+                        if(maxReceivedQty >= purchqty)
+                        {
+                            purchLine.PurchReceivedNow = purchqty;
+                            purchLine.modifiedField(fieldNum(PurchLine, PurchReceivedNow));
+
+                            _metPOReceipt.Error = NoYes::No;
+
+                            return purchLine;
+                        }
+                    }
+                }
+                else
+                {
+                    _metPOReceipt.Error = NoYes::Yes;
+                    _metPOReceipt.ErrorMessage = strFmt("@MET:NoLinesFoundValidation", _metPOReceipt.ProductNumber, _metPOReceipt.PurchaseOrderNumber, _metPOReceipt.OrderVendorAccountNumber);
+                }
+            }
+        }
+        else
+        {
+            _metPOReceipt.Error = NoYes::Yes;
+            _metPOReceipt.ErrorMessage = strFmt("@MET:NoLinesFoundValidation", _metPOReceipt.ProductNumber, _metPOReceipt.PurchaseOrderNumber, _metPOReceipt.OrderVendorAccountNumber);
+        }
+
+        return purchLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postProductReceipt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// method post product receipt for a given list of purchase lines
+    /// </summary>
+    /// <param name = "_metPOReceipt">metPOReceipt buffer</param>
+    /// <returns>boolean value indicating if the PO receipting is successful </returns>
+    public boolean postProductReceipt(METPOReceipt _metPOReceipt)
+    {
+        boolean         ret = true;
+        PurchTable      purchTable = PurchTable::find(_metPOReceipt.PurchaseOrderNumber);
+        PurchFormLetter purchFormLetter = PurchFormLetter::construct(DocumentStatus::PackingSlip);
+
+        try
+        {
+            ttsbegin;
+
+            purchFormLetter.createFromLines(true);
+            purchFormLetter.parmLineList(purchLineList.pack());
+
+            purchFormLetter.update(purchTable, _metPOReceipt.PackingSlipId, DateTimeUtil::date(_metPOReceipt.ProductReceiptDate), PurchUpdate::ReceiveNow);
+
+            ttscommit;
+        }
+        catch(Exception::Error)
+        {
+            _metPOReceipt.Error = NoYes::Yes;
+            _metPOReceipt.ErrorMessage = strFmt("@MET:POReceiptError", _metPOReceipt.PackingSlipId);
+
+            ret = false;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInfologMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the latest infolog error message
+    /// </summary>
+    private void getInfologMessage()
+    {
+        SysInfologEnumerator sysInfologEnumerator;
+        SysInfologMessageStruct sysInfologMessageStruct;
+
+        sysInfologEnumerator = SysInfologEnumerator::newData(infolog.infologData());
+
+        while (sysInfologEnumerator.moveNext())
+        {
+            sysInfologMessageStruct = new SysInfologMessageStruct(sysInfologEnumerator.currentMessage());
+
+            if (sysInfologEnumerator.currentException() == Exception::Error)
+            {
+                errorMessage += strfmt(sysInfologMessageStruct.message());
+            }
+            infologMessage += strfmt(sysInfologMessageStruct.message());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLogLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// update the error message to metPORecipts buffer
+    /// </summary>
+    /// <param name = "_mbsErrorMsg"></param>
+    /// <param name = "_mbsInfologMsg"></param>
+    /// <param name = "_metPOReceipts"></param>
+    private void updateLogLine(str _mbsErrorMsg, str _mbsInfologMsg, METPOReceipt _metPOReceipts)
+    {
+        ttsbegin;
+
+        // if log header is available use the global variable to update the current log line to the below
+        // status
+        _metPOReceipts.selectForUpdate(true);
+        _metPOReceipts.ErrorMessage  = _mbsErrorMsg + _mbsInfologMsg;
+        _metPOReceipts.Error  = NoYes::Yes;
+        _metPOReceipts.doUpdate();
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
