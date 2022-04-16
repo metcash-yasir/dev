@@ -11,20 +11,25 @@ class METSalesItemSubstitution
 {        
     // TODO prompt when interactive
 
-    #define.MAXSUBLEVELS(10)
+    #define.MAXSUBLEVELS(10)    
 
+    // Referenced records
     SalesLine                               salesLine;
     METSalesLine                            metSalesLine;
     InventDim                               inventDim;
     SalesTable                              salesTable;
 
+    // Options
     boolean                                 interactive;  
     boolean                                 verboseLogging;
-    UserConnection                          verboseLogConnection;
-    METSalesItemSubstitutionAccountRelation substitutionGroup;
-
     boolean                                 runCreationTimeChecks;      // Checks at time of line creation
     boolean                                 runReservationTimeChecks;   // Checks at time of line reservation
+
+    // State/member
+    UserConnection                          verboseLogConnection;
+    METSalesItemSubstitutionAccountRelation substitutionGroup;
+    METSalesItemSubstitutionRounding        rounding;
+
 
 }
 ]]></Declaration>
@@ -165,15 +170,7 @@ class METSalesItemSubstitution
                 if(this.runReservationTimeChecks)
                 {
                     this.verboseInfo(funcName(), 'Searching for reservation-time substitutes', searchDepth == 1);
-
-                    Qty         qtyOnHand                   = this.queryOnHandQty(currentSearchItemID, inventDim);
-                    boolean     itemHasSufficientQtyOnHand  = qtyOnHand >= salesLine.QtyOrdered;
-
-                    this.verboseInfo(funcName(), strFmt('Item %1 has %2 on-hand (%3)',
-                        currentSearchItemID,
-                        qtyOnHand,
-                        itemHasSufficientQtyOnHand ? 'Sufficient for order quantity' : 'Insufficient for order quantity'));
-
+                    
                     select firstonly validtimestate(today) itemSub
                         order by AccountCode asc
                         where   itemSub.ItemId              == currentSearchItemID
@@ -196,35 +193,46 @@ class METSalesItemSubstitution
                             
                         switch(itemSub.SubstitutionCode)
                         {
-                            case METSalesItemSubstitutionCode::Never:
+                            case METSalesItemSubstitutionCode::Replacement:
+                                matchingItemSub = itemSub;
+                                break;
+                            case METSalesItemSubstitutionCode::Never:   // TODO difference?
                             case METSalesItemSubstitutionCode::NoAlternative:
                                 continueSearch  = false;
                                 matchingItemSub = itemSub;
                                 break;
                             case METSalesItemSubstitutionCode::OutOfStock:
-                            case METSalesItemSubstitutionCode::Replacement: // same as oos?
+                                Qty         qtyOnHand                   = this.queryOnHandQty(currentSearchItemID, inventDim);
+                                boolean     itemHasSufficientQtyOnHand  = qtyOnHand >= salesLine.QtyOrdered;
+
+                                this.verboseInfo(funcName(), strFmt('Item %1 has %2 on-hand (%3)',
+                                    currentSearchItemID,
+                                    qtyOnHand,
+                                    itemHasSufficientQtyOnHand ? 'Sufficient for order quantity' : 'Insufficient for order quantity'));
 
                                 if(itemHasSufficientQtyOnHand)
                                 {
-                                    continueSearch  = false;
-                                    matchingItemSub = null;
+                                    // Out of stock entry found, but item has enough stock.
+                                    continueSearch = false;
                                 }
                                 else
                                 {
+                                    // Out of stock entry found, and search item is out of stock. Continue search.
                                     currentSearchItemID = itemSub.SubstituteItemId;
                                     matchingItemSub     = itemSub;
                                 }
 
                                 break;
                             default:
-                            throw error(strFmt("Unexpected substitution code '%1' in %2",
-                                itemSub.SubstitutionCode,
-                                funcName()));
+                                throw error(strFmt("Unexpected substitution code '%1' in %2",
+                                    itemSub.SubstitutionCode,
+                                    funcName()));
                         }
                     }
                     else
                     {
-                        this.verboseInfo(funcName(), 'No substitute found');
+                        this.verboseInfo(funcName(), strFmt('No substitute found for item %1',
+                            currentSearchItemID));
                     }
                 }   
                 if(!itemSub)
@@ -243,12 +251,13 @@ class METSalesItemSubstitution
             {
                 this.verboseInfo(funcName(), strFmt('Final matching subtitute: %1', matchingItemSub.description()));
 
-                metSalesLine.SubstituteOriginalItemID        = salesLine.ItemId;
-                metSalesLine.SubstituteReplacementItemID     = matchingItemSub.SubstituteItemId;
-                metSalesLine.SubstituteParentItemID          = '';
-                metSalesLine.SubstitutionType                = METSalesItemSubstitutionType::SubstitutionCode;
-                metSalesLine.SubstitutionCode                = matchingItemSub.SubstitutionCode;
-                metSalesLine.SubstitutionSetupRefRecID       = matchingItemSub.RecId;
+                metSalesLine.SubstituteOriginalItemID       = salesLine.ItemId;
+                metSalesLine.SubstituteReplacementItemID    = matchingItemSub.SubstituteItemId;
+                metSalesLine.SubstituteParentItemID         = '';
+                metSalesLine.SubstitutionType               = METSalesItemSubstitutionType::SubstitutionCode;
+                metSalesLine.SubstitutionCode               = matchingItemSub.SubstitutionCode;
+                metSalesLine.SubstitutionSetupRefRecID      = matchingItemSub.RecId;
+                rounding                                    = matchingItemSub.Rounding;
 
                 switch(metSalesLine.SubstitutionCode)
                 {
@@ -272,6 +281,7 @@ class METSalesItemSubstitution
                     metSalesLine.SubstitutionType               = METSalesItemSubstitutionType::ParentChild;
                     metSalesLine.SubstitutionCode               = METSalesItemSubstitutionCode::None;
                     metSalesLine.SubstitutionSetupRefRecID      = matchingParentChild.RecId;
+                    rounding                                    = matchingParentChild.Rounding;
                 }
             }
 
@@ -279,21 +289,31 @@ class METSalesItemSubstitution
             {
                 if(replaceItem)
                 {
-                    this.verboseInfo(funcName(), strFmt('Item %1 replaced with %2',
-                        salesLine.ItemId,
-                        metSalesLine.SubstituteReplacementItemID));
+                    boolean copiedToNewLine;
                     if(salesLine.RecId)
                     {
                         this.copyToNewLine(metSalesLine.SubstituteReplacementItemID);
+                        copiedToNewLine = true;
+                    }
+                    else
+                    {
+                        this.verboseInfo(funcName(), strFmt('Item %1 replaced with %2',
+                            salesLine.ItemId,
+                            metSalesLine.SubstituteReplacementItemID));                    
                     }
 
                     salesLine.ItemId = metSalesLine.SubstituteReplacementItemID;
                     salesLine.itemIdChanged();
 
-                    this.updateQuantity();
+                    if(!copiedToNewLine)
+                    {
+                        this.updateQuantity();
+                    }
+
+                    info(strFmt("@MET:SubItemReplaced",
+                        metSalesLine.SubstituteOriginalItemID,
+                        metSalesLine.SubstituteReplacementItemID));
                 }
-                //salesLine.update();
-                //metSalesLine.update();
             }
         }
         else
@@ -311,11 +331,13 @@ class METSalesItemSubstitution
 			<Method>
 				<Name>searchParentChild</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Search for parent/child relationship.
+    /// </summary>
+    /// <param name = "_itemID">_itemID</param>
+    /// <returns>Matching record or null</returns>
     protected METSalesItemSubstitutionParentChild searchParentChild(ItemId _itemID)
     {
-        this.verboseInfo(funcName(), strFmt('Searching parent/child relationship for child item %1',
-            _itemID));
-
         METSalesItemSubstitutionParentChild parentChild;        
         select firstonly parentChild
             where   parentChild.InventSiteId    == salesTable.InventSiteId
@@ -362,12 +384,13 @@ class METSalesItemSubstitution
         newLine.itemIdChanged();
         newLine.insert();
 
+        // TODO copy notes etc.
         METSalesLine metNewLine = metSalesLine.data();
         metNewLine.SalesLine = newLine.RecId;
         metNewLine.insert();
 
         guid logReference;
-        metSalesLine.SubstitutionVerboseLogReference = logReference;  
+        metSalesLine.SubstitutionVerboseLogReference = logReference;    // clear ref on original record. 
         metSalesLine.update();
         
         this.verboseInfo(funcName(), strFmt('Order line (Item %1, Lot ID %2) has been copied and replaced by (Item %3, Lot ID %4)',
@@ -404,6 +427,7 @@ class METSalesItemSubstitution
         Qty             onHandQty;
         boolean         checkTestOnHandQtyTable = true; // **** This is temporary, for testing/debugging only
         
+        // ***** This is only for testing!
         if(checkTestOnHandQtyTable)
         {
             METSalesItemSubstituteTestOnHand testOnHand = METSalesItemSubstituteTestOnHand::find(
@@ -455,6 +479,8 @@ class METSalesItemSubstitution
         InventTableModule   replacementItemInvent   = replacementItem.inventTableModuleInvent();    
         UnitOfMeasureSymbol replacementSalesUnit    = this.getItemSalesUnit(replacementItem.ItemId);
         
+        this.verboseInfo(funcName(), '** Updating quantity for substituted item **');
+
         this.verboseInfo(funcName(), strFmt('Original %1 item ordered %2 %3 (%4 %5)',
             originalItem.ItemId,
             salesLine.SalesQty,
@@ -469,26 +495,70 @@ class METSalesItemSubstitution
 
         if(originalItemInvent.UnitId == replacementItemInvent.UnitID)
         {
-            Qty replacementQty = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+            Qty replacementQtySalesUnit = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
                 replacementItem.ItemId,
                 InventDim::findOrCreate(inventDim).inventDimId,
                 salesLine.QtyOrdered,
                 replacementItemInvent.UnitId,
                 replacementSalesUnit,
                 true,
-                true);
+                false);
 
-            if(replacementQty == 0)
+            this.verboseInfo(funcName(), strFmt('Conversion from inventory unit %1 %2 to sales unit %3 %4',
+                salesLine.QtyOrdered,
+                replacementItemInvent.UnitId,
+                replacementQtySalesUnit,
+                replacementSalesUnit));
+
+            if(real2int(replacementQtySalesUnit) != replacementQtySalesUnit)
+            {                
+                Qty     roundedSalesQty;
+                boolean roundingApplied;
+                int     roundingPrecision = 1;  // ** config?
+                switch(rounding)
+                {
+                    case METSalesItemSubstitutionRounding::ToNearest:
+                        roundedSalesQty = round(replacementQtySalesUnit, roundingPrecision);
+                        roundingApplied = true;
+                        break;
+                    case METSalesItemSubstitutionRounding::Up:
+                        roundedSalesQty = roundUp(replacementQtySalesUnit, roundingPrecision);
+                        roundingApplied = true;
+                        break;
+                    case METSalesItemSubstitutionRounding::Down:
+                        roundedSalesQty = roundDown(replacementQtySalesUnit, roundingPrecision);
+                        roundingApplied = true;
+                        break;
+                }
+                if(roundingApplied)
+                {
+                    this.verboseInfo(funcName(), strFmt('%1 rounded to %2 using method %3',
+                        replacementQtySalesUnit,
+                        roundedSalesQty,
+                        rounding));
+                    replacementQtySalesUnit = roundedSalesQty;
+                }
+                else
+                {
+                    this.verboseInfo(funcName(), 'No rounding applied due to configuration');                        
+                    if(replacementQtySalesUnit < 1)
+                    {
+                        this.warning(strFmt('Warning during conversion of %1 %2 to %3 for substitute item %4',
+                            salesLine.SalesQty,
+                            salesLine.SalesUnit,
+                            replacementQtySalesUnit,
+                            replacementItem.ItemId));  
+                        replacementQtySalesUnit = 1;    // *** TODO confirm requirements for this scenario.
+                    }
+                }
+            }
+            else
             {
-                replacementQty = 1; // ** 
+                this.verboseInfo(funcName(), 'Rounding not required');
             }
 
-            salesLine.SalesQty  = replacementQty;
-            salesLine.SalesUnit = replacementSalesUnit;
-        
-            this.verboseInfo(funcName(), strFmt('Initial conversion to %1 %2',
-                salesLine.SalesQty,
-                salesLine.SalesUnit));            
+            salesLine.SalesQty  = replacementQtySalesUnit;
+            salesLine.SalesUnit = replacementSalesUnit;                
         
             // TODO min/max/etc is not working correctly with the site/item specific
             // settings mod. When it is, logic should not be replicated here. Ordinarily
@@ -552,11 +622,13 @@ class METSalesItemSubstitution
             }
             if(salesSetup.MultipleQty)
             {
-                // TODO apply rounding
                 int salesQtyInt = real2int(salesLine.SalesQty);
                 int multQtyInt  = real2int(salesSetup.MultipleQty);
                 if(salesQtyInt mod multQtyInt)
                 {
+                    this.verboseInfo(funcName(), strFmt('Rounding %1 up to nearest multiple of %2',
+                        salesLine.SalesQty,
+                        multQtyInt));
                     salesQtyInt         = ((salesQtyInt / multQtyInt) + 1) * multQtyInt;
                     salesLine.SalesQty  = salesQtyInt;
                 }
@@ -618,6 +690,17 @@ class METSalesItemSubstitution
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>warning</Name>
+				<Source><![CDATA[
+    private boolean warning(str _msg)
+    {
+        this.verboseInfo(funcName(), _msg);
+        return checkFailed(_msg);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>verboseInfo</Name>
 				<Source><![CDATA[
     /// <summary>jh
@@ -641,7 +724,7 @@ class METSalesItemSubstitution
             {
                 verboseLog.setConnection(this.verboseLogConnection);
             }
-            verboseLog.insert();
+            verboseLog.insert();            
         }
     }
 
@@ -706,7 +789,7 @@ class METSalesItemSubstitution
     /// <param name = "_salesLine">_salesLine</param>
     /// <param name = "_metSalesLine">_metSalesLine</param>
     /// <param name = "_inventDim">_inventDim</param>
-    /// <returns></returns>
+    /// <returns>Validation result</returns>
     static public boolean runSalesLineCreationFromForm(
         SalesLine       _salesLine,
         METSalesLine    _metSalesLine,
@@ -718,7 +801,7 @@ class METSalesItemSubstitution
             _inventDim);
         sub.runCreationTimeChecks       = true;
         sub.interactive                 = true;
-        sub.runReservationTimeChecks    = (_salesLine.Reservation == ItemReservation::Automatic);
+        sub.runReservationTimeChecks    = true; // ***** TODO (_salesLine.Reservation == ItemReservation::Automatic);
         return sub.run();
     }
 
@@ -760,8 +843,6 @@ class METSalesItemSubstitution
     /// <param name = "_salesLine">_salesLine</param>
     /// <param name = "_metSalesLine">_metSalesLine</param>
     /// <param name = "_inventDim">_inventDim</param>
-    /// <param name = "_eventSource">_eventSource</param>
-    /// <param name = "_interactive">_interactive</param>
     /// <returns>New instance</returns>
     static private METSalesItemSubstitution construct(
         SalesLine                               _salesLine,
@@ -773,6 +854,21 @@ class METSalesItemSubstitution
             _metSalesLine,
             _inventDim);
         return sub;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>maxSearchDepth</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Max. search depth. This is configurable in the inventory parameters but may
+    /// not exceed this number.
+    /// </summary>
+    /// <returns>Result</returns>
+    static public int maxSearchDepth()
+    {
+        return #MAXSUBLEVELS;
     }
 
 ]]></Source>
