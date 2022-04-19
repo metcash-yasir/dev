@@ -29,12 +29,11 @@ class METPostProductReceiptService extends SysOperationServiceBase
         PackingSlipId   packingSlipIdCur, packingSlipIdNew;
         utcdatetime     productReceiptDate;
         boolean         isPostingSuccessful;
+        #OCCRetryCount
         
         try
         {
-            ttsbegin;
-
-            while select forupdate metPOReceipt
+            while select metPOReceipt
                 group by PurchaseOrderNumber, OrderVendorAccountNumber, ProductReceiptDate, PackingSlipId, ProductNumber, ReceivedPurchaseQuantity, ReceivedInventoryQuantity
                 where metPOReceipt.Processed == NoYes::No
                    && metPOReceipt.Error == NoYes::Yes
@@ -42,7 +41,7 @@ class METPostProductReceiptService extends SysOperationServiceBase
 
                 if((packingSlipIdCur != metPOReceipt.PackingSlipId) &&  packingSlipIdCur) //Check if new PO receipt
                 {
-                    select metPOReceiptLoc
+                    select firstonly metPOReceiptLoc
                         where metPOReceiptLoc.PackingSlipId == packingSlipIdCur
                             && metPOReceiptLoc.ProductReceiptDate == productReceiptDate;
                         
@@ -63,7 +62,7 @@ class METPostProductReceiptService extends SysOperationServiceBase
             }
             if(packingSlipIdCur)  //Check if new PO receipt
             {
-                select metPOReceiptLoc
+                select firstonly metPOReceiptLoc
                             where metPOReceiptLoc.PackingSlipId == packingSlipIdCur
                                && metPOReceiptLoc.ProductReceiptDate == productReceiptDate;
                         
@@ -72,14 +71,54 @@ class METPostProductReceiptService extends SysOperationServiceBase
                 this.clearLinesFromList(purchLineList);
             }
 
-            metPOReceipt.doUpdate();
-
-            ttscommit;
-
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            errorMessage    = METConstants::emptyString;
+            System.Exception ex = ClrInterop::getLastException();
+            if (ex != null)
+            {
+                ex = ex.get_InnerException();
+                if (ex != null)
+                {
+                    errorMessage += ex.Message + ex.ToString();
+                }
+            }
+            
+            this.updateLogLine(errorMessage, infologMessage, metPOReceipt);
         }
         catch(Exception::Error)
         {
-            errorMessage    = '';
+            errorMessage    = METConstants::emptyString;
 
             //If an error occurs, check if log header is available
             this.getInfologMessage();
@@ -118,7 +157,6 @@ class METPostProductReceiptService extends SysOperationServiceBase
     /// Adds purchase lines to the purchaseLineList.
     /// </summary>
     /// <param name = "_purchLine">purchase line record.</param>
-    /// <param name = "_metAMEXJournalId">AMEX journal id.</param>
     /// <returns>purchase lines list.</returns>
 
     public List addPOLinesToList(PurchLine _purchLine)
@@ -143,7 +181,6 @@ class METPostProductReceiptService extends SysOperationServiceBase
     {
         METPOReceipt metPOReceiptLoc;
 
-        ttsbegin;
         if(_isPostingSuccessful)
         {
             delete_from metPOReceiptLoc
@@ -153,16 +190,18 @@ class METPostProductReceiptService extends SysOperationServiceBase
         }
         else
         {
+            ttsbegin;
             while select forupdate metPOReceiptLoc
                 where metPOReceiptLoc.PackingSlipId == _metPOReceipt.PackingSlipId
                    && metPOReceiptLoc.ProductReceiptDate == _metPOReceipt.ProductReceiptDate
             {
                 metPOReceiptLoc.Error = NoYes::Yes;
-                metPOReceiptLoc.ErrorMessage = "Posting PO receipt failed";
+                metPOReceiptLoc.ErrorMessage = strFmt("@MET:POReceiptError", _metPOReceipt.PackingSlipId);
                 metPOReceiptLoc.doUpdate();
             }
+            ttscommit;
         }
-        ttscommit;
+        
 
     }
 
@@ -203,7 +242,7 @@ class METPostProductReceiptService extends SysOperationServiceBase
             
             if(_metPOReceipt.ReceivedInventoryQuantity) //Convert inventory quantity to purchase quantity
             {
-                UnitOfMeasureRecId toUnitOfMeasure  = UnitOfMeasure::unitOfMeasureIdBySymbol('ea');
+                UnitOfMeasureRecId toUnitOfMeasure  = UnitOfMeasure::unitOfMeasureIdBySymbol(METConstants::unitEach);
                 UnitOfMeasureRecId fromUnitOfMeasure  = UnitOfMeasure::unitOfMeasureIdBySymbol(purchLine.PurchUnit);
                 EcoResProductUnitConverter ecoResProductUnitConverter = EcoResProductUnitConverter::newForReleasedProduct(purchLine.ItemId, purchLine.InventDimId, fromUnitOfMeasure, toUnitOfMeasure, false, true);
                 boolean conversionOk    = ecoResProductUnitConverter.canValueBeConverted();
