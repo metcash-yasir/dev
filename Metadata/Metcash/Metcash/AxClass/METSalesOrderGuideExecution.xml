@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesOrderGuideExecution</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_22903_SalesOrderGuide
+/// Handles execution of sales order guides (applying checks and updates to orders
+/// based on applicable guide).
+/// </summary>
+final class METSalesOrderGuideExecution
+{
+    // Params
+    SalesId                     salesID;
+
+    // State
+    SalesTable                  salesTable;
+    SalesLine                   salesLine;
+    InventTable                 inventTable;
+    METSalesOrderGuideTable     orderGuide;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public boolean run()
+    {
+        salesTable = SalesTable::find(salesId);
+        if(!salesTable)
+            throw error(strFmt("Sales order '%1' does not exist", salesId));
+
+        METSalesOrderGuideID guideID = METSalesOrderGuideExecution::determineSalesOrderGuide(salesTable);
+        if(guideID)
+        {
+            orderGuide = METSalesOrderGuideTable::find(guideID);
+            if(!orderGuide)
+            {
+                throw error(strFmt("Order guide '%1' found for sales order '%2' does not exist",
+                    guideID,
+                    salesTable.SalesId));
+            }
+
+            ttsbegin;
+       
+            while select forupdate salesLine
+                where   salesLine.SalesId   == salesTable.SalesId
+            join inventTable
+                where   inventTable.ItemId  == salesLine.ItemId
+            {
+                if(!this.checkLine())
+                {
+                    salesLine.RemainInventPhysical  = 0;
+                    salesLine.RemainInventFinancial = 0;
+                    salesLine.RemainSalesPhysical   = 0;
+                    salesLine.RemainSalesFinancial  = 0;
+                    salesLine.update();
+                }
+            }
+
+            ttscommit;
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkLine</Name>
+				<Source><![CDATA[
+    protected boolean checkLine()
+    {     
+        boolean checkExpandedItemList = false;  // TODO setting on guide, requires publish function
+
+        if(checkExpandedItemList)
+        {
+            return this.checkLinePreExpandedItemList();
+        }
+        else
+        {
+            METSalesOrderGuideLine  guideLine;
+
+            // Check item-specific guide lines
+            while select guideLine
+            order by guideLine.IncludeExclude
+            where   guideLine.SalesOrderGuideID == orderGuide.SalesOrderGuideID
+            &&      guideLine.LineType          == METSalesOrderGuideLineType::Item
+            &&      guideLine.ItemId            == salesLine.ItemId
+            {
+                if(guideLine.IncludeExclude == METSalesOrderGuideInclusion::Include)
+                {
+                    // Specific inclusion for item.
+                    return true;
+                }
+                else
+                {
+                    // Specific exclusion for item.
+                    return false;
+                }
+            }
+
+            // Check attribute-based guide lines
+            while select guideLine
+            order by guideLine.IncludeExclude
+            where   guideLine.SalesOrderGuideID == orderGuide.SalesOrderGuideID
+            &&      guideLine.LineType          == METSalesOrderGuideLineType::Attribute
+            &&      guideLine.AttributeName     != ''
+            &&      guideLine.AttributeValue    != ''
+            {
+                METEcoResProductAttributeValueExpanded productAttributeValue;
+                select firstonly productAttributeValue
+                where   productAttributeValue.Product       == inventTable.Product
+                &&      productAttributeValue.AttributeName == guideLine.AttributeName
+                &&      productAttributeValue.TextValue     == guideLine.AttributeValue;
+                if(productAttributeValue)
+                {
+                    if(guideLine.IncludeExclude == METSalesOrderGuideInclusion::Include)
+                    {
+                        // Item has an included attribute value
+                        return true;
+                    }
+                    else
+                    {
+                        // Item has an excluded attribute value
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkLinePreExpandedItemList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check line via pre-expanded / published list of items.
+    /// </summary>
+    /// <returns></returns>
+    protected boolean checkLinePreExpandedItemList()
+    {
+        METSalesOrderGuideExpandedItemList guideItemList;
+        select firstonly RecId from guideItemList
+            where   guideItemList.SalesOrderGuideID == orderGuide.SalesOrderGuideID
+            &&      guideItemList.ItemId            == salesLine.ItemId;
+        return guideItemList.RecId != 0;        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSalesID</Name>
+				<Source><![CDATA[
+    public SalesID parmSalesID(SalesId _salesID = salesID)
+    {
+        salesID = _salesID;
+        return salesID;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>determineSalesOrderGuide</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determine sales order guide applicable to the specified sales order.
+    /// </summary>
+    /// <param name = "_salesTable">_salesTable</param>
+    /// <returns>Order guide ID, or blank if none found</returns>
+    static public METSalesOrderGuideID determineSalesOrderGuide(SalesTable _salesTable)
+    {
+        METSalesOrderGuideID    guideID;
+        METCustTable            metCust;
+        
+        metCust = METCustTable::find(_salesTable.CustAccount);
+        if(metCust.SalesOrderGuideID)
+        {
+            guideID = metCust.SalesOrderGuideID;
+        }
+        else
+        {
+            // TODO Check "Customer operations group pricing attributes". Pending dev?
+            if(metCust.CustOperGroupId)
+            {
+                METCustOperGroup operGroup = METCustOperGroup::find(metCust.CustOperGroupId);
+                if(operGroup.SalesOrderGuideID)
+                {
+                    guideID = operGroup.SalesOrderGuideID;
+                }
+            }
+        }
+        return guideID;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyChecksToOrder</Name>
+				<Source><![CDATA[
+    static boolean applyChecksToOrder(SalesId _salesID)
+    {
+        METSalesOrderGuideExecution exec = new METSalesOrderGuideExecution();
+        exec.parmSalesID(_salesID);
+        return exec.run();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
