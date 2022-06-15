@@ -216,6 +216,7 @@ class METItemPackChangeHelper
             this.updateItemStatus(metItemSiteSettingsSetupTemp, METConstants::Discontinued, true);
             this.rePriceOpenSalesOrders();
             this.processSlowMovingItems();
+            this.processCDSWarehouse();
 
             ttscommit;
         }
@@ -239,9 +240,9 @@ class METItemPackChangeHelper
             ret = checkFailed("@MET:METPackChangeError");
         }
 
-        //ret = this.checkStock() && ret;
+        ret = this.checkStock() && ret;
 
-        //ret = this.checkOpenPurchQty() && ret;
+        ret = this.checkOpenPurchQty() && ret;
 
         return ret;
     }
@@ -382,6 +383,7 @@ class METItemPackChangeHelper
         if (whsPhysDimUOM.RecId)
         {
             buf2Buf(_whsPhysDimUOMTempItem, whsPhysDimUOM);
+            whsPhysDimUOM.ItemId = _metItemSiteSettingsSetupOriginal.ItemId;
             whsPhysDimUOM.update();
         }
         else 
@@ -398,7 +400,7 @@ class METItemPackChangeHelper
 				<Name>createBarcode</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Creates the barcodes
+    /// Create the barcodes
     /// </summary>
     /// <param name = "_metItemSiteSettingsSetupOriginal">The original item site settings buffer</param>
     private void createBarcode(MetItemSiteSettingsSetup _metItemSiteSettingsSetupOriginal, MetItemSiteSettingsSetup _metItemSiteSettingsSetupTemp)
@@ -406,12 +408,26 @@ class METItemPackChangeHelper
         InventItemBarcode inventItemBarcode, inventItemBarcodeTemp;
 
         select inventItemBarcodeTemp where
-            inventItemBarcodeTemp.itemId == _metItemSiteSettingsSetupTemp.ItemId;
+            inventItemBarcodeTemp.itemId == _metItemSiteSettingsSetupTemp.ItemId
+            && inventItemBarcodeTemp.useForPrinting == NoYes::Yes;
 
-        inventItemBarcode.clear();
-        buf2Buf(inventItemBarcodeTemp, inventItemBarcode);
-        inventItemBarcode.ItemId = _metItemSiteSettingsSetupOriginal.ItemId;
-        inventItemBarcode.insert();
+        select firstonly forupdate inventItemBarcode 
+            where inventItemBarcode.itemId == _metItemSiteSettingsSetupOriginal.ItemId
+            && inventItemBarcode.useForPrinting == NoYes::Yes;
+
+        if (!inventItemBarcode.RecId)
+        {
+            inventItemBarcode.clear();
+            buf2Buf(inventItemBarcodeTemp, inventItemBarcode);
+            inventItemBarcode.ItemId = _metItemSiteSettingsSetupOriginal.ItemId;
+            inventItemBarcode.insert();
+        }
+        else
+        {
+            buf2Buf(inventItemBarcodeTemp, inventItemBarcode);
+            inventItemBarcode.ItemId = _metItemSiteSettingsSetupOriginal.ItemId;
+            inventItemBarcode.update();
+        }
 
     }
 
@@ -476,7 +492,7 @@ class METItemPackChangeHelper
             while select RecId from salesTable
                 where salesTable.SalesStatus == SalesStatus::Backorder
                 && salesTable.DocumentStatus == DocumentStatus::Confirmation    
-            join forupdate * from salesLine
+            join forupdate salesLine
                 where salesLine.SalesId == salesTable.SalesId
                 && salesLine.ItemId == metItemSiteSettingsSetupOriginal.ItemId
                 && salesLine.SalesStatus == SalesStatus::Backorder
@@ -503,8 +519,6 @@ class METItemPackChangeHelper
                 inventTableModuleNewPack = InventTableModule::find(inventTable.ItemId, ModuleInventPurchSales::Invent);
                 ecoResProduct = EcoResProduct::find(inventTable.Product);
 
-                //      unitOfMeasureFrom = UnitOfMeasure::findBySymbol(inventTableModuleNewPack.UnitId);
-                
                 unitOfMeasureTo = UnitOfMeasure::findBySymbol(inventTable.inventItemSalesSetup(inventDim.inventdimId).METSalesUnit);
 
                 unitOfMeasureConverter = UnitOfMeasureConverter::newFromConversionParameters(unitOfMeasureFrom.RecId, unitOfMeasureTo.RecId, NoYes::No, ecoResProduct.RecId);
@@ -549,37 +563,94 @@ class METItemPackChangeHelper
         MetItemSiteSettingsSetup metItemSiteSettingsSetupLocal;
         InventItemPurchSetup inventItemPurchSetupLocal;
         InventItemSalesSetup inventItemSalesSetupLocal;
+        InventLocation inventLocation;
 
         inventDim.inventSiteId = metItemSiteSettingsSetupOriginal.InventSiteId;
         inventDim = InventDim::findOrCreate(inventDim);
         reqItemTable = reqItemTable::find(metItemSiteSettingsSetupOriginal.ItemId, inventDim.inventDimId, true);
-        if (inventParameters.METNDCSite == metItemSiteSettingsSetupOriginal.InventSiteId && (reqItemTable.METOSCCode == 'S' || reqItemTable.METOSCCode == 'V'))
+        if (inventParameters.METNDCSite == metItemSiteSettingsSetupOriginal.InventSiteId && 
+            (reqItemTable.METOSCCode == METConstants::S || reqItemTable.METOSCCode == METConstants::V))
         {
-            while select forupdate reqItemTableUpdate
-                where reqItemTableUpdate.ItemId == metItemSiteSettingsSetupOriginal.ItemId
-                && reqItemTableUpdate.RecId != reqItemTable.RecId
-                && reqItemTableUpdate.ReqPOType == ReqPOType::Transfer
-                && reqItemTableUpdate.InventLocationIdReqMain == reqItemTable.InventLocationIdReqMain
-            join InventSiteId from inventDim
-                where inventDim.inventDimId == reqItemTable.CovInventDimId
+            while select metItemSiteSettingsSetupLocal where metItemSiteSettingsSetupLocal.ItemId == metItemSiteSettingsSetupOriginal.ItemId
+            {
+                inventDim.clear();
+                inventDim.inventSiteId = metItemSiteSettingsSetupLocal.InventSiteId;
+                inventDim = InventDim::findOrCreate(inventDim);
+                reqItemTable = reqItemTable::find(metItemSiteSettingsSetupOriginal.ItemId, inventDim.inventDimId, true);
+
+                if (reqItemTable.ReqPOType == ReqPOType::Transfer)
+                {
+                    // Check if warehouse is linked to NDC site
+                    select RecId from inventLocation
+                        where inventLocation.InventLocationId == reqItemTable.InventLocationIdReqMain
+                        && inventLocation.InventSiteId == inventParameters.METNDCSite;
+                    
+                    if (inventLocation.RecId)
+                    {
+                        select forupdate metItemSiteSettingsSetupLocal
+                            where metItemSiteSettingsSetupLocal.ItemId == metItemSiteSettingsSetupOriginal.ItemId
+                            && metItemSiteSettingsSetupLocal.InventSiteId == inventDim.InventSiteId;
+
+                        inventItemPurchSetupLocal = InventItemPurchSetup::find(metItemSiteSettingsSetupLocal.ItemId, inventDim.inventDimId);
+                        inventItemSalesSetupLocal = InventItemSalesSetup::find(metItemSiteSettingsSetupLocal.ItemId, InventDim.inventDimId);
+
+                        this.replaceOriginalItemSiteInfo(
+                            inventItemPurchSetupLocal, inventItemPurchSetupTempItem,
+                            inventItemSalesSetupLocal, inventItemSalesSetupTempItem,
+                            metItemSiteSettingsSetupLocal, metItemSiteSettingsSetupTemp);
+
+                        this.updateItemStatus(metItemSiteSettingsSetupLocal, METConstants::Active);
+                    }
+                    
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCDSWarehouse</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process CDS warehouse items 
+    /// </summary>
+    private void processCDSWarehouse()
+    {
+        ReqItemTable reqItemTableLocal;
+        InventLocation inventLocationLocal;
+        MetItemSiteSettingsSetup metItemSiteSettingsSetupLocal;
+        InventItemPurchSetup inventItemPurchSetupLocal;
+        InventItemSalesSetup inventItemSalesSetupLocal;
+        InventDim inventDim;
+        
+        while select reqItemTableLocal 
+            where reqItemTableLocal.ItemId == metItemSiteSettingsSetupOriginal.ItemId
+            && reqItemTableLocal.ReqPOType == ReqPOType::Transfer
+        join InventSiteId, InventDimId from inventDim
+            where inventDim.inventDimId == reqItemTableLocal.CovInventDimId
+            
+        {
+            inventLocationLocal = InventLocation::find(reqItemTableLocal.inventDim().InventLocationId);
+
+            if (inventLocationLocal.METCSDWarehouse)
             {
                 select forupdate metItemSiteSettingsSetupLocal
                     where metItemSiteSettingsSetupLocal.ItemId == metItemSiteSettingsSetupOriginal.ItemId
                     && metItemSiteSettingsSetupLocal.InventSiteId == inventDim.InventSiteId;
 
-                    inventItemPurchSetupLocal = InventItemPurchSetup::find(metItemSiteSettingsSetupLocal.ItemId, inventDim.inventDimId);
-                    inventItemSalesSetupLocal = InventItemSalesSetup::find(metItemSiteSettingsSetupLocal.ItemId, InventDim.inventDimId);
+                inventItemPurchSetupLocal = InventItemPurchSetup::find(metItemSiteSettingsSetupLocal.ItemId, inventDim.inventDimId);
+                inventItemSalesSetupLocal = InventItemSalesSetup::find(metItemSiteSettingsSetupLocal.ItemId, InventDim.inventDimId);
 
-                    this.replaceOriginalItemSiteInfo(
+                this.replaceOriginalItemSiteInfo(
                         inventItemPurchSetupLocal, inventItemPurchSetupTempItem,
                         inventItemSalesSetupLocal, inventItemSalesSetupTempItem,
                         metItemSiteSettingsSetupLocal, metItemSiteSettingsSetupTemp);
 
-                this.createBarcode(metItemSiteSettingsSetupLocal, metItemSiteSettingsSetupTemp);
-                this.createPhysicalDim(metItemSiteSettingsSetupLocal, whsPhysDimUOMTempItem);
                 this.updateItemStatus(metItemSiteSettingsSetupLocal, METConstants::Active);
                 
             }
+
         }
     }
 
@@ -597,7 +668,7 @@ class METItemPackChangeHelper
     {
         WHSPhysDimUOM whsPhysDimUOM;
         
-        select * from whsPhysDimUOM
+        select whsPhysDimUOM
             where whsPhysDimUOM.itemId == _itemId;
 
         return whsPhysDimUOM;
