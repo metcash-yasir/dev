@@ -1,0 +1,495 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>KPMGMultiCustAccountStatementExtController</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_15231_Customer Statement DCP 07/02/2022
+/// "Statement To" functionality. Display Multiple Accounts per report
+/// </summary>
+class KPMGMultiCustAccountStatementExtController extends CustAccountStatementExtController
+{
+    KPMGLinkedCustAccountTmp METLinkedCustAccountTmp;
+    KPMGLinkedCustAccountTmp METLinkedCustAccountTmpParent;
+    CustTable                METCustTableParent;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Instantiate controller and start operation
+    /// </summary>
+    /// <param name = "_args">Args</param>
+    public static void main(Args _args)
+    {
+        SrsPrintMgmtFormLetterController controller = new KPMGMultiCustAccountStatementExtController();
+        controller.parmReportName(PrintMgmtDocType::construct(PrintMgmtDocumentType::KPMGMultiCustAccountStatement).getDefaultReportFormat());
+        controller.parmArgs(_args);
+        CustAccountStatementExtController::startControllerOperation(controller, _args);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runPrintMgmt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs the print report. copied from CustAccountStatementExtController
+    /// </summary>
+    protected void runPrintMgmt()
+    {
+        //If from date and to date are empty, but date interval is specified populate dates from date interval parameters
+        if (this.parmContract().parmDateCode() && !this.parmContract().parmFromDate() && !this.parmContract().parmToDate())
+        {
+            LedgerPeriodCode ledgerPeriodCode = LedgerPeriodCode::find(this.parmContract().parmDateCode());
+
+            if (ledgerPeriodCode)
+            {
+                this.parmContract().parmFromDate(ledgerPeriodCode.fromDate());
+                this.parmContract().parmToDate(ledgerPeriodCode.toDate());
+            }
+        }
+        
+        this.preRunPrintMgmt();
+
+        // <GCN>
+        isTaxIntegrateEnable_CN = SysCountryRegionCode::isLegalEntityInCountryRegion([#isoCN]) && CustParameters::find().TaxIntegrationSystem_CN;
+        // </GCN>
+
+        // Pre-validate the number of reports that will be printed
+        initialPreRunValidate = true;
+        var preRunValidateState = this.processPreRunValidate();
+        initialPreRunValidate = false;
+        
+        if (preRunValidateState != SrsReportPreRunState::Run)
+        {
+            return;
+        }
+
+        // Report Parameters
+        statementStartDate = this.parmContract().parmFromDate();
+        statementEndDate = this.parmContract().parmToDate() == dateNull() ? maxDate() : this.parmContract().parmToDate();
+        onlyOpen = this.parmContract().parmOnlyOpen();
+        includeReversed = this.parmContract().parmIncludeReversed();
+        printGiro = this.parmContract().parmPrintGiro();
+        printNotZero = this.parmContract().parmPrintNonZero();
+        printAmountOnGiro = this.parmContract().parmPrintAmountGiro();
+        printPaymentSchedule = this.parmContract().parmPrintPaymentSchedule();
+        specifyDueToDate = this.parmContract().parmSpecifyDueToDate();
+
+        showAging = this.parmContract().parmPrintAging(); // Controls whether any aging is shown
+        
+        if (showAging)
+        {
+            useAgingDefinition = this.parmContract().parmAgingPeriod(); // predefined or manually defined aging periods?
+            
+            if (useAgingDefinition)
+            {
+                agingDefinition = this.parmContract().parmAgingBucket(); // If using predefined aging, this is the aging definition name
+                showAgingDescription = this.parmContract().parmAgingBucketPrintDescription() == NoYesCombo::Yes;
+            }
+            else
+            {
+                manualAgingInterval = this.parmContract().parmInterval();
+                manualAgingDayMonth = this.parmContract().parmDayMonth();
+                manualAgingDirection = this.parmContract().parmPrintingDirection();
+            }
+        }
+
+        statementCompany = curext();
+
+        if (this.getGiroType() != PaymentStub::None)
+        {
+            SysQuery::findOrCreateRange(query.dataSourceTable(tableNum(CustTable)), fieldNum(CustTable, GiroTypeAccountStatement)).value(strFmt('%1', this.getGiroType()));
+        }
+
+        this.initializePrintManagementSettingDetail();
+
+        // Company list
+        container selectedCompanyList = KPMGMUltiCustAccountStatementExtController::getSelectedCompanyList(query, curext());
+
+        if (this.getGiroType() == PaymentStub::FIK752 && (Ledger::accountingCurrency(CompanyInfo::current()) != 'DKK' || this.checkCurrency()))
+        {
+            info("@SYS343346");
+        }
+
+        if (this.getGiroType() == PaymentStub::ESR_red_bank && this.KPMGcheckMultipleCurrency())
+        {
+            throw info("@SYS344476");
+        }
+
+        // Checking start date and end date
+        if (statementStartDate == dateNull() || statementEndDate == dateMax())
+        {
+            showAging = false;
+        }
+
+        if (conLen(selectedCompanyList) > 0)
+        {
+            query.allowCrossCompany(true); //std has this as false
+            
+            var customerQueryRun = new QueryRun(query);
+            boolean isEncounteredException = false;
+            
+            this.METPopulateLinkedCustAccountTables(customerQueryRun);
+
+            CustTable METCustTable;
+
+            while select LinkedCustAccountNum, LinkedLegalEntity
+                from METLinkedCustAccountTmpParent
+                group by LinkedCustAccountNum asc, LinkedLegalEntity
+                where   METLinkedCustAccountTmpParent.Parent == NoYes::Yes
+            {
+                changecompany(METLinkedCustAccountTmpParent.LinkedLegalEntity)
+                {
+                    METCustTableParent = CustTable::find(METLinkedCustAccountTmpParent.LinkedCustAccountNum);
+
+                    if(!METCustTableParent)
+                    {
+                        warning(strFmt("@KPMGAddOn:StatementToAccountNotFound", METLinkedCustAccountTmpParent.LinkedCustAccountNum, METLinkedCustAccountTmpParent.LinkedLegalEntity));
+                        continue;
+                    }
+                }
+                                
+                createdTransactionId = 0;
+                
+                // Reset this flag after printing each customer details.
+                custAccountStatementExtTmp.Flag = 0;
+                
+                try
+                {
+                    ttsbegin;
+
+                    while select METLinkedCustAccountTmp
+                        order by Parent desc, LinkedCustAccountNum asc
+                        where   METLinkedCustAccountTmp.LinkedCustAccountNum   == METLinkedCustAccountTmpParent.LinkedCustAccountNum
+                        &&      METLinkedCustAccountTmp.LinkedLegalEntity      == METLinkedCustAccountTmpParent.LinkedLegalEntity
+                        &&      METLinkedCustAccountTmp.AddressOnly            == NoYes::No
+                    {    
+
+                        selectedCompanyList = conNull();
+                        selectedCompanyList = [METLinkedCustAccountTmp.LegalEntity];
+
+                        changecompany(METLinkedCustAccountTmp.LegalEntity)
+                        {
+                            METCustTable = CustTable::find(METLinkedCustAccountTmp.CustAccountNum);
+                            setPrefix(strFmt("@AccountsReceivable:CustAccountNumber", METCustTable.AccountNum));
+                        }
+
+                        if(!this.parmCancelRun())
+                        {
+                            // If no customer language is specified use current user language
+                            languageId = METCustTable.languageId() ? METCustTable.languageId() : infolog.language();
+   
+                            this.processParty(query, METCustTable.Party, selectedCompanyList);
+                        }
+                    }
+                    
+                    ttscommit;
+
+                    // only run the report if any data was inserted
+                    if (createdTransactionId)
+                    {
+                        this.populateReportSettingsByCustomer(METCustTableParent);
+    
+                        this.outputReports();
+                    }
+                }
+                catch
+                {
+                    isEncounteredException = true;
+                }
+            }
+            
+            if (isEncounteredException)
+            {
+                //This error has been thrown just to fail the batch after processing all the customers and
+                //later on this error message is overwritten by the framework generic message.
+                throw Error('');
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populateCustAccountStatementExtTmp</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Populates the core fields on the <c>CustAccountStatementExtTmp</c> buffer in preparation for insert.
+    /// </summary>
+    /// <param name = "_custCurrencyIndex">The customer currency index.</param>
+    protected void populateCustAccountStatementExtTmp(int _custCurrencyIndex)
+    {
+        super(_custCurrencyIndex);
+
+        if (custPre)
+        {
+            changecompany(METLinkedCustAccountTmpParent.LinkedLegalEntity)
+            {
+                custAccountStatementExtTmp.KPMGCustTable_AccountNumParent   = METCustTableParent.AccountNum;
+                custAccountStatementExtTmp.KPMGCustTable_NameParent         = METCustTableParent.name();
+                custAccountStatementExtTmp.KPMGKnownAsParent                = DirPartyTable::findRec(METCustTableParent.party).KnownAs;
+                custAccountStatementExtTmp.KPMGCustTable_AddressParent      = DirUtility::replaceAddressTokenLanguage(METCustTableParent.statementAddress(), METCustTableParent.languageId());
+                custAccountStatementExtTmp.KPMGContactPersonParent          = ContactPerson::find(METCustTableParent.ContactPersonId).personName();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSelectedCompanyList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copy of standard. Builds a container of selected companies from query
+    /// </summary>
+    /// <param name = "_query">Dialog Query</param>
+    /// <param name = "_company">Company Id</param>
+    /// <returns>Container of selected companies from query</returns>
+    private static container getSelectedCompanyList(Query _query, CompanyId _company)
+    {
+        container queryCompanyRange;
+        container queryCompanyRangeList;
+        container selectedCompanyList = conNull();
+        container sharedCompanyList;
+        boolean isShared;
+        int i;
+
+        #Define.CompanyPosition(1)
+        #Define.IsMarkedPosition(2)
+
+        if (isConfigurationkeyEnabled(configurationKeyNum(CustCentralizedCustStatement)))
+        {
+            // this retrieves the company range specified by the user on the statement dialog
+            queryCompanyRangeList = _query.getCompanyRange();
+
+            sharedCompanyList = CustVendOpenTransManager::findSharedServiceCompanies(_company);
+
+            // include only valid companies in the company list
+            for (i = 1; i <= conLen(queryCompanyRangeList); i++)
+            {
+                queryCompanyRange = conPeek(queryCompanyRangeList, i);
+
+                isShared = conFind(sharedCompanyList, conPeek(queryCompanyRange, #CompanyPosition)) != 0;
+
+                if (conPeek(queryCompanyRange, #IsMarkedPosition) && isShared)
+                {
+                    selectedCompanyList += conPeek(queryCompanyRange, #CompanyPosition);
+                }
+            }
+        }
+        else
+        {
+            selectedCompanyList += _company;
+        }
+
+        return selectedCompanyList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>KPMGcheckMultipleCurrency</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copy of standard. Currency check
+    /// </summary>
+    /// <returns>True if currency is valid</returns>
+    private boolean KPMGcheckMultipleCurrency()
+    {
+        CustTable KPMGCustTable = this.parmArgs().record();
+        container KPMGCurrencyList = KPMGCustTable.getCurrenciesForAllTrans(this.parmContract().parmFromDate(), this.parmContract().parmToDate(), this.parmContract().parmIncludeReversed());
+        CurrencyCode KPMGCurrencyCode = conPeek(KPMGCurrencyList, 1);
+        int i;
+
+        for (i = 2; i <= conLen(KPMGCurrencyList); i++)
+        {
+            if (KPMGCurrencyCode != conPeek(KPMGCurrencyList, i))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>METPopulateLinkedCustAccountTables</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds 2 temp tables of Customers and their Parent 
+    /// </summary>
+    /// <param name = "_customerQueryRun">Dialog Query</param>
+    public void METPopulateLinkedCustAccountTables(QueryRun _customerQueryRun)
+    {
+        var METCustomerList = new Set(Types::Int64);
+
+        METCustTable    METCustTableLinked;
+
+        ttsbegin;
+            
+        while (_customerQueryRun.next())
+        {
+            CustTable custTable = _customerQueryRun.get(tableNum(CustTable));
+                
+            // Do not run twice for the same customer
+            if (!METCustomerList.in(custTable.RecId))
+            {
+                setPrefix(strFmt("@AccountsReceivable:CustAccountNumber", CustTable.AccountNum));
+                METCustomerList.add(custTable.RecId);
+
+                METLinkedCustAccountTmp.clear();
+                METLinkedCustAccountTmp.CustAccountNum  = custTable.AccountNum;
+                METLinkedCustAccountTmp.LegalEntity     = CustTable.DataAreaId;
+                
+                container conCompanies = [METLinkedCustAccountTmp.LegalEntity];
+
+                //find Linked account
+                select firstonly crosscompany : conCompanies LinkedCustAccountNum, LinkedLegalEntity, RecId
+                    from    METCustTableLinked
+                    where   METCustTableLinked.AccountNum == METLinkedCustAccountTmp.CustAccountNum
+                    &&      METCustTableLinked.LinkedCustAccountNum
+                    &&      METCustTableLinked.LinkedLegalEntity;
+
+                if(METCustTableLinked.recId)
+                {
+                    METLinkedCustAccountTmp.LinkedCustAccountNum   = METCustTableLinked.LinkedCustAccountNum;
+                    METLinkedCustAccountTmp.LinkedLegalEntity      = METCustTableLinked.LinkedLegalEntity;
+                }
+                else
+                {
+                    METLinkedCustAccountTmp.LinkedCustAccountNum   = METLinkedCustAccountTmp.CustAccountNum;
+                    METLinkedCustAccountTmp.LinkedLegalEntity      = METLinkedCustAccountTmp.LegalEntity;
+                }
+
+                if( METLinkedCustAccountTmp.LinkedCustAccountNum == METLinkedCustAccountTmp.CustAccountNum
+                &&  METLinkedCustAccountTmp.LinkedLegalEntity    == METLinkedCustAccountTmp.LegalEntity )
+                {
+                    METLinkedCustAccountTmp.Parent = NoYes::Yes;
+                }
+                
+                METLinkedCustAccountTmp.insert();
+            }
+        }
+        ttscommit;
+         
+        //keep parent table synced
+        ttsbegin;
+        insert_recordset METLinkedCustAccountTmpParent (CustAccountNum, LegalEntity, LinkedCustAccountNum, LinkedLegalEntity, Parent, AddressOnly)
+                select CustAccountNum, LegalEntity, LinkedCustAccountNum, LinkedLegalEntity, Parent, AddressOnly
+                from    METLinkedCustAccountTmp;
+
+        ttscommit;
+
+        //are there any LinkedCustAccountNum (ie Parent account) that dont have their own record? Will need one for Addressing
+        ttsbegin;
+
+        while select LinkedCustAccountNum, LinkedLegalEntity
+            from    METLinkedCustAccountTmpParent
+            group by LinkedCustAccountNum, LinkedLegalEntity
+            where METLinkedCustAccountTmpParent.Parent == NoYes::No
+        {
+            select firstonly RecId
+                from    METLinkedCustAccountTmp
+                where   METLinkedCustAccountTmp.CustAccountNum         == METLinkedCustAccountTmpParent.LinkedCustAccountNum
+                &&      METLinkedCustAccountTmp.LegalEntity            == METLinkedCustAccountTmpParent.LinkedLegalEntity
+                &&      METLinkedCustAccountTmp.Parent                 == NoYes::Yes;
+
+            if(!METLinkedCustAccountTmp.RecId)
+            {
+                //create parent 'Address only' record
+                METLinkedCustAccountTmp.clear();
+                METLinkedCustAccountTmp.CustAccountNum         = METLinkedCustAccountTmpParent.LinkedCustAccountNum;
+                METLinkedCustAccountTmp.LegalEntity            = METLinkedCustAccountTmpParent.LinkedLegalEntity;
+                METLinkedCustAccountTmp.LinkedCustAccountNum   = METLinkedCustAccountTmpParent.LinkedCustAccountNum;
+                METLinkedCustAccountTmp.LinkedLegalEntity      = METLinkedCustAccountTmpParent.LinkedLegalEntity;
+                METLinkedCustAccountTmp.Parent                 = NoYes::Yes;
+                METLinkedCustAccountTmp.AddressOnly            = NoYes::Yes;
+                METLinkedCustAccountTmp.insert();
+            }
+        }
+
+        ttscommit;
+
+        //keep parent table synced
+        ttsbegin;
+        insert_recordset METLinkedCustAccountTmpParent (CustAccountNum, LegalEntity, LinkedCustAccountNum, LinkedLegalEntity, Parent, AddressOnly)
+            select CustAccountNum, LegalEntity, LinkedCustAccountNum, LinkedLegalEntity, Parent, AddressOnly
+            from    METLinkedCustAccountTmp
+            where   METLinkedCustAccountTmp.AddressOnly == NoYes::yes;
+
+        ttscommit;
+
+        //get all Parent accounts (that are not 'Address only') and add in all child accounts that are missing 
+        while select CustAccountNum, LegalEntity
+            from    METLinkedCustAccountTmpParent
+            group by CustAccountNum, LegalEntity
+            where   METLinkedCustAccountTmpParent.Parent       == NoYes::Yes
+            &&      METLinkedCustAccountTmpParent.AddressOnly  == NoYes::No
+        {
+            ttsbegin;
+
+            //find child accounts of parent.
+            while select crosscompany METCustTableLinked
+                where   METCustTableLinked.LinkedCustAccountNum   == METLinkedCustAccountTmpParent.CustAccountNum
+                &&      METCustTableLinked.LinkedLegalEntity      == METLinkedCustAccountTmpParent.LegalEntity
+
+                notexists join METLinkedCustAccountTmp
+                where   METLinkedCustAccountTmp.CustAccountNum == METCustTableLinked.AccountNum
+                &&      METLinkedCustAccountTmp.LegalEntity    == METCustTableLinked.DataAreaid
+            {
+                //create child records
+                METLinkedCustAccountTmp.clear();
+                METLinkedCustAccountTmp.CustAccountNum         = METCustTableLinked.AccountNum;
+                METLinkedCustAccountTmp.LegalEntity            = METCustTableLinked.DataAreaid;
+                METLinkedCustAccountTmp.LinkedCustAccountNum   = METCustTableLinked.LinkedCustAccountNum;
+                METLinkedCustAccountTmp.LinkedLegalEntity      = METCustTableLinked.LinkedLegalEntity;
+                METLinkedCustAccountTmp.Parent                 = NoYes::No;
+                METLinkedCustAccountTmp.AddressOnly            = NoYes::No;
+                METLinkedCustAccountTmp.insert();
+
+                //add new customer to query range as it wasnt selected by end user
+                QueryBuildDataSource qbdsCustTable = SysQuery::findOrCreateDataSource(query, tableNum(CustTable));
+                QueryBuildRange     qbrCustTable = qbdsCustTable.addRange(fieldNum(CustTable, AccountNum));
+                qbrCustTable.value(queryValue(METLinkedCustAccountTmp.CustAccountNum));
+                
+            }
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initFormLetterReport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the form letter report. Copy from standard
+    /// </summary>
+    protected void initFormLetterReport()
+    {
+        formLetterReport = FormLetterReport::construct(PrintMgmtDocumentType::KPMGMultiCustAccountStatement);
+        formLetterReport.parmPrintType(PrintCopyOriginal::OriginalPrint);
+        formLetterReport.parmReportRun().parmCheckScreenOutput(true);
+
+        //super();
+
+        if (formLetterReport)
+        {
+            formLetterReport.parmReportRunController(this);
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
