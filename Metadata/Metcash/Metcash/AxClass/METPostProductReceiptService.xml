@@ -34,7 +34,7 @@ class METPostProductReceiptService extends SysOperationServiceBase
         try
         {
             while select metPOReceipt
-                group by PurchaseOrderNumber, OrderVendorAccountNumber, ProductReceiptDate, PackingSlipId, ProductNumber, ReceivedPurchaseQuantity, ReceivedInventoryQuantity
+                group by PurchaseOrderNumber, OrderVendorAccountNumber, ProductReceiptDate, PackingSlipId, ProductNumber, Quantity, InventSiteId
                 where metPOReceipt.Processed == NoYes::No
                    && metPOReceipt.Error == NoYes::Yes
             {
@@ -217,12 +217,20 @@ class METPostProductReceiptService extends SysOperationServiceBase
     /// <returns>purchase line that matches the criteria</returns>
     public PurchLine getPurchLine(METPOReceipt _metPOReceipt)
     {
-        PurchLine purchLine, purchLineCount, purchLineToSplit;
-        PurchQty  qtyToSplit, purchqty;
+        PurchLine                       purchLine, purchLineCount, purchLineToSplit;
+        PurchQty                        qtyToSplit, purchqty;
+        MetItemSiteSettingsSetup        itemSiteSettingsSetup;
+        UnitOfMeasureSymbol             unitIDFrom;
+        UnitOfMeasureSymbol             unitIDTo;
+        UnitOfMeasureConversionFactor   conversionFactor;
 
         select count(RecId) from purchLineCount
             where purchLineCount.PurchId == _metPOReceipt.PurchaseOrderNumber
                     && purchLineCount.ItemId == _metPOReceipt.ProductNumber;
+
+        select firstonly UnitId from itemSiteSettingsSetup
+            where itemSiteSettingsSetup.ItemId == purchLine.ItemId
+                && itemSiteSettingsSetup.InventSiteId == _metPOReceipt.InventSiteId;
 
         if(purchLineCount.RecId >= 1)
         {
@@ -230,35 +238,55 @@ class METPostProductReceiptService extends SysOperationServiceBase
                     where purchLine.PurchId == _metPOReceipt.PurchaseOrderNumber
                         && purchLine.ItemId == _metPOReceipt.ProductNumber;
 
-            if((_metPOReceipt.ReceivedInventoryQuantity ==0) && (_metPOReceipt.ReceivedPurchaseQuantity == 0)) // If both quantities are zero
+            if(_metPOReceipt.Quantity == 0)
             {
-                purchLine.PurchReceivedNow = 0; 
+                purchLine.PurchReceivedNow = 0;
                 purchLine.modifiedField(fieldNum(PurchLine, PurchReceivedNow));
 
                 _metPOReceipt.Error = NoYes::No;
 
                 return purchLine;
             }
-            
-            if(_metPOReceipt.ReceivedInventoryQuantity) //Convert inventory quantity to purchase quantity
+            else
             {
-                UnitOfMeasureRecId toUnitOfMeasure  = UnitOfMeasure::unitOfMeasureIdBySymbol(METConstants::unitEach);
-                UnitOfMeasureRecId fromUnitOfMeasure  = UnitOfMeasure::unitOfMeasureIdBySymbol(purchLine.PurchUnit);
-                EcoResProductUnitConverter ecoResProductUnitConverter = EcoResProductUnitConverter::newForReleasedProduct(purchLine.ItemId, purchLine.InventDimId, fromUnitOfMeasure, toUnitOfMeasure, false, true);
-                boolean conversionOk    = ecoResProductUnitConverter.canValueBeConverted();
-                if (! conversionOk)
-                {
-                    _metPOReceipt.Error = NoYes::Yes;
-                    _metPOReceipt.ErrorMessage = strFmt("@MET:ProductUnitConversionValidation", purchLine.ItemId, purchLine.PurchUnit);
+                unitIDFrom = itemSiteSettingsSetup.UnitId;
+                unitIDTo = purchLine.PurchUnit;
 
-                    return purchLine;
+                if(unitIDFrom == unitIDTo)
+                {
+                    purchqty = any2int(purchLine.PurchQty);
+                }
+                else
+                {
+                    conversionFactor = roundUp(UnitOfMeasureConversion::findByConversion(
+                UnitOfMeasure::findBySymbol(unitIDFrom).RecId,
+                UnitOfMeasure::findBySymbol(unitIDTo).RecId,
+                EcoResProduct::findByProductNumber(purchLine.ItemId).RecId)
+                .Factor, 0);
+
+                    if(conversionFactor != 0)
+                    {
+                        purchqty = any2int(purchLine.PurchQty / conversionFactor);
+                    }
+                    else
+                    {
+                        conversionFactor = roundUp(UnitOfMeasureConversion::findByConversion(
+                UnitOfMeasure::findBySymbol(unitIDTo).RecId,
+                UnitOfMeasure::findBySymbol(unitIDFrom).RecId,
+                EcoResProduct::findByProductNumber(purchLine.ItemId).RecId)
+                .Factor, 0);
+
+                        if(conversionFactor != 0)
+                        {
+                            purchqty = any2int(purchLine.PurchQty * conversionFactor);
+                        }
+                        else
+                        {
+                            purchqty = purchLine.PurchQty;
+                        }
+                    }
                 }
 
-                purchqty = ecoResProductUnitConverter.convertValue(_metPOReceipt.ReceivedInventoryQuantity);
-            }
-            else if (_metPOReceipt.ReceivedPurchaseQuantity)
-            {
-                purchqty = _metPOReceipt.ReceivedPurchaseQuantity;
             }
 
             if(purchLine.PurchQty >= purchqty) //Check if quantities match
