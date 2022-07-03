@@ -123,7 +123,10 @@ class METPostProductReceiptService extends SysOperationServiceBase
             //If an error occurs, check if log header is available
             this.getInfologMessage();
             System.Exception ex = CLRInterop::getLastException();
-            errorMessage += ex.Message + ex.ToString();
+            if (ex != null)
+            {
+                errorMessage += ex.Message + ex.ToString();
+            }
             
             this.updateLogLine(errorMessage, infologMessage, metPOReceipt);
         }
@@ -196,7 +199,7 @@ class METPostProductReceiptService extends SysOperationServiceBase
                    && metPOReceiptLoc.ProductReceiptDate == _metPOReceipt.ProductReceiptDate
             {
                 metPOReceiptLoc.Error = NoYes::Yes;
-                metPOReceiptLoc.ErrorMessage = strFmt("@MET:POReceiptError", _metPOReceipt.PackingSlipId);
+                metPOReceiptLoc.ErrorMessage = _metPOReceipt.ErrorMessage;
                 metPOReceiptLoc.doUpdate();
             }
             ttscommit;
@@ -223,25 +226,36 @@ class METPostProductReceiptService extends SysOperationServiceBase
         UnitOfMeasureSymbol             unitIDFrom;
         UnitOfMeasureSymbol             unitIDTo;
         UnitOfMeasureConversionFactor   conversionFactor;
+        InventDim                       inventDim;
 
         select count(RecId) from purchLineCount
             where purchLineCount.PurchId == _metPOReceipt.PurchaseOrderNumber
-                    && purchLineCount.ItemId == _metPOReceipt.ProductNumber;
+                    && purchLineCount.ItemId == _metPOReceipt.ProductNumber
+                    && purchLineCount.PurchStatus == PurchStatus::Backorder;
 
         select firstonly UnitId from itemSiteSettingsSetup
-            where itemSiteSettingsSetup.ItemId == purchLine.ItemId
-                && itemSiteSettingsSetup.InventSiteId == _metPOReceipt.InventSiteId;
+                    where itemSiteSettingsSetup.ItemId == _metPOReceipt.ProductNumber
+                        && itemSiteSettingsSetup.InventSiteId == _metPOReceipt.InventSiteId;
 
         if(purchLineCount.RecId >= 1)
         {
-            select firstonly purchLine
+            select forupdate firstonly purchLine
                     where purchLine.PurchId == _metPOReceipt.PurchaseOrderNumber
-                        && purchLine.ItemId == _metPOReceipt.ProductNumber;
+                        && purchLine.ItemId == _metPOReceipt.ProductNumber
+                        && purchLine.PurchStatus == PurchStatus::Backorder
+                    join RecId from inventDim
+                        where inventDim.inventDimId == purchLine.InventDimId
+                           && inventDim.InventSiteId == _metPOReceipt.InventSiteId;
 
             if(_metPOReceipt.Quantity == 0)
             {
+                ttsbegin;
+
                 purchLine.PurchReceivedNow = 0;
                 purchLine.modifiedField(fieldNum(PurchLine, PurchReceivedNow));
+                purchLine.update();
+
+                ttscommit;
 
                 _metPOReceipt.Error = NoYes::No;
 
@@ -254,7 +268,7 @@ class METPostProductReceiptService extends SysOperationServiceBase
 
                 if(unitIDFrom == unitIDTo)
                 {
-                    purchqty = any2int(purchLine.PurchQty);
+                    purchqty = _metPOReceipt.Quantity;
                 }
                 else
                 {
@@ -266,7 +280,7 @@ class METPostProductReceiptService extends SysOperationServiceBase
 
                     if(conversionFactor != 0)
                     {
-                        purchqty = any2int(purchLine.PurchQty / conversionFactor);
+                        purchqty = any2int(_metPOReceipt.Quantity * conversionFactor);
                     }
                     else
                     {
@@ -278,11 +292,11 @@ class METPostProductReceiptService extends SysOperationServiceBase
 
                         if(conversionFactor != 0)
                         {
-                            purchqty = any2int(purchLine.PurchQty * conversionFactor);
+                            purchqty = any2int(_metPOReceipt.Quantity / conversionFactor);
                         }
                         else
                         {
-                            purchqty = purchLine.PurchQty;
+                            purchqty = _metPOReceipt.Quantity;
                         }
                     }
                 }
@@ -291,8 +305,11 @@ class METPostProductReceiptService extends SysOperationServiceBase
 
             if(purchLine.PurchQty >= purchqty) //Check if quantities match
             {
+                ttsbegin;
                 purchLine.PurchReceivedNow = purchqty;
                 purchLine.modifiedField(fieldNum(PurchLine, PurchReceivedNow));
+                purchLine.update();
+                ttscommit;
 
                 _metPOReceipt.Error = NoYes::No;
 
@@ -317,11 +334,12 @@ class METPostProductReceiptService extends SysOperationServiceBase
                         purchLineToSplit.RemainPurchPhysical = qtyToSplit;
                         purchLineToSplit.modifiedField(fieldNum(PurchLine, RemainPurchPhysical));
                         purchLineToSplit.update();
-                        ttscommit;
 
                         purchLine.PurchReceivedNow = purchqty;
                         purchLine.modifiedField(fieldNum(PurchLine, PurchReceivedNow));
-
+                        purchLine.update();
+                        ttscommit;
+                        
                         _metPOReceipt.Error = NoYes::No;
 
                         return purchLine;
@@ -336,8 +354,11 @@ class METPostProductReceiptService extends SysOperationServiceBase
 
                         if(maxReceivedQty >= purchqty)
                         {
+                            ttsbegin;
                             purchLine.PurchReceivedNow = purchqty;
                             purchLine.modifiedField(fieldNum(PurchLine, PurchReceivedNow));
+                            purchLine.update();
+                            ttscommit;
 
                             _metPOReceipt.Error = NoYes::No;
 
@@ -380,22 +401,27 @@ class METPostProductReceiptService extends SysOperationServiceBase
         try
         {
             ttsbegin;
-
             purchFormLetter.createFromLines(true);
             purchFormLetter.parmLineList(purchLineList.pack());
-
             purchFormLetter.update(purchTable, _metPOReceipt.PackingSlipId, DateTimeUtil::date(_metPOReceipt.ProductReceiptDate), PurchUpdate::ReceiveNow);
-
             ttscommit;
         }
         catch(Exception::Error)
         {
             _metPOReceipt.Error = NoYes::Yes;
-            _metPOReceipt.ErrorMessage = strFmt("@MET:POReceiptError", _metPOReceipt.PackingSlipId);
+            errorMessage    = METConstants::emptyString;
 
+            //If an error occurs, check if log header is available
+            this.getInfologMessage();
+            System.Exception ex = CLRInterop::getLastException();
+            if (ex != null)
+            {
+                errorMessage += ex.Message + ex.ToString();
+            }
+            
+            this.updateLogLine(errorMessage, infologMessage, _metPOReceipt);
             ret = false;
         }
-
         return ret;
     }
 
@@ -439,16 +465,19 @@ class METPostProductReceiptService extends SysOperationServiceBase
     /// <param name = "_metPOReceipts">the metPOReceipt buffer to be updated with the error message </param>
     private void updateLogLine(str _mbsErrorMsg, str _mbsInfologMsg, METPOReceipt _metPOReceipts)
     {
-        ttsbegin;
 
         // if log header is available use the global variable to update the current log line to the below
         // status
-        _metPOReceipts.selectForUpdate(true);
-        _metPOReceipts.ErrorMessage  = _mbsErrorMsg + _mbsInfologMsg;
-        _metPOReceipts.Error  = NoYes::Yes;
-        _metPOReceipts.doUpdate();
+        if(_metPOReceipts.RecId)
+        {
+            ttsbegin;
+            _metPOReceipts.selectForUpdate(true);
+            _metPOReceipts.ErrorMessage  = _mbsErrorMsg + METConstants::LineBreak + _mbsInfologMsg;
+            _metPOReceipts.Error  = NoYes::Yes;
+            _metPOReceipts.doUpdate();
+            ttscommit;
+        }
 
-        ttscommit;
     }
 
 ]]></Source>
