@@ -8,6 +8,7 @@
 /// </summary>
 class METCustLicDueEmailSendService extends SysOperationServiceBase
 {
+    const real  RetryNum = 3;
 }
 ]]></Declaration>
 		<Methods>
@@ -32,10 +33,7 @@ class METCustLicDueEmailSendService extends SysOperationServiceBase
         {
             error("@MET:METMissingEmailTemplateError");
         }
-        if(!custParms.CustDefaultEmailPurpose)
-        {
-            error("@MET:METMissingEmailPurpose");
-        }
+        
         SysEmailTable           emailTable = SysEmailTable::find(custParms.CustLicenceExpiryEmailTemplate);
         SysEmailMessageTable    emailMessageTable = SysEmailMessageTable::find(custParms.CustLicenceExpiryEmailTemplate, emailTable.DefaultLanguage);
         
@@ -52,9 +50,16 @@ class METCustLicDueEmailSendService extends SysOperationServiceBase
             RefRecId                    custTobaccoLicTableRecId = conPeek(custLicDueTableRecIds, recIdContainerCount);
 
             select firstonly custTobaccoLicTable where custTobaccoLicTable.RecId == custTobaccoLicTableRecId;
-            select firstonly Party from custtable where custtable.AccountNum == custTobaccoLicTable.CustomerNumber;                   
+            select firstonly Party from custtable where custtable.AccountNum == custTobaccoLicTable.CustomerNumber;
+
+            if(!custParms.CustDefaultEmailPurpose)
+            {
+                error("@MET:METMissingEmailPurpose");
+            }
+            LogisticsLocationRoleName   llRoleName;
+            llRoleName = custTobaccoLicTable.SendNotificationsTo ? custTobaccoLicTable.SendNotificationsTo : custParms.CustDefaultEmailPurpose;
             
-            toEmailIdContainer = DirParty::electronicAddressLocatorsByRole(custtable.Party, LogisticsElectronicAddressMethodType::Email, custParms.CustDefaultEmailPurpose);
+            toEmailIdContainer = DirParty::electronicAddressLocatorsByRole(custtable.Party, LogisticsElectronicAddressMethodType::Email, llRoleName);
             Str1260 toEmailId = con2Str(toEmailIdContainer, METConstants::Comma);
 
             templateTokens = new Map(Types::String, Types::String);
@@ -65,12 +70,47 @@ class METCustLicDueEmailSendService extends SysOperationServiceBase
             SysMailerMessageBuilder messageBuilder = new SysMailerMessageBuilder();
             messageBuilder.addTo(toEmailId).setSubject(emailSubject).setBody(SysEmailMessage::stringExpand(emailBody, SysEmailTable::htmlEncodeParameters(templateTokens)));
 
-            if (emailSenderAddr)
+            try
             {
-                messageBuilder.setFrom(emailSenderAddr, emailSenderName);
-                SysMailerFactory::getNonInteractiveMailer().sendNonInteractive(messageBuilder.getMessage());
-            }
+                if (emailSenderAddr)
+                {
+                    messageBuilder.setFrom(emailSenderAddr, emailSenderName);
+                    SysMailerFactory::getNonInteractiveMailer().sendNonInteractive(messageBuilder.getMessage());
 
+                    ttsbegin;
+                    custTobaccoLicTable.selectForUpdate(true);
+                    custTobaccoLicTable.LastEmailSentDate = DateTimeUtil::date(DateTimeUtil::getSystemDateTime());
+                    if(custTobaccoLicTable.validateWrite())
+                    {
+                        custTobaccoLicTable.update();
+                    }
+                    ttscommit;
+                }
+            }
+            catch(Exception::Error)
+            {
+                info("@MET:METEmailSendError", custTobaccoLicTable.CustomerNumber);
+            }
+            catch(Exception::UpdateConflict)
+            {
+                Info("@MET:METCustTobaccoLicTableUpdateConflict", custTobaccoLicTable.CustomerNumber);
+                throw Exception::UpdateConflictNotRecovered;
+            }
+            catch(Exception::CLRError)
+            {
+                System.Exception netExcepn;
+                info("@MET:METRebateCLRException");
+                netExcepn = CLRInterop::getLastException();
+                info(netExcepn.ToString());
+            }
+            catch(Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                retry;
+            }
         }
     }
 
