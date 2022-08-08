@@ -14,19 +14,6 @@ final class METRetailPricingSimulator_Extension
 ]]></Declaration>
 		<Methods>
 			<Method>
-				<Name>calculatePricesAndDiscounts</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// CoC
-    /// </summary>
-    public void calculatePricesAndDiscounts()
-    {
-        next calculatePricesAndDiscounts();
-    }
-
-]]></Source>
-			</Method>
-			<Method>
 				<Name>updatePriceAndDiscountsInDbTable</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -50,25 +37,33 @@ final class METRetailPricingSimulator_Extension
     /// </summary>
     private void metAddAdditionalDetail()
     {
-        RetailPricingSimulatorSalesLine         simSalesLine;
-        InventTable                             inventTable;
+        RetailPricingSimulatorSalesLine simSalesLine;
+        InventTable                     inventTable;
+        InventTableModule               inventTableModuleInvent;
+        CustTable                       custTable;
 
         ttsbegin;
 
-        while select forupdate simSalesLine
+        //DCP 08/08/2022 Code cleanup
+        while select forupdate METChargesAmount, METTaxAmountTotal, METUnitOfMeasureConversion, METTotalCharges, METTaxAmountPerUnit,
+                                METLandedCostAmount, METTotalSalesPrice, METMarginPercent, METBaseInventoryCost, METTaxAmountLCExclusions, 
+                                METTotalChargesTax, Product, Quantity, RetailPricingSimulatorSalesTransaction, SalesPrice, UoM, RecId
+            from    simSalesLine
             where   simSalesLine.RetailPricingSimulatorSalesTransaction  == psSalesTransaction.RecID
         {
-            inventTable = InventTable::findByProduct(simSalesLine.Product);
-
-            this.metAddCharges(simSalesLine);
-            this.metAddTax(simSalesLine);
+            inventTable             = InventTable::findByProduct(simSalesLine.Product);
+            inventTableModuleInvent = inventTable.inventTableModuleInvent();
+            custTable               = CustTable::find(psSalesTransaction.CustAccount);
+            
+            this.metAddCharges(simSalesLine, inventTable, custTable);
+            this.metAddTax(simSalesLine, inventTable, custTable);
             
             // UoM
             Qty conversionToInvUnit;
-            var uomConversion = UnitOfMeasureConversion::findByConversion(
-                simSalesLine.UoM, 
-                UnitOfMeasure::findBySymbol(inventTable.inventTableModuleInvent().UnitId).RecId,
-                simSalesLine.Product);
+            var uomConversion = UnitOfMeasureConversion::findByConversion(simSalesLine.UoM, 
+                                                                            UnitOfMeasure::findBySymbol(inventTableModuleInvent.UnitId).RecId,
+                                                                            simSalesLine.Product);
+            
             if(uomConversion)
             {
                 simSalesLine.METUnitOfMeasureConversion = uomConversion.displayQuickFormulaWithLocalSeparators();
@@ -78,19 +73,17 @@ final class METRetailPricingSimulator_Extension
             // Summary/total fields
             Price pricePerUnit = simSalesLine.SalesPrice / (simSalesLine.Quantity ? simSalesLine.Quantity : 1);
 
-            simSalesLine.METTaxAmountTotal += simSalesLine.METTotalChargesTax;
+            simSalesLine.METTaxAmountTotal  += simSalesLine.METTotalChargesTax;
             simSalesLine.METTaxAmountPerUnit = simSalesLine.METTaxAmountTotal / (simSalesLine.Quantity ? simSalesLine.Quantity : 1);
                    
-            simSalesLine.METLandedCostAmount    = 
-                (simSalesLine.SalesPrice + simSalesLine.METTotalCharges + simSalesLine.METTaxAmountLCExclusions) / 
-                (simSalesLine.Quantity ? simSalesLine.Quantity : 1) / 
-                (conversionToInvUnit ? conversionToInvUnit : 1);
+            simSalesLine.METLandedCostAmount = (simSalesLine.SalesPrice + simSalesLine.METTotalCharges + simSalesLine.METTaxAmountLCExclusions) / 
+                                                (simSalesLine.Quantity ? simSalesLine.Quantity : 1) / 
+                                                (conversionToInvUnit ? conversionToInvUnit : 1);
                 
             simSalesLine.METTotalSalesPrice     = simSalesLine.SalesPrice + simSalesLine.METTotalCharges + simSalesLine.METTaxAmountTotal;
-            simSalesLine.METBaseInventoryCost   = inventTable.inventTableModuleInvent().price();
-            simSalesLine.METMarginPercent       = 
-                (pricePerUnit + simSalesLine.METChargesAmount - simSalesLine.METBaseInventoryCost) /
-                (pricePerUnit + simSalesLine.METChargesAmount) * 100;
+            simSalesLine.METBaseInventoryCost   = inventTableModuleInvent.price();
+            simSalesLine.METMarginPercent       = (pricePerUnit + simSalesLine.METChargesAmount - simSalesLine.METBaseInventoryCost) /
+                                                    (pricePerUnit + simSalesLine.METChargesAmount) * 100;
 
             simSalesLine.update();
         }
@@ -106,43 +99,42 @@ final class METRetailPricingSimulator_Extension
     /// <summary>
     /// Add tax calculation
     /// </summary>
-    /// <param name = "_simSalesLine">_simSalesLine</param>
-    private void metAddTax(RetailPricingSimulatorSalesLine _simSalesLine)
+    /// <param name = "_simSalesLine">Retail simulator Sales line</param>
+    /// <param name = "_inventTable">Inventory table</param>
+    /// <param name = "_custTable">Customer table</param>
+    private void metAddTax(RetailPricingSimulatorSalesLine _simSalesLine, InventTable _inventTable, CustTable _custTable)
     {
-        CustTable       custTable       = CustTable::find(psSalesTransaction.CustAccount);
-        InventTable     inventTable     = InventTable::findByProduct(_simSalesLine.Product);
-        Amount          taxAmount;
-        Tax             tax;
+        CustTable           custTable       = _custTable;
+        InventTable         inventTable     = _inventTable;
+        InventTableModule   inventTableModuleSales   = inventTable.inventTableModuleSales();
+        Amount              taxAmount;
+        Tax                 tax;
+        TransDate           taxDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
 
         // All tax codees
-        {
-            tax = Tax::construct();
+        tax = Tax::construct();
+        taxAmount = tax.taxCalcWithoutSource(custTable.TaxGroup,
+                                            inventTableModuleSales.TaxItemGroupId,
+                                            taxDate,
+                                            psSalesTransaction.ChannelCurrency,
+                                            _simSalesLine.SalesPrice,
+                                            TaxModuleType::Sales);
 
-            taxAmount = tax.taxCalcWithoutSource(
-                custTable.TaxGroup,
-                inventTable.inventTableModuleSales().TaxItemGroupId,
-                DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),
-                psSalesTransaction.ChannelCurrency,
-                _simSalesLine.SalesPrice,
-                TaxModuleType::Sales);
-
-            _simSalesLine.METTaxAmountTotal = taxAmount;
-        }
+        _simSalesLine.METTaxAmountTotal = taxAmount;
+        
         // Calculation with landed cost tax code exclusions
-        {
-            tax = Tax::construct();
-            tax.parmMetExcludeBasedOnLandedCostCalcFlag(true);
+        tax = Tax::construct();
+        tax.parmMetExcludeBasedOnLandedCostCalcFlag(true);
 
-            taxAmount = tax.taxCalcWithoutSource(
-                custTable.TaxGroup,
-                inventTable.inventTableModuleSales().TaxItemGroupId,
-                DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),
-                psSalesTransaction.ChannelCurrency,
-                _simSalesLine.SalesPrice,
-                TaxModuleType::Sales);
+        taxAmount = tax.taxCalcWithoutSource(custTable.TaxGroup,
+                                            inventTableModuleSales.TaxItemGroupId,
+                                            taxDate,
+                                            psSalesTransaction.ChannelCurrency,
+                                            _simSalesLine.SalesPrice,
+                                            TaxModuleType::Sales);
 
-            _simSalesLine.METTaxAmountLCExclusions = taxAmount;
-        }
+        _simSalesLine.METTaxAmountLCExclusions = taxAmount;
+        
     }
 
 ]]></Source>
@@ -153,47 +145,51 @@ final class METRetailPricingSimulator_Extension
     /// <summary>
     /// Add charges detail
     /// </summary>
-    /// <param name = "_simSalesLine">_simSalesLine</param>
-    private void metAddCharges(RetailPricingSimulatorSalesLine _simSalesLine)
+    /// <param name = "_simSalesLine">Retail simulator Sales line</param>
+    /// <param name = "_inventTable">Inventory table</param>
+    /// <param name = "_custTable">Customer table</param>
+    private void metAddCharges(RetailPricingSimulatorSalesLine _simSalesLine, InventTable _inventTable, CustTable _custTable)
     {
+        CustTable                               custTable   = _custTable;
+        InventTable                             inventTable = _inventTable;
+        
         MarkupTrans                             markupTrans;
         MarkupTable                             markupTable;
         METRetailPricingSimulatorMarkupTrans    simMarkupTrans;
-        CustTable                               custTable   = CustTable::find(psSalesTransaction.CustAccount);
-        InventTable                             inventTable = InventTable::findByProduct(_simSalesLine.Product);
+        TransDate                               taxDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+        MarkupAmount                            calculatedAmount;
 
         delete_from simMarkupTrans
             where   simMarkupTrans.SimulatorSalesLine == _simSalesLine.RecId;
 
-        Markup::insertMarkupTrans(
-            HeadingLine::Line,
-            MarkupModuleType::Cust,
-            psSalesTransaction,
-            custTable.AccountNum,
-            custTable.MarkupGroup,
-            custTable.Currency,
-            custTable.languageId(),
-            inventTable.ItemId
-        );
+        Markup::insertMarkupTrans(HeadingLine::Line,
+                                    MarkupModuleType::Cust,
+                                    psSalesTransaction,
+                                    custTable.AccountNum,
+                                    custTable.MarkupGroup,
+                                    custTable.Currency,
+                                    custTable.languageId(),
+                                    inventTable.ItemId);
 
         _simSalesLine.METChargesAmount  = 0;
         _simSalesLine.METTotalCharges   = 0;
 
         RecordInsertList insertList = new RecordInsertList(tableNum(METRetailPricingSimulatorMarkupTrans));
 
-        while select markupTrans
+        while select markupTrans        //leaving 'select all' as is. MarkupTrans record buffer used repeatedly in multiple method calls
             where   markupTrans.TransTableId    == psSalesTransaction.TableID
             &&      markupTrans.TransRecId      == psSalesTransaction.RecID
-        join markupTable
+            
+        join    TaxItemGroup
+            from    markupTable
             where   markupTable.MarkupCode      == markupTrans.MarkupCode
             &&      markupTable.ModuleType      == MarkupModuleType::Cust
         {
-            markupTrans.CalculatedAmount = Markup::calcTrans(
-                markupTrans,
-                _simSalesLine.Quantity,
-                _simSalesLine.SalesPrice,
-                0,      // Intercompany price requirements?
-                DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));
+            calculatedAmount = Markup::calcTrans(markupTrans,
+                                                _simSalesLine.Quantity,
+                                                _simSalesLine.SalesPrice,
+                                                0,      // Intercompany price requirements?
+                                                taxDate);
 
             simMarkupTrans.clear();
             simMarkupTrans.SimulatorSalesTransaction    = psSalesTransaction.RecID;
@@ -201,7 +197,7 @@ final class METRetailPricingSimulator_Extension
             simMarkupTrans.MarkupCode                   = markupTrans.MarkupCode;
             simMarkupTrans.MarkupCategory               = markupTrans.MarkupCategory;
             simMarkupTrans.Value                        = markupTrans.Value;
-            simMarkupTrans.CalculatedAmount             = markupTrans.CalculatedAmount;
+            simMarkupTrans.CalculatedAmount             = calculatedAmount;
 
             if(simMarkupTrans.MarkupCategory == MarkupCategory::Fixed)
             {
@@ -213,13 +209,12 @@ final class METRetailPricingSimulator_Extension
             }
 
             
-            simMarkupTrans.TaxAmount = Tax::calcTaxAmount(
-                custTable.TaxGroup,
-                markupTable.TaxItemGroup,
-                DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()),
-                psSalesTransaction.ChannelCurrency,
-                simMarkupTrans.CalculatedAmount,
-                TaxModuleType::Sales);
+            simMarkupTrans.TaxAmount = Tax::calcTaxAmount(custTable.TaxGroup,
+                                                            markupTable.TaxItemGroup,
+                                                            taxDate,
+                                                            psSalesTransaction.ChannelCurrency,
+                                                            simMarkupTrans.CalculatedAmount,
+                                                            TaxModuleType::Sales);
 
             insertList.add(simMarkupTrans);
 
