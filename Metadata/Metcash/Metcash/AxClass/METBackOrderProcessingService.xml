@@ -20,77 +20,127 @@ class METBackOrderProcessingService extends SysOperationServiceBase
     /// <param name = "_contract">The data contract object</param>
     public void processOperation(METBackOrderProcessingDataContract _contract)
     {
+        Query query;
         QueryRun queryRun;
+        QueryBuildDataSource qbdsPurchTable;
+        QueryBuildDataSource qbdsMetPurchTable;
+        
         InventSite inventSite;
         PurchTable purchTable;
-        METPurchTable metPurchTable;
         PurchLine purchLine;
-        VendPackingSlipJour vendPackingSlipJour;
-        
+        VendPackingSlipJour vendPackingSlipJour;        
+        METBackOrderPurchLineTmp metBackOrderPurchLineTmp;
+
         utcdatetime currentDateTime = DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::getSystemDateTime(), DateTimeUtil::getUserPreferredTimezone());
         
         date startDate; 
         date endDate =  DateTimeUtil::date(currentDateTime);
         int totalDays;
-      
-        queryRun = new QueryRun(_contract.getQuery());
+        
+        query = _contract.getQuery();
+        
+        qbdsPurchTable = query.dataSourceTable(tableNum(InventSite)).addDataSource(tableNum(PurchTable));
+        qbdsPurchTable.relations(true);
+        qbdsPurchTable.joinMode(JoinMode::InnerJoin);
+        qbdsPurchTable.addRange(fieldNum(PurchTable, PurchStatus)).value(queryValue(PurchStatus::Backorder));
+        //qbdsPurchTable.addRange(fieldNum(PurchTable, PurchStatus)).value(queryValue(PurchStatus::Received));
+
+        qbdsMetPurchTable = qbdsPurchTable.addDataSource(tableNum(MetPurchTable));
+        qbdsMetPurchTable.relations(true);
+        qbdsMetPurchTable.joinMode(JoinMode::InnerJoin);
+        qbdsMetPurchTable.addRange(fieldNum(METPurchTable, POBackOrderSetting)).value(queryValue(NoYes::No));
+        
+        queryRun = new QueryRun(query);
 
         while (queryRun.next())
         {
+            inventSite = null;
+            purchTable = null;
+            vendPackingSlipJour = null;
+            
             inventSite = queryRun.get(tableNum(InventSite));
+            purchTable = queryRun.get(tableNum(PurchTable));            
+            select maxOf(DeliveryDate) from vendPackingSlipJour
+                where vendPackingSlipJour.PurchId == purchTable.PurchId;
 
-            while select PurchId, InventSiteId from purchTable where purchTable.InventSiteId == inventSite.SiteId
-                join RecId, POBackOrderSetting from metPurchTable where metPurchTable.PurchId == purchTable.PurchId &&
-                metPurchTable.POBackOrderSetting == NoYes::No 
+            if (vendPackingSlipJour.DeliveryDate)
             {
-                vendPackingSlipJour = null;
-                select maxOf(DeliveryDate) from vendPackingSlipJour
-                    where vendPackingSlipJour.PurchId == purchTable.PurchId;
-
-                if (vendPackingSlipJour.DeliveryDate)
-                {
-                    startDate = vendPackingSlipJour.DeliveryDate;
-                    totalDays = endDate - startDate; //Calculate number of days from today to last posted product receipt including weekends.
+                startDate = vendPackingSlipJour.DeliveryDate;
+                totalDays = endDate - startDate; //Calculate number of days from today to last posted product receipt including weekends.
                     
-                    if (!_contract.parmIncludeWeekends())
-                    {                        
-                        totalDays = 0;
+                if (!_contract.parmIncludeWeekends())
+                {                        
+                    totalDays = 0;
 
-                        //Calculate number of days from today to last posted product receipt excluding weekends.
-                        while (startDate < endDate)
-                        {
-                            int dayNumber = dayOfWk(startDate);
-                            if (dayNumber == 6 || dayNumber == 7) // Saturday or Sunday
-                            {
-                                startDate++;
-                                continue;
-                            }
-                            
-                            totalDays++;
-                            startDate++;
-                        }
-                    }
-
-                    if (totalDays > inventSite.METPOBackOrderBatchJobDays)
+                    //Calculate number of days from today to last posted product receipt excluding weekends.
+                    while (startDate < endDate)
                     {
-                        ttsbegin;
-
-                        // Set deliver remainer to 0 and line status to cancelled for lines which are not received at all.
-                        update_recordset purchLine
-                            setting RemainInventPhysical = 0, RemainPurchPhysical = 0, PurchStatus = PurchStatus::Canceled
-                        where purchLine.PurchId == purchTable.PurchId
-                            && purchLine.QtyOrdered == purchLine.RemainInventPhysical;
-
-                        // Set deliver remainer to 0 and line status to received for lines which are partially received
-                        update_recordset purchLine
-                            setting RemainInventPhysical = 0, RemainPurchPhysical = 0, PurchStatus = PurchStatus::Received
-                        where purchLine.PurchId == purchTable.PurchId
-                            && purchLine.QtyOrdered > purchLine.RemainInventPhysical;
-
-                        ttscommit;
+                        int dayNumber = dayOfWk(startDate);
+                        if (dayNumber == 6 || dayNumber == 7) // Saturday or Sunday
+                        {
+                            startDate++;
+                            continue;
+                        }
+                            
+                        totalDays++;
+                        startDate++;
                     }
                 }
-            }
+
+                if (totalDays > inventSite.METPOBackOrderBatchJobDays)
+                {   
+                    ttsbegin;
+
+                    // Hold Order Qty and Amount in a temp table.
+                    insert_recordset metBackOrderPurchLineTmp (PurchId, PurchQty, LineAmount, LineNumber)
+                        select PurchId, PurchQty, LineAmount, LineNumber from purchLine
+                            where purchLine.PurchId == purchTable.PurchId;
+
+                    //Cancel PO lines.
+                    PurchCancel purchCancel = PurchCancel::METConstruct();
+                    purchCancel.parmMetPurchTable(purchTable);
+                    purchCancel.run();                       
+                    
+                    // Restore Order Qty and Amount from temp table.
+                    purchLine.skipDataMethods(true);
+                    update_recordset purchLine setting 
+                        purchQty = metBackOrderPurchLineTmp.PurchQty, 
+                        LineAmount = metBackOrderPurchLineTmp.LineAmount,
+                        LineNumber = metBackOrderPurchLineTmp.LineNumber
+                        where purchLine.PurchId == purchTable.PurchId
+                    join metBackOrderPurchLineTmp
+                        where metBackOrderPurchLineTmp.PurchId == purchLine.PurchId &&
+                        metBackOrderPurchLineTmp.LineNumber == purchLine.LineNumber;
+
+                    // Confirm PO
+                    this.confirmPO(purchTable);
+
+                    // Empty temp table
+                    delete_from metBackOrderPurchLineTmp
+                        where metBackOrderPurchLineTmp.PurchId == purchTable.PurchId;
+
+                    ttscommit;
+                }
+            }            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>confirmPO</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Confirms the Purchase Order
+    /// </summary>
+    /// <param name = "_purchTable">The Purchase Order record buffer to be confirmed.</param>
+    private void confirmPO(PurchTable _purchTable)
+    {
+        _purchTable.reread();
+        if (_purchTable.DocumentState == VersioningDocumentState::Approved)
+        {
+            PurchFormLetter purchFormLetter = PurchFormLetter::construct(DocumentStatus::PurchaseOrder);
+            purchFormLetter.update(_purchTable, _purchTable.PurchId);
         }
     }
 
