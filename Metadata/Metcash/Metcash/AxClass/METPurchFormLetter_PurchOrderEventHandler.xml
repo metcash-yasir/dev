@@ -23,7 +23,7 @@ class METPurchFormLetter_PurchOrderEventHandler
     public static void PurchFormLetter_PurchOrder_Post_validate(XppPrePostArgs args)
     {
         Valid ret = args.getReturnValue();
-        boolean isError;
+        boolean conversionFound;
 
         if(args.getThis() is PurchFormLetter_Confirmation || args.getThis() is PurchFormLetter_ConfirmationRequest)
         {
@@ -50,8 +50,10 @@ class METPurchFormLetter_PurchOrderEventHandler
             MetItemSiteSettingsSetup        itemSiteSettingSetup;
             InventDim                       inventDim;
             boolean                         conversionPresent;
+            UnitOfMeasureConversion         unitOfMeasureConversion;
+            Qty                             warehouseQty;
 
-            while select PurchUnit, ItemId from purchLine
+            while select PurchUnit, ItemId, PurchQty from purchLine
                 where purchLine.PurchId == PurchTable.PurchId
                    join UnitId from itemSiteSettingSetup
                     where itemSiteSettingSetup.ItemId == purchLine.ItemId
@@ -59,17 +61,24 @@ class METPurchFormLetter_PurchOrderEventHandler
                             where inventDim.inventDimId == purchLine.InventDimId
                                && inventDim.InventSiteId == itemSiteSettingSetup.InventSiteId
             {
-                if(!isError)
+                
+                [conversionFound, warehouseQty] = METPurchFormLetter_PurchOrderEventHandler::getWarehouseUnitAndQty(purchLine, itemSiteSettingSetup.UnitId);
+                if(!conversionFound)
                 {
-                    conversionPresent = METPurchFormLetter_PurchOrderEventHandler::istUOMConversionPresent(purchLine.PurchUnit, itemSiteSettingSetup.UnitId, purchLine.ItemId);
-                    if(!conversionPresent)
-                    {
-                        isError = true;
-                        break;
-                    }
+                    break;
+                }
+                else
+                {
+                    ttsbegin;
+                    purchLine.selectForUpdate(true);
+                    purchLine.reread();
+                    purchLine.METPOLineWarehouseUnitId = itemSiteSettingSetup.UnitId;
+                    purchLine.METPOLineWarehouseQty = warehouseQty;
+                    purchLine.doUpdate();
+                    ttscommit;
                 }
             }
-            if(isError)
+            if(!conversionFound)
             {
                 ret = ret && checkFailed(strFmt("@MET:POWarehouseUnitValidation", purchLine.ItemId));
             }
@@ -81,47 +90,62 @@ class METPurchFormLetter_PurchOrderEventHandler
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>istUOMConversionPresent</Name>
+				<Name>getWarehouseUnitAndQty</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Method to determine if conversion exists  for the given units 
+    /// Method to determine if conversion exists  between the purchase and warehouse units
     /// </summary>
-    /// <param name = "purchUnit">the purchase UOM</param>
+    /// <param name = "purchLine">the purchase line</param>
     /// <param name = "warehouseUnit">the warehouse UOM</param>
-    /// <param name = "itemid">the item ID</param>
-    /// <returns>True if UOM conversion is found/else false</returns>
-    public static boolean istUOMConversionPresent(UnitOfMeasureSymbol purchUnit, UnitOfMeasureSymbol warehouseUnit, ItemId itemid)
+    /// <returns>True if UOM conversion is found/else false and the warehouse quantity</returns>
+    public static container getWarehouseUnitAndQty(PurchLine purchLine, UnitOfMeasureSymbol warehouseUnit)
     {
         UnitOfMeasureConversion     unitOfMeasureConversion;
         boolean                     isUnitConversionPresent = true;
+        UnitOfMeasureSymbol         purchUnit = purchLine.PurchUnit;
+        ItemId                      itemId = purchLine.ItemId;
+        Qty                         warehouseQty;
 
         if(purchUnit == warehouseUnit)
         {
             isUnitConversionPresent = true;
+            warehouseQty = purchLine.PurchQty;
         }
         else if(warehouseUnit != METConstants::emptyString)
         {
-            //Check warehouse to purchase conversion as this is the usual case
-            unitOfMeasureConversion = UnitOfMeasureConversion::findByConversion(
-                                                    UnitOfMeasure::findBySymbol(warehouseUnit).RecId,
-                                                    UnitOfMeasure::findBySymbol(purchUnit).RecId,
-                                                    EcoResProduct::findByProductNumber(itemid).RecId);
-            if(!unitOfMeasureConversion.RecId) 
+            select firstonly RecId, Factor from unitOfMeasureConversion
+                where unitOfMeasureConversion.Product == EcoResProduct::findByProductNumber(itemId).RecId
+                    && unitOfMeasureConversion.FromUnitOfMeasure==UnitOfMeasure::unitOfMeasureIdBySymbol(warehouseUnit)
+                    && unitOfMeasureConversion.ToUnitOfMeasure==UnitOfMeasure::unitOfMeasureIdBySymbol(purchUnit)
+                    && unitOfMeasureConversion.Rounding==UnitOfMeasureConversionRounding::Nearest;
+
+            if(unitOfMeasureConversion.RecId)
+            {
+                isUnitConversionPresent = true;
+                warehouseQty = purchLine.PurchQty * unitOfMeasureConversion.Factor;
+            }
+            else
             {
                 //Check purchase to warehouse conversion
-                unitOfMeasureConversion = UnitOfMeasureConversion::findByConversion(
-                                                    UnitOfMeasure::findBySymbol(purchUnit).RecId,
-                                                    UnitOfMeasure::findBySymbol(warehouseUnit).RecId,
-                                                    EcoResProduct::findByProductNumber(itemid).RecId);
+                select firstonly RecId, Factor from unitOfMeasureConversion
+                    where unitOfMeasureConversion.Product == EcoResProduct::findByProductNumber(itemId).RecId
+                        && unitOfMeasureConversion.FromUnitOfMeasure==UnitOfMeasure::unitOfMeasureIdBySymbol(purchUnit)
+                        && unitOfMeasureConversion.ToUnitOfMeasure==UnitOfMeasure::unitOfMeasureIdBySymbol(warehouseUnit)
+                        && unitOfMeasureConversion.Rounding==UnitOfMeasureConversionRounding::Nearest;
 
-                if(!unitOfMeasureConversion.RecId)
+                if(unitOfMeasureConversion.RecId)
+                {
+                    isUnitConversionPresent = true;
+                    warehouseQty = purchLine.PurchQty * unitOfMeasureConversion.Factor;
+                }
+                else
                 {
                     isUnitConversionPresent = false;
                 }
             }
         }
 
-        return isUnitConversionPresent;
+        return [isUnitConversionPresent, warehouseQty];
     }
 
 ]]></Source>
