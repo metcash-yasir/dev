@@ -1,0 +1,232 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesOrderService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The service class for sales order cancel process.
+/// </summary>
+class METSalesOrderService extends SysOperationServiceBase
+{
+    #OCCRetryCount
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>cancelSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// cancels the sales order.
+    /// </summary>
+    /// <param name="salesOrderCancelRequest">
+    /// The contract instance
+    /// </param>
+    /// <returns>
+    /// The response <c>METSalesOrderCancelResponseContract</c>
+    /// </returns>
+    public METSalesOrderCancelResponseContract cancelSalesOrder(METSalesOrderCancelRequestContract salesOrderCancelRequest)
+    {
+        METProcessingStatus cancelResult;
+        Description255      cancelMessage;
+
+        [cancelResult, cancelMessage] = this.processCancelSalesOrder(salesOrderCancelRequest);
+        
+        return METSalesOrderCancelResponseContract::newFromParameters(cancelResult, cancelMessage);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelPickList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// cancels the Pick list AND sales order.
+    /// </summary>
+    /// <param name="pickListCancelRequest">
+    /// The contract instance
+    /// </param>
+    /// <returns>
+    /// The response <c>METSalesOrderCancelResponseContract</c>
+    /// </returns>
+    public METSalesOrderCancelResponseContract cancelPickList(METPickListCancelRequestContract pickListCancelRequest)
+    {
+        METProcessingStatus cancelResult;
+        Description255      cancelMessage, pickListCancelMessage, SalesOrderCancelMessage;
+        METSalesOrderCancelRequestContract salesOrderCancelRequest;
+        METPickListService  pickListService;
+        DataAreaId          dataAreaId;
+        WMSPickingRouteID   pickingRouteId;
+
+        WMSPickingRoute     pickingRoute;
+        WMSPickingRouteLink pickingRouteLink;
+        SalesTable          salesTable;
+        Set                 salesIdList = new Set(Types::String);
+
+        pickListService = METPickListService::contruct();
+
+        [cancelResult, pickListCancelMessage] = pickListService.processCancelPickList(pickListCancelRequest);
+
+        salesOrderCancelRequest = METSalesOrderCancelRequestContract::construct();
+        
+        dataAreaId = pickListCancelRequest.parmDataAreaId();
+        pickingRouteId = pickListCancelRequest.parmPickingRouteId();
+        
+        salesOrderCancelRequest.parmDataAreaId(dataAreaId);
+        
+        changecompany(dataAreaId)
+        {
+            //Pick List can have multiple Sales Orders
+            //** Exists joins would not work in this scenario **
+            select  RecId, SalesId
+            from    salesTable
+            
+            join    recid
+            from    pickingRouteLink
+            where   pickingRouteLink.OrigInventTransRefId   == salesTable.SalesId
+            &&      pickingRouteLink.InventTransType        == InventTransType::Sales
+
+            join    RecId 
+            from    pickingRoute
+            where   pickingRoute.pickingRouteID     == pickingRouteLink.PickingRouteId
+            &&      pickingRoute.ActivationDateTime == pickingRouteLink.ActivationDateTime
+            &&      pickingRoute.pickingRouteID     == pickingRouteId;
+        
+            //do at least one loop, even if there is no record, so that processCancelSalesOrder() can handle the error.
+            do
+            {
+                //process each Sales Order only once
+                if(!salesIdList.in(salesTable.salesId))
+                {
+                    salesIdList.add(salesTable.salesId);
+
+                    salesOrderCancelRequest.parmSalesId(salesTable.salesId);
+
+                    [cancelResult, SalesOrderCancelMessage] = this.processCancelSalesOrder(salesOrderCancelRequest);
+                }
+
+                next salesTable;
+            }
+            while(salesTable.SalesId);
+        }
+        cancelMessage = strFmt("@MET:PlaceHolder", pickListCancelMessage, SalesOrderCancelMessage);
+
+        return METSalesOrderCancelResponseContract::newFromParameters(cancelResult, cancelMessage);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCancelSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// cancels the sales order
+    /// </summary>
+    /// <param name="_salesOrderCancelRequest">The contract instance</param>
+    /// <returns>Container of results</returns>
+    public container processCancelSalesOrder(METSalesOrderCancelRequestContract _salesOrderCancelRequest)
+    {
+        boolean             salesOrderCancelled;
+        SalesUpdateRemain   salesUpdateRemain;
+        METProcessingStatus cancelResult;
+        Description255      cancelMessage;
+        SalesTable          salesTable;
+        SalesId             salesId;
+        DataAreaId          dataAreaId;
+
+        salesId     = _salesOrderCancelRequest.parmSalesId();
+        dataAreaId  = _salesOrderCancelRequest.parmDataAreaId();
+
+        try
+        {
+            ttsbegin;
+
+            changecompany(dataAreaId)
+            {
+                salesTable = SalesTable::find(salesId, true);
+        
+                if(!salesTable.RecId)
+                {
+                    cancelResult = METProcessingStatus::Error;
+                    cancelMessage = "@MET:SalesOrderNotFound";
+                }
+                else if(salesTable.SalesStatus != SalesStatus::Backorder)
+                {
+                    cancelResult = METProcessingStatus::Error;
+                    cancelMessage = "@MET:SalesOrderNotOpen";
+                }
+                else
+                {
+                    salesUpdateRemain = SalesUpdateRemain::construct();
+
+                    salesOrderCancelled = salesUpdateRemain.cancelOpenOrderLinesDeliveryRemainder(salesTable);
+
+                    if(salesOrderCancelled)
+                    {
+                        cancelResult = METProcessingStatus::Success;
+                        cancelMessage = "@MET:SalesOrderCancelled";
+                    }
+                    else
+                    {
+                        cancelResult = METProcessingStatus::Error;
+                        cancelMessage =  "@MET:SalesCancellationFailed";
+                    }
+                }
+
+                if(cancelResult == METProcessingStatus::Error)
+                {
+                    throw error(cancelMessage);
+                }
+
+                ttscommit;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error("@MET:SalesCancelDeadlock");
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error("@MET:SalesCancelDeadlock");
+                throw Exception::Deadlock;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error("@MET:SalesCancelUpdateConflict");
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error("@MET:SalesCancelUpdateConflict");
+                throw Exception::UpdateConflict;
+            }
+        }
+
+        return [cancelResult, cancelMessage];
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
