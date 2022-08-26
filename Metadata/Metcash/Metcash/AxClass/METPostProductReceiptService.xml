@@ -9,9 +9,9 @@
 /// </summary>
 class METPostProductReceiptService extends SysOperationServiceBase
 {
-    List         purchLineList = new List(Types::Record);
     str          errorMessage;
     str          infologMessage;
+    List         purchLineList;
 
 }
 ]]></Declaration>
@@ -47,8 +47,7 @@ class METPostProductReceiptService extends SysOperationServiceBase
 
         while select RecId from metPOReceipt
             group by PackingSlipId
-            where metPOReceipt.Processed == NoYes::Yes
-                   || metPOReceipt.Error == NoYes::Yes
+            where metPOReceipt.Error == NoYes::Yes
         {
             noOfPackingSlips++;
         }
@@ -57,8 +56,7 @@ class METPostProductReceiptService extends SysOperationServiceBase
 
         while select metPOReceipt
              group by PackingSlipId
-               where metPOReceipt.Processed == NoYes::Yes
-                   || metPOReceipt.Error == NoYes::Yes
+               where metPOReceipt.Error == NoYes::Yes
         {
             i++;
             j++;
@@ -90,42 +88,6 @@ class METPostProductReceiptService extends SysOperationServiceBase
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>clearLinesFromList</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Deletes purchase lines from the purchaseLineList.
-    /// </summary>
-    /// <param name = "_purchLineList">purchase line list.</param>
-    public void clearLinesFromList(List _purchLineList)
-    {
-        ListIterator    listIterator = new ListIterator(_purchLineList);
-
-        while(listIterator.more())
-        {
-            listIterator.delete();
-        }
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>addPOLinesToList</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Adds purchase lines to the purchaseLineList.
-    /// </summary>
-    /// <param name = "_purchLine">purchase line record.</param>
-    /// <returns>purchase lines list.</returns>
-    public List addPOLinesToList(PurchLine _purchLine)
-    {
-        purchLineList.addEnd(_purchLine);
-
-        return purchLineList; 
-    }
-
-]]></Source>
-			</Method>
-			<Method>
 				<Name>getInfologMessage</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -137,6 +99,7 @@ class METPostProductReceiptService extends SysOperationServiceBase
         SysInfologMessageStruct sysInfologMessageStruct;
 
         sysInfologEnumerator = SysInfologEnumerator::newData(infolog.infologData());
+        infologMessage = METConstants::emptyString;
 
         while (sysInfologEnumerator.moveNext())
         {
@@ -162,13 +125,12 @@ class METPostProductReceiptService extends SysOperationServiceBase
         METPOReceipt metPOReceiptLoc;
 
         ttsbegin;
-        while select forupdate Error, ErrorMessage
+        while select forupdate Error, ErrorMessage, ProcessedDate
             from metPOReceiptLoc
             where metPOReceiptLoc.PackingSlipId == _packingSlipId
         {
             metPOReceiptLoc.Error = NoYes::Yes;
             metPOReceiptLoc.ErrorMessage = _mbsErrorMsg + _mbsInfologMsg;
-            metPOReceiptLoc.Processed = NoYes::Yes;
             metPOReceiptLoc.ProcessedDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
             metPOReceiptLoc.doUpdate();
         }
@@ -191,12 +153,14 @@ class METPostProductReceiptService extends SysOperationServiceBase
         boolean             isError;
         ListEnumerator      packingSlipListEnumerator;
         PackingSlipId       packingSlipId;
-        METPOReceipt        metPOReceipt;
+        METPOReceipt        metPOReceipt, metPOReceiptLoc;
         PurchLine           purchLine, purchLineToSplit;
         utcdatetime         productReceiptDate;
         boolean             isPostingSuccessful;
         Qty                 purchQty, qtyToSplit;
         RecId               purchineRecId;
+        
+
         packingSlipListEnumerator      = _contract.parmReceiptList().getEnumerator();
 
         while (packingSlipListEnumerator.moveNext())
@@ -206,16 +170,18 @@ class METPostProductReceiptService extends SysOperationServiceBase
                 ttsBegin;
 
                 packingSlipId = packingSlipListEnumerator.current();
+                productReceiptDate = utcDateTimeNull();
+                isError = false;
+                purchLineList = new List(Types::Record);
 
                 while select metPOReceipt
-                group by PurchaseOrderNumber, ProductReceiptDate, PackingSlipId, ProductNumber, Quantity, InventSiteId
-                where metPOReceipt.Processed == NoYes::Yes
-                   || metPOReceipt.Error == NoYes::Yes 
-                   && metPOReceipt.PackingSlipId == packingSlipId
+                group by PurchaseOrderNumber, ProductReceiptDate, PackingSlipId, ProductNumber, Quantity, InventSiteId, ItemBatchNumber
+                    where metPOReceipt.Error == NoYes::Yes 
+                       && metPOReceipt.PackingSlipId == packingSlipId
                 {
                     productReceiptDate = metPOReceipt.ProductReceiptDate;
 
-                    [purchineRecId, purchQty, qtyToSplit] = this.getPurchLineNew(metPOReceipt);
+                    [purchineRecId, purchQty, qtyToSplit] = this.getPurchLine(metPOReceipt);
                     
                     select firstonly purchLine
                             where purchLine.RecId == purchineRecId;
@@ -244,11 +210,11 @@ class METPostProductReceiptService extends SysOperationServiceBase
                                 purchLineToSplit.update();
                             }
                         }
-                        this.addPOLinesToList(purchLine);  //add lines to list
+                        purchLineList.addEnd(purchLine);;  //add lines to list
                     }
                     else
                     {
-                        isError = true;
+                        throw Error(strFmt("@MET:NoLinesFoundValidation", metPOReceipt.ProductNumber, metPOReceipt.PurchaseOrderNumber));
                     }
                 }
 
@@ -261,12 +227,10 @@ class METPostProductReceiptService extends SysOperationServiceBase
                     purchFormLetter.parmLineList(purchLineList.pack());
                     purchFormLetter.update(purchTable, packingSlipId, DateTimeUtil::date(productReceiptDate), PurchUpdate::ReceiveNow);
 
-                    delete_from metPOReceipt
-                    where metPOReceipt.PackingSlipId == packingSlipId
-                       && metPOReceipt.ProductReceiptDate == productReceiptDate;
+                    delete_from metPOReceiptLoc
+                        where metPOReceiptLoc.PackingSlipId == packingSlipId
+                           && metPOReceiptLoc.ProductReceiptDate == productReceiptDate;
                 }
-
-                this.clearLinesFromList(purchLineList);
 
                 ttscommit;
             }
@@ -303,8 +267,6 @@ class METPostProductReceiptService extends SysOperationServiceBase
                         errorMessage    = "@MET:POReceiptsUpdateConflictError";
                         this.getInfologMessage();
                         this.updateLogLine(errorMessage, infologMessage, packingSlipId);
-                        //error (strFmt("@MET:METAMEXFreeTxtInvError", customer, company));
-                        //error("@Subledger:UpdateConflictErrorThrown");
                         isError = true;
                     }
                     else
@@ -314,8 +276,9 @@ class METPostProductReceiptService extends SysOperationServiceBase
                 }
                 else
                 {
-                    //error (strFmt("@MET:METAMEXFreeTxtInvError", customer, company));
-                    //error("@Subledger:UpdateConflictErrorThrown");
+                    errorMessage    = "@MET:POReceiptsUpdateConflictError";
+                    this.getInfologMessage();
+                    this.updateLogLine(errorMessage, infologMessage, packingSlipId);
                     isError = true;
                 }
             }
@@ -326,14 +289,14 @@ class METPostProductReceiptService extends SysOperationServiceBase
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>getPurchLineNew</Name>
+				<Name>getPurchLine</Name>
 				<Source><![CDATA[
     /// <summary>
     /// Method to identify the purchase line against which the quantity will be recieved
     /// </summary>
     /// <param name = "_metPOReceipt">metPOReceipt buffer</param>
     /// <returns>purchase line that matches the criteria</returns>
-    public container getPurchLineNew(METPOReceipt _metPOReceipt)
+    public container getPurchLine(METPOReceipt _metPOReceipt)
     {
         PurchLine                       purchLine, purchLineCount, purchLineToSplit;
         PurchQty                        qtyToSplit, purchqty;
@@ -478,25 +441,9 @@ class METPostProductReceiptService extends SysOperationServiceBase
                             }
                         }
                     }
-                    else
-                    {
-                        _metPOReceipt.Error = NoYes::Yes;
-                        _metPOReceipt.ErrorMessage = strFmt("@MET:NoLinesFoundValidation", _metPOReceipt.ProductNumber, _metPOReceipt.PurchaseOrderNumber);
-                    }
                 }
             }
-            else
-            {
-                _metPOReceipt.Error = NoYes::Yes;
-                _metPOReceipt.ErrorMessage = strFmt("@MET:NoLinesFoundValidation", _metPOReceipt.ProductNumber, _metPOReceipt.PurchaseOrderNumber);
-            }
         }
-        else
-        {
-            _metPOReceipt.Error = NoYes::Yes;
-            _metPOReceipt.ErrorMessage = strFmt("@MET:NoLinesFoundValidation", _metPOReceipt.ProductNumber, _metPOReceipt.PurchaseOrderNumber);
-        }
-
         return [purchLine.RecId, purchqty, 0];
     }
 
