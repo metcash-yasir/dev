@@ -10,10 +10,7 @@
 class METSalesItemSubstitution
 {        
     // TODO This needs to be integrated with the date-based reservation logic, 
-    // which is still pending design/implementation.
-    
-    // TODO need to determine manual process for reservation and whether this will
-    // be used/permitted.
+    // which is still pending design/implementation. 
 
     #define.MAXSUBLEVELS(10)    
 
@@ -24,15 +21,17 @@ class METSalesItemSubstitution
     SalesTable                              salesTable;
 
     // Options
-    boolean                                 interactive;  
+    public boolean                          interactive;  
     boolean                                 verboseLogging;
-    boolean                                 runReservationTimeChecks;   // Checks at time of line reservation
+    public boolean                          runReservationTimeChecks;   // Checks at time of line reservation
 
     // State/member
     UserConnection                          verboseLogConnection;
     METSalesItemSubstitutionAccountRelation substitutionGroup;
     METSalesItemSubstitutionRounding        rounding;
 
+    // Result
+    boolean                                 newLineCreated;
 
 }
 ]]></Declaration>
@@ -152,7 +151,8 @@ class METSalesItemSubstitution
                         where   itemSub.ItemId              == currentSearchItemID
                         &&     (itemSub.InventSiteId == METConstants::emptyString || itemSub.InventSiteId == salesTable.InventSiteId)
                         &&     (itemSub.SubstitutionCode    == METSalesItemSubstitutionCode::Always
-                            ||  itemSub.SubstitutionCode    == METSalesItemSubstitutionCode::Never)
+                            ||  itemSub.SubstitutionCode    == METSalesItemSubstitutionCode::NoAlternative
+                            ||  itemSub.SubstitutionCode    == METSalesItemSubstitutionCode::None)
                         &&  (   // table/group/all match
                             (itemSub.AccountCode == METSalesItemSubstitutionAccountCodeType::Table &&
                                 itemSub.AccountRelation == salesTable.CustAccount)
@@ -184,8 +184,9 @@ class METSalesItemSubstitution
                         order by AccountCode asc
                         where   itemSub.ItemId              == currentSearchItemID
                         &&      (itemSub.InventSiteId == METConstants::emptyString || itemSub.InventSiteId == salesTable.InventSiteId)
-                        &&      itemSub.SubstitutionCode    != METSalesItemSubstitutionCode::Always
-                        &&      itemSub.SubstitutionCode    != METSalesItemSubstitutionCode::Never
+                        &&      itemSub.SubstitutionCode    == METSalesItemSubstitutionCode::Replacement
+                            ||  itemSub.SubstitutionCode    == METSalesItemSubstitutionCode::Never
+                            ||  itemSub.SubstitutionCode    == METSalesItemSubstitutionCode::OutOfStock
                         &&  (   // table/group/all match
                             (itemSub.AccountCode == METSalesItemSubstitutionAccountCodeType::Table &&
                                 itemSub.AccountRelation == salesTable.CustAccount)
@@ -215,9 +216,9 @@ class METSalesItemSubstitution
                                 boolean     itemHasSufficientQtyOnHand  = qtyOnHand >= salesLine.QtyOrdered;
 
                                 this.verboseInfo(funcName(), strFmt("@MET:ItemOnhand",
-                                                currentSearchItemID,
-                                                qtyOnHand,
-                                                itemHasSufficientQtyOnHand ? "@MET:SufficientOrderQuantity" : "@MET:InsufficientOderQuantity"));
+                                    currentSearchItemID,
+                                    qtyOnHand,
+                                    itemHasSufficientQtyOnHand ? "@MET:SufficientOrderQuantity" : "@MET:InsufficientOderQuantity"));
 
                                 if(itemHasSufficientQtyOnHand)
                                 {
@@ -246,7 +247,11 @@ class METSalesItemSubstitution
                                         currentSearchItemID));
                     }
                 } 
-                if(!itemSub)
+                if(itemSub)
+                {
+                    currentSearchItemID = itemSub.SubstituteItemId;
+                }
+                else
                 {
                     continueSearch = false;
                 }
@@ -266,25 +271,32 @@ class METSalesItemSubstitution
             {
                 this.verboseInfo(funcName(), strFmt("@MET:FinalMatchingSubstitute", matchingItemSub.description()));
 
-                if(matchingItemSub.SubstitutionCode == METSalesItemSubstitutionCode::Always)
+                switch(matchingItemSub.SubstitutionCode)
                 {
-                    performUpdates = this.yesNoPrompt(strFmt("@MET:SubPromptReplacement",
-                                                    salesLine.ItemId, 
-                                                    matchingItemSub.SubstituteItemId));
-                }
-                else
-                {
-                    switch(matchingItemSub.SubstitutionCode)
-                    {
-                        case METSalesItemSubstitutionCode::Never:
-                        case METSalesItemSubstitutionCode::NoAlternative:
+                    case METSalesItemSubstitutionCode::Always:
+                        performUpdates = this.yesNoPrompt(strFmt("@MET:SubPromptReplacement",
+                            salesLine.ItemId,
+                            matchingItemSub.SubstituteItemId));
+                        break;
+   
+                    case METSalesItemSubstitutionCode::OutOfStock:
+                        if(this.queryOnHandQty(matchingItemSub.SubstituteItemId, inventDim) < salesLine.QtyOrdered)
+                        {
+                            // TODO LABEL
+                            this.verboseInfo(funcName(), strFmt("@MET:SubInsufficientOnHandNoSubMade",
+                                matchingItemSub.SubstituteItemId));
                             performUpdates = false;
-                            subWarningOnly = true;
-                            info(strFmt("@MET:SalesSubFoundNoReplacement",
-                                matchingItemSub.SubstitutionCode,
-                                salesLine.ItemID));
-                            break;
-                    }
+                        }
+                        break;
+
+                    case METSalesItemSubstitutionCode::Never:
+                    case METSalesItemSubstitutionCode::NoAlternative:
+                        performUpdates = false;
+                        subWarningOnly = true;
+                        info(strFmt("@MET:SalesSubFoundNoReplacement",
+                            matchingItemSub.SubstitutionCode,
+                            salesLine.ItemID));
+                        break;
                 }
 
                 if(performUpdates)
@@ -336,11 +348,10 @@ class METSalesItemSubstitution
             {
                 if(replaceItem)
                 {
-                    boolean copiedToNewLine;
                     if(salesLine.RecId)
                     {
                         this.copyToNewLine(metSalesLine.SubstituteReplacementItemID);
-                        copiedToNewLine = true;
+                        newLineCreated = true;
                     }
                     else
                     {
@@ -349,12 +360,23 @@ class METSalesItemSubstitution
                                                             metSalesLine.SubstituteReplacementItemID));                    
                     }
 
-                    if(!copiedToNewLine)
+                    if(!newLineCreated)
                     {
                         salesLine.ItemId = metSalesLine.SubstituteReplacementItemID;
+
+                        InventDim salesLineInventDim = salesLine.inventDim();
+                        salesLineInventDim.InventLocationId = '';
+                        salesLine.InventDimId = InventDim::findOrCreate(salesLineInventDim).inventDimId;
+
+                        SalesQty    originalSalesQty        = salesLine.SalesQty;
+                        InventQty   originalQtyOrdered      = salesLine.QtyOrdered;
+                            
+                        salesLine.itemIdChanged();  
+
+                        salesLine.SalesQty      = originalSalesQty;
+                        salesLine.QtyOrdered    = originalQtyOrdered;
+
                         this.updateQuantity();
-                        salesLine.itemIdChanged();
-                        // TODO requires testing around unified pricing changes.
 
                         if(salesLine.RecId)
                         {
@@ -441,47 +463,110 @@ class METSalesItemSubstitution
         this.verboseInfo(funcName(), strFmt("@MET:CopyingNewLineWithItem",
                                             _newItemId));
 
-        SalesLine newLine;
+        SalesLine newLine, existingLine;
 
-        this.updateQuantity();
+        existingLine = salesLine;
 
         newLine.initFromSalesTable(salesTable);
         newLine.initFromSalesLine(salesLine, true, true, true);
-        newLine.ItemId = _newItemId;        
-        newLine.itemIdChanged();
-
-        METSalesLine metNewLine = newLine.metSalesLine();
-        metNewLine = metSalesLine.data();
-
-        metNewLine.SalesLine = newLine.RecId;
+        newLine.ItemId              = _newItemId;
+        newLine.PackedExtensions    = conNull();
         
-        newLine.metPackMETSalesLine(metNewLine);
-        newLine.insert();
+        METSalesLine newMetSalesLine = metSalesLine.data();
 
-        // TODO copy notes etc.
-        
+        salesLine       = newLine;
+        inventDim       = salesLine.inventDim();
+        metSalesLine    = newMetSalesLine;
+
+        SalesQty    originalSalesQty        = salesLine.SalesQty;
+        InventQty   originalQtyOrdered      = salesLine.QtyOrdered;
+                            
+        salesLine.itemIdChanged();
+
+        salesLine.SalesQty      = originalSalesQty;
+        salesLine.QtyOrdered    = originalQtyOrdered;
+
+        this.updateQuantity();        
+
+        salesLine.insert();
+        metSalesLine.SalesLine = salesLine.RecID;
+        metSalesLine.insert();
+
+        existingLine.delete();
 
         guid logReference;
         metSalesLine.SubstitutionVerboseLogReference = logReference;    // clear ref on original record. 
-
-        //Instead of directly updating the METSalesLine record, follow SysExtensionSerialization to perform update from base table
-        SalesLine salesLineLoc = SalesLine::findRecId(metSalesLine.SalesLine, true);
-        salesLineLoc.metPackMETSalesLine(metSalesLine);
-        salesLineLoc.update();
         
         this.verboseInfo(funcName(), strFmt("@MET:OrderLineItemLotCopiedReplacedItemLot",
                                             salesLine.ItemId,
                                             salesLine.InventTransId,
                                             newLine.ItemId,
                                             newLine.InventTransId));
-        
-        salesLine.delete();   
-
-        salesLine       = newLine;
-        inventDim       = salesLine.inventDim();
-        metSalesLine    = metNewLine;
+       
 
         return newLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getNewLineCreated</Name>
+				<Source><![CDATA[
+     /// <summary>
+     /// Return true if new line created.
+     /// </summary>
+     /// <returns>Result</returns>
+    public boolean getNewLineCreated()
+    {
+        return newLineCreated;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// parmSalesLine
+    /// </summary>
+    /// <param name = "_salesLine">_salesLine</param>
+    /// <returns>SalesLine</returns>
+    public SalesLine parmSalesLine(SalesLine _salesLine = salesLine)
+    {
+        salesLine = _salesLine;
+        return salesLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmMetSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// parmMetSalesLine
+    /// </summary>
+    /// <param name = "_metSalesLine">_metSalesLine</param>
+    /// <returns>METSalesLine</returns>
+    public METSalesLine parmMetSalesLine(METSalesLine _metSalesLine = metSalesLine)
+    {
+        metSalesLine = _metSalesLine;
+        return metSalesLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmInventDim</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// parmInventDim
+    /// </summary>
+    /// <param name = "_inventDim">_inventDim</param>
+    /// <returns>InventDim</returns>
+    public InventDim parmInventDim(InventDim _inventDim = inventDim)
+    {
+        inventDim = _inventDim;
+        return inventDim;
     }
 
 ]]></Source>
@@ -638,19 +723,14 @@ class METSalesItemSubstitution
 
             salesLine.SalesQty  = replacementQtySalesUnit;
             salesLine.SalesUnit = replacementSalesUnit;                
-        
-            // TODO min/max/etc is not working correctly with the site/item specific
-            // settings mod. When it is, logic should not be replicated here. Ordinarily
-            // it will be called via modifySalesQty below.
-            this.applyMinMaxMultiple();
 
-            salesLine.METSkipMinMaxMultipleCheck = true;
+            salesLine.METSkipQuantityUpdatePrompts = true;
             SalesLine::modifySalesQty(
                 salesLine, 
                 inventDim, 
                 true, 
                 false);
-            salesLine.METSkipMinMaxMultipleCheck = false;
+            salesLine.METSkipQuantityUpdatePrompts = false;
 
             this.verboseInfo(funcName(), strFmt("@MET:FinalConversionSalesInventoryItem",
                 salesLine.SalesQty,
@@ -670,49 +750,6 @@ class METSalesItemSubstitution
             ret = false;
         }
         return ret;       
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>applyMinMaxMultiple</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Apply min/max/multiple logic to sales order line. 
-    /// TODO, pending completion of site-specific sales unit mod.
-    /// </summary>
-    protected void applyMinMaxMultiple()
-    {
-        InventItemSalesSetup salesSetup = this.findInventItemSalesSetup(salesLine.ItemId);
-        if(salesSetup)
-        {            
-            this.verboseInfo(funcName(), strFmt("@MET:ItemSiteSetupFoundItemSite",
-                                                salesLine.ItemId,
-                                                salesSetup.inventSiteId()));
-            if(salesSetup.LowestQty && salesLine.SalesQty < salesSetup.LowestQty)
-            {
-                this.verboseInfo(funcName(), strFmt("@MET:QuantityUpdatedMinimum", salesSetup.LowestQty));
-                salesLine.SalesQty = salesSetup.LowestQty;
-            }
-            if(salesSetup.HighestQty && salesLine.SalesQty > salesSetup.HighestQty)
-            {
-                this.verboseInfo(funcName(), strFmt("@MET:QuantityUpdatedMaximum", salesSetup.highestQty));
-                salesLine.SalesQty = salesSetup.HighestQty;
-            }
-            if(salesSetup.MultipleQty)
-            {
-                int salesQtyInt = real2int(salesLine.SalesQty);
-                int multQtyInt  = real2int(salesSetup.MultipleQty);
-                if(salesQtyInt mod multQtyInt)
-                {
-                    this.verboseInfo(funcName(), strFmt("@MET:RoundingUpNearestMultiple",
-                                                        salesLine.SalesQty,
-                                                        multQtyInt));
-                    salesQtyInt         = ((salesQtyInt / multQtyInt) + 1) * multQtyInt;
-                    salesLine.SalesQty  = salesQtyInt;
-                }
-            }
-        }
     }
 
 ]]></Source>
@@ -754,7 +791,7 @@ class METSalesItemSubstitution
     protected InventItemSalesSetup findInventItemSalesSetup(ItemId _itemID)
     {
         InventDim siteDim;
-        siteDim.InventSiteID    = this.salesTable.InventSiteId;
+        siteDim.InventSiteID    = this.salesLine.inventDim().InventSiteId;
         siteDim                 = InventDim::findOrCreate(siteDim);
         InventItemSalesSetup salesSetup = InventItemSalesSetup::find(
             _itemID,
@@ -925,7 +962,7 @@ class METSalesItemSubstitution
     /// <param name = "_metSalesLine">_metSalesLine</param>
     /// <param name = "_inventDim">_inventDim</param>
     /// <returns>New instance</returns>
-    static private METSalesItemSubstitution construct(
+    static public METSalesItemSubstitution construct(
         SalesLine                               _salesLine,
         METSalesLine                            _metSalesLine,
         InventDim                               _inventDim)
