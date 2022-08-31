@@ -27,7 +27,7 @@ class METPostProductReceiptService extends SysOperationServiceBase
     {
         int                 bundlesize, noOfPackingSlips, totalTasks, i, j, task;
         List                packingSlipList      = new List(Types::String);
-        METPOReceipt        metPOReceipt, metPOReceiptLoc;
+        METPOReceipt        metPOReceipt;
 
         BatchHeader batchHeader = this.getCurrentBatchHeader();
 
@@ -150,16 +150,15 @@ class METPostProductReceiptService extends SysOperationServiceBase
     {
         #OCCRetryCount
 
-        boolean             isError;
-        ListEnumerator      packingSlipListEnumerator;
-        PackingSlipId       packingSlipId;
-        METPOReceipt        metPOReceipt, metPOReceiptLoc;
-        PurchLine           purchLine, purchLineToSplit;
-        utcdatetime         productReceiptDate;
-        boolean             isPostingSuccessful;
-        Qty                 purchQty, qtyToSplit;
-        RecId               purchineRecId;
-        
+        boolean                 isError, isRegistrationSuccessful;
+        ListEnumerator          packingSlipListEnumerator;
+        PackingSlipId           packingSlipId;
+        METPOReceipt            metPOReceipt, metPOReceiptLoc;
+        PurchLine               purchLine, purchLineToSplit;
+        utcdatetime             productReceiptDate;
+        boolean                 isCWItem;
+        Qty                     purchQty, qtyToSplit;
+        RecId                   purchineRecId;
 
         packingSlipListEnumerator      = _contract.parmReceiptList().getEnumerator();
 
@@ -172,6 +171,7 @@ class METPostProductReceiptService extends SysOperationServiceBase
                 packingSlipId = packingSlipListEnumerator.current();
                 productReceiptDate = utcDateTimeNull();
                 isError = false;
+                isCWItem = false;
                 purchLineList = new List(Types::Record);
 
                 while select metPOReceipt
@@ -181,17 +181,18 @@ class METPostProductReceiptService extends SysOperationServiceBase
                 {
                     productReceiptDate = metPOReceipt.ProductReceiptDate;
 
-                    [purchineRecId, purchQty, qtyToSplit] = this.getPurchLine(metPOReceipt);
+                    [purchineRecId, purchQty, qtyToSplit, isCWItem] = this.getPurchLine(metPOReceipt);
                     
                     select firstonly purchLine
                             where purchLine.RecId == purchineRecId;
 
                     if(purchLine.RecId)
                     {
-                        purchLine.selectForUpdate(true);
-                        purchLine.PurchReceivedNow = purchQty;
-                        purchLine.modifiedField(fieldNum(PurchLine, PurchReceivedNow));
-                        purchLine.update();
+                        isRegistrationSuccessful = this.registerPurchLine(purchLine, purchQty, isCWItem);
+                        if(!isRegistrationSuccessful)
+                        {
+                            throw Error("@MET:POLineRegistrationError");
+                        }
 
                         if(qtyToSplit > 0)
                         {
@@ -204,10 +205,11 @@ class METPostProductReceiptService extends SysOperationServiceBase
 
                             if(purchLineToSplit.RecId)
                             {
-                                purchLineToSplit.selectForUpdate(true);
-                                purchLineToSplit.RemainPurchPhysical = qtyToSplit;
-                                purchLineToSplit.modifiedField(fieldNum(PurchLine, RemainPurchPhysical));
-                                purchLineToSplit.update();
+                                isRegistrationSuccessful = this.registerPurchLine(purchLine, qtyToSplit, isCWItem);
+                                if(!isRegistrationSuccessful)
+                                {
+                                    throw Error("@MET:POLineRegistrationError");
+                                }
                             }
                         }
                         purchLineList.addEnd(purchLine);;  //add lines to list
@@ -225,7 +227,7 @@ class METPostProductReceiptService extends SysOperationServiceBase
 
                     purchFormLetter.createFromLines(true);
                     purchFormLetter.parmLineList(purchLineList.pack());
-                    purchFormLetter.update(purchTable, packingSlipId, DateTimeUtil::date(productReceiptDate), PurchUpdate::ReceiveNow);
+                    purchFormLetter.update(purchTable, packingSlipId, DateTimeUtil::date(productReceiptDate), PurchUpdate::Recorded);
 
                     delete_from metPOReceiptLoc
                         where metPOReceiptLoc.PackingSlipId == packingSlipId
@@ -305,6 +307,9 @@ class METPostProductReceiptService extends SysOperationServiceBase
         UnitOfMeasureConversionFactor   conversionFactor;
         InventDim                       inventDim, inventDimCount;
         InventTableModule               inventTableModule;
+        EcoResProduct                   ecoResProduct;
+        InventTable                     inventTable;
+        boolean                         isCWItem;
 
         
 
@@ -335,51 +340,61 @@ class METPostProductReceiptService extends SysOperationServiceBase
                         && inventDim.inventBatchId == _metPOReceipt.ItemBatchNumber;
 
             
-            warehouseUnit = itemSiteSettingsSetup.UnitId;
-            purchUnit = purchLine.PurchUnit;
+            select firstonly PdsCWProduct from ecoResProduct
+                join inventTable
+                    where inventTable.ItemId == _metPOReceipt.ProductNumber
+                        && inventTable.Product == ecoResProduct.RecId;
 
-            select firstonly UnitId from inventTableModule
-                        where inventTableModule.ItemId      == purchLine.ItemId
-                           && inventTableModule.ModuleType == ModuleInventPurchSales::Invent;
-
-            if(inventTableModule.UnitId)
-            {
-                inventoryUnit = inventTableModule.UnitId;
-            }
-
-            // Calculate the purchase qty from the warehouse quantity
-            if(warehouseUnit == purchUnit)
+            if(ecoResProduct.PdsCWProduct)
             {
                 purchqty = _metPOReceipt.Quantity;
-            }
-            else if(warehouseUnit == METConstants::emptyString)
-            {
-                purchqty = _metPOReceipt.Quantity;
+                isCWItem = true;
+
+                select firstonly purchLine
+                    where purchLine.PurchId == _metPOReceipt.PurchaseOrderNumber
+                        && purchLine.ItemId == _metPOReceipt.ProductNumber
+                        && purchLine.PurchStatus == PurchStatus::Backorder
+                        && purchLine.PdsCWQty >= purchqty
+                        && purchLine.IsDeleted == NoYes::No
+                    join RecId from inventDim
+                        where inventDim.inventDimId == purchLine.InventDimId
+                           && inventDim.InventSiteId == _metPOReceipt.InventSiteId
+                           && inventDim.inventBatchId == _metPOReceipt.ItemBatchNumber;
+
+                if(purchLine.RecId)
+                {
+
+                    return [purchLine.RecId, purchqty, 0, isCWItem];
+                }
             }
             else
             {
-                conversionFactor = roundUp(UnitOfMeasureConversion::findByConversion(
-                            UnitOfMeasure::findBySymbol(warehouseUnit).RecId,
-                            UnitOfMeasure::findBySymbol(purchUnit).RecId,
-                            EcoResProduct::findByProductNumber(purchLine.ItemId).RecId)
-                            .Factor, 0);
+                warehouseUnit = itemSiteSettingsSetup.UnitId;
+                purchUnit = purchLine.PurchUnit;
 
-                if(conversionFactor != 0)
+                select firstonly UnitId from inventTableModule
+                            where inventTableModule.ItemId      == purchLine.ItemId
+                               && inventTableModule.ModuleType == ModuleInventPurchSales::Invent;
+
+                if(inventTableModule.UnitId)
                 {
-                    if(purchUnit == inventoryUnit)
-                    {
-                        purchqty = _metPOReceipt.Quantity * conversionFactor;
-                    }
-                    else
-                    {
-                        purchqty = _metPOReceipt.Quantity / conversionFactor;
-                    }
+                    inventoryUnit = inventTableModule.UnitId;
+                }
+
+                // Calculate the purchase qty from the warehouse quantity
+                if(warehouseUnit == purchUnit)
+                {
+                    purchqty = _metPOReceipt.Quantity;
+                }
+                else if(warehouseUnit == METConstants::emptyString)
+                {
+                    purchqty = _metPOReceipt.Quantity;
                 }
                 else
                 {
                     conversionFactor = roundUp(UnitOfMeasureConversion::findByConversion(
-                                UnitOfMeasure::findBySymbol(purchUnit).RecId,
                                 UnitOfMeasure::findBySymbol(warehouseUnit).RecId,
+                                UnitOfMeasure::findBySymbol(purchUnit).RecId,
                                 EcoResProduct::findByProductNumber(purchLine.ItemId).RecId)
                                 .Factor, 0);
 
@@ -394,66 +409,143 @@ class METPostProductReceiptService extends SysOperationServiceBase
                             purchqty = _metPOReceipt.Quantity / conversionFactor;
                         }
                     }
-                }
-            }
-
-            select forupdate firstonly purchLine
-                    where purchLine.PurchId == _metPOReceipt.PurchaseOrderNumber
-                        && purchLine.ItemId == _metPOReceipt.ProductNumber
-                        && purchLine.PurchStatus == PurchStatus::Backorder
-                        && purchLine.PurchQty >= purchqty
-                        && purchLine.IsDeleted == NoYes::No
-                    join RecId from inventDim
-                        where inventDim.inventDimId == purchLine.InventDimId
-                           && inventDim.InventSiteId == _metPOReceipt.InventSiteId
-                           && inventDim.inventBatchId == _metPOReceipt.ItemBatchNumber;
-
-            if(purchLine.RecId)
-            {
-                if(purchLine.PurchQty >= purchqty) //Check if quantities match
-                {
-                    return [purchLine.RecId, purchqty, 0];
-                }
-                else
-                {
-                    if(purchLineCount.RecId > 1)  //try to split the lines
+                    else
                     {
-                        qtyToSplit = purchqty - purchLine.PurchQty;
+                        conversionFactor = roundUp(UnitOfMeasureConversion::findByConversion(
+                                    UnitOfMeasure::findBySymbol(purchUnit).RecId,
+                                    UnitOfMeasure::findBySymbol(warehouseUnit).RecId,
+                                    EcoResProduct::findByProductNumber(purchLine.ItemId).RecId)
+                                    .Factor, 0);
 
-                        select firstonly RecId from purchLineToSplit
-                            where purchLineToSplit.PurchId == _metPOReceipt.PurchaseOrderNumber
-                                && purchLineToSplit.ItemId == _metPOReceipt.ProductNumber
-                                && purchLineToSplit.PurchQty >= qtyToSplit
-                                && purchLine.PurchStatus == PurchStatus::Backorder
-                                && purchLineToSplit.LineNumber != purchLine.LineNumber
-                                && purchLineToSplit.IsDeleted == NoYes::No
-                            join RecId from inventDim
-                                where inventDim.inventDimId == purchLineToSplit.InventDimId
-                                   && inventDim.InventSiteId == _metPOReceipt.InventSiteId
-                                   && inventDim.inventBatchId == _metPOReceipt.ItemBatchNumber;
-
-                        if(purchLineToSplit.RecId)
+                        if(conversionFactor != 0)
                         {
-                            return [purchLine.RecId, purchqty, qtyToSplit];
-                        }
-
-                    }
-                    else if((purchLineCount.RecId == 1))
-                    {
-                        if (purchLine.OverDeliveryPct > 0) //Check if overdelivery is allowed
-                        {
-                            Qty maxReceivedQty = purchLine.PurchQty * (1 + purchLine.OverDeliveryPct / 100);
-
-                            if(maxReceivedQty >= purchqty)
+                            if(purchUnit == inventoryUnit)
                             {
-                                return [purchLine.RecId, purchqty, 0];
+                                purchqty = _metPOReceipt.Quantity * conversionFactor;
+                            }
+                            else
+                            {
+                                purchqty = _metPOReceipt.Quantity / conversionFactor;
+                            }
+                        }
+                    }
+                }
+
+                select firstonly purchLine
+                        where purchLine.PurchId == _metPOReceipt.PurchaseOrderNumber
+                            && purchLine.ItemId == _metPOReceipt.ProductNumber
+                            && purchLine.PurchStatus == PurchStatus::Backorder
+                            && purchLine.PurchQty >= purchqty
+                            && purchLine.IsDeleted == NoYes::No
+                        join RecId from inventDim
+                            where inventDim.inventDimId == purchLine.InventDimId
+                               && inventDim.InventSiteId == _metPOReceipt.InventSiteId
+                               && inventDim.inventBatchId == _metPOReceipt.ItemBatchNumber;
+
+                if(purchLine.RecId)
+                {
+                    if(purchLine.PurchQty >= purchqty) //Check if quantities match
+                    {
+                        return [purchLine.RecId, purchqty, 0, isCWItem];
+                    }
+                    else
+                    {
+                        if(purchLineCount.RecId > 1)  //try to split the lines
+                        {
+                            qtyToSplit = purchqty - purchLine.PurchQty;
+
+                            select firstonly RecId from purchLineToSplit
+                                where purchLineToSplit.PurchId == _metPOReceipt.PurchaseOrderNumber
+                                    && purchLineToSplit.ItemId == _metPOReceipt.ProductNumber
+                                    && purchLineToSplit.PurchQty >= qtyToSplit
+                                    && purchLine.PurchStatus == PurchStatus::Backorder
+                                    && purchLineToSplit.LineNumber != purchLine.LineNumber
+                                    && purchLineToSplit.IsDeleted == NoYes::No
+                                join RecId from inventDim
+                                    where inventDim.inventDimId == purchLineToSplit.InventDimId
+                                       && inventDim.InventSiteId == _metPOReceipt.InventSiteId
+                                       && inventDim.inventBatchId == _metPOReceipt.ItemBatchNumber;
+
+                            if(purchLineToSplit.RecId)
+                            {
+                                return [purchLine.RecId, purchqty, qtyToSplit, isCWItem];
+                            }
+
+                        }
+                        else if((purchLineCount.RecId == 1))
+                        {
+                            if (purchLine.OverDeliveryPct > 0) //Check if overdelivery is allowed
+                            {
+                                Qty maxReceivedQty = purchLine.PurchQty * (1 + purchLine.OverDeliveryPct / 100);
+
+                                if(maxReceivedQty >= purchqty)
+                                {
+                                    return [purchLine.RecId, purchqty, 0, isCWItem];
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        return [purchLine.RecId, purchqty, 0];
+        return [purchLine.RecId, purchqty, 0, isCWItem];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>registerPurchLine</Name>
+				<Source><![CDATA[
+   /// <summary>
+   /// This method is used to register a purchase line
+   /// </summary>
+   /// <param name = "_purchLine">the purchase line record</param>
+   /// <param name = "_purchQty">the quantity to be registered</param>
+   /// <param name = "isCWItem">boolean value indicating CW item</param>
+   /// <returns></returns>
+    public boolean registerPurchLine(PurchLine _purchLine, Qty _purchQty, boolean isCWItem)
+    {
+        InventTrans             inventTrans;
+        InventDim               inventDim;
+        InventTransWMS_Register inventTransWMS_register;
+        TmpInventTransWMS       tmpInventTransWMS;
+        UnitOfMeasureSymbol     inventoryUnit;
+        InventTableModule       inventTableModule;
+        boolean                 ret;
+
+        select firstonly UnitId from inventTableModule
+            where inventTableModule.ItemId      == _purchLine.ItemId
+               && inventTableModule.ModuleType == ModuleInventPurchSales::Invent;
+
+        if(inventTableModule.UnitId)
+        {
+            inventoryUnit = inventTableModule.UnitId;
+        }
+
+        inventTrans = InventTrans::findTransId(_purchLine.InventTransId);
+
+        if(inventTrans && inventTrans.StatusReceipt != StatusReceipt::Registered)
+        {
+            if(isCWItem)
+            {
+                inventTrans.PdsCWQty = _purchQty;
+            }
+            else
+            {
+                if(_purchLine.PurchUnit == inventoryUnit)
+                {
+                    inventTrans.Qty = _purchQty;
+                }
+                else
+                {
+                    inventTrans.Qty = _purchLine.unitConvertPurch2Invent(_purchQty);
+                }
+            }
+            inventTransWMS_Register = InventTransWMS_Register::newStandard(tmpInventTransWMS);
+            inventTransWMS_Register.createFromInventTrans(inventTrans, inventTrans.inventDim());
+            ret = inventTransWMS_Register.updateInvent(_purchLine);
+        }
+        return ret;
     }
 
 ]]></Source>
