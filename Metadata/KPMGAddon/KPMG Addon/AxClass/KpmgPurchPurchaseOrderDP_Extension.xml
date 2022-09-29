@@ -23,10 +23,115 @@ final class KpmgPurchPurchaseOrderDP_Extension
     /// </param>
     protected void insertOrderHeader(PurchPurchaseOrderHeader _purchaseOrderHeader)
     {
-        PurchTable purchTable                      = PurchTable::find(_purchaseOrderHeader.PurchId);
+        PurchTable          purchTable      = PurchTable::find(_purchaseOrderHeader.PurchId);
+        InventLocation      inventLocation  = InventLocation::find(purchTable.InventLocationId);
+        METPurchTable       metPurchTable   = METPurchTable::findByPurchTable(purchTable.RecID);
+        METIndustryKeyTable industryKey     = METIndustryKeyTable::find(inventLocation.METWHSubEntity);
+        CompanyInfo         companyInfo     = CompanyInfo::find();
+        Image               img;
+
         _purchaseOrderHeader.Payment               = PaymTerm::find(purchTable.Payment).Description;        
         _purchaseOrderHeader.KPMGContactPersonId   = purchTable.contactPersonName();
         _purchaseOrderHeader.KPMGPurchOrderFormNum = purchTable.PurchOrderFormNum;
+
+        str docNum = _purchaseOrderHeader.PurchOrderDocNum;
+
+        _purchaseOrderHeader.METVersionText             = strFmt("@MET:METVersion", substr(docNum, strFind(docNum, "@MET:METHyphen", 1, 999) + 1, 999));
+
+        if(industryKey)
+        {
+            if(industryKey.CoRegNum)
+            {
+                _purchaseOrderHeader.CompanyCoRegNum  = industryKey.CoRegNum;
+            }
+            if(industryKey.POConfFormNote)
+            {
+                _purchaseOrderHeader.FormLetterRemarksTxt = industryKey.POConfFormNote;
+            }
+            switch(industryKey.Logo)
+            {
+                case METIndustryKeyLogo::Logo1:
+                    img = CompanyImage::metGetImage(companyInfo);
+                    break;
+                case METIndustryKeyLogo::Logo2:
+                    img = METCompanyImage::getImage(companyInfo, METCompanyImageType::CompanyLogo);
+                    break;
+                case METIndustryKeyLogo::Logo3:
+                    img = METCompanyImage::getImage(companyInfo, METCompanyImageType::CompanyLogo3);
+                    break;
+                case METIndustryKeyLogo::Logo4:
+                    img = METCompanyImage::getImage(companyInfo, METCompanyImageType::CompanyLogo4);
+                    break;
+            }
+            _purchaseOrderHeader.CompanyLogo = img.getData();
+        }
+
+        if(metPurchTable.POSubSource)
+        {
+            _purchaseOrderHeader.METOrderToDetails          = strFmt("@MET:METABNVendorSubSource",
+                purchTable.vendTable_OrderAccount().VATNum,
+                purchTable.InvoiceAccount,
+                metPurchTable.POSubSource);
+        }
+        else
+        {
+            _purchaseOrderHeader.METOrderToDetails          = strFmt("@MET:METABNVendor",
+                purchTable.vendTable_OrderAccount().VATNum,
+                purchTable.OrderAccount);
+        }
+
+        if(purchTable.PurchStatus == PurchStatus::Canceled)
+        {
+            _purchaseOrderHeader.METHeaderStatus = "@MET:METCancelledPO";
+        }
+        else
+        {
+            if(strStartsWith(metPurchTable.POSubSource, "@MET:METUB"))
+            {
+               _purchaseOrderHeader.METHeaderStatus = "@MET:METUnderBondPO";
+            }
+        }
+
+        _purchaseOrderHeader.METDeliveryDate            = purchTable.DeliveryDate;
+
+        if(purchTable.ReqAttention)
+        {
+            _purchaseOrderHeader.METSpecialInstructions     = "@MET:METSpecialPOInstructions" + purchTable.ReqAttention;
+        }
+
+        _purchaseOrderHeader.METContactName             = purchTable.editContactPersonName(false, METConstants::emptyString);
+        _purchaseOrderHeader.METContactEmail            = purchTable.contactPerson().email();
+        _purchaseOrderHeader.METContactPhone            = purchTable.contactPerson().phone();
+        
+        if(metPurchTable.POPlannerCode)
+        {
+            METPlannerCodeSetup plannerCode;
+            select firstonly plannerCode
+                where   plannerCode.PlannerCode == metPurchTable.POPlannerCode;
+            if(plannerCode)
+            {
+                HcmWorker plannerWorker = HcmWorker::find(plannerCode.PlannerCodePersonnelNumber);
+                if(plannerWorker)
+                {
+                    _purchaseOrderHeader.METPlannerContactName             = plannerWorker.name();
+                    _purchaseOrderHeader.METPlannerContactEmail            = plannerWorker.email();
+                    _purchaseOrderHeader.METPlannerContactPhone            = plannerWorker.phone();
+                }
+            }
+        }
+        
+        
+        _purchaseOrderHeader.METReceivingDockDetails    = this.getElectronicAddressByPostalAddress(inventLocation, LogisticsElectronicAddressMethodType::Phone).Locator;
+        _purchaseOrderHeader.METLegendText              = VendFormletterParameters::find().METPurchOrderReportLegendText;
+
+        Email deliverToEmail = this.getElectronicAddressByPostalAddress(inventLocation, LogisticsElectronicAddressMethodType::Email).Locator;
+        _purchaseOrderHeader.METDeliveryAddressWithAdditionalDetails = _purchaseOrderHeader.DeliveryAddress;
+
+        if(deliverToEmail)
+        {
+            _purchaseOrderHeader.METDeliveryAddressDetail2 += strFmt("@MET:METContact", deliverToEmail);
+        }
+
         next insertOrderHeader(_purchaseOrderHeader);
     }
 
@@ -58,6 +163,78 @@ final class KpmgPurchPurchaseOrderDP_Extension
         KPMGPurchPurchaseOrderHeader.Amount                     = _vendPurchOrderJour.Amount;
 
         return KPMGPurchPurchaseOrderHeader;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertOrderLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Insert the order line.
+    /// </summary>
+    /// <param name = "_purchaseOrderTmp">order line record to insert</param>
+    protected void insertOrderLine(PurchPurchaseOrderTmp _purchaseOrderTmp)
+    {
+        PurchLine           purchLine           = PurchLine::findInventTransId(_purchaseOrderTmp.PurchLineInventTransId);
+        InventDim           inventDim           = purchLine.inventDim();
+        VendPurchOrderJour  purchJour;
+        InventTable         inventTable         = InventTable::find(purchLine.ItemId);
+
+        purchJour = VendPurchOrderJour::findRecId(_purchaseOrderTmp.JournalRecId);
+               
+        PurchLineAllVersions lineAllVersions;
+        select firstonly lineAllVersions
+            where   lineAllVersions.PurchTableVersionRecId  == purchJour.PurchTableVersion
+            &&      lineAllVersions.InventTransId           == _purchaseOrderTmp.PurchLineInventTransId;
+
+        MetItemSiteSettingsSetup metItemSiteSettings;
+        // NB no indexes or find methods defined on this table at time of writing.
+        select firstonly metItemSiteSettings
+            where   metItemSiteSettings.ItemId          == purchLine.ItemId
+            &&      metItemSiteSettings.InventSiteId    == inventDim.InventSiteId;
+
+        _purchaseOrderTmp.METGTIN                   = purchLine.BarCode;
+        _purchaseOrderTmp.METTi                     = metItemSiteSettings.CartonPerLayer;
+        _purchaseOrderTmp.METHi                     = metItemSiteSettings.Layers;
+        _purchaseOrderTmp.METMLOR                   = metItemSiteSettings.TempRcvLimit ? metItemSiteSettings.TempRcvLimit : inventTable.PdsBestBefore;
+        _purchaseOrderTmp.METAmountIncTax           = lineAllVersions.LineAmount + lineAllVersions.ConfirmedTaxAmount;
+        _purchaseOrderTmp.METPurchPriceIncTax       = _purchaseOrderTmp.METAmountIncTax / lineAllVersions.PurchQty;
+        _purchaseOrderTmp.TaxAmount                 = lineAllVersions.ConfirmedTaxAmount;
+
+        if(_purchaseOrderTmp.METTi && _purchaseOrderTmp.METHi)
+        {
+            _purchaseOrderTmp.METPalletQty = _purchaseOrderTmp.Qty / _purchaseOrderTmp.METTi / _purchaseOrderTmp.METHi;
+        }
+
+        next insertOrderLine(_purchaseOrderTmp);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getElectronicAddressByPostalAddress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the ElectronicAddressByPostalAddress
+    /// </summary>
+    /// <param name = "_inventLocation">InventLocation</param>
+    /// <param name = "_type">LogisticsElectronicAddressMethodType</param>
+    /// <returns>LogisticsElectronicAddress</returns>
+    public LogisticsElectronicAddress getElectronicAddressByPostalAddress(InventLocation _inventLocation, LogisticsElectronicAddressMethodType _type)
+    {
+        LogisticsLocation               logisticsLocation;
+        InventLocationLogisticsLocation inventLocationLogisticsLocation;
+        LogisticsElectronicAddress      electronicAddress;
+
+        select firstOnly RecId from inventLocationLogisticsLocation
+            where inventLocationLogisticsLocation.InventLocation == _inventLocation.RecId
+        join RecId from logisticsLocation
+            where logisticsLocation.ParentLocation == inventLocationLogisticsLocation.Location;
+ 
+        electronicAddress = LogisticsElectronicAddress::findByLocationAndType(logisticsLocation.RecId, _type);
+ 
+        return electronicAddress;
     }
 
 ]]></Source>
