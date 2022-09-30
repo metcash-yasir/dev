@@ -1,0 +1,218 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPriceChangeTrackTradeAgreement</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_24248 Pricing Data Extract
+/// Track changes related to prices and add entry to Price Change tracking table for later processing
+/// </summary>
+using System.ComponentModel.Composition;
+
+[Export(identifierStr(Dynamics.AX.Application.METPriceChangeTrack))]
+[ExportMetadata(enumStr(METPriceChangeType), enumLiteralStr(METPriceChangeType, TradeAgreement))]
+public class METPriceChangeTrackTradeAgreement extends METPriceChangeTrack
+{
+    PriceDiscAdmTable       priceDiscAdmTable;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>initInstanceSource</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialise the instance
+    /// </summary>
+    /// <param name = "_common">Table record</param>
+    public void initInstanceSource(Common _common)
+    {
+        this.setInternals(_Common);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setInternals</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set internal variables
+    /// </summary>
+    /// <param name = "_common">Table record</param>
+    public void setInternals(Common _common)
+    {
+        priceDiscAdmTable   = _common as PriceDiscAdmTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPriceChangeType</Name>
+				<Source><![CDATA[
+    public METPriceChangeType getPriceChangeType()
+    {
+        return METPriceChangeType::TradeAgreement;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processSource</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the base record that triggered the change
+    /// </summary>
+    public void processSource()
+    {
+        //Requirements
+        //1. Trade agreement line is updated to Posted 
+        //2. Relation is Price (sales)
+        //3. Only Party code type of Group or Table
+
+        PriceDiscAdmTrans       priceDiscAdmTrans;
+        RecordInsertList        priceChangeTrackingList;
+
+        if( priceDiscAdmTable.Posted && priceDiscAdmTable.DefaultRelation == PriceType::PriceSales)
+        {
+            priceChangeTrackingList = new RecordInsertList(tableNum(METPriceChangeTracking));
+            
+            while select priceDiscAdmTrans
+                where   priceDiscAdmTrans.JournalNum    == priceDiscAdmTable.JournalNum
+                &&      priceDiscAdmTrans.ItemCode      == PriceDiscProductCodeType::Table
+                &&     (priceDiscAdmTrans.AccountCode   == PriceDiscPartyCodeType::GroupId || priceDiscAdmTrans.AccountCode  == PriceDiscPartyCodeType::Table)
+            {
+                priceChangeTracking.clear();
+                this.setCommonValues(priceDiscAdmTrans);
+                priceChangeTracking.PriceDiscJournalNum     = priceDiscAdmTrans.JournalNum;
+                priceChangeTracking.PriceDiscLineNum        = priceDiscAdmTrans.LineNum;
+                priceChangeTracking.PriceDiscPartyCode      = priceDiscAdmTrans.AccountCode;
+                priceChangeTracking.PriceDiscAccountRelation = priceDiscAdmTrans.AccountRelation;
+                priceChangeTracking.ItemId                  = priceDiscAdmTrans.itemCode == PriceDiscProductCodeType::Table ? priceDiscAdmTrans.ItemRelation : blankValue;
+                priceChangeTracking.FromDate                = priceDiscAdmTrans.FromDate ? priceDiscAdmTrans.FromDate : DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimezone());
+                priceChangeTracking.ToDate                  = priceDiscAdmTrans.ToDate;
+                priceChangeTracking.InventSiteId            = InventDim::find(priceDiscAdmTrans.inventDimId).InventSiteId;
+                priceChangeTracking.UnitId                  = priceDiscAdmTrans.UnitId;
+                priceChangeTracking.Price                   = priceDiscAdmTrans.amount;
+                priceChangeTracking.PriceQty                = priceDiscAdmTrans.priceUnit;
+                priceChangeTracking.QuantityAmountFrom      = priceDiscAdmTrans.QuantityAmountFrom;
+                priceChangeTracking.QuantityAmountTo        = priceDiscAdmTrans.QuantityAmountTo;
+
+                priceChangeTrackingList.add(priceChangeTracking);
+            }
+
+            ttsbegin;
+            priceChangeTrackingList.insertDatabase();
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processChange</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the Change tracking record
+    /// </summary>
+    public void processChange()
+    {
+        priceDataFeedCount = 0;
+        priceDataFeedList = new RecordInsertList(tableNum(METPriceDataFeed));
+
+        switch(priceChangeTracking.PriceDiscPartyCode)
+        {
+            case PriceDiscPartyCodeType::Table:
+                this.processChangeSingle(priceChangeTracking);
+                break;
+            case PriceDiscPartyCodeType::GroupId:
+                this.processChangeMulti();
+                break;
+        }
+
+        if(priceDataFeedCount)
+        {
+            ttsbegin;
+            priceDataFeedList.insertDatabase();
+            ttscommit;
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processChangeSingle</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the Change tracking record
+    /// </summary>
+    /// <param name = "_priceChangeTrackingUpdated">price Change tracking record</param>
+    public void processChangeSingle(METPriceChangeTracking  _priceChangeTrackingUpdated)
+    {
+        boolean             validityCheck = true;
+        
+        //1. Execute the Item/Site validity check
+        validityCheck = this.ItemSiteValidation(_priceChangeTrackingUpdated.ItemId, _priceChangeTrackingUpdated.InventSiteId);
+
+        if(validityCheck)
+        {
+            //2. Execute the Customer/Item validity check
+            validityCheck = this.CustomerItemValidation(_priceChangeTrackingUpdated.priceDiscAccountRelation, _priceChangeTrackingUpdated.ItemId);
+        }
+
+        if(validityCheck)
+        {
+            this.createPriceDataFeed(_priceChangeTrackingUpdated);
+            priceDataFeedList.add(priceDataFeed);
+
+            priceDataFeedCount++;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processChangeMulti</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the Change tracking record
+    /// </summary>
+    public void processChangeMulti()
+    {
+        CustTable               custTable;
+        METPriceChangeTracking  priceChangeTrackingUpdated;
+
+        while select AccountNum
+            from    custTable
+            where   custTable.PriceGroup == priceChangeTracking.PriceDiscAccountRelation
+        {
+            priceChangeTrackingUpdated.data(priceChangeTracking);
+            priceChangeTrackingUpdated.PriceDiscAccountRelation = custTable.AccountNum;
+            priceChangeTrackingUpdated.RecId = 0;
+
+            this.processChangeSingle(priceChangeTrackingUpdated);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPriceDataFeed</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a Price data feed record
+    /// </summary>
+    /// <param name = "_priceChangeTrackingUpdated">Price change tracking</param>
+    public void createPriceDataFeed(METPriceChangeTracking _priceChangeTrackingUpdated)
+    {
+        super(_priceChangeTrackingUpdated);
+
+        priceDataFeed.EndDate = _priceChangeTrackingUpdated.FromDate;
+
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -1,0 +1,394 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPriceChangeTrackService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_24248 Pricing Data Extract DCP 28/07/2022
+/// </summary>
+class METPriceChangeTrackService extends SysOperationServiceBase
+{
+    Batch           batchTask;
+    Batch           batchTaskCurrent;
+    BatchHeader     batchHeader;
+    RefRecId        batchJobId;
+    RefRecId        headerTaskId;
+    boolean         isExecutingInBatch;
+    Counter         maxThreadCount;
+    Counter         minThreadCount = 1;
+    METThreadCount  threadCount;
+    METBundleCount  bundleCount;
+    container       guidCon;    //task giud container used in clean up process at end of main batch
+
+    METPriceChangeTrackContract    dataContract;
+    List                        serviceList = new List(Types::Class);
+
+    
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// processing logic
+    /// </summary>
+    /// <param name = "_dataContract">The data contract</param>
+    public void process(METPriceChangeTrackContract _dataContract)
+    {
+        #OCCRetryCount
+
+        try
+        {
+            this.initialise(_dataContract);
+        
+            if(!dataContract.validate())
+            {
+                error("@MET:PriceChangeTrackBatchFailed");
+                
+                if(isExecutingInBatch)
+                {
+                    //ensure batch status is "Error"
+                    throw Exception::Error;
+                }
+                else
+                {
+                    //dont throw error when run from GUI
+                    return;
+                }
+            }
+
+            this.processTasks();
+            this.waitTaskFinished();
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error("@MET:PriceChangeTrackBatchFailed");
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error("@MET:PriceChangeTrackBatchFailed");
+                throw Exception::Deadlock;
+            }
+        }
+        catch
+        {
+            error("@MET:PriceChangeTrackBatchFailed");
+            throw Exception::Error;
+            
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>Initialise global variables</summary>
+    /// <param name = "_dataContract">Data contract</param>
+    public void initialise(METPriceChangeTrackContract _dataContract)
+    {
+        dataContract        = _dataContract;
+
+        batchTaskCurrent    = this.getCurrentBatchTask();
+        batchJobId          = batchTaskCurrent.BatchJobId;
+        headerTaskId        = batchTaskCurrent.RecId;
+        batchHeader         = BatchHeader::construct(batchJobId);
+        isExecutingInBatch  = batchTaskCurrent ? true : false;
+        threadCount         = dataContract.parmThreadCount();
+        bundleCount         = dataContract.parmBundleCount();
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTasks</Name>
+				<Source><![CDATA[
+    /// <summary>Create sub tasks that do the actual processing</summary>
+    public void processTasks()
+    {
+        counter                         threadCountLoc;
+        SysOperationServiceController   controller;
+        METPriceChangeTrackTaskService     PriceChangeTrackTaskService;
+        METPriceChangeTrackContract        taskDataContract;
+        str                             serializedContract;
+        METTaskGuid                     taskGuid;
+
+        threadCountLoc = this.getThreadCount();
+
+        if(isExecutingInBatch)
+        {
+            for(int i=1;i<=threadCountLoc;i++)
+            {
+                controller = new SysOperationServiceController(classStr(METPriceChangeTrackTaskService), methodStr(METPriceChangeTrackTaskService, process));
+                controller.parmDialogCaption("@MET:PriceChangeTrackBatchTask");
+
+                // grab contract instance from controller, use same contract
+                taskDataContract = controller.getDataContractObject() as METPriceChangeTrackContract;
+                taskDataContract.parmIsMainBatchTask(i==1);
+                taskDataContract.parmBundleCount(bundleCount);
+                
+                taskGuid = newGuid();
+                guidCon += taskGuid;    
+                taskDataContract.parmTaskGuidStr(guid2Str(taskGuid));
+
+                batchHeader.addTask(controller);
+            }
+
+            batchHeader.save();
+        }
+        else
+        {
+            //process run from GUI
+            for(int i=1;i<=threadCountLoc;i++)
+            {
+                PriceChangeTrackTaskService    = METPriceChangeTrackTaskService::construct();
+                taskDataContract            = METPriceChangeTrackContract::construct();
+
+                taskDataContract.parmIsMainBatchTask(i==1);
+                taskDataContract.parmBundleCount(bundleCount);
+                
+                taskGuid = newGuid();
+                guidCon += taskGuid;
+                taskDataContract.parmTaskGuidStr(guid2Str(taskGuid));
+
+                serializedContract = FormJsonSerializer::serializeClass(taskDataContract); //convert Contract class to string for use in Container
+
+                System.Threading.Tasks.Task task = Global::runAsync(classNum(METPriceChangeTrackTaskService),
+                                                                    staticMethodStr(METPriceChangeTrackTaskService, processAsync),
+                                                                    [serializedContract]);
+                serviceList.addEnd(task);
+
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>waitTaskFinishedAsync</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Execute tasks when run from gui AND wait untill all are completed or errored
+    /// </summary>
+    public void waitTaskFinishedAsync()
+    {
+        int                             counter;
+        ListEnumerator                  enumerator;
+        System.Threading.Tasks.Task[]   allTasks;
+        System.Threading.Tasks.Task     task;
+
+        if (serviceList && serviceList.elements() > 0)
+        {
+            allTasks = new System.Threading.Tasks.Task[serviceList.elements()]();
+
+            enumerator = serviceList.getEnumerator();
+            
+            while (enumerator.moveNext())
+            {
+                task = enumerator.current();
+                allTasks.SetValue(task, counter);
+                counter++;
+            }
+
+            //  This will start all Tasks running and wait until they have completed
+            System.Threading.Tasks.Task::WaitAll(allTasks);
+
+            this.handleResults(allTasks);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>handleResults</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// check the result of the running threads
+    /// </summary>
+    /// <param name = "_tasks">Container of Tasks</param>
+    private void handleResults(System.Threading.Tasks.Task[] _tasks)
+    {
+        AsyncTaskResult taskResult;
+
+        if (_tasks)
+        {
+            for (int i = 0; i < _tasks.Length; i++)
+            {
+                taskResult = AsyncTaskResult::getAsyncTaskResult(_tasks.getValue(i));
+                this.processTaskResult(taskResult);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTaskResult</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// check the result of the individual thread
+    /// </summary>
+    /// <param name = "_taskResult">Task result</param>
+    private void processTaskResult(AsyncTaskResult _taskResult)
+    {
+        System.Exception exception;
+        str errorStr = '';
+
+        if (_taskResult != null)
+        {
+            exception = _taskResult.getException();
+            
+            if (exception)
+            {
+                container infologCon = _taskResult.getInfologData();
+                container infoException, infoItem;
+                str ExceptionMsg, ItemMsg;
+                
+                for(int j = 2; j < conLen(infologCon); j += 2)
+                {
+                    infoException = conPeek(infologCon, j);
+                    ExceptionMsg  = conPeek(infoException, 2);
+
+                    infoItem      = conPeek(infologCon, j + 1);
+                    ItemMsg       = conPeek(infoItem, 2);
+
+                    errorStr += strFmt("%1 : %2\n", ItemMsg, ExceptionMsg);
+                }
+                
+                throw error(errorStr);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getThreadCount</Name>
+				<Source><![CDATA[
+    /// <summary>Calculate the number of tasks to create</summary>
+    /// <returns>The calculated thread count</returns>
+    public counter getThreadCount()
+    {
+        if(isExecutingInBatch)
+        {
+            BatchServerConfig batchServerConfig;
+                
+            while select firstonly MaxBatchSessions
+                from batchServerConfig
+                where batchServerConfig.ServerId == batchTaskCurrent.ServerId
+            {
+                maxThreadCount = batchServerConfig.MaxBatchSessions;
+            }
+            
+            //have at least 1 thread
+            threadCount = threadCount < minThreadCount ? minThreadCount : threadCount;
+            
+            //max of server config threads
+            threadCount = threadCount > maxThreadCount ? maxThreadCount : threadCount;
+        }
+        
+        return threadCount;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>waitTaskFinished</Name>
+				<Source><![CDATA[
+    /// <summary>Start tasks running and wait on all sub tasks to finish</summary>
+    public void waitTaskFinished()
+    {
+        if(isExecutingInBatch)
+        {
+            this.waitTaskFinishedBatch();
+        }
+        else
+        {
+            this.waitTaskFinishedAsync();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>waitTaskFinishedBatch</Name>
+				<Source><![CDATA[
+    /// <summary>Wait until all batch Tasks have completed</summary>
+    public void waitTaskFinishedBatch()
+    {
+        utcDateTime     startDateTime = DateTimeUtil::utcNow();
+        utcDateTime     nowDateTime;
+        METLargeSeconds seconds;
+        const Seconds   maxSeconds = 7200; //2 hours
+        METLargeCounter taskWaitingCount = -1;
+                
+        //wait on all tasks to end.
+        while (taskWaitingCount != 0)
+        {
+            // Fetch the batch records that have NOT finished or are NOT errored out.
+            select count(RecId)
+                from batchTask
+                where   batchTask.BatchJobId == batchJobId
+                &&      batchTask.RecId    != headerTaskId      //not this header task
+                &&      batchTask.Status   != BatchStatus::Error
+                &&      batchTask.Status   != BatchStatus::Finished;
+
+            taskWaitingCount = batchTask.RecId;
+
+            // If we still have tasks processing then wait
+            if (taskWaitingCount != 0)
+            {
+                System.Threading.Thread::Sleep(60000);  //60 seconds
+            }
+
+            //check maximum wait limit exceeded
+            nowDateTime = DateTimeUtil::utcNow();
+                    
+            Seconds = DateTimeUtil::getDifference(nowDateTime, startDateTime);
+
+            if(Seconds >= maxSeconds) //if wait time is longer than 2 hours break out of loop
+            {
+                break;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
