@@ -5,6 +5,7 @@
 		<Declaration><![CDATA[
 public class METSalesTableEntity extends common
 {
+
 }
 ]]></Declaration>
 		<Methods>
@@ -76,6 +77,7 @@ public class METSalesTableEntity extends common
             
             select metSalesTableEntity
                 where metSalesTableEntity.SalesId == metSalesTableStdReturn.SalesId;
+            
             metSalesTableEntityList.addEnd(metSalesTableEntity);
 
             
@@ -121,6 +123,12 @@ public class METSalesTableEntity extends common
                 metSalesTable.selectForUpdate(true);
                 metSalesTable.ReturnStatus = str2Enum(metReturnStatus, returnStatus);
                 metSalesTable.update();
+                if(metSalesTable.ReturnStatus == METReturnStatus::Rejected)
+                {
+                    METSalesTableEntity::returnCancel(metSalesTableStd);
+                }
+                
+
                 ttscommit;
 
             }
@@ -180,11 +188,218 @@ public class METSalesTableEntity extends common
 
 ]]></Source>
 			</Method>
+			<Method>
+				<Name>returnCancel</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_24809 Returns Claims
+    ///  method to get Return order cancelled
+    /// </summary>
+    /// <param name="_returnTable"> Get return order id</param>    
+    public static void returnCancel(SalesTable _returnTable)
+    {
+        SalesTable          returnTableUpdate;
+        MCRSalesOrderCancellation mcrSalesOrderCancellation = new MCRSalesOrderCancellation();
+                
+        boolean mcrOrderCompletionEnabled = RetailMCRChannelTable::mcrEnableOrderCompletion(_returnTable);
+        if (mcrOrderCompletionEnabled)
+        {
+            
+            mcrSalesOrderCancellation.preCancel(_returnTable);
+            // %1 return order(s) was cancelled
+            //SalesTable::changeReturnStatus(formDataSource, ReturnUpdateAction::Cancel)));            
+            SalesLine           returnLine;           
+            Counter             numberOfRecords;
+            SalesTable          salesTable;
+            PurchTable          purchTable;
+            PurchLine           purchLine;
+            
+            while select forupdate returnLine
+                          where returnLine.SalesId == _returnTable.SalesId
+            {
+                if (returnLine.interCompanySalesLineExist())
+                {
+                    purchLine            = PurchLine::findInventTransId(returnLine.InventRefTransId,true);
+                    purchTable           = PurchTable::find(purchLine.PurchId);
+
+                    purchLine.SkipUpdate = InterCompanySkipUpdate::Internal;
+                    purchLine.delete(false);
+
+                    if (!purchTable.existPurchLine())
+                    {
+                        if (purchTable.InterCompanyCompanyId
+                                &&  purchTable.InterCompanySalesId)
+                        {
+                            changecompany(purchTable.InterCompanyCompanyId)
+                            {
+                                salesTable = null;
+                                salesTable = SalesTable::find(purchTable.InterCompanySalesId,true);
+                                if (salesTable)
+                                            salesTable.delete();
+                            }
+                        }
+                    }
+                }
+
+                returnLine.SalesQty            = 0;
+                returnLine.CostPrice           = 0;
+                returnLine.ExpectedRetQty      = 0;
+                returnLine.salesQtyModified();
+                returnLine.DeliveryType        = TradeLineDlvType::None;
+                returnLine.SourcingOrigin      = SalesSourcingOrigin::Inventory;
+                returnLine.SkipUpdate          = InterCompanySkipUpdate::Internal;
+                returnLine.ReturnStatus        = ReturnStatusLine::Canceled;   // This assignment is required to make sure that InventPendingQuantity gets cleaned up
+                returnLine.SalesStatus         = SalesStatus::Canceled;        // This assignment is required to make sure that InventPendingQuantity gets cleaned up
+                returnLine.ReturnClosedDate    = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+                returnLine.InventTransIdReturn = '';
+                returnLine.update();
+            }
+            if (isConfigurationkeyEnabled(configurationKeyNum(MCRCallCenter)))
+            {
+                returnLine.skipDataMethods(true);
+                update_recordset returnLine
+                        setting          ReturnStatus         = ReturnStatusLine::Canceled,
+                                         CostPrice            = 0,
+                                         InventTransIdReturn  = '',
+                                         SalesStatus          = SalesStatus::Canceled,
+                                         ReturnClosedDate     = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone())
+                        where returnLine.SalesId == _returnTable.SalesId;
+            }           
+        }
+        SpecTransManager::newFromSpec(_returnTable).deleteAll();
+        returnTableUpdate = SalesTable::find(_returnTable.SalesId, true);
+        returnTableUpdate.ReturnStatus               = ReturnStatusHeader::Canceled;
+        returnTableUpdate.SalesStatus                = SalesStatus::Canceled;
+        returnTableUpdate.InterCompanyDirectDelivery = false;
+        METSalesTableEntity::unlinkAgreement(_returnTable,true, false, false, true);
+        returnTableUpdate.update();
+        if (_returnTable.SalesStatus == SalesStatus::Canceled)
+        {
+            mcrSalesOrderCancellation.postCancelOrder(_returnTable);
+        }
+
+        mcrSalesOrderCancellation.postCancelAdjPayment(_returnTable);
+
+        
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unlinkAgreement</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Unlink agreement on <c>SalesTable</c> record.
+    /// </summary> 
+    /// </param>
+    /// <param name="salesTable">
+    /// A <c>SalesTable</c> record.
+    /// </param>
+    /// <param name="_unlinkLines">
+    /// A boolean indicates whether to unlink <c>SalesLine</c> or not.    
+    /// </param>
+    /// <param name="_recalculatePrice">
+    /// A boolean indicates whether to recalculate price or not.
+    /// </param>
+    /// <param name="_doUpdateSalesTable">
+    /// A boolean indicates whether to udpate <c>SalesTable</c> or not.
+    /// </param>
+    /// <param name="_doUpdateSalesLine">
+    /// A boolean indicates whether to udpate <c>SalesLine</c> or not.
+    
+    public static void unlinkAgreement(SalesTable _salesTable,
+                                        boolean _unlinkLines      = false,
+                                        boolean _recalculatePrice = false,
+                                        boolean _doUpdateSalesTable = true,
+                                        boolean _doUpdateSalesLine  = true
+                                        )
+    {
+        AgreementReleaseHeaderMatch agreementReleaseHeaderMatch;
+        SalesLine                   salesLine;
+        boolean                     restorePriceDiscChagnePolicy = true;
+        SalesTable_RU               salesTableRU;
+
+        #ISOCountryRegionCodes
+
+        if (_salesTable.MatchingAgreement)
+        {
+            ttsbegin;
+
+            if (_unlinkLines)
+            {
+                while select forupdate salesLine
+                        where salesLine.SalesId == _salesTable.SalesId
+                {
+                    METSalesTableEntity::unlinkAgreementOnSalesLine(salesLine, _recalculatePrice, _doUpdateSalesLine);
+                }
+            }
+
+            delete_from agreementReleaseHeaderMatch
+            where agreementReleaseHeaderMatch.SalesTableSalesId == _salesTable.SalesId
+               && agreementReleaseHeaderMatch.SalesTableDataAreaId == _salesTable.DataAreaId;
+
+            _salesTable.MatchingAgreement = 0;
+
+            if (SysCountryRegionCode::isLegalEntityInCountryRegion([#isoRU]))
+            {
+                salesTableRU = _salesTable.salesTable_RU();
+                salesTableRU.AgreementHeaderExt_RU = 0;
+                _salesTable.packSalesTable_RU(salesTableRU);
+
+                _salesTable.DefaultDimension = AgreementHeaderExt_RU::clearAgreementDimension(_salesTable.DefaultDimension);
+            }
+
+            if (_doUpdateSalesTable)
+            {
+                _salesTable.doUpdate();
+            }
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unlinkAgreementOnSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Unlink agreement on <c>SalesLine</c> record.
+    /// </summary>
+    /// <param name="_salesLine">
+    /// A <c>SalesLine</c> record.
+    /// </param>
+    /// <param name="_recalculatePrice">
+    /// A boolean indicates whether to recalculate price or not.
+    /// </param>
+    /// <param name="_doUpdateSalesLine">
+    /// A boolean indicates whether to udpate <c>SalesLine</c> or not.
+    /// </param>
+    public static void unlinkAgreementOnSalesLine(SalesLine _salesLine, boolean _recalculatePrice, boolean _doUpdateSalesLine)
+    {
+        if (_salesLine.MatchingAgreementLine)
+        {
+            if (_recalculatePrice)
+            {
+                SalesLine::modifySalesQty(_salesLine,_salesLine.inventDim());
+            }
+            else
+            {
+                // Set Price Discount Change Policy originated by PriceDiscSystemSource::Agreement.
+                _salesLine.setPriceDiscChangePolicy(PriceDiscSystemSource::Agreement);
+            }
+
+            _salesLine.unLinkAgreementLine(_doUpdateSalesLine);
+        }
+    }
+
+]]></Source>
+			</Method>
 		</Methods>
 	</SourceCode>
 	<ConfigurationKey>LogisticsBasic</ConfigurationKey>
 	<FormRef>SalesTable</FormRef>
-	<Label>MET Sales orders</Label>
+	<Label>@MET:METSalesOrders</Label>
 	<SubscriberAccessLevel>
 		<Read>Allow</Read>
 	</SubscriberAccessLevel>
