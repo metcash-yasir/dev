@@ -24,9 +24,323 @@ class METRebateExternalDataSourceService extends SysOperationServiceBase
     /// <param name = "_contract"> METRebateExternalDataSourceContract </param>
     public void processOperation(METRebateExternalDataSourceContract _contract)
     {
+        FeatureManagementState      featureManagementState;
+
+        select firstonly1 featureManagementState where featureManagementState.Name == METConstants::UnifiedPricingFeature;
+        if(featureManagementState.IsEnabled == NoYes::Yes && _contract.parmTAMRebateDeal().ModuleInventCustVend == ModuleInventCustVend::Cust)
+        {
+            this.unifiedPricingEnabled(_contract);
+        }
+        else if(_contract.parmTAMRebateDeal().ModuleInventCustVend == ModuleInventCustVend::Vend)
+        {
+            this.unifiedPricingVendorRebateDeal(_contract);
+        }
+        else
+        {
+            this.unifiedPricingNotEnabled(_contract);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unifiedPricingEnabled</Name>
+				<Source><![CDATA[
+    protected void unifiedPricingEnabled(METRebateExternalDataSourceContract _contract)
+    {
+        TAMRebateTable      rebateTable;
+        TAMRebateDeal       rebateDeal;
+        TAMRebateDateTrans  rebateDateTrans;
+
+        TAMRebateDeal               rebateDealContract  =   _contract.parmTAMRebateDeal();
+        TAMRebateTransactionType    transType           =   _contract.parmTransType();
+        Qty                         toleranceQty        =   _contract.parmToleranceQty();
+
+        while select rebateTable join rebateDeal where rebateTable.RebateDeal == rebateDeal.RecId
+        && rebateDeal.RecId == rebateDealContract.RecId
+        && (rebateDeal.METImportScan == NoYes::Yes || rebateDeal.METImportSupplier == NoYes::Yes)
+        {
+            GUPPricingRuleCopy pricingRuleCopyCustHeader, pricingRuleCopyItemLine;
+
+            pricingRuleCopyCustHeader = this.GUPPricingRuleCopy_InitFromPricingRule(GUPPricingRule::find(rebateTable.PricingRuleHeader));
+            Query queryCustTable = GUPPricingObjectQueryBuilder::constructFromPricingRuleCopy(pricingRuleCopyCustHeader).build();
+            QueryRun qrCustTable = new QueryRun(queryCustTable);
+            this.insertCustomers(qrCustTable);
+
+            pricingRuleCopyItemLine = this.GUPPricingRuleCopy_InitFromPricingRule(GUPPricingRule::find(rebateTable.PricingRuleLine));
+            Query queryInventTable = GUPPricingObjectQueryBuilder::constructFromPricingRuleCopy(pricingRuleCopyItemLine).build();
+            QueryRun qrInventTable = new QueryRun(queryInventTable);
+            this.insertProducts(qrInventTable);
+
+            Query                   queryScanSupplier = new Query();
+            QueryBuildDataSource    qbdsScanSupplier, qbdsRebateLineCustTmp, qbdsRebateLineProdTmp;
+
+            qbdsScanSupplier = queryScanSupplier.addDataSource(tableNum(METRebateScanSupplierTable));
+            qbdsScanSupplier.addRange(fieldNum(METRebateScanSupplierTable, TransactionDate)).value(queryRange(_contract.parmFromTransDate(), _contract.parmToTransDate()));
+            qbdsScanSupplier.addSortField(fieldNum(METRebateScanSupplierTable, TransactionDate), SortOrder::Ascending);
+            qbdsScanSupplier.addRange(fieldNum(METRebateScanSupplierTable, Processed)).value(queryValue(NoYes::No));
+            qbdsScanSupplier.addRange(fieldNum(METRebateScanSupplierTable, CustVendACType)).value(queryValue(CustVendACType::Cust));
+
+            qbdsRebateLineCustTmp = qbdsScanSupplier.addDataSource(tableNum(METRebateLineCustTmp));
+            qbdsRebateLineCustTmp.relations(false);
+            qbdsRebateLineCustTmp.fetchMode(QueryFetchMode::One2One);
+            qbdsRebateLineCustTmp.linkFields(fieldStr(METRebateScanSupplierTable, CustVendAccount), fieldStr(METRebateLineCustTmp, CustAccount));
+
+            qbdsRebateLineProdTmp = qbdsScanSupplier.addDataSource(tableNum(METRebateLineProductTmp));
+            qbdsRebateLineProdTmp.relations(false);
+            qbdsRebateLineProdTmp.fetchMode(QueryFetchMode::One2One);
+            qbdsRebateLineProdTmp.linkFields(fieldStr(METRebateScanSupplierTable, ItemId), fieldStr(METRebateLineProductTmp, ItemId));
+
+            QueryRun queryRunScanSupplier = new QueryRun(queryScanSupplier);
+            while(queryRunScanSupplier.next())
+            {
+                TAMRebateDate               rebateDate;
+                METRebateScanSupplierTable  scanSupplierData;
+
+                scanSupplierData    =   queryRunScanSupplier.get(tableNum(METRebateScanSupplierTable));
+            
+                select firstonly rebateDate where rebateDate.RebateId == rebateTable.RebateId
+                                           && rebateDate.RebateFromDate <= scanSupplierData.TransactionDate
+                                           && rebateDate.RebateToDate >= scanSupplierData.TransactionDate;
+                if(rebateDate)
+                {
+                    rebateDateTrans = this.createDateTrans(rebateDealContract.RecId, rebateTable.RebateId, scanSupplierData.TransactionDate, rebateDate, transType);
+
+                    if(rebateDateTrans.RebateFromDate <= scanSupplierData.TransactionDate && rebateDateTrans.RebateToDate >= scanSupplierData.TransactionDate)
+                    {
+                        this.createTrans(rebateDateTrans, rebateDate, scanSupplierData, toleranceQty, rebateTable.UnitId);
+                    }
+                }
+            }
+        
+            TAMRebateTrans              rebateTrans;
+
+            delete_from rebateDateTrans where rebateDateTrans.RebateDeal == rebateDealContract.RecId
+            notexists join rebateTrans where rebateDateTrans.RebateTransId == rebateTrans.RebateTransId;
+
+            METRebateLineCustTmp    rebateLineCust;
+            delete_from rebateLineCust;
+            
+            METRebateLineProductTmp rebateLineProd;
+            delete_from rebateLineProd;
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unifiedPricingVendorRebateDeal</Name>
+				<Source><![CDATA[
+    protected void unifiedPricingVendorRebateDeal(METRebateExternalDataSourceContract _contract)
+    {
         TAMRebateDeal               rebateDealContract;
         TAMRebateDateTrans          rebateDateTrans;
-        TAMRebateParameters         rebateParameters;
+        TAMRebateTransactionType    transType;
+        Qty                         toleranceQty;
+
+        Query                       query;
+        QueryRun                    queryRun;
+        QueryBuildDataSource        qbdsRebateTable, qbdsRebateScanSupplier, qbdsRebateGroupLink, qbdsInventTable, qbdsVendTable, qbdsRebateGroupLinkVend;
+
+        unitCache = new Map(Types::String, Types::Int64);
+
+        query = new Query();
+        rebateDealContract  =   _contract.parmTAMRebateDeal();
+        transType           =   _contract.parmTransType();
+        toleranceQty        =   _contract.parmToleranceQty();
+
+        qbdsRebateScanSupplier = query.addDataSource(tableNum(METRebateScanSupplierTable));
+        qbdsRebateScanSupplier.addRange(fieldNum(METRebateScanSupplierTable, TransactionDate)).value(queryRange(_contract.parmFromTransDate(), _contract.parmToTransDate()));
+        qbdsRebateScanSupplier.addSortField(fieldNum(METRebateScanSupplierTable, TransactionDate), SortOrder::Ascending);
+        qbdsRebateScanSupplier.addRange(fieldNum(METRebateScanSupplierTable, Processed)).value(queryValue(NoYes::No));
+        qbdsRebateScanSupplier.addRange(fieldNum(METRebateScanSupplierTable, CustVendACType)).value(queryValue(CustVendACType::Vend));
+        if(rebateDealContract.METImportScan)
+        {
+            qbdsRebateScanSupplier.addRange(fieldNum(METRebateScanSupplierTable, IsScanSupplier)).value(queryValue(METScanSupplier::Scan));
+        }
+        if(rebateDealContract.METImportSupplier)
+        {
+            qbdsRebateScanSupplier.addRange(fieldNum(METRebateScanSupplierTable, IsScanSupplier)).value(queryValue(METScanSupplier::Supplier));
+        }
+
+        qbdsInventTable = qbdsRebateScanSupplier.addDataSource(tableNum(InventTable));
+        qbdsInventTable.relations(false);
+        qbdsInventTable.fetchMode(QueryFetchMode::One2One);
+        qbdsInventTable.addLink(fieldNum(InventTable, ItemId), fieldNum(METRebateScanSupplierTable, ItemId));
+        
+        qbdsVendTable = qbdsRebateScanSupplier.addDataSource(tableNum(VendTable));
+        qbdsVendTable.relations(false);
+        qbdsVendTable.fetchMode(queryfetchMode::One2One);
+        qbdsVendTable.linkFields(fieldStr(VendTable, AccountNum), fieldStr(METRebateScanSupplierTable, CustVendAccount));
+
+        qbdsRebateGroupLink = qbdsInventTable.addDataSource(tableNum(TAMRebateGroupLink));
+        qbdsRebateGroupLink.joinMode(JoinMode::OuterJoin);
+        qbdsRebateGroupLink.relations(false);
+        qbdsRebateGroupLink.fetchMode(QueryFetchMode::One2One);
+        qbdsRebateGroupLink.linkFields(fieldStr(TAMRebateGroupLink, RefRecId), fieldStr(InventTable, RecId));
+        qbdsRebateGroupLink.linkFields(fieldStr(TAMRebateGroupLink, RefTableId), fieldStr(InventTable, TableId));
+        qbdsRebateGroupLink.addRange(fieldNum(TAMRebateGroupLink, ModuleInventCustVend)).value(queryValue(ModuleInventCustVend::Invent));
+        
+        qbdsRebateGroupLinkVend = qbdsVendTable.addDataSource(tableNum(TAMRebateGroupLink));
+        qbdsRebateGroupLinkVend.joinMode(JoinMode::OuterJoin);
+        qbdsRebateGroupLinkVend.relations(false);
+        qbdsRebateGroupLinkVend.fetchMode(QueryFetchMode::One2One);
+        qbdsRebateGroupLinkVend.linkFields(fieldStr(TAMRebateGroupLink, RefRecId), fieldStr(VendTable, RecId));
+        qbdsRebateGroupLinkVend.linkFields(fieldStr(TAMRebateGroupLink, RefTableId), fieldStr(VendTable, TableId));
+        qbdsRebateGroupLinkVend.addRange(fieldNum(TAMRebateGroupLink, ModuleInventCustVend)).value(queryValue(ModuleInventCustVend::Vend));
+
+        qbdsRebateTable = qbdsRebateScanSupplier.addDataSource(tableNum(TAMRebateTable));
+        qbdsRebateTable.relations(false);
+        qbdsRebateTable.fetchMode(QueryFetchMode::One2One);
+        qbdsRebateTable.addRange(fieldNum(TAMRebateTable, RebateDeal)).value(int642Str(rebateDealContract.RecId));
+         
+        qbdsRebateTable.addRange(fieldnum(TAMRebateTable, ItemRelation)).value(strFmt('((((%1.%2 == %3) && (%1.%4 == %5.%6)) || ((%1.%2 == %7) && (%1.%4 == %8.%9))) && (((%1.%10 == %3) && (%1.%11 == %5.%13)) || ((%1.%10 == %7) && (%1.%11 == %12.%9))))',
+            qbdsRebateTable.name(),
+            fieldStr(TAMRebateTable, ItemCode),
+            enum2int(TableGroupAll::Table),
+            fieldStr(TAMRebateTable, ItemRelation),
+            qbdsRebateScanSupplier.name(),
+            fieldStr(METRebateScanSupplierTable, ItemId),
+            enum2int(TableGroupAll::GroupId),
+            qbdsRebateGroupLink.name(),
+            fieldStr(TAMRebateGroupLink, RebateGroupId),
+            fieldStr(TAMRebateTable, AccountCode),
+            fieldStr(TAMRebateTable, AccountRelation),
+            qbdsRebateGroupLinkVend.name(),
+            fieldStr(METRebateScanSupplierTable, CustVendAccount)));
+
+        queryRun = new QueryRun(query);
+        while(queryRun.next())
+        {
+            TAMRebateTable              rebateTable;
+            TAMRebateDate               rebateDate;
+            METRebateScanSupplierTable  scanSupplierData;
+
+            rebateTable         =   queryRun.get(tableNum(TAMRebateTable));
+            scanSupplierData    =   queryRun.get(tableNum(METRebateScanSupplierTable));
+            
+            select firstonly rebateDate where rebateDate.RebateId == rebateTable.RebateId
+                                           && rebateDate.RebateFromDate <= scanSupplierData.TransactionDate
+                                           && rebateDate.RebateToDate >= scanSupplierData.TransactionDate;
+            if(rebateDate)
+            {
+                rebateDateTrans = this.createDateTrans(rebateDealContract.RecId, rebateTable.RebateId, scanSupplierData.TransactionDate, rebateDate, transType);
+
+                if(rebateDateTrans.RebateFromDate <= scanSupplierData.TransactionDate && rebateDateTrans.RebateToDate >= scanSupplierData.TransactionDate)
+                {
+                    this.createTrans(rebateDateTrans, rebateDate, scanSupplierData, toleranceQty, rebateTable.UnitId);
+                }
+            }
+        }
+        
+        TAMRebateTrans              rebateTrans;
+
+        delete_from rebateDateTrans where rebateDateTrans.RebateDeal == rebateDealContract.RecId
+            notexists join rebateTrans where rebateDateTrans.RebateTransId == rebateTrans.RebateTransId;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>GUPPricingRuleCopy_InitFromPricingRule</Name>
+				<Source><![CDATA[
+    protected GUPPricingRuleCopy GUPPricingRuleCopy_InitFromPricingRule(GUPPricingRule _pricingRule)
+    {
+        ttsbegin;
+        GUPPricingRuleCopy pricingRuleCopy;
+        delete_from pricingRuleCopy where pricingRuleCopy.RuleId == _pricingRule.RecId;
+
+        pricingRuleCopy.selectForUpdate(true);
+        pricingRuleCopy.ExclusionType = _pricingRule.ExclusionType;
+        pricingRuleCopy.PriceAttributeGroupName = _pricingRule.PriceAttributeGroupName;
+        pricingRuleCopy.RuleId = _pricingRule.RecId;
+        pricingRuleCopy.AllowMultiValue = _pricingRule.AllowMultiValue;
+        pricingRuleCopy.insert();
+
+        GUPPricingRuleCondition pricingRuleCondition;
+        GUPPricingRuleConditionCopy pricingRuleConditionCopy;
+        delete_from pricingRuleConditionCopy where pricingRuleConditionCopy.RuleId == pricingRuleCopy.RuleId;
+        while select pricingRuleCondition
+            where pricingRuleCondition.RuleId == pricingRuleCopy.RuleId
+        {
+            pricingRuleConditionCopy.clear();
+            pricingRuleConditionCopy.ConditionAttribute = pricingRuleCondition.ConditionAttribute;
+            pricingRuleConditionCopy.ConditionValue = pricingRuleCondition.ConditionValue;
+            pricingRuleConditionCopy.RuleId = pricingRuleCopy.RuleId;
+            pricingRuleConditionCopy.insert();
+        }
+        
+        GUPPricingRuleExclusion pricingRuleExclusion;
+        GUPPricingRuleExclusionCopy pricingRuleExclusionCopy;
+        delete_from pricingRuleExclusionCopy where pricingRuleExclusionCopy.RuleId == pricingRuleCopy.RuleId;
+        while select pricingRuleExclusion
+            where pricingRuleExclusion.RuleId == pricingRuleCopy.RuleId
+        {
+            pricingRuleCopy.addToExclusion(pricingRuleExclusion.Exclusion);
+        }
+
+        ttscommit;
+
+        return pricingRuleCopy;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertCustomers</Name>
+				<Source><![CDATA[
+    protected void insertCustomers(QueryRun _qrCustTable)
+    {
+        RecordInsertList        custRecordInsertList;
+        METRebateLineCustTmp    rebateLineCustomers;
+        CustTable               custTable;
+        custRecordInsertList = new RecordInsertList(tableNum(METRebateLineCustTmp));
+        while(_qrCustTable.next())
+        {
+            custTable   =   _qrCustTable.get(tableNum(CustTable));
+            rebateLineCustomers.CustAccount = custTable.AccountNum;
+            if(rebateLineCustomers.validateWrite())
+            {
+                custRecordInsertList.add(rebateLineCustomers);
+            }
+            custRecordInsertList.insertDatabase();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertProducts</Name>
+				<Source><![CDATA[
+    protected void insertProducts(QueryRun _qrInventTable)
+    {
+        RecordInsertList            productRecordInsertList;
+        METRebateLineProductTmp     rebateLineProducts;
+        InventTable                 inventTable;
+        productRecordInsertList = new RecordInsertList(tableNum(METRebateLineProductTmp));
+        while(_qrInventTable.next())
+        {
+            inventTable   =   _qrInventTable.get(tableNum(InventTable));
+            rebateLineProducts.ItemId = inventTable.ItemId;
+            if(rebateLineProducts.validateWrite())
+            {
+                productRecordInsertList.add(rebateLineProducts);
+            }
+            productRecordInsertList.insertDatabase();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unifiedPricingNotEnabled</Name>
+				<Source><![CDATA[
+    protected void unifiedPricingNotEnabled(METRebateExternalDataSourceContract _contract)
+    {
+        TAMRebateDeal               rebateDealContract;
+        TAMRebateDateTrans          rebateDateTrans;
         TAMRebateTransactionType    transType;
         Qty                         toleranceQty;
 
@@ -35,7 +349,6 @@ class METRebateExternalDataSourceService extends SysOperationServiceBase
         QueryBuildDataSource        qbdsRebateTable, qbdsRebateScanSupplier, qbdsRebateGroupLink, qbdsInventTable, qbdsCustTable, qbdsRebateGroupLinkCust;
 
         unitCache = new Map(Types::String, Types::Int64);
-        rebateParameters = TAMRebateParameters::find();
 
         query = new Query();
         rebateDealContract  =   _contract.parmTAMRebateDeal();
@@ -129,6 +442,7 @@ class METRebateExternalDataSourceService extends SysOperationServiceBase
 
         delete_from rebateDateTrans where rebateDateTrans.RebateDeal == rebateDealContract.RecId
             notexists join rebateTrans where rebateDateTrans.RebateTransId == rebateTrans.RebateTransId;
+
     }
 
 ]]></Source>
@@ -152,7 +466,6 @@ class METRebateExternalDataSourceService extends SysOperationServiceBase
                                                  TAMRebateTransactionType   _transType)
     {
         TAMRebateDateTrans          rebateDateTrans;
-        FromDate                    rebateToDateLoc;
 
         select firstonly1 rebateDateTrans
             where rebateDateTrans.RebateId == _rebateTableRebateId
@@ -168,7 +481,7 @@ class METRebateExternalDataSourceService extends SysOperationServiceBase
         {
             try
             {
-                ttsbegin;                
+                ttsbegin;
                 rebateDateTrans.RebateFromDate              =   _scanSupplierTransDate;
                 rebateDateTrans.RebateToDate                =   _scanSupplierTransDate + this.getRebateToDate(_rebateDate, _scanSupplierTransDate);
 
@@ -297,6 +610,7 @@ class METRebateExternalDataSourceService extends SysOperationServiceBase
             rebateTrans.RebateId                    =   _rebateDateTrans.RebateId;
             rebateTrans.CurrencyCode                =   _scanSupplierData.CurrencyCode;
             rebateTrans.METRebateScanSupplierTable  =   _scanSupplierData.RecId;
+            rebateTrans.Claimed                     =   NoYes::Yes;
 
             if(rebateTrans.validateWrite())
             {
