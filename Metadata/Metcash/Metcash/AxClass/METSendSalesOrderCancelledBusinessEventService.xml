@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSendSalesOrderCancelledBusinessEventService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Service class to send sales order cancellation business event as a batch
+/// </summary>
+class METSendSalesOrderCancelledBusinessEventService extends SysOperationServiceBase
+{
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the sales order cancellations.
+    /// </summary>
+    /// <param name="_contract">
+    /// An object of the <c>METSendSalesOrderCancelledBusinessEventContract</c> class.
+    /// </param>
+    public void process(METSendSalesOrderCancelledBusinessEventContract _contract)
+    {
+        int            bundlesize, noOfRecordsToBeSent, totalTasks, i, j, task;
+        List           salesList      = new List(Types::String);
+        SalesLine      salesLine;
+        METSalesLine   metSalesLine;
+
+        BatchHeader batchHeader = this.getCurrentBatchHeader();
+
+        task = 1;
+
+        totalTasks      =   _contract.parmTasks();
+        if (totalTasks <= 0)
+        {
+            totalTasks = 1;
+        }
+        if (batchHeader == null)
+        {
+            batchHeader = batchHeader::construct();
+        }
+
+        batchHeader.parmCaption("@MET:SOCancellationNotificationBatch");
+
+        while select SalesId from salesLine group by SalesId
+            join RecId from metsalesLine
+                where metSalesLine.SalesLine == salesLine.RecId
+                   && salesLine.SalesStatus == SalesStatus::Canceled
+                   && metSalesLine.IntegrationStatus  == METIntegrationStatus::ReadyToSend
+        {
+            noOfRecordsToBeSent++;
+        }
+
+        bundleSize      =   real2int(roundUp((noOfRecordsToBeSent / totalTasks), 1.0));
+
+        while select SalesId from salesLine group by SalesId
+            join RecId from metsalesLine
+                where metSalesLine.SalesLine == salesLine.RecId
+                   && salesLine.SalesStatus == SalesStatus::Canceled
+                   && metSalesLine.IntegrationStatus  == METIntegrationStatus::ReadyToSend
+        {
+            i++;
+            j++;
+
+            salesList.addEnd(salesLine.SalesId);
+
+            if(i == bundlesize || j == noOfRecordsToBeSent)
+            {
+                SysOperationServiceController sendSalesOrderCancelledBusinessEventController = new SysOperationServiceController(
+                                                                classStr(METSendSalesOrderCancelledBusinessEventService),
+                                                                methodStr(METSendSalesOrderCancelledBusinessEventService, sendBusinessEvent));
+
+                sendSalesOrderCancelledBusinessEventController.parmDialogCaption(strFmt("@MET:SOCancellationNotificationBatchTaskDesc", task));
+
+                METSendSalesOrderCancelledBusinessEventContract sendSalesOrderCancelledBusinessEventcontract = sendSalesOrderCancelledBusinessEventController.getDataContractObject() as METSendSalesOrderCancelledBusinessEventContract;
+                sendSalesOrderCancelledBusinessEventcontract.parmSalesList(salesList);
+
+                
+                if (this.isExecutingInBatch())
+                {
+                    batchHeader.addRuntimeTask(sendSalesOrderCancelledBusinessEventController, this.getCurrentBatchTask().RecId);
+                }
+                else
+                {
+                    sendSalesOrderCancelledBusinessEventController.parmExecutionMode(SysOperationExecutionMode::Synchronous);
+                    sendSalesOrderCancelledBusinessEventController.run();
+                }
+
+                salesList = new List(Types::String);
+                task++;
+                i = 0;
+            }
+        }
+        
+        if (this.isExecutingInBatch())
+        {
+            batchHeader.save();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendBusinessEvent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes as the runtime task to send the SO cancellation business events.
+    /// </summary>
+    /// <param name="_contract">
+    /// Data Contract object passed from the Controller object.
+    /// </param>
+    void sendBusinessEvent(METSendSalesOrderCancelledBusinessEventContract    _contract)
+    {
+        SalesTable     salesTable;
+        ListEnumerator salesListEnumerator;
+        SalesId        salesId;
+        boolean        isError;
+        BatchJob       batchJob;
+
+        salesListEnumerator      = _contract.parmSalesList().getEnumerator();
+
+        while (salesListEnumerator.moveNext())
+        {
+            try
+            {
+                salesId = salesListEnumerator.current();
+
+                select salesId, dataAreaId from salesTable
+                    where salesTable.SalesId == salesId;
+
+                if(BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METSalesOrderCancelledBusinessEvent)))
+                {
+                    METSalesOrderCancelledBusinessEvent::newFromSalesCancellation(salesTable).send();
+                }
+                else
+                {
+                    throw error("@MET:SOCancellationBusinessEventNotEnabled");
+                }
+            }
+            catch (Exception::Error)
+            {
+                isError = false;
+            }
+            if (isError)
+            {
+                error("@MET:SOCancellationBusinessEventError");
+                if (this.isExecutingInBatch())
+                {
+                    select firstonly batchJob where batchJob.RecId == this.getCurrentBatchTask().BatchJobId;
+                    if (batchJob.RecId)
+                    {
+                        ttsBegin;
+                        batchJob.selectForUpdate(true);
+                        batchJob.Status = BatchStatus::Error;
+                        batchJob.update();
+                        ttsCommit;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

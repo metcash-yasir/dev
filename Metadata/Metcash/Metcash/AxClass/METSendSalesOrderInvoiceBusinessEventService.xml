@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSendSalesOrderInvoiceBusinessEventService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Service class to send sales order invoice business events as a batch
+/// </summary>
+class METSendSalesOrderInvoiceBusinessEventService extends SysOperationServiceBase
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the sales order invoices.
+    /// </summary>
+    /// <param name="_contract">
+    /// An object of the <c>METSendSalesOrderInvoiceBusinessEventContract</c> class.
+    /// </param>
+    public void process(METSendSalesOrderInvoiceBusinessEventContract _contract)
+    {
+        int                 bundlesize, noOfRecordsToBeSent, totalTasks, i, j, task;
+        List                invoiceList      = new List(Types::Int64);
+        CustInvoiceJour     custInvoiceJour;
+        METCustInvoiceJour  metCustInvoiceJour;
+
+        BatchHeader batchHeader = this.getCurrentBatchHeader();
+
+        task = 1;
+
+        totalTasks      =   _contract.parmTasks();
+        if (totalTasks <= 0)
+        {
+            totalTasks = 1;
+        }
+        if (batchHeader == null)
+        {
+            batchHeader = batchHeader::construct();
+        }
+
+        batchHeader.parmCaption("@MET:SOInvoiceNotificationBatch");
+
+        while select RecId from custInvoiceJour
+            join RecId from metCustInvoiceJour
+                where metCustInvoiceJour.CustInvoiceJour == custInvoiceJour.RecId
+                   && metCustInvoiceJour.IntegrationStatus  == METIntegrationStatus::ReadyToSend
+        {
+            noOfRecordsToBeSent++;
+        }
+
+        bundleSize      =   real2int(roundUp((noOfRecordsToBeSent / totalTasks), 1.0));
+
+        while select RecId from custInvoiceJour
+            join RecId from metCustInvoiceJour
+                where metCustInvoiceJour.CustInvoiceJour == custInvoiceJour.RecId
+                   && metCustInvoiceJour.IntegrationStatus  == METIntegrationStatus::ReadyToSend
+        {
+            i++;
+            j++;
+
+            invoiceList.addEnd(custInvoiceJour.RecId);
+
+            if(i == bundlesize || j == noOfRecordsToBeSent)
+            {
+                SysOperationServiceController sendSalesOrderInvoiceBusinessEventController = new SysOperationServiceController(
+                                                                classStr(METSendSalesOrderInvoiceBusinessEventService),
+                                                                methodStr(METSendSalesOrderInvoiceBusinessEventService, sendBusinessEvent));
+
+                sendSalesOrderInvoiceBusinessEventController.parmDialogCaption(strFmt("@MET:SOInvoiceNotificationBatchTaskDesc", task));
+
+                METSendSalesOrderInvoiceBusinessEventContract sendSalesOrderInvoiceBusinessEventcontract = sendSalesOrderInvoiceBusinessEventController.getDataContractObject() as METSendSalesOrderInvoiceBusinessEventContract;
+                sendSalesOrderInvoiceBusinessEventcontract.parmInvoiceList(invoiceList);
+
+                
+                if (this.isExecutingInBatch())
+                {
+                    batchHeader.addRuntimeTask(sendSalesOrderInvoiceBusinessEventController, this.getCurrentBatchTask().RecId);
+                }
+                else
+                {
+                    sendSalesOrderInvoiceBusinessEventController.parmExecutionMode(SysOperationExecutionMode::Synchronous);
+                    sendSalesOrderInvoiceBusinessEventController.run();
+                }
+
+                invoiceList = new List(Types::Int64);
+                task++;
+                i = 0;
+            }
+        }
+        
+        if (this.isExecutingInBatch())
+        {
+            batchHeader.save();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendBusinessEvent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes as the runtime task to send the SO invoice business events.
+    /// </summary>
+    /// <param name="_contract">
+    /// Data Contract object passed from the Controller object.
+    /// </param>
+    void sendBusinessEvent(METSendSalesOrderInvoiceBusinessEventContract    _contract)
+    {
+        CustInvoiceJour custInvoiceJour;
+        ListEnumerator  invoiceListEnumerator;
+        RecId           invoiceRecId;
+        boolean         isError;
+        BatchJob        batchJob;
+
+        invoiceListEnumerator      = _contract.parmInvoiceList().getEnumerator();
+
+        while (invoiceListEnumerator.moveNext())
+        {
+            try
+            {
+                invoiceRecId = invoiceListEnumerator.current();
+
+                select firstonly custInvoiceJour
+                    where custInvoiceJour.RecId == invoiceRecId;
+
+                if(BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METSalesInvoicePostedBusinessEvent)))
+                {
+                    METSalesInvoicePostedBusinessEvent::newFromCustInvoiceJour(custInvoiceJour).send();
+                }
+                else
+                {
+                    throw error("@MET:SOInvoiceBusinessEventNotEnabled");
+                }
+            }
+            catch (Exception::Error)
+            {
+                isError = false;
+            }
+            if (isError)
+            {
+                error("@MET:SOInvoiceBusinessEventError");
+                if (this.isExecutingInBatch())
+                {
+                    select firstonly batchJob where batchJob.RecId == this.getCurrentBatchTask().BatchJobId;
+                    if (batchJob.RecId)
+                    {
+                        ttsBegin;
+                        batchJob.selectForUpdate(true);
+                        batchJob.Status = BatchStatus::Error;
+                        batchJob.update();
+                        ttsCommit;
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
