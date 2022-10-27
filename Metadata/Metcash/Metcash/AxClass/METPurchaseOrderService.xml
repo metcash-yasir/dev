@@ -1,0 +1,535 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPurchaseOrderService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// This service class for purchase order changes
+/// </summary>
+class METPurchaseOrderService extends SysOperationServiceBase
+{
+    #OCCRetryCount
+
+    METProcessingStatus                         processingStatus;
+    Description255                              processingMessage;
+    PurchTable                                  purchTable;
+    METPurchTable                               metPurchTable;
+
+    DataAreaId                                  dataAreaId;
+    METPurchActions                             type;
+    PurchId                                     purchaseOrderNumber;
+    POEDIPOAMsg                                 poeDIPOAMsg;
+    METPOEDIFAMsg                               metPOEDIFAMsg;
+    METPOYardDAppointmentStartDateTime          metPOYardDAppointmentStartDateTime;
+    METPOYardDAppointmentEndDateTime            metPOYardDAppointmentEndDateTime;
+    ListEnumerator                              listEnum;
+
+    PurchLine                                   purchLine;
+    METPurchLine                                metPurchLine;
+
+    List                                        linesContractList;
+    METPurchaseOrderServiceLinesContract        linesContract;
+    METVersioningPurchaseOrder                  versioningPurchaseOrder;
+
+
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>changePurchaseOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Service operation method to update the purchase order.
+    /// </summary>
+    /// <param name="_purchaseOrderContract">
+    /// The instance of <c>METPurchaseOrderServiceContract</c>
+    /// </param>
+    /// <returns>
+    /// The response <c>METPurchaseOrderContract</c>
+    /// </returns>
+    public METPurchaseOrderServiceResponseContract changePurchaseOrder(METPurchaseOrderServiceContract _purchaseOrderContract)
+    {
+        METProcessingStatus result;
+        Description255      message = "@MET:NoRecordsUpdated"; //default message
+
+        [result, message] = this.updatePurchaseOrder(_purchaseOrderContract);
+        
+        return METPurchaseOrderServiceResponseContract::newFromParameters(result, message);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePurchaseOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update purchase order.
+    /// </summary>
+    /// <param name="_purchaseOrderContract">List of contracts</param>
+    /// <returns>Container of Results</returns>
+    public container updatePurchaseOrder(METPurchaseOrderServiceContract _purchaseOrderContract)
+    {
+        this.initParams(_purchaseOrderContract);
+
+        changecompany(dataAreaId)
+        {
+            purchTable = PurchTable::find(purchaseOrderNumber, true);
+
+            [processingStatus, processingMessage] = this.validate();
+
+            if (processingStatus == METProcessingStatus::Error)
+            {
+                return [processingStatus, processingMessage];
+            }
+
+            try
+            {
+                metPurchTable = purchTable.metPurchTable();
+                //Create <c>MetPurchTable</c> record if not exists.
+                if(!metPurchTable)
+                {
+                    metPurchTable = purchTable.metCreateMETPurchTable();
+                }
+
+                if (this.type == METPurchActions::Cancel)
+                {
+                    //Requestchange is handled inside PurchCancel
+                    this.cancelPurchaseOrder();
+                }
+                else
+                {
+                    ttsbegin;
+                    this.requestChange();
+
+                    this.updatePurchaseOrderHeader();
+
+                    this.updatePurchaseOrderLines();
+
+                    this.confirmChanges();
+
+                    this.checkUpdateProcessingStatus();
+                    ttscommit;
+                }
+               
+            }
+
+            catch (Exception::Deadlock)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        processingMessage = "@MET:PurchaseOrderUpdateFailedDatabaseDeadlock";
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    processingMessage = "@MET:PurchaseOrderUpdateFailedDatabaseDeadlock";
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        processingMessage = "@MET:PurchaseOrderUpdateFailedDatabaseConflict";
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    processingMessage = "@MET:PurchaseOrderUpdateFailedDatabaseConflict";
+                }
+            }
+            catch
+            {
+                purchTable.reread();
+                if (this.type == METPurchActions::Cancel
+                    && !purchTable.isCanceled())
+                {
+                    processingMessage = "@MET:PurchaseOrderNotCancelled";
+                }
+                else
+                {
+                    processingMessage = "@MET:PurchaseOrderNotUpdated";
+                }
+                processingStatus = METProcessingStatus::Error;
+            }
+
+        }
+
+        return [processingStatus, processingMessage];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>confirmChanges</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Confirm the purchase order changes
+    /// </summary>
+    private void confirmChanges()
+    {
+        if (purchTable.ChangeRequestRequired)
+        {
+            versioningPurchaseOrder = METVersioningPurchaseOrder::newPurchaseOrder(PurchTable::find(purchTable.PurchId));
+            if (purchTable.canSubmitToWorkflow())
+            {
+                versioningPurchaseOrder.submitChangeRequest();
+            }
+            versioningPurchaseOrder.approveChangeRequest();
+        }
+        purchTable.reread();
+        if (this.type == METPurchActions::Confirm
+            &&  purchTable.DocumentState == VersioningDocumentState::Approved
+            && purchTable.ChangeRequestRequired)
+        {
+            versioningPurchaseOrder.confirm();
+        }
+        else if(this.type == METPurchActions::Confirmation
+            && purchTable.DocumentState == VersioningDocumentState::Approved)
+        {
+            PurchFormLetter purchFormLetter = PurchFormLetter::construct(DocumentStatus::PurchaseOrder);
+            purchFormLetter.purchTable(purchTable);
+            PurchFormLetter.METparmServiceConfirmation(noYes::Yes);
+            purchFormLetter.parmExecutionMode(SysOperationExecutionMode::Synchronous);
+            if(purchFormLetter.validate())
+            {
+                purchFormLetter.update(purchTable,purchTable.PurchId);
+            }
+            else
+            {
+                processingMessage = "@MET:POConfirmationValidation";
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkUpdateProcessingStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the processing status.
+    /// </summary>
+    private void checkUpdateProcessingStatus()
+    {
+        purchTable.reread();
+
+        if (processingStatus == METProcessingStatus::Error)
+        {
+            return;
+        }
+
+        if (this.type == METPurchActions::Cancel
+                && !purchTable.isCanceled())
+        {
+            processingMessage = "@MET:PurchaseOrderNotCancelled";
+        }
+        else if(this.type != METPurchActions::Cancel
+                && !purchTable.isDocumentConfirmed())
+        {
+            processingMessage = "@MET:PurchaseOrderNotUpdated";
+        }
+
+        if (processingMessage)
+        {
+            processingStatus = METProcessingStatus::Error;
+            throw Exception::Error;
+        }
+        else
+        {
+            processingStatus = METProcessingStatus::Success;
+        }
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelPurchaseOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancel purchase order
+    /// </summary>
+    private void cancelPurchaseOrder()
+    {
+        PurchCancel purchCancel = PurchCancel::METconstruct();
+        purchCancel.parmMETPurchTable(purchTable);
+        purchCancel.runOperation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePurchaseOrderHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update purchase order header details
+    /// </summary>
+    private void updatePurchaseOrderHeader()
+    {
+        //Check & Update purchase order header.
+        if (this.canUpdatePOHeader())
+        {
+            metPurchTable.selectForUpdate(true);
+            if (poeDIPOAMsg)
+            {
+                metPurchTable.POEDIPOAMsg = poeDIPOAMsg;
+            }
+
+            if (metPOEDIFAMsg)
+            {
+                metPurchTable.POEDIFAMsg = metPOEDIFAMsg;
+            }
+
+            if (metPOYardDAppointmentStartDateTime)
+            {
+                metPurchTable.POYardDAppointmentStartDateTime = metPOYardDAppointmentStartDateTime;
+            }
+
+            if (metPOYardDAppointmentEndDateTime)
+            {
+                metPurchTable.POYardDAppointmentEndDateTime = metPOYardDAppointmentEndDateTime;
+            }
+
+            metPurchTable.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePurchaseOrderLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update purchase order line details
+    /// </summary>
+    private void updatePurchaseOrderLines()
+    {
+        if (!this.canUpdatePOLines())
+        {
+            return;
+        }
+
+        listEnum     =    linesContractList.getEnumerator();
+
+        while (listEnum.moveNext())
+        {
+            linesContract   =   listEnum.current();
+            select firstonly1 forupdate purchLine
+                where purchLine.PurchId == purchaseOrderNumber
+                && purchLine.LineNumber == linesContract.parmLineNumber();
+            if(purchLine)
+            {
+                boolean isCWItem = PdsGlobal::pdsIsCWItem(purchLine.ItemId);
+                if (isCWItem && linesContract.parmCWQuantity()!= 0)
+                {
+                    purchLine.PdsCWQty      = linesContract.parmCWQuantity();
+                    purchLine.pdsCWQtyConversion();
+                    PurchLine::modifyPurchQty(purchLine, purchLine.inventDim());
+                }
+                else if(!isCWItem && linesContract.parmPurchaseQty() != 0)
+                {
+                    purchLine.PurchQty    = linesContract.parmPurchaseQty();
+                    PurchLine::modifyPurchQty(purchLine, purchLine.inventDim());
+                }
+                else if (linesContract.parmCWQuantity() == 0 
+                    || linesContract.parmPurchaseQty() == 0)
+                {
+                    purchLine.RemainPurchPhysical         = 0;
+                    purchLine.RemainInventPhysical        = 0;
+                    purchLine.PdsCWRemainInventPhysical   = 0;
+                }
+                purchLine.update();
+                
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParams</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialise parameters.
+    /// </summary>
+    /// <param name="_purchaseOrderContract">Instance of METPurchaseOrderServiceContract class</param>
+    private void initParams(METPurchaseOrderServiceContract _purchaseOrderContract)
+    {
+
+        processingStatus                        = METProcessingStatus::None;
+        dataAreaId                              = _purchaseOrderContract.parmDataAreaId();
+        type                                    = _purchaseOrderContract.parmType();
+        purchaseOrderNumber                     = _purchaseOrderContract.parmPurchId();
+        poeDIPOAMsg                             = _purchaseOrderContract.parmPOEDIPOAMsg();
+        metPOEDIFAMsg                           = _purchaseOrderContract.parmMETPOEDIFAMsg();
+        metPOYardDAppointmentStartDateTime      = _purchaseOrderContract.parmMETPOYardDAppointmentStartDateTime();
+        metPOYardDAppointmentEndDateTime        = _purchaseOrderContract.parmMETPOYardDAppointmentEndDateTime();
+        linesContractList                       = _purchaseOrderContract.parmLineContract();
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canUpdatePOHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update <c>PurchTable</c> only if header values are passed in the service contract.
+    /// </summary>
+    /// <returns>true if header to be updated;otherwise false.</returns>
+    public boolean canUpdatePOHeader()
+    {
+        return (poeDIPOAMsg || metPOEDIFAMsg || metPOYardDAppointmentStartDateTime || metPOYardDAppointmentEndDateTime);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canUpdatePOLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if PO line details are passed in the service contract.
+    /// </summary>
+    /// <returns>true if PO line to be updated;otherwise false.</returns>
+    public boolean canUpdatePOLines()
+    {
+        return linesContractList && linesContractList.elements();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate parameters
+    /// </summary>
+    /// <returns>container</returns>
+    private container validate()
+    {
+
+        if (!dataAreaId)
+        {
+            processingMessage = strFmt("@SYS84753", "@SYS177726");
+        }
+        else if (!purchaseOrderNumber)
+        {
+            processingMessage = strFmt("@SYS84753", "@SYS23482");
+        }
+
+        if (!processingMessage && 
+            !purchTable)
+        {
+            processingMessage = "@MET:PurchaseOrderNotFound";
+        }
+        if (!processingMessage
+            && purchTable.ChangeRequestRequired)
+        {
+            boolean     canAffectNextYearBudgetSource;
+            Ledger ledger = Ledger::findByLegalEntity(CompanyInfo::findDataArea(dataAreaId).RecId);
+
+            canAffectNextYearBudgetSource = Ledger::isLedgerBudgetControlEnabled(ledger.RecId)
+                && BudgetControlConfiguration::isSourceIntegratorEnabled(ledger.RecId, BudgetControlSourceIntegrator::PurchaseOrder)
+                && LedgerFiscalCalendar::findFirstOpenPeriodInYear(ledger.FiscalCalendar, purchTable.AccountingDate).RecId == 0;
+                
+            if(canAffectNextYearBudgetSource && METPurchaseOrderService::IsBudgetTracked(purchTable.PurchId))
+            {
+                processingMessage = "@Budget:NotAllowRequestChangeOnPODueToPeriodOnHold";
+            }
+        }
+
+        if (!processingMessage 
+            && purchTable.PurchStatus == PurchStatus::Canceled)
+        {
+            processingMessage = "@MET:PurchaseOrderCancelled";
+        }
+
+        if (!processingMessage
+            && !purchTable.existPurchLine())
+        {
+            processingMessage = "@MET:Nopurchaselinesexist";
+        }
+
+        if (processingMessage)
+        {
+            processingStatus = METProcessingStatus::Error;
+        }
+
+        return [processingStatus, processingMessage];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>requestChange</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create purchase order change request
+    /// </summary>
+    private void requestChange()
+    {
+        ttsbegin;
+        versioningPurchaseOrder = METVersioningPurchaseOrder::newPurchaseOrder(purchTable);
+        if (versioningPurchaseOrder.canChangeBeRequested())
+        {
+            versioningPurchaseOrder.createChangeRequest();
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>IsBudgetTracked</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MPJ_23295_CustomOdataAPIPORequestChange on 12 Apr 2022 by chaminda
+    /// alternate method to following
+    /// BudgetSourceCollectionIntegrator::isDocumentBudgetTracked(purchTable)
+    /// </summary>
+    /// <param name="_purchId"> Get purchase order number</param>
+    /// <returns> boolean </returns>
+    public static boolean IsBudgetTracked(PurchId _purchId)
+    {
+        boolean     isTracked   = false;
+        PurchTable  purchTable  = PurchTable::find(_purchId);
+        SourceDocumentLine sourceDocumentLine = SourceDocumentLine::findBySourceDocumentHeader(purchTable.SourceDocumentHeader);
+        while (!isTracked && sourceDocumentLine)
+        {
+            // Is there a budget being tracked?
+            BudgetSourceInquiryDetails budgetDetails = BudgetSourceSourceDocumentLine::getBudgetSourceInquiryDetails(sourceDocumentLine);
+
+            if (budgetDetails)
+            {
+                while (!isTracked && budgetDetails.next())
+                {
+                    isTracked = budgetDetails.currentAmountTracked() != 0;
+                }
+            }
+
+            next sourceDocumentLine;
+        }
+
+        return isTracked;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
