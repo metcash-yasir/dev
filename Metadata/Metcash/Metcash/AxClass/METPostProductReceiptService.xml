@@ -11,7 +11,6 @@ class METPostProductReceiptService extends SysOperationServiceBase
 {
     str          errorMessage;
     str          infologMessage;
-    List         purchLineList;
 
 }
 ]]></Declaration>
@@ -213,7 +212,6 @@ class METPostProductReceiptService extends SysOperationServiceBase
                 productReceiptDate = utcDateTimeNull();
                 isError = false;
                 isCWItem = false;
-                purchLineList = new List(Types::Record);
 
                 while select metPOReceipt
                 group by PurchaseOrderNumber, ProductReceiptDate, PackingSlipId, ProductNumber, Quantity, InventSiteId, ItemBatchNumber, ItemCatchWeightQuantity
@@ -253,7 +251,6 @@ class METPostProductReceiptService extends SysOperationServiceBase
                                 }
                             }
                         }
-                        purchLineList.addEnd(purchLine);  //add lines to list
                     }
                     else
                     {
@@ -264,11 +261,30 @@ class METPostProductReceiptService extends SysOperationServiceBase
                 if(!isError)
                 {
                     PurchTable      purchTable = PurchTable::find(purchLine.PurchId);
-                    PurchFormLetter purchFormLetter = PurchFormLetter::construct(DocumentStatus::PackingSlip);
+                    ParmId purchParmId = NumberSeq::newGetNum(CompanyInfo::numRefParmId()).num();
 
-                    purchFormLetter.createFromLines(true);
-                    purchFormLetter.parmLineList(purchLineList.pack());
-                    purchFormLetter.update(purchTable, packingSlipId, DateTimeUtil::date(productReceiptDate), PurchUpdate::Recorded);
+                    PurchFormLetter_PackingSlip purchFormLetter_PackingSlip = PurchFormLetter::construct(DocumentStatus::PackingSlip);
+                    purchFormLetter_PackingSlip.parmLoadFromSysLastValue(false); //don't load any saved values
+                    purchFormLetter_PackingSlip.parmId(purchParmId);
+                    purchFormLetter_PackingSlip.transDate(DateTimeUtil::date(productReceiptDate));
+                    purchFormLetter_PackingSlip.parmDocumentOrigin(DocumentOrigin::Manual);
+                    purchFormLetter_PackingSlip.parmVersioningUpdateType(VersioningUpdateType::Initial);
+                    purchFormLetter_PackingSlip.parmSourceTable(purchTable);
+                    purchFormLetter_PackingSlip.parmShowDialog(false);
+                    purchFormLetter_PackingSlip.printFormLetter(false);
+                    purchFormLetter_PackingSlip.initParameters();
+
+                    PurchFormLetterContract contract = purchFormLetter_PackingSlip.getContract() as PurchFormLetterContract;
+                    contract.parmSpecQty(PurchUpdate::Recorded);
+                    contract.parmSpecQtyIsSet(true);
+
+                    //create the parmTable and parmLines
+                    purchFormLetter_PackingSlip.initLinesQuery(true);
+                    purchFormLetter_PackingSlip.parmNumber(packingSlipId);
+                    purchFormLetter_PackingSlip.updatePurchParmTableNum(purchFormLetter_PackingSlip.parmNumber());
+
+                    purchFormLetter_PackingSlip.startOperation();
+
 
                     delete_from metPOReceiptLoc
                         where metPOReceiptLoc.PackingSlipId == packingSlipId
@@ -341,7 +357,7 @@ class METPostProductReceiptService extends SysOperationServiceBase
     /// <returns>purchase line that matches the criteria</returns>
     public container getPurchLine(METPOReceipt _metPOReceipt)
     {
-        PurchLine                       purchLine, purchLineCount, purchLineToSplit;
+        PurchLine                       purchLine, purchLineCount, purchLineToSplit, purchLineCW;
         PurchQty                        qtyToSplit, purchqty;
         UnitOfMeasureSymbol             warehouseUnit, purchUnit, inventoryUnit;
         UnitOfMeasureConversionFactor   conversionFactor;
@@ -384,20 +400,28 @@ class METPostProductReceiptService extends SysOperationServiceBase
                 purchqty = _metPOReceipt.Quantity;
                 isCWItem = true;
 
-                select firstonly purchLine
-                    where purchLine.PurchId == _metPOReceipt.PurchaseOrderNumber
-                        && purchLine.ItemId == _metPOReceipt.ProductNumber
-                        && purchLine.PurchStatus == PurchStatus::Backorder
-                        && purchLine.PdsCWQty >= purchqty
-                        && purchLine.IsDeleted == NoYes::No
+                select firstonly purchLineCW
+                    where purchLineCW.PurchId == _metPOReceipt.PurchaseOrderNumber
+                        && purchLineCW.ItemId == _metPOReceipt.ProductNumber
+                        && purchLineCW.PurchStatus == PurchStatus::Backorder
+                        && purchLineCW.PdsCWQty >= purchqty
+                        && purchLineCW.IsDeleted == NoYes::No
                     join RecId from inventDim
-                        where inventDim.inventDimId == purchLine.InventDimId
+                        where inventDim.inventDimId == purchLineCW.InventDimId
                            && inventDim.InventSiteId == _metPOReceipt.InventSiteId;
 
-                if(purchLine.RecId)
+                if(purchLineCW.RecId)
                 {
+                    return [purchLineCW.RecId, purchqty, 0, isCWItem];
+                }
+                else if (purchLine.OverDeliveryPct > 0) //Check if overdelivery is allowed
+                {
+                    Qty maxReceivedQty = purchLine.PurchQty * (1 + purchLine.OverDeliveryPct / 100);
 
-                    return [purchLine.RecId, purchqty, 0, isCWItem];
+                    if(maxReceivedQty >= purchqty)
+                    {
+                        return [purchLine.RecId, purchqty, 0, isCWItem];
+                    }
                 }
             }
             else
@@ -468,7 +492,6 @@ class METPostProductReceiptService extends SysOperationServiceBase
                         where purchLine.PurchId == _metPOReceipt.PurchaseOrderNumber
                             && purchLine.ItemId == _metPOReceipt.ProductNumber
                             && purchLine.PurchStatus == PurchStatus::Backorder
-                            && purchLine.PurchQty >= purchqty
                             && purchLine.IsDeleted == NoYes::No
                         join RecId from inventDim
                             where inventDim.inventDimId == purchLine.InventDimId
