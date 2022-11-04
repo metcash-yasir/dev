@@ -37,28 +37,34 @@ class METSalesItemSubstitution
 ]]></Declaration>
 		<Methods>
 			<Method>
-				<Name>run</Name>
+				<Name>validate</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Perform substitute checks/replacements.
+    /// Validates the setup and data 
     /// </summary>
-    /// <returns>True if validation result is ok. (Not necessarily whether a replacement was made)</returns>
-    public boolean run()
+    /// <returns>Validation result True/False</returns>
+    public boolean validate()
     {
-        boolean ret = true;
-
-        if(!CustParameters::find().METSubstitutionEnabled)
+        if(!CustParameters::find().METSubstitutionEnabled ||
+           !salesLine.metSubstitutionsActive())
         {
             // Subs not enabled at legal-entity level.
-            return true;
-        }
+            return false;
+        }    
+        
+        return true;
+    }
 
-        if(!salesLine.metSubstitutionsActive())
-        {
-            // Subs not applicable to this line.
-            return true;
-        }
-
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initVerboseLogging</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// intializes verbose logging
+    /// </summary>    
+    protected void initVerboseLogging()
+    {
         if(CustParameters::find().METSubstitutionVerboseLogging)
         {
             this.verboseLogging         = true;
@@ -69,6 +75,229 @@ class METSalesItemSubstitution
                 metSalesLine.SubstitutionVerboseLogReference = newGuid();
             }
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>substituteItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Substitutes item
+    /// </summary>
+    /// <param name = "_matchingItemSub">_matchingItemSub</param>
+    /// <param name = "_matchingParentChild">_matchingParentChild</param>
+    /// <returns>True if Item is substituted</returns>
+    public boolean substituteItem(METSalesItemSubstitute _matchingItemSub, METSalesItemSubstitutionParentChild _matchingParentChild)
+    {
+        boolean performUpdates = true;
+        boolean subWarningOnly;
+        boolean ret = true;
+
+        ttsbegin;
+
+        if(_matchingItemSub || _matchingParentChild)
+        {
+            boolean replaceItem         = true;
+            boolean orderGuideValid     = true;
+            ItemId  replacementItemID   = (_matchingItemSub != null) ? _matchingItemSub.SubstituteItemId : _matchingParentChild.ParentItemID;
+
+            if(replacementItemID != salesLine.ItemId &&
+               !METSalesOrderGuideExecution::isLineOrderable(salesLine, replacementItemID))
+            {
+                this.verboseInfo(funcName(), strFmt("@MET:SubNotReplacedDueToOrderGuide", replacementItemID));
+                warning(strFmt("@MET:SubNotReplacedDueToOrderGuide", replacementItemID));
+                subWarningOnly          = true;
+                orderGuideValid         = false;
+                replaceItem             = false;
+                if(_matchingItemSub)
+                {
+                    metSalesLine.ReasonId   = _matchingItemSub.OrderGuideReasonId;
+                }
+            }
+           
+            if(orderGuideValid)
+            {
+                if(_matchingItemSub)
+                {
+                    this.verboseInfo(funcName(), strFmt("@MET:FinalMatchingSubstitute", _matchingItemSub.description()));
+
+                    boolean replacementItemHasSufficientOnHand = this.queryOnHandQty(_matchingItemSub.SubstituteItemId, inventDim) >= salesLine.QtyOrdered;
+
+                    if(!replacementItemHasSufficientOnHand && _matchingItemSub.OrderOriginalItem)
+                    {
+                        this.verboseInfo(funcName(), "@MET:SubInsufficientOnHandOrderOriginalItem");
+                        replaceItem = false;
+                    }
+
+                    if(replaceItem)
+                    {
+                        switch(_matchingItemSub.SubstitutionCode)
+                        {
+                            case METSalesItemSubstitutionCode::Always:
+                                performUpdates = this.yesNoPrompt(strFmt("@MET:SubPromptReplacement",
+                                    salesLine.ItemId,
+                                    _matchingItemSub.SubstituteItemId));
+                                break;
+   
+                            case METSalesItemSubstitutionCode::OutOfStock:
+                                if(!replacementItemHasSufficientOnHand)
+                                {
+                                    this.verboseInfo(funcName(), strFmt("@MET:SubInsufficientOnHandNoSubMade",
+                                        _matchingItemSub.SubstituteItemId));
+                                    warning(strFmt("@MET:SubInsufficientOnHandNoSubMade", _matchingItemSub.SubstituteItemID));
+                            
+                                    performUpdates = false;
+                                    subWarningOnly = true;
+                                }
+                                break;
+
+                            case METSalesItemSubstitutionCode::Never:
+                            case METSalesItemSubstitutionCode::NoAlternative:
+                                performUpdates = false;
+                                subWarningOnly = true;
+                                info(strFmt("@MET:SalesSubFoundNoReplacement",
+                                    _matchingItemSub.SubstitutionCode,
+                                    salesLine.ItemID));
+                                break;
+                        }
+                    }
+
+                    if(performUpdates)
+                    {
+                        if(!metSalesLine.SubstituteOriginalItemID)
+                        {
+                            metSalesLine.SubstituteOriginalItemID       = salesLine.ItemId;
+                        }
+                        metSalesLine.SubstituteReplacementItemID    = _matchingItemSub.SubstituteItemId;
+                        metSalesLine.SubstituteParentItemID         = METConstants::emptyString;
+                        metSalesLine.SubstitutionType               = METSalesItemSubstitutionType::SubstitutionCode;
+                        metSalesLine.SubstitutionCode               = _matchingItemSub.SubstitutionCode;
+                        metSalesLine.SubstitutionSetupRefRecID      = _matchingItemSub.RecId;
+                        rounding                                    = _matchingItemSub.Rounding;
+                    }
+                }
+                else
+                {
+                    this.verboseInfo(funcName(), "@MET:NoMatchingSubstituteEntryFound");
+
+                    if(_matchingParentChild)
+                    {
+                        this.verboseInfo(funcName(), strFmt("@MET:FinalMatchingParentItem", _matchingParentChild.description()));
+
+                        if(_matchingItemSub.SubstitutionCode == METSalesItemSubstitutionCode::Always)
+                        {
+                            performUpdates = this.yesNoPrompt(strFmt("@MET:SubPromptReplacementParentChild",
+                                                                    salesLine.ItemId,
+                                                                    _matchingParentChild.ParentItemID));
+                        }
+                    
+                        if(performUpdates)
+                        {
+                            if(!metSalesLine.SubstituteOriginalItemID)
+                            {
+                                metSalesLine.SubstituteOriginalItemID       = salesLine.ItemId;
+                            }
+                            metSalesLine.SubstituteReplacementItemID    = _matchingParentChild.ParentItemID;
+                            metSalesLine.SubstituteParentItemID         = _matchingParentChild.ParentItemID;
+                            metSalesLine.SubstitutionType               = METSalesItemSubstitutionType::ParentChild;
+                            metSalesLine.SubstitutionCode               = METSalesItemSubstitutionCode::None;
+                            metSalesLine.SubstitutionSetupRefRecID      = _matchingParentChild.RecId;
+                            rounding                                    = _matchingParentChild.Rounding;
+                        }
+                    }
+                }
+            }
+
+            if(performUpdates)
+            {
+                if(replaceItem && metSalesLine.SubstituteReplacementItemID != salesLine.ItemId)
+                {
+                    if(salesLine.RecId)
+                    {
+                        this.copyToNewLine(metSalesLine.SubstituteReplacementItemID);
+                        newLineCreated = true;
+                    }
+                    else
+                    {
+                        this.verboseInfo(funcName(), strFmt("@MET:ItemReplacedWith",
+                                                            salesLine.ItemId,
+                                                            metSalesLine.SubstituteReplacementItemID));
+                    }
+
+                    if(!newLineCreated)
+                    {
+                        salesLine.ItemId = metSalesLine.SubstituteReplacementItemID;
+
+                        InventDim salesLineInventDim = salesLine.inventDim();
+                        salesLineInventDim.InventLocationId = '';
+                        salesLine.InventDimId = InventDim::findOrCreate(salesLineInventDim).inventDimId;
+
+                        SalesQty    originalSalesQty        = salesLine.SalesQty;
+                        InventQty   originalQtyOrdered      = salesLine.QtyOrdered;
+                            
+                        salesLine.itemIdChanged();
+
+                        salesLine.SalesQty      = originalSalesQty;
+                        salesLine.QtyOrdered    = originalQtyOrdered;
+
+                        this.updateQuantity();
+                    }
+
+                    info(strFmt("@MET:SubItemReplaced",
+                        metSalesLine.SubstituteOriginalItemID,
+                        metSalesLine.SubstituteReplacementItemID));
+                }
+
+                if(!newLineCreated && salesLine.RecId)
+                {
+                    salesLine.metPackMETSalesLine(metSalesLine);
+                    salesLine.update();
+                }
+            }
+            else
+            {
+                this.verboseInfo(funcName(), "@MET:NoUpdatesMadePerformUpdatesFalseReturnFailed");
+                if(!subWarningOnly)
+                {
+                    ret = checkFailed("@MET:SubReplacementNotAccepted");
+                }
+                else
+                {
+                    ret = true;
+                }
+
+            }
+        }
+        else
+        {
+            this.verboseInfo(funcName(), "@MET:NoMatchingSubstituteParentChildRecordFoundNoSubstituteMade");
+        }
+
+        ttscommit;
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Perform substitute checks/replacements.
+    /// </summary>
+    /// <returns>True if validation result is ok. (Not necessarily whether a replacement was made)</returns>
+    public boolean run()
+    {
+        boolean ret = true;
+
+        if (!this.validate())
+        {
+            return true;
+        }
+
+        this.initVerboseLogging();
 
         this.verboseInfo(funcName(), strFmt("@MET:SalesOrderLotIdRecId",
                                             salesLine.SalesId,
@@ -258,190 +487,7 @@ class METSalesItemSubstitution
             }            
         }   // main search loop
 
-        ttsbegin;
-        
-        boolean performUpdates = true;
-        boolean subWarningOnly;
-
-        if(matchingItemSub || matchingParentChild)
-        {
-            boolean replaceItem         = true;
-            boolean orderGuideValid     = true;
-            ItemId  replacementItemID   = (matchingItemSub != null) ? matchingItemSub.SubstituteItemId : matchingParentChild.ParentItemID;
-
-            if(replacementItemID != salesLine.ItemId &&           
-               !METSalesOrderGuideExecution::isLineOrderable(salesLine, replacementItemID))
-            {
-                this.verboseInfo(funcName(), strFmt("@MET:SubNotReplacedDueToOrderGuide", replacementItemID));
-                warning(strFmt("@MET:SubNotReplacedDueToOrderGuide", replacementItemID));
-                subWarningOnly          = true;
-                orderGuideValid         = false;
-                replaceItem             = false;
-                if(matchingItemSub)
-                {
-                    metSalesLine.ReasonId   = matchingItemSub.OrderGuideReasonId;
-                }
-            }
-           
-            if(orderGuideValid)
-            {
-                if(matchingItemSub)
-                {
-                    this.verboseInfo(funcName(), strFmt("@MET:FinalMatchingSubstitute", matchingItemSub.description()));
-
-                    boolean replacementItemHasSufficientOnHand = this.queryOnHandQty(matchingItemSub.SubstituteItemId, inventDim) >= salesLine.QtyOrdered;
-
-                    if(!replacementItemHasSufficientOnHand && matchingItemSub.OrderOriginalItem)
-                    {
-                        this.verboseInfo(funcName(), "@MET:SubInsufficientOnHandOrderOriginalItem");
-                        replaceItem = false;
-                    }
-
-                    if(replaceItem)
-                    {
-                        switch(matchingItemSub.SubstitutionCode)
-                        {
-                            case METSalesItemSubstitutionCode::Always:
-                                performUpdates = this.yesNoPrompt(strFmt("@MET:SubPromptReplacement",
-                                    salesLine.ItemId,
-                                    matchingItemSub.SubstituteItemId));
-                                break;
-   
-                            case METSalesItemSubstitutionCode::OutOfStock:
-                                if(!replacementItemHasSufficientOnHand)
-                                {
-                                    this.verboseInfo(funcName(), strFmt("@MET:SubInsufficientOnHandNoSubMade",
-                                        matchingItemSub.SubstituteItemId));
-                                    warning(strFmt("@MET:SubInsufficientOnHandNoSubMade", matchingItemSub.SubstituteItemID));
-                            
-                                    performUpdates = false;
-                                    subWarningOnly = true;
-                                }
-                                break;
-
-                            case METSalesItemSubstitutionCode::Never:
-                            case METSalesItemSubstitutionCode::NoAlternative:
-                                performUpdates = false;
-                                subWarningOnly = true;
-                                info(strFmt("@MET:SalesSubFoundNoReplacement",
-                                    matchingItemSub.SubstitutionCode,
-                                    salesLine.ItemID));
-                                break;
-                        }
-                    }
-
-                    if(performUpdates)
-                    {
-                        if(!metSalesLine.SubstituteOriginalItemID)
-                        {
-                            metSalesLine.SubstituteOriginalItemID       = salesLine.ItemId;
-                        }
-                        metSalesLine.SubstituteReplacementItemID    = matchingItemSub.SubstituteItemId;
-                        metSalesLine.SubstituteParentItemID         = METConstants::emptyString;
-                        metSalesLine.SubstitutionType               = METSalesItemSubstitutionType::SubstitutionCode;
-                        metSalesLine.SubstitutionCode               = matchingItemSub.SubstitutionCode;
-                        metSalesLine.SubstitutionSetupRefRecID      = matchingItemSub.RecId;
-                        rounding                                    = matchingItemSub.Rounding;
-                    }
-                }
-                else
-                {
-                    this.verboseInfo(funcName(), "@MET:NoMatchingSubstituteEntryFound");
-
-                    if(matchingParentChild)
-                    {
-                        this.verboseInfo(funcName(), strFmt("@MET:FinalMatchingParentItem", matchingParentChild.description()));
-
-                        if(matchingItemSub.SubstitutionCode == METSalesItemSubstitutionCode::Always)
-                        {
-                            performUpdates = this.yesNoPrompt(strFmt("@MET:SubPromptReplacementParentChild",
-                                                                    salesLine.ItemId,
-                                                                    matchingParentChild.ParentItemID));
-                        }
-                    
-                        if(performUpdates)
-                        {
-                            if(!metSalesLine.SubstituteOriginalItemID)
-                            {
-                                metSalesLine.SubstituteOriginalItemID       = salesLine.ItemId;
-                            }
-                            metSalesLine.SubstituteReplacementItemID    = matchingParentChild.ParentItemID;
-                            metSalesLine.SubstituteParentItemID         = matchingParentChild.ParentItemID;
-                            metSalesLine.SubstitutionType               = METSalesItemSubstitutionType::ParentChild;
-                            metSalesLine.SubstitutionCode               = METSalesItemSubstitutionCode::None;
-                            metSalesLine.SubstitutionSetupRefRecID      = matchingParentChild.RecId;
-                            rounding                                    = matchingParentChild.Rounding;
-                        }
-                    }
-                }
-            }
-
-            if(performUpdates)
-            {
-                if(replaceItem && metSalesLine.SubstituteReplacementItemID != salesLine.ItemId)
-                {
-                    if(salesLine.RecId)
-                    {
-                        this.copyToNewLine(metSalesLine.SubstituteReplacementItemID);
-                        newLineCreated = true;
-                    }
-                    else
-                    {
-                        this.verboseInfo(funcName(), strFmt("@MET:ItemReplacedWith",
-                                                            salesLine.ItemId,
-                                                            metSalesLine.SubstituteReplacementItemID));                    
-                    }
-
-                    if(!newLineCreated)
-                    {
-                        salesLine.ItemId = metSalesLine.SubstituteReplacementItemID;
-
-                        InventDim salesLineInventDim = salesLine.inventDim();
-                        salesLineInventDim.InventLocationId = '';
-                        salesLine.InventDimId = InventDim::findOrCreate(salesLineInventDim).inventDimId;
-
-                        SalesQty    originalSalesQty        = salesLine.SalesQty;
-                        InventQty   originalQtyOrdered      = salesLine.QtyOrdered;
-                            
-                        salesLine.itemIdChanged();  
-
-                        salesLine.SalesQty      = originalSalesQty;
-                        salesLine.QtyOrdered    = originalQtyOrdered;
-
-                        this.updateQuantity();
-                    }
-
-                    info(strFmt("@MET:SubItemReplaced",
-                        metSalesLine.SubstituteOriginalItemID,
-                        metSalesLine.SubstituteReplacementItemID));
-                }
-
-                if(!newLineCreated && salesLine.RecId)
-                {
-                    salesLine.metPackMETSalesLine(metSalesLine);
-                    salesLine.update();
-                }
-            }
-            else
-            {
-                this.verboseInfo(funcName(), "@MET:NoUpdatesMadePerformUpdatesFalseReturnFailed");
-                if(!subWarningOnly)
-                {
-                    ret = checkFailed("@MET:SubReplacementNotAccepted");
-                }
-                else
-                {
-                    ret = true;
-                }
-
-            }
-        }
-        else
-        {
-            this.verboseInfo(funcName(), "@MET:NoMatchingSubstituteParentChildRecordFoundNoSubstituteMade");
-        }
-
-        ttscommit;
+        ret = this.substituteItem(matchingItemSub, matchingParentChild);
         
         return ret;
     }
@@ -503,11 +549,14 @@ class METSalesItemSubstitution
         newLine.ItemId              = _newItemId;
         newLine.PackedExtensions    = conNull();
         
-        METSalesLine newMetSalesLine = metSalesLine.data();
+        METSalesLine newMetSalesLine;
+        buf2Buf(metSalesLine, newMetSalesLine);
+
+        newMetSalesLine.salesLine   = 0;
 
         salesLine       = newLine;
         inventDim       = salesLine.inventDim();
-        metSalesLine    = newMetSalesLine;
+        
 
         SalesQty    originalSalesQty        = salesLine.SalesQty;
         InventQty   originalQtyOrdered      = salesLine.QtyOrdered;
@@ -517,12 +566,19 @@ class METSalesItemSubstitution
         salesLine.SalesQty      = originalSalesQty;
         salesLine.QtyOrdered    = originalQtyOrdered;
 
-        this.updateQuantity();        
+        this.updateQuantity();
+        
+        //salesLine.metPackMETSalesLine(metSalesLine);
+        //salesLine.insert();
 
-        salesLine.insert();
-        metSalesLine.SalesLine = salesLine.RecID;
-        metSalesLine.insert();
+        salesLine.createLine(true, false, false, false, false);
+        
+        newMetSalesLine.SalesLine = salesLine.RecID;
+        newMetSalesLine.insert();
 
+        metSalesLine    = newMetSalesLine;
+
+        existingLine.selectForUpdate(true);
         existingLine.delete();
 
         guid logReference;
@@ -611,7 +667,7 @@ class METSalesItemSubstitution
     /// <param name = "_itemID">_itemID</param>
     /// <param name = "_inventDim">_inventDim</param>
     /// <returns>On-hand quantity</returns>
-    protected Qty queryOnHandQty(ItemId _itemID, InventDim _inventDim)
+    public Qty queryOnHandQty(ItemId _itemID, InventDim _inventDim)
     {
         InventDimParm   onHandDimParm;
         onHandDimParm.initFromInventDim(inventDim);
@@ -856,15 +912,16 @@ class METSalesItemSubstitution
     /// <param name = "_func">_func</param>
     /// <param name = "_msg">_msg</param>
     /// <param name = "_condition">_condition</param>
-    private void verboseInfo(str _func, str _msg, boolean _condition = true)
+    protected void verboseInfo(str _func, str _msg, boolean _condition = true)
     {
         if(this.verboseLogging && _condition)
         {
             METSalesItemSubstitutionVerboseLog  verboseLog;
+            #define.DOT(".")
 
             verboseLog.SalesId          = salesTable.SalesId;
             verboseLog.Message          = _msg;
-            verboseLog.Function         = subStr(_func, strFind(_func, ".", 1, 999) + 1, 999);
+            verboseLog.Function         = subStr(_func, strFind(_func, #DOT, 1, 999) + 1, 999);
             verboseLog.LogReference     = metSalesLine.SubstitutionVerboseLogReference;
 
             if(this.verboseLogConnection)

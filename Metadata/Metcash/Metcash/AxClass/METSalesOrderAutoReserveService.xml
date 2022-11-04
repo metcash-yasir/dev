@@ -1,0 +1,455 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesOrderAutoReserveService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_28395_Stock reservation
+/// Service class <c>METSalesOrderAutoReserveService</c> which is executing the logic for sales line auto reservation
+/// </summary>
+
+class METSalesOrderAutoReserveService extends SysOperationServiceBase
+{
+    METSalesOrderTypeID     metSalesOrderTypeId;
+    Days                    metReserveDaysPriorShipDate;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Auto reserve service
+    /// </summary>
+    /// <param name = "_contract">Instance of the <c>METSalesOrderAutoReserveContract</c> class</param>
+    public void processOperation(METSalesOrderAutoReserveContract _contract)
+    {
+        int                         bundlesize;
+        int                         noOfItemIds;
+        int                         totalTasks;
+        int                         i, j;
+        int                         task;
+
+        SalesTable                  salesTable;
+        SalesLine                   salesLine;
+        MCRHoldCodeTrans            mcrHoldCodeTrans;        
+        METSalesOrderTypes          salesOrderTypes;  
+        InventTrans                 inventTrans;
+        InventTransOrigin           inventTransOrigin;
+        List                        itemIdList      = new List(Types::String);
+        METTaskGuid                 batchRunGUID = newGuid();
+
+        BatchHeader         batchHeader = this.getCurrentBatchHeader();
+
+        if (batchHeader == null)
+        {
+            batchHeader = batchHeader::construct();
+        }
+        batchHeader.parmCaption("@MET:ClearOrderHold");
+
+        totalTasks      =   _contract.parmTasks();
+
+        totalTasks  = totalTasks <= 0 ? 1 : totalTasks;
+        
+        task            = 1;
+        j               = 0;
+        i               = 0;
+
+        metSalesOrderTypeId = _contract.parmMetSalesOrderTypeId();
+        
+        while select ItemId from salesLine group by ItemId
+            where salesLine.SalesStatus == SalesStatus::Backorder
+                && salesLine.QtyOrdered > 0
+            exists join inventTransOrigin
+                where inventTransOrigin.InventTransId     == salesLine.InventTransId
+                    && inventTransOrigin.ReferenceCategory == InventTransType::Sales
+                exists join inventTrans
+                    where  inventTransOrigin.RecId == inventTrans.InventTransOrigin
+                        && inventTrans.StatusReceipt == StatusReceipt::None
+                        &&  inventTrans.StatusIssue   == StatusIssue::OnOrder
+            exists join salesTable
+                where salesTable.SalesId == salesLine.SalesId
+                    && ((metSalesOrderTypeId == '')
+                        || (metSalesOrderTypeId != '' && salesTable.METSalesOrderType == metSalesOrderTypeId))  
+                exists join salesOrderTypes
+                    where salesOrderTypes.SalesOrderTypeID == salesTable.METSalesOrderType
+                notexists join mcrHoldCodeTrans
+                    where mcrHoldCodeTrans.InventRefId == salesTable.SalesId
+                        && mcrHoldCodeTrans.mcrCleared   == NoYes::Yes
+        {
+            noOfItemIds++;
+        }        
+
+        bundleSize      =   real2int(roundUp((noOfItemIds / totalTasks), 1.0));
+
+        SysOperationServiceController salesOrderAutoConfirmController = new SysOperationServiceController(
+                                                                classStr(METSalesOrderAutoReserveService),
+                                                                methodStr(METSalesOrderAutoReserveService, salesOrderAutoConfirmSubTask));
+
+        salesOrderAutoConfirmController.parmDialogCaption("@MET:AutomaticSalesConfirmationFinalTask");
+        METSalesOrderAutoReserveContract salesOrderAutoConfirmContract = salesOrderAutoConfirmController.getDataContractObject() as METSalesOrderAutoReserveContract;
+        salesOrderAutoConfirmContract.parmBatchRunGUID(batchRunGUID);
+
+        batchHeader.addRuntimeTask(salesOrderAutoConfirmController, this.getCurrentBatchTask().RecId);
+
+        while select ItemId from salesLine group by ItemId
+            where salesLine.SalesStatus == SalesStatus::Backorder
+                && salesLine.QtyOrdered > 0
+            exists join inventTransOrigin
+                where inventTransOrigin.InventTransId     == salesLine.InventTransId
+                    && inventTransOrigin.ReferenceCategory == InventTransType::Sales
+                exists join inventTrans
+                    where  inventTransOrigin.RecId == inventTrans.InventTransOrigin
+                        && inventTrans.StatusReceipt == StatusReceipt::None
+                        &&  inventTrans.StatusIssue   == StatusIssue::OnOrder
+            exists join salesTable
+                where salesTable.SalesId == salesLine.SalesId
+                    && ((metSalesOrderTypeId == '')
+                        || (metSalesOrderTypeId != '' && salesTable.METSalesOrderType == metSalesOrderTypeId))
+                exists join salesOrderTypes
+                    where salesOrderTypes.SalesOrderTypeID == salesTable.METSalesOrderType
+                notexists join mcrHoldCodeTrans
+                    where mcrHoldCodeTrans.InventRefId == salesTable.SalesId
+                        && mcrHoldCodeTrans.mcrCleared   == NoYes::Yes
+        {
+            i++;
+            j++;
+
+            itemIdList.addEnd(salesLine.ItemId);
+
+            if(i == bundlesize || j == noOfItemIds)
+            {
+                SysOperationServiceController salesOrderAutoReserveController = new SysOperationServiceController(
+                                                                classStr(METSalesOrderAutoReserveService),
+                                                                methodStr(METSalesOrderAutoReserveService, salesOrderAutoReserveSubTask));
+
+                salesOrderAutoReserveController.parmDialogCaption(strFmt("@MET:AutomaticSalesConfirmationSubTask", task));
+
+                METSalesOrderAutoReserveContract salesOrderAutoReserveContract = salesOrderAutoReserveController.getDataContractObject() as METSalesOrderAutoReserveContract;
+                salesOrderAutoReserveContract.parmItemIdList(itemIdList);
+                salesOrderAutoReserveContract.parmBatchRunGUID(batchRunGUID);
+
+                batchHeader.addRuntimeTask(salesOrderAutoReserveController, this.getCurrentBatchTask().RecId);
+                batchHeader.addDependency(salesOrderAutoConfirmController, salesOrderAutoReserveController, BatchDependencyStatus::FinishedOrError);
+
+                itemIdList = new List(Types::String);
+                task++;
+                i = 0;
+            }
+        }
+
+        batchHeader.save();     
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>salesOrderAutoReserveSubTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sales order auto reserve
+    /// </summary>
+    /// <param name = "_contract">Instance of the <c>METSalesOrderAutoReserveContract</c> class</param>
+    public void salesOrderAutoReserveSubTask(METSalesOrderAutoReserveContract _contract)
+    {
+        SalesTable                      salesTable;
+        SalesLine                       salesLine;
+        MCRHoldCodeTrans                mcrHoldCodeTrans;
+        InventTrans                     inventTrans;
+        InventTransOrigin               inventTransOrigin;        
+        METSalesOrderTypes              salesOrderTypes;
+        METSalesPurchLineShipDateTmp    salesLineShipDateTmp;
+        SalesParameters                 salesParameters = SalesParameters::find();
+        SalesId                         itemId;
+        ListEnumerator                  itemIdListEnumerator;
+        date                            currentDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        
+        metSalesOrderTypeId         = _contract.parmMetSalesOrderTypeId();
+        metReserveDaysPriorShipDate = _contract.parmMETReserveDaysPriorShipDate();
+        
+        itemIdListEnumerator        = _contract.parmItemIdList().getEnumerator();
+
+        while (itemIdListEnumerator.moveNext())
+        {
+            itemId = itemIdListEnumerator.current();
+
+            ttsbegin;
+
+            if (salesParameters.METAutoReserveDateSequence == METAutoReserveDateSequence::RequestedShipDate)
+            {
+                insert_recordset salesLineShipDateTmp (RefRecId, ShippingDate)
+                select RecId, ShippingDateConfirmed from salesLine
+                    where salesLine.SalesStatus == SalesStatus::Backorder
+                        && salesLine.QtyOrdered > 0
+                        && salesLine.ShippingDateConfirmed != dateNull()
+                        && salesLine.ItemId == itemId
+                    exists join salesTable
+                        where salesTable.SalesId == salesLine.SalesId
+                            && ((metSalesOrderTypeId == '')
+                                || (metSalesOrderTypeId != '' && salesTable.METSalesOrderType == metSalesOrderTypeId))
+                        exists join salesOrderTypes
+                            where salesOrderTypes.SalesOrderTypeID == salesTable.METSalesOrderType
+                        notexists join mcrHoldCodeTrans
+                            where mcrHoldCodeTrans.InventRefId == salesTable.SalesId
+                                && mcrHoldCodeTrans.mcrCleared   == NoYes::Yes;
+
+                insert_recordset salesLineShipDateTmp (RefRecId, ShippingDate)
+                select RecId, ShippingDateRequested from salesLine
+                    where salesLine.SalesStatus == SalesStatus::Backorder
+                        && salesLine.QtyOrdered > 0
+                        && salesLine.ShippingDateConfirmed == dateNull()
+                        && salesLine.ItemId == itemId
+                    exists join salesTable
+                        where salesTable.SalesId == salesLine.SalesId
+                            && ((metSalesOrderTypeId == '')
+                                || (metSalesOrderTypeId != '' && salesTable.METSalesOrderType == metSalesOrderTypeId))
+                        exists join salesOrderTypes
+                            where salesOrderTypes.SalesOrderTypeID == salesTable.METSalesOrderType
+                        notexists join mcrHoldCodeTrans
+                            where mcrHoldCodeTrans.InventRefId == salesTable.SalesId
+                                && mcrHoldCodeTrans.mcrCleared   == NoYes::Yes;
+        
+                while select salesLine order by salesOrderTypes.AutoReservePriority, salesLineShipDateTmp.ShippingDate
+                    where salesLine.SalesStatus == SalesStatus::Backorder
+                        && salesLine.QtyOrdered > 0
+                        && salesLine.ItemId == itemId
+                    join salesLineShipDateTmp
+                        where salesLineShipDateTmp.RefRecId == salesLine.RecId
+                    && ((salesLine.Reservation != ItemReservation::None)
+                       || ((salesLine.Reservation == ItemReservation::None) 
+                            && (salesLineShipDateTmp.ShippingDate + salesParameters.METReserveDaysPriorShipDate ) >= currentDate))
+                    join RecId from inventTransOrigin
+                            where inventTransOrigin.InventTransId     == salesLine.InventTransId
+                                && inventTransOrigin.ReferenceCategory == InventTransType::Sales
+                        join inventTrans
+                            where  inventTransOrigin.RecId == inventTrans.InventTransOrigin
+                                && inventTrans.StatusReceipt == StatusReceipt::None
+                                &&  inventTrans.StatusIssue   == StatusIssue::OnOrder
+                    exists join salesTable
+                        where salesTable.SalesId == salesLine.SalesId
+                            && ((metSalesOrderTypeId == '')
+                                || (metSalesOrderTypeId != '' && salesTable.METSalesOrderType == metSalesOrderTypeId))
+                        exists join salesOrderTypes
+                            where salesOrderTypes.SalesOrderTypeID == salesTable.METSalesOrderType
+                        notexists join mcrHoldCodeTrans
+                            where mcrHoldCodeTrans.InventRefId == salesTable.SalesId
+                                && mcrHoldCodeTrans.mcrCleared   == NoYes::Yes
+                {
+                    this.reserve(salesLine, inventTrans, _contract.parmBatchRunGUID());                   
+                }
+            }
+
+            else if (salesParameters.METAutoReserveDateSequence == METAutoReserveDateSequence::OrderDate)
+            {
+                while select salesLine order by salesOrderTypes.AutoReservePriority, CreatedDateTime
+                    where salesLine.SalesStatus == SalesStatus::Backorder
+                        && salesLine.QtyOrdered > 0
+                        && salesLine.ItemId == itemId
+                    join RecId from inventTransOrigin
+                            where inventTransOrigin.InventTransId     == salesLine.InventTransId
+                                && inventTransOrigin.ReferenceCategory == InventTransType::Sales
+                        join inventTrans
+                            where  inventTransOrigin.RecId == inventTrans.InventTransOrigin
+                                && inventTrans.StatusReceipt == StatusReceipt::None
+                                &&  inventTrans.StatusIssue   == StatusIssue::OnOrder
+                    exists join salesTable
+                        where salesTable.SalesId == salesLine.SalesId
+                            && ((metSalesOrderTypeId == '')
+                                || (metSalesOrderTypeId != '' && salesTable.METSalesOrderType == metSalesOrderTypeId))
+                        exists join salesOrderTypes
+                            where salesOrderTypes.SalesOrderTypeID == salesTable.METSalesOrderType
+                        notexists join mcrHoldCodeTrans
+                            where mcrHoldCodeTrans.InventRefId == salesTable.SalesId
+                                && mcrHoldCodeTrans.mcrCleared   == NoYes::Yes
+                {
+                    this.reserve(salesLine, inventTrans, _contract.parmBatchRunGUID());
+                }
+
+            }    
+            
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>salesOrderAutoConfirmSubTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sales order auto confirm
+    /// </summary>
+    /// <param name = "_contract">Instance of the <c>METSalesOrderAutoReserveContract</c> class</param>
+    /// 
+    public void salesOrderAutoConfirmSubTask(METSalesOrderAutoReserveContract _contract)
+    {
+        SalesTable                      salesTable;        
+        METSalesOrderTypes              salesOrderTypes;
+        METSalesIdTmp                   metSalesIdTmp;        
+        METTaskGuid                     batchRunGUID    = _contract.parmBatchRunGUID();
+        SalesFormLetter_Confirm         confirm;
+
+        while select metSalesIdTmp group by SalesId
+            where metSalesIdTmp.BatchRunGuid == batchRunGUID
+            join salesTable
+                where metSalesIdTmp.SalesId == salesTable.SalesId
+                join ConfirmSalesOrder from salesOrderTypes
+                    where salesOrderTypes.SalesOrderTypeID == salesTable.METSalesOrderType            
+        {
+            METSalesIdTmp                   metSalesIdTmpComplete;
+
+            select firstonly metSalesIdTmpComplete
+                where metSalesIdTmpComplete.SalesId == metSalesIdTmp.SalesId
+                    && metSalesIdTmpComplete.BatchRunGuid == batchRunGUID
+                    && metSalesIdTmpComplete.IsSubstituted == NoYes::Yes;
+            
+            if (metSalesIdTmpComplete.RecId)
+            {
+                RetailSalesTable retailSales = salesTable.retailSalesTable();
+                RetailSalesOrderCalculator::setPricesDiscountsAndDateTypeOnOrderOnServer(salesTable.SalesId, retailSales.TotalManualDiscountPercentage, SalesPriceDateType::Today);
+                
+                MCREndOrder::orderRecapForExternalGiftCard(salesTable);
+                if (salesTable.useUnifiedPricingEngine())
+                {
+                    salesTable.lockPriceForRetailOrder();
+                }
+
+                GUPParameters gupParameters = GUPParameters::find();
+                if (gupParameters.AutoConfirmSalesOrderWithComplete ||
+                    salesOrderTypes.ConfirmSalesOrder == METConfirmSalesOrder::OrderReserved)
+                {
+                    confirm = SalesFormLetter::construct(DocumentStatus::Confirmation);
+
+                    confirm.update( salesTable,
+                                    DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()),
+                                    SalesUpdate::All);
+                }
+            }
+            else if (salesOrderTypes.ConfirmSalesOrder == METConfirmSalesOrder::OrderReserved)
+            {   
+                confirm = SalesFormLetter::construct(DocumentStatus::Confirmation);
+            
+                confirm.update( salesTable, 
+                                DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), 
+                                SalesUpdate::All);
+            }
+        }
+
+        delete_from metSalesIdTmp
+            where metSalesIdTmp.BatchRunGuid == batchRunGUID;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reserveSalesQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reserve sales line quantity
+    /// </summary>
+    /// <param name = "_inventTrans">InventTrans</param>   
+    /// <returns>Success/Failure</returns>
+    public boolean reserveSalesQty(InventTrans _inventTrans)
+    {
+        InventMovement                  inventMovement;
+        InventUpd_Reservation           inventUpd_Reservation;
+        boolean                         ret = false;
+
+        if (_inventTrans)
+        {
+            try
+            {
+                Inventmovement        = _inventTrans.inventmovement(true);
+                inventUpd_Reservation = InventUpd_Reservation::newInventDim(inventmovement, _inventTrans.inventDim(), _inventTrans.Qty, false);
+                inventUpd_Reservation.updatenow();
+                ret = inventUpd_Reservation.parmReservationFailed() ? false : true;
+            }
+            catch
+            {
+                ret = false;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reserve</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reserves sales quantity
+    /// </summary>
+    /// <param name = "_salesLine">Sales line</param> 
+    /// <param name = "_inventTrans">InventTrans</param>
+    /// <param name = "_batchRunGUID">BatchRunGUID</param>
+    
+    public void reserve(SalesLine _salesLine, InventTrans   _inventTrans, METTaskGuid     _batchRunGUID)
+    {
+        SalesLine       salesLineSubs       = SalesLine::findInventTransId(_salesLine.InventTransId);
+        METSalesLine    metSalesLineSubs    = METSalesLine::find(salesLineSubs.RecId);
+        boolean         ret = false;
+        METSalesIdTmp   metSalesIdTmp;        
+
+        METSalesOrderAutoReserve    metSalesOrderAutoReserve    = new METSalesOrderAutoReserve();
+
+        SalesLine   newSalesLine    = metSalesOrderAutoReserve.applySubstitution(salesLineSubs, metSalesLineSubs, salesLineSubs.inventDim());
+
+        if (newSalesLine)
+        {
+            InventTrans             inventTransNew;
+            InventTransOrigin       inventTransOriginNew;
+
+            select firstonly metSalesIdTmp
+                where metSalesIdTmp.SalesId == _salesLine.SalesId
+                    && metSalesIdTmp.BatchRunGuid == _batchRunGUID
+                    && metSalesIdTmp.IsSubstituted == NoYes::Yes;
+
+            if (!metSalesIdTmp)
+            {
+                metSalesIdTmp.SalesId       = _salesLine.SalesId;
+                metSalesIdTmp.BatchRunGuid  = _batchRunGUID;
+                metSalesIdTmp.IsSubstituted = NoYes::Yes;
+                metSalesIdTmp.insert();
+            }
+
+            select inventTransNew
+                where  inventTransNew.StatusReceipt == StatusReceipt::None
+                    &&  inventTransNew.StatusIssue   == StatusIssue::OnOrder
+                exists join inventTransOriginNew
+                    where inventTransOriginNew.RecId == inventTransNew.InventTransOrigin
+                        && inventTransOriginNew.InventTransId     == newSalesLine.InventTransId
+                        && inventTransOriginNew.ReferenceCategory == InventTransType::Sales;
+
+            if (inventTransNew)
+            {
+                ret = this.reserveSalesQty(inventTransNew);
+            }
+        }
+        else
+        {
+            ret = this.reserveSalesQty(_inventTrans);
+        }
+
+        if (ret)
+        {
+            select firstonly metSalesIdTmp
+                where metSalesIdTmp.SalesId == _salesLine.SalesId
+                    && metSalesIdTmp.BatchRunGuid == _batchRunGUID;
+
+            if (!metSalesIdTmp)
+            {
+                metSalesIdTmp.SalesId       = _salesLine.SalesId;
+                metSalesIdTmp.BatchRunGuid  = _batchRunGUID;
+                metSalesIdTmp.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

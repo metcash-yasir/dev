@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesOrderHoldClearService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_28395_Stock reservation - 21/07/2022
+/// Service class <c>METSalesOrderHoldClearService</c> which is executing the logic for clearing sales order hold
+/// </summary>
+
+class METSalesOrderHoldClearService extends SysOperationServiceBase
+{
+    METSalesOrderTypeID     metSalesOrderTypeId;   
+ 
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sales order clear hold logic
+    /// </summary>
+    /// <param name = "_contract">Instance of the <c>METSalesOrderHoldClearContract</c> class</param>
+    public void processOperation(METSalesOrderHoldClearContract _contract)
+    {
+        int                     bundlesize;
+        int                     noOfSalesOrders;
+        int                     totalTasks;
+        int                     i, j;
+        int                     task;
+        List                    salesIdList      = new List(Types::String);
+        Date                    dateToday = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        SalesTable              salesTable;
+        METSalesTable           metSalesTable;
+        MCRHoldCodeTrans        mcrHoldCodeTrans;
+        
+        BatchHeader             batchHeader = this.getCurrentBatchHeader();
+
+        if (batchHeader == null)
+        {
+            batchHeader = batchHeader::construct();
+        }               
+        batchHeader.parmCaption("@MET:ClearOrderHold");
+
+        totalTasks      =   _contract.parmTasks();
+
+        totalTasks  = totalTasks <= 0 ? 1 : totalTasks;
+        
+        task            = 1;
+        j               = 0; 
+        i               = 0;        
+
+        metSalesOrderTypeId = _contract.parmMetSalesOrderTypeId();
+
+        select count(RecId) from salesTable
+            where salesTable.SalesStatus == SalesStatus::Backorder &&
+                  ((metSalesOrderTypeId == '') ||
+                  (metSalesOrderTypeId != '' && salesTable.METSalesOrderType == metSalesOrderTypeId))
+            exists join mcrHoldCodeTrans
+                where mcrHoldCodeTrans.InventRefId == salesTable.SalesId &&
+                      mcrHoldCodeTrans.mcrCleared   == NoYes::No
+            exists join metSalesTable
+                where metSalesTable.SalesTable == salesTable.RecId &&
+                      metSalesTable.ReleaseDate <= dateToday;
+        
+        noOfSalesOrders     = salesTable.RecId;
+
+        bundleSize      =   real2int(roundUp((noOfSalesOrders / totalTasks), 1.0));
+
+        while select SalesId from salesTable
+            where salesTable.SalesStatus == SalesStatus::Backorder &&
+                  ((metSalesOrderTypeId == '') ||
+                  (metSalesOrderTypeId != '' && salesTable.METSalesOrderType == metSalesOrderTypeId))
+            exists join mcrHoldCodeTrans
+                where mcrHoldCodeTrans.InventRefId == salesTable.SalesId &&
+                      mcrHoldCodeTrans.mcrCleared   == NoYes::No
+            exists join metSalesTable
+                where metSalesTable.SalesTable == salesTable.RecId &&
+                      metSalesTable.ReleaseDate <= dateToday
+        {
+            i++;
+            j++;
+
+            salesIdList.addEnd(salesTable.SalesId);
+
+            if(i == bundlesize || j == noOfSalesOrders)
+            {
+                SysOperationServiceController salesOrderHoldClearController = new SysOperationServiceController(
+                                                                classStr(METSalesOrderHoldClearService),
+                                                                methodStr(METSalesOrderHoldClearService, salesOrderHoldClearSubtask));
+
+                salesOrderHoldClearController.parmDialogCaption(strFmt("@MET:ClearOrderHoldBatchSubTask", task));
+
+                METSalesOrderHoldClearContract salesOrderHoldClearcontract = salesOrderHoldClearController.getDataContractObject() as METSalesOrderHoldClearContract;
+                salesOrderHoldClearcontract.parmSalesIdList(salesIdList);
+
+                batchHeader.addRuntimeTask(salesOrderHoldClearController, this.getCurrentBatchTask().RecId);
+                salesIdList = new List(Types::String);
+                task++;
+                i = 0;
+            }
+        }
+
+        batchHeader.save();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>salesOrderHoldClearSubtask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sales order clear hold logic
+    /// </summary>
+    /// <param name = "_contract">Instance of the <c>METSalesOrderHoldClearContract</c> class</param>
+    public void salesOrderHoldClearSubtask(METSalesOrderHoldClearContract _contract)
+    {
+        SalesTable              salesTable;
+        SalesLine               salesLine;
+        MCRHoldCodeTrans        mcrHoldCodeTrans;
+        InventTrans             inventTrans;
+        InventTransOrigin       inventTransOrigin;
+        InventMovement          inventMovement;
+        InventUpd_Reservation   inventUpd_Reservation;
+        SalesFormLetter         salesFormLetter;
+        METSalesOrderTypes      salesorderType;
+        SalesId                 salesId;
+        ListEnumerator          salesIdListEnumerator;        
+
+        metSalesOrderTypeId         = _contract.parmMetSalesOrderTypeId();
+
+        salesIdListEnumerator       = _contract.parmSalesIdList().getEnumerator();
+
+        while (salesIdListEnumerator.moveNext())
+        {
+            salesId = salesIdListEnumerator.current();
+            
+            ttsbegin;
+
+            while select forupdate salesTable
+                where salesTable.SalesId == salesId
+                join forupdate mcrHoldCodeTrans 
+                    where mcrHoldCodeTrans.InventRefId == salesTable.SalesId &&
+                          mcrHoldCodeTrans.mcrCleared   == NoYes::No     
+                join OrderReserve, ConfirmSalesOrder from salesorderType
+                    where salesorderType.SalesOrderTypeID == salesTable.METSalesOrderType
+            {
+                mcrHoldCodeTrans.mcrCleared   = NoYes::Yes;
+                mcrHoldCodeTrans.update();
+
+                salesTable.Reservation  = salesorderType.OrderReserve ? ItemReservation::None : SalesParameters::find().Reservation;
+                salesTable.update();
+
+                if (salesorderType.OrderReserve)
+                {               
+                    while select salesLine
+                        where salesLine.SalesId == salesTable.SalesId &&
+                              salesLine.SalesStatus == SalesStatus::Backorder
+                        join RecId from inventTransOrigin
+                                where inventTransOrigin.InventTransId     == salesLine.InventTransId
+                                   && inventTransOrigin.ReferenceCategory == InventTransType::Sales
+                            join inventTrans
+                                where  inventTransOrigin.RecId == inventTrans.InventTransOrigin
+                                    && inventTrans.StatusReceipt == StatusReceipt::None
+                                    &&  inventTrans.StatusIssue   == StatusIssue::OnOrder                                
+                    {                
+                        Inventmovement        = inventTrans.inventmovement(true);
+                        inventUpd_Reservation = InventUpd_Reservation::newInventDim(inventmovement, inventTrans.inventDim(), inventTrans.Qty, false);
+                        inventUpd_Reservation.updatenow();
+                    }
+                }       
+
+                if (salesorderType.ConfirmSalesOrder == METConfirmSalesOrder::OrderReserved)
+                {   
+                    select firstonly RecId from inventTrans
+                        where  inventTrans.StatusReceipt == StatusReceipt::None
+                            && inventTrans.Qty < 0
+                            && (inventTrans.StatusIssue   == StatusIssue::ReservOrdered ||
+                                inventTrans.StatusIssue   == StatusIssue::ReservPhysical)
+                        exists join inventTransOrigin
+                            where inventTransOrigin.RecId == inventTrans.InventTransOrigin                               
+                            && inventTransOrigin.ReferenceCategory == InventTransType::Sales
+                            && inventTransOrigin.ReferenceId == salesTable.SalesId;
+
+                    if (inventTrans)
+                    {
+                        salesFormLetter = SalesFormLetter::construct(DocumentStatus::Confirmation);
+                        salesFormLetter.update(salesTable, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), SalesUpdate::All);
+                    }
+                }            
+            }
+
+            ttscommit;
+        }        
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

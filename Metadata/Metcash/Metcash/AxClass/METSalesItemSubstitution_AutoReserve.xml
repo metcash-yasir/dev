@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesItemSubstitution_AutoReserve</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ-28395 Stock reservation
+/// Responsible for dealing with item substitution logic for auto reservation.
+/// </summary>
+class METSalesItemSubstitution_AutoReserve extends METSalesItemSubstitution
+{
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructor
+    /// </summary>
+    /// <param name = "_salesLine">_salesLine</param>
+    /// <param name = "_metSalesLine">_metSalesLine</param>
+    /// <param name = "_inventDim">_inventDim</param>
+    protected void new(
+        SalesLine       _salesLine,
+        METSalesLine    _metSalesLine,
+        InventDim       _inventDim)
+    {
+        super(_salesLine, _metSalesLine, _inventDim);
+
+        verboseLogging  = false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ConstructAutoReserve</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct and init instance for auto reserve batch.
+    /// </summary>
+    /// <param name = "_salesLine">_salesLine</param>
+    /// <param name = "_metSalesLine">_metSalesLine</param>
+    /// <param name = "_inventDim">_inventDim</param>
+    /// <returns>Instance</returns>
+    public static METSalesItemSubstitution_AutoReserve ConstructAutoReserve(
+        SalesLine       _salesLine,
+        METSalesLine    _metSalesLine,
+        InventDim       _inventDim)
+    {
+        METSalesItemSubstitution_AutoReserve    metSalesItemSubstitution_AutoReserve = new METSalesItemSubstitution_AutoReserve(_salesLine,
+                                                                                                                                _metSalesLine,
+                                                                                                                                _inventDim);
+        
+        return metSalesItemSubstitution_AutoReserve;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>searchSubstitionItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Searches substitution item
+    /// </summary>
+    /// <returns>METSalesItemSubstitute record</returns>
+    public METSalesItemSubstitute searchSubstitionItem()
+    {
+        METSalesItemSubstitute              itemSub;
+        METSalesItemSubstitute              matchingItemSub;
+        date                                today = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+        boolean                             continueSearch      = true;
+        ItemId                              currentSearchItemID = salesLine.ItemId;
+        container                           itemsSearched;
+        int                                 searchDepth         = 0;
+        int                                 maxSearchDepth      = min(CustParameters::find().METSalesSubstituteMaxLevels, #MAXSUBLEVELS);
+
+        inventDim.InventSiteId = salesTable.InventSiteId;
+
+        // *** tbd, may define a separate "substitution group". For now
+        // we"re using the customer group.
+        substitutionGroup = salesTable.custTable_CustAccount().CustGroup;  
+        
+        if(!maxSearchDepth)
+        {
+            maxSearchDepth = #MAXSUBLEVELS;
+        }
+
+        while(continueSearch && (searchDepth < maxSearchDepth))
+        {
+            searchDepth++;
+
+            if(conFind(itemsSearched, currentSearchItemID))
+            {
+                break;
+            }
+
+            itemsSearched += currentSearchItemID;                
+            
+                    
+            select firstonly validtimestate(today) itemSub
+                order by AccountCode asc
+                where   itemSub.ItemId              == currentSearchItemID
+                &&      (itemSub.InventSiteId == salesTable.InventSiteId || itemSub.InventSiteId == METConstants::emptyString)
+                &&      itemSub.SubstitutionCode    == METSalesItemSubstitutionCode::OutOfStock
+                &&  (   // table/group/all match
+                    (itemSub.AccountCode == METSalesItemSubstitutionAccountCodeType::Table &&
+                        itemSub.AccountRelation == salesTable.CustAccount)
+                ||  (itemSub.AccountCode == METSalesItemSubstitutionAccountCodeType::GroupId &&
+                        itemSub.AccountRelation == substitutionGroup)
+                ||  (itemSub.AccountCode == METSalesItemSubstitutionAccountCodeType::All &&
+                        itemSub.AccountRelation == METConstants::emptyString)
+                );
+
+            if(itemSub)
+            {
+                Qty         qtyOnHand                   = this.queryOnHandQty(itemSub.SubstituteItemId, inventDim);
+                boolean     itemHasSufficientQtyOnHand  = qtyOnHand >= salesLine.QtyOrdered;
+
+                if(itemHasSufficientQtyOnHand)
+                {
+                    // Out of stock entry found, but item has enough stock.
+                    continueSearch = false;
+                }
+                else
+                {
+                    // Out of stock entry found, and search item is out of stock. Continue search.
+                    currentSearchItemID = itemSub.SubstituteItemId;
+                    matchingItemSub     = itemSub;
+                }                
+            }  
+        }
+        
+        return itemSub;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Substitutes item
+    /// </summary>
+    /// /// <param name = "_matchingItemSub"> Matching Item Substitute</param>
+    /// <returns>SalesLine</returns>
+    public SalesLine createSalesLine(METSalesItemSubstitute _matchingItemSub)
+    {
+        ttsbegin;
+
+        if(_matchingItemSub)
+        {
+            boolean replaceItem         = true;
+            boolean orderGuideValid     = true;
+            ItemId  replacementItemID   = _matchingItemSub.SubstituteItemId;
+
+            if(replacementItemID != salesLine.ItemId &&
+               !METSalesOrderGuideExecution::isLineOrderable(salesLine, replacementItemID))
+            {               
+                orderGuideValid         = false;
+                replaceItem             = false;
+                if(_matchingItemSub)
+                {
+                    metSalesLine.ReasonId   = _matchingItemSub.OrderGuideReasonId;
+                }
+            }
+           
+            if(orderGuideValid)
+            {
+                if(!metSalesLine.SubstituteOriginalItemID)
+                {
+                    metSalesLine.SubstituteOriginalItemID       = salesLine.ItemId;
+                }
+                metSalesLine.SubstituteReplacementItemID    = _matchingItemSub.SubstituteItemId;
+                metSalesLine.SubstituteParentItemID         = METConstants::emptyString;
+                metSalesLine.SubstitutionType               = METSalesItemSubstitutionType::SubstitutionCode;
+                metSalesLine.SubstitutionCode               = _matchingItemSub.SubstitutionCode;
+                metSalesLine.SubstitutionSetupRefRecID      = _matchingItemSub.RecId;
+                rounding                                    = _matchingItemSub.Rounding;                
+            }
+
+            if(replaceItem && salesLine.RecId && metSalesLine.SubstituteReplacementItemID != salesLine.ItemId)
+            {
+                this.copyToNewLine(metSalesLine.SubstituteReplacementItemID);
+                newLineCreated = true;
+            }
+
+            if(!newLineCreated && salesLine.RecId)
+            {
+                salesLine.metPackMETSalesLine(metSalesLine);
+                salesLine.update();
+            }                        
+        }
+        
+        ttscommit;
+
+        return salesLine;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
