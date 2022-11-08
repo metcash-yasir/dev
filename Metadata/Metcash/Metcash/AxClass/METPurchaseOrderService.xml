@@ -11,7 +11,7 @@ class METPurchaseOrderService extends SysOperationServiceBase
     #OCCRetryCount
 
     METProcessingStatus                         processingStatus;
-    Description255                              processingMessage;
+    ErrorMessage                                processingMessage;
     PurchTable                                  purchTable;
     METPurchTable                               metPurchTable;
 
@@ -32,8 +32,6 @@ class METPurchaseOrderService extends SysOperationServiceBase
     METVersioningPurchaseOrder                  versioningPurchaseOrder;
 
 
-
-
 }
 ]]></Declaration>
 		<Methods>
@@ -51,8 +49,8 @@ class METPurchaseOrderService extends SysOperationServiceBase
     /// </returns>
     public METPurchaseOrderServiceResponseContract changePurchaseOrder(METPurchaseOrderServiceContract _purchaseOrderContract)
     {
-        METProcessingStatus result;
-        Description255      message = "@MET:NoRecordsUpdated"; //default message
+        METProcessingStatus     result;
+        ErrorMessage            message;
 
         [result, message] = this.updatePurchaseOrder(_purchaseOrderContract);
         
@@ -93,7 +91,7 @@ class METPurchaseOrderService extends SysOperationServiceBase
                     metPurchTable = purchTable.metCreateMETPurchTable();
                 }
 
-                if (this.type == METPurchActions::Cancel)
+                if (this.type == enum2int(METPurchActions::Cancel))
                 {
                     //Requestchange is handled inside PurchCancel
                     this.cancelPurchaseOrder();
@@ -101,17 +99,17 @@ class METPurchaseOrderService extends SysOperationServiceBase
                 else
                 {
                     ttsbegin;
-                    this.requestChange();
 
                     this.updatePurchaseOrderHeader();
 
-                    this.updatePurchaseOrderLines();
+                    this.processPurchaseOrderLines();
 
                     this.confirmChanges();
 
-                    this.checkUpdateProcessingStatus();
                     ttscommit;
                 }
+
+                this.checkUpdateProcessingStatus();
                
             }
 
@@ -154,7 +152,7 @@ class METPurchaseOrderService extends SysOperationServiceBase
             catch
             {
                 purchTable.reread();
-                if (this.type == METPurchActions::Cancel
+                if (this.type == enum2int(METPurchActions::Cancel)
                     && !purchTable.isCanceled())
                 {
                     processingMessage = "@MET:PurchaseOrderNotCancelled";
@@ -169,6 +167,103 @@ class METPurchaseOrderService extends SysOperationServiceBase
         }
 
         return [processingStatus, processingMessage];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processPurchaseOrderLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update purchase order line details
+    /// </summary>
+    private void processPurchaseOrderLines()
+    {
+        if (!this.canUpdatePOLines() || processingMessage)
+        {
+            return;
+        }
+
+        listEnum     =    linesContractList.getEnumerator();
+
+        this.requestChange();
+
+        while (listEnum.moveNext())
+        {
+            linesContract   =   listEnum.current();
+            select firstonly1 forupdate purchLine
+                where purchLine.PurchId == purchaseOrderNumber
+                && purchLine.LineNumber == linesContract.parmLineNumber();
+            if(purchLine && purchLine.validateWrite())
+            {
+                ttsbegin;
+                boolean isCWItem = PdsGlobal::pdsIsCWItem(purchLine.ItemId);
+                if (isCWItem && linesContract.parmCWQuantity()!= 0)
+                {
+                    purchLine.PdsCWQty      = linesContract.parmCWQuantity();
+                    purchLine.pdsCWQtyConversion();
+                    this.updateQuantities(purchLine);
+                    purchLine.update();
+                }
+                else if(!isCWItem && linesContract.parmPurchaseQty() != 0)
+                {
+                    purchLine.PurchQty    = linesContract.parmPurchaseQty();
+                    this.updateQuantities(purchLine);
+                    purchLine.update();
+                }
+                else if (linesContract.parmCWQuantity() == 0
+                    || linesContract.parmPurchaseQty() == 0)
+                {
+                    this.cancelLine(purchLine);
+                }
+                ttscommit;
+            }
+        }
+ 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateQuantities</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Upate purchline quantities
+    /// </summary>
+    /// <param name = "_purchLine">purchline buffer</param>
+    protected void updateQuantities(PurchLine _purchLine)
+    {
+        if (_purchLine.PurchQty != _purchLine.orig().PurchQty)
+        {
+            InventMovement::bufferSetTransQtyUnit(_purchLine);
+        }
+
+        PurchTableForm_DeliverySchedule     purchTableForm = new PurchTableForm_DeliverySchedule(_purchLine);
+        PurchLineWritePreSuperInputContract inputContractPre = PurchLineWritePreSuperInputContract::construct();
+
+        inputContractPre.parmPurchTable(PurchTable::find(_purchLine.PurchId));
+        inputContractPre.parmPurchLine(_purchLine);
+        purchTableForm.purchLine_WritePreSuper(inputContractPre);
+
+        if (_purchLine.LineDeliveryType == LineDeliveryType::OrderLineWithMultipleDeliveries)
+        {
+            purchTableForm.deliveryLinesSync(purchLine, false);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancel purchase line
+    /// </summary>
+    /// <param name = "_purchLine">purchline buffer</param>
+    protected void cancelLine(PurchLine     _purchLine)
+    {
+        PurchCancel         purchCancel = purchCancel::METconstruct();  
+        purchCancel.metCancelPurchLine(_purchLine);
     }
 
 ]]></Source>
@@ -191,13 +286,13 @@ class METPurchaseOrderService extends SysOperationServiceBase
             versioningPurchaseOrder.approveChangeRequest();
         }
         purchTable.reread();
-        if (this.type == METPurchActions::Confirm
+        if (this.type == enum2int(METPurchActions::Confirm)
             &&  purchTable.DocumentState == VersioningDocumentState::Approved
             && purchTable.ChangeRequestRequired)
         {
             versioningPurchaseOrder.confirm();
         }
-        else if(this.type == METPurchActions::Confirmation
+        else if(this.type == enum2int(METPurchActions::Confirmation)
             && purchTable.DocumentState == VersioningDocumentState::Approved)
         {
             PurchFormLetter purchFormLetter = PurchFormLetter::construct(DocumentStatus::PurchaseOrder);
@@ -233,12 +328,12 @@ class METPurchaseOrderService extends SysOperationServiceBase
             return;
         }
 
-        if (this.type == METPurchActions::Cancel
+        if (this.type == enum2int(METPurchActions::Cancel)
                 && !purchTable.isCanceled())
         {
             processingMessage = "@MET:PurchaseOrderNotCancelled";
         }
-        else if(this.type != METPurchActions::Cancel
+        else if(this.type != enum2int(METPurchActions::Cancel)
                 && !purchTable.isDocumentConfirmed())
         {
             processingMessage = "@MET:PurchaseOrderNotUpdated";
@@ -312,56 +407,6 @@ class METPurchaseOrderService extends SysOperationServiceBase
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>updatePurchaseOrderLines</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Update purchase order line details
-    /// </summary>
-    private void updatePurchaseOrderLines()
-    {
-        if (!this.canUpdatePOLines())
-        {
-            return;
-        }
-
-        listEnum     =    linesContractList.getEnumerator();
-
-        while (listEnum.moveNext())
-        {
-            linesContract   =   listEnum.current();
-            select firstonly1 forupdate purchLine
-                where purchLine.PurchId == purchaseOrderNumber
-                && purchLine.LineNumber == linesContract.parmLineNumber();
-            if(purchLine)
-            {
-                boolean isCWItem = PdsGlobal::pdsIsCWItem(purchLine.ItemId);
-                if (isCWItem && linesContract.parmCWQuantity()!= 0)
-                {
-                    purchLine.PdsCWQty      = linesContract.parmCWQuantity();
-                    purchLine.pdsCWQtyConversion();
-                    PurchLine::modifyPurchQty(purchLine, purchLine.inventDim());
-                }
-                else if(!isCWItem && linesContract.parmPurchaseQty() != 0)
-                {
-                    purchLine.PurchQty    = linesContract.parmPurchaseQty();
-                    PurchLine::modifyPurchQty(purchLine, purchLine.inventDim());
-                }
-                else if (linesContract.parmCWQuantity() == 0 
-                    || linesContract.parmPurchaseQty() == 0)
-                {
-                    purchLine.RemainPurchPhysical         = 0;
-                    purchLine.RemainInventPhysical        = 0;
-                    purchLine.PdsCWRemainInventPhysical   = 0;
-                }
-                purchLine.update();
-                
-            }
-        }
-    }
-
-]]></Source>
-			</Method>
-			<Method>
 				<Name>initParams</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -373,10 +418,10 @@ class METPurchaseOrderService extends SysOperationServiceBase
 
         processingStatus                        = METProcessingStatus::None;
         dataAreaId                              = _purchaseOrderContract.parmDataAreaId();
-        type                                    = _purchaseOrderContract.parmType();
+        type                                    = str2Enum(type, _purchaseOrderContract.parmType());
         purchaseOrderNumber                     = _purchaseOrderContract.parmPurchId();
-        poeDIPOAMsg                             = _purchaseOrderContract.parmPOEDIPOAMsg();
-        metPOEDIFAMsg                           = _purchaseOrderContract.parmMETPOEDIFAMsg();
+        poeDIPOAMsg                             = str2Enum(poeDIPOAMsg, _purchaseOrderContract.parmPOEDIPOAMsg());
+        metPOEDIFAMsg                           = str2Enum(poeDIPOAMsg, _purchaseOrderContract.parmMETPOEDIFAMsg());
         metPOYardDAppointmentStartDateTime      = _purchaseOrderContract.parmMETPOYardDAppointmentStartDateTime();
         metPOYardDAppointmentEndDateTime        = _purchaseOrderContract.parmMETPOYardDAppointmentEndDateTime();
         linesContractList                       = _purchaseOrderContract.parmLineContract();
