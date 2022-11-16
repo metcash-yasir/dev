@@ -100,12 +100,18 @@ final class METPurchPurchaseOrderHeaderV2Entity_Extension
     public static void postTargetProcess(DMFDefinitionGroupExecution _dmfDefinitionGroupExecution)
     {
         DMFDefinitionGroupExecution locDefinitionGroupExecution;
+        DMFEntity                   dmfEntity, dmfParentEntity;
+                    
  
         while select locDefinitionGroupExecution
             where locDefinitionGroupExecution.DefinitionGroup == _dmfDefinitionGroupExecution.DefinitionGroup &&
                locDefinitionGroupExecution.ExecutionId == _dmfDefinitionGroupExecution.ExecutionId &&
-               locDefinitionGroupExecution.RecId != _dmfDefinitionGroupExecution.RecId &&
-               locDefinitionGroupExecution.Entity like METConstants::PurchaseOrderCompositeLike
+               locDefinitionGroupExecution.RecId != _dmfDefinitionGroupExecution.RecId 
+            join RecId from dmfEntity
+                where dmfEntity.EntityName == locDefinitionGroupExecution.Entity
+            join RecId from dmfParentEntity
+                where dmfParentEntity.EntityName == dmfEntity.ParentEntityName
+                && dmfParentEntity.EntityType == DMFEntityTypes::CompositEntity
         {
             if(locDefinitionGroupExecution.EntityXMLName == dataentityviewstr(PurchPurchaseOrderLineV2Entity))
             {
@@ -187,6 +193,91 @@ final class METPurchPurchaseOrderHeaderV2Entity_Extension
                                 purchId);
         
         return totalQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metProcessDataForCompositeEntity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to process composite entity logic
+    /// </summary>
+    /// <param name = "_dmfDefinitionGroupExecution">Type DefinitionGroupExecution</param>
+    public static void metProcessDataForCompositeEntity(DMFDefinitionGroupExecution _dmfDefinitionGroupExecution)
+    {
+        PurchPurchaseOrderHeaderV2Staging  metStaging;
+        VendPurchOrderJour                 vendPurchOrderJour;
+        PurchTable                         purchTable;
+        METSalesTable                      metSalesTable;
+        SalesTable                         salesTable;
+        DMFEntity                          dmfEntity, dmfParentEntity;
+
+        #OCCRetryCount
+
+        try
+        {
+                    
+            while select PurchaseOrderNumber from metStaging
+                where metStaging.DefinitionGroup    == _dmfDefinitionGroupExecution.DefinitionGroup
+                   && metStaging.ExecutionId           == _dmfDefinitionGroupExecution.ExecutionId
+                   && metStaging.TransferStatus        == DMFTransferStatus::Completed
+                notexists join RecId from vendPurchOrderJour
+                    where vendPurchOrderJour.PurchId == metStaging.PurchaseOrderNumber
+            {
+                select firstonly PurchId, DataAreaId, InterCompanyOrder, InterCompanyCompanyId, InterCompanySalesId from purchTable
+                            where purchTable.PurchId == metStaging.PurchaseOrderNumber;
+
+                if(purchTable.DocumentState == VersioningDocumentState::Draft)
+                {
+                    METPurchPurchaseOrderHeaderV2Entity::poAutoApprovalService(purchTable.DataAreaId, purchTable.PurchId);
+                }
+                if(purchTable.InterCompanyOrder)
+                {
+                    changecompany(purchTable.InterCompanyCompanyId)
+                    {
+                        select firstonly forupdate metSalesTable
+                                    join RecId from salesTable
+                                       where salesTable.RecId == metSalesTable.SalesTable
+                                          && salesTable.SalesId == purchTable.InterCompanySalesId;
+                        if(metSalesTable.RecId)
+                        {
+                            ttsbegin;
+                            metSalesTable.DespatchDay = metStaging.METDespatchDay;
+                            metSalesTable.DespatchTime = metStaging.METDespatchTime;
+                            metSalesTable.CutOffDay = metStaging.METCutOffDay;
+                            metSalesTable.CutOffTime = metStaging.METCutOffTime;
+                            metSalesTable.StagingLaneId = metStaging.METStagingLaneId;
+                            metSalesTable.Door = metStaging.METDoor;
+                            metSalesTable.doUpdate();
+                            ttscommit;
+                        }
+
+                    }
+                }
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            // retry on deadlock
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            // try to resolve update conflict
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::UpdateConflictNotRecovered;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch(Exception::Error)
+        {
+            throw Error(strFmt("@MET:POApprovalError",metStaging.PurchaseOrderNumber));
+        }
     }
 
 ]]></Source>
