@@ -1,0 +1,365 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPriceChangeTrackAutoChargeEnabled</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_24248 Pricing Data Extract
+/// Process Price Change tracking records for Auto Charges Enabled and create Price Data Feed records
+/// </summary>
+using System.ComponentModel.Composition;
+
+[Export(identifierStr(Dynamics.AX.Application.METPriceChangeTrack))]
+[ExportMetadata(enumStr(METPriceChangeType), enumLiteralStr(METPriceChangeType, AutoChargeEnabled))]
+public class METPriceChangeTrackAutoChargeEnabled extends METPriceChangeTrack
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>setInternals</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set internal variables
+    /// </summary>
+    /// <param name = "_priceChangeTracking">Price change tracking record</param>
+    public void setInternals(METPriceChangeTracking _priceChangeTracking, boolean _showValidation)
+    {
+        super(_priceChangeTracking, _showValidation);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPriceChangeType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the Price change type
+    /// </summary>
+    /// <returns>Price change type</returns>
+    public METPriceChangeType getPriceChangeType()
+    {
+        return METPriceChangeType::AutoChargeEnabled;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the Change tracking record and create a Price data feed record
+    /// </summary>
+    public void process()
+    {
+        GUPGroupAll         markupTableGroup;
+        Query               custPreviewQuery;
+        Query               productPreviewQuery;
+        GUPPricingRuleCopy  pricingRuleCopyCustHeader, pricingRuleCopy;
+        Set                 custAccountSet, inventItemSet;
+
+        priceDataFeedCount = 0;
+        priceDataFeedList = new RecordInsertList(tableNum(METPriceDataFeed));
+
+        pricingRuleCopyCustHeader.initFromPricingRule(GUPPricingRule::find(priceChangeTrackingOrig.pricingRuleHeader));
+        pricingRuleCopy.initFromPricingRule(GUPPricingRule::find(priceChangeTrackingOrig.pricingRuleLine));
+
+        markupTableGroup = MarkupAutoLine::metFindByRecId(priceChangeTrackingOrig.RefRecId).metMarkupTable().PricingGroupCodeHeader;
+        custPreviewQuery = this.buildCustQuery(pricingRuleCopyCustHeader, priceChangeTrackingOrig.InventSiteId, markupTableGroup);
+        custAccountSet = this.buildCustValues(custPreviewQuery, pricingRuleCopyCustHeader);
+            
+        productPreviewQuery = this.buildProductQueryBase(pricingRuleCopy);
+        inventItemSet = this.buildItemValues(productPreviewQuery, pricingRuleCopy);
+
+        if(custAccountSet && inventItemSet)
+        {
+            this.processMulti(custAccountSet, inventItemSet);
+        }
+        
+        if(priceDataFeedCount)
+        {
+            ttsbegin;
+            priceDataFeedList.insertDatabase();
+            ttscommit;
+        }
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processMulti</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the Change tracking record
+    /// </summary>
+    /// <param name = "_custAccountSet">Customer Accounts</param>
+    /// <param name = "_inventItemSet">Items</param>
+    public void processMulti(Set _custAccountSet, Set _inventItemSet)
+    {
+        METPriceChangeTracking priceChangeTrackingUpdate;
+        SetEnumerator       custAccountEnumerator, inventItemEnumerator;
+        AccountNum          custAccount;
+        ItemId              inventItem;
+        Set                 custAccountSet, inventItemSet;
+        boolean             validityCheck;
+        METUnitOfMeasure    unitOfMeasure;
+
+        custAccountSet  = _custAccountSet;
+        inventItemSet   = _inventItemSet;
+
+        custAccountEnumerator = custAccountSet.getEnumerator();
+
+        while(custAccountEnumerator.moveNext())
+        {
+            custAccount = custAccountEnumerator.current();
+
+            inventItemEnumerator = inventItemSet.getEnumerator();
+
+            while(inventItemEnumerator.moveNext())
+            {
+                validityCheck = true;
+                inventItem  = inventItemEnumerator.current();
+                unitOfMeasure = this.getUnitOfMeasure(inventItem);
+                
+                //1. Is there an Entry in Price Feed previously for Item number, Customer, Site, Unit of measure, From date, From quantity
+                if(!METPriceDataFeed::existForCustItem(custAccount, 
+                                                        inventItem, 
+                                                        priceChangeTrackingOrig.inventSiteId, 
+                                                        unitOfMeasure,
+                                                        priceChangeTrackingOrig.FromDate, 
+                                                        priceChangeTrackingOrig.QuantityAmountFrom))
+                {
+                    //2.Execute the Item/Site validity check
+                    validityCheck = this.ItemSiteValidation(inventItem, priceChangeTrackingOrig.inventSiteId);
+
+                    //3. Execute the Customer/Item validity check
+                    validityCheck = validityCheck && this.CustomerItemValidation(custAccount, inventItem);
+                                            
+                    if(validityCheck)
+                    {
+                        //update priceChangeTracking values for processing, but dont committ to DB
+                        buf2Buf(priceChangeTrackingOrig, priceChangeTrackingUpdate);
+                        
+                        priceChangeTrackingUpdate.PriceDiscAccountRelation  = custAccount;
+                        priceChangeTrackingUpdate.ItemId                    = inventItem;
+                        priceChangeTrackingUpdate.UnitId                    = unitOfMeasure;
+
+                        this.createPriceDataFeed(priceChangeTrackingUpdate);
+                        this.createRelatedComponents(priceChangeTrackingUpdate);
+                        this.createPriceDataFeedExpire(priceChangeTrackingUpdate);
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPriceDataFeed</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a Price data feed record
+    /// </summary>
+    /// <param name = "_priceChangeTracking">Change Tracking record</param>
+    public void createPriceDataFeed(METPriceChangeTracking _priceChangeTracking)
+    {
+        this.createPriceDataFeedBase(_priceChangeTracking);
+
+        priceDataFeed.ChangeCode        = _priceChangeTracking.ChargeCodeDescription;
+        priceDataFeed.ChangeCodeLineNum = _priceChangeTracking.ChargeCodeLineNum;
+        priceDataFeed.CreationType      = METCreationType::Original;
+
+        priceDataFeedList.add(priceDataFeed);
+        priceDataFeedCount++;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPriceDataFeedRelated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a Price data feed record
+    /// </summary>
+    /// <param name = "_priceChangeTracking">Change Tracking record</param>
+    public void createPriceDataFeedRelated(METPriceChangeTracking _priceChangeTracking)
+    {
+        this.createPriceDataFeedBase(_priceChangeTracking);
+
+        priceDataFeed.ChangeCode        = _priceChangeTracking.ChargeCodeDescription;
+        priceDataFeed.ChangeCodeLineNum = _priceChangeTracking.ChargeCodeLineNum;
+        priceDataFeed.CreationType      = METCreationType::RelatedAutoCharge;
+
+        priceDataFeedList.add(priceDataFeed);
+        priceDataFeedCount++;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPriceDataFeedExpire</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a Price data feed record
+    /// </summary>
+    /// <param name = "_priceChangeTracking">Change Tracking record</param>
+    public void createPriceDataFeedExpire(METPriceChangeTracking _priceChangeTracking)
+    {
+        METPriceChangeTracking priceChangeTrackingUpdate;
+        TransDate   expireDate;
+
+        expireDate = this.getExpireDate(_priceChangeTracking.ToDate);
+
+        if(!METPriceDataFeed::existForCustItem(_priceChangeTracking.PriceDiscAccountRelation,
+                                                _priceChangeTracking.ItemId,
+                                                _priceChangeTracking.InventSiteId,
+                                                _priceChangeTracking.UnitId,
+                                                expireDate,
+                                                _priceChangeTracking.QuantityAmountFrom))
+        {
+            buf2Buf(_priceChangeTracking, priceChangeTrackingUpdate);
+
+            priceChangeTrackingUpdate.FromDate = expireDate;
+
+            this.createPriceDataFeedBase(priceChangeTrackingUpdate);
+
+            priceDataFeed.ChangeCode        = priceChangeTrackingUpdate.ChargeCodeDescription;
+            priceDataFeed.ChangeCodeLineNum = priceChangeTrackingUpdate.ChargeCodeLineNum;
+            priceDataFeed.CreationType      = METCreationType::ExpiryAutoCharge;
+
+            priceDataFeedList.add(priceDataFeed);
+            priceDataFeedCount++;  
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRelatedComponents</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a Price data feed records from Related components
+    /// </summary>
+    /// <param name = "_priceChangeTracking">Change Tracking record</param>
+    public void createRelatedComponents(METPriceChangeTracking _priceChangeTracking)
+    {
+        MarkupAutoLine          markupAutoLine;
+        MarkupAutoTable         markupAutoTable;
+
+        QueryBuildDataSource    qbdsLine, qbdsHeader;
+        Query   query = new Query(queryStr(METMarkupAutoLineHeader));
+
+        QueryRun    qr;
+
+        qbdsLine = query.dataSourceTable(tableNum(MarkupAutoLine));
+
+        qbdsLine.rangeField(fieldNum(MarkupAutoLine, RecId)).value(SysQuery::valueNot(_priceChangeTracking.RefRecId));
+        qbdsLine.rangeField(fieldNum(MarkupAutoLine, ToDate)).value(SysQueryRangeUtil::metGreaterThanDate(_priceChangeTracking.FromDate));
+        qbdsLine.rangeField(fieldNum(MarkupAutoLine, InventSiteId)).value(queryValue(_priceChangeTracking.InventSiteId));
+
+        if(_priceChangeTracking.ChargeCodeModuleCategory == HeadingLine::Line)
+        {
+            qbdsLine.rangeField(fieldNum(MarkupAutoLine, MarkupCategory)).value(queryValue(MarkupCategory::Percent));
+            qbdsLine.rangeField(fieldNum(MarkupAutoLine, MarkupCategory)).value(queryValue(MarkupCategory::Pcs));
+        }
+
+        qr = new QueryRun(query);
+
+        while(qr.next())
+        {
+            markupAutoLine = qr.get(tableNum(markupAutoLine));
+            markupAutoTable = qr.get(tableNum(MarkupAutoTable));
+
+            this.createRelatedComponentsCommon(_priceChangeTracking, markupAutoTable, markupAutoLine);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRelatedComponentsCommon</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a Price data feed records from Related components
+    /// </summary>
+    /// <param name = "_priceChangeTracking">Change Tracking record</param>
+    /// <param name = "_markupAutoTable">Markup Auto Table</param>
+    /// <param name = "_markupAutoLine">Markup Auto Line</param>
+    public void createRelatedComponentsCommon(METPriceChangeTracking _priceChangeTracking, MarkupAutoTable _markupAutoTable, MarkupAutoLine _markupAutoLine)
+    {
+        METPriceChangeTracking      priceChangeTrackingUpdate;
+        InventDim                   inventDim;
+        RefRecId                    pricingRuleHeaderPrevious, pricingRuleHeader, linePricingRulePrevious, linePricingRule;
+        Query                       custPreviewQuery;
+        Query                       productPreviewQuery;
+        GUPPricingRuleCopy          pricingRuleCopyCustHeader, pricingRuleCopy;
+        Set                         custAccountSet, inventItemSet;
+        TransDate                   startDate;
+        QueryBuildDataSource        qbds;
+        QueryBuildRange             qbr;
+
+        pricingRuleHeader       = _markupAutoLine.pricingRuleHeader ? _markupAutoLine.pricingRuleHeader : _markupAutoTable.PricingRuleHeader;
+        linePricingRule         = _markupAutoLine.PricingRuleLine ? _markupAutoLine.PricingRuleLine : _markupAutoTable.PricingRuleLine;
+
+        if(pricingRuleHeader != pricingRuleHeaderPrevious)
+        {
+            pricingRuleCopyCustHeader.initFromPricingRule(GUPPricingRule::find(pricingRuleHeader));
+            custPreviewQuery = this.buildCustQuery(pricingRuleCopyCustHeader, _priceChangeTracking.InventSiteId, _markupAutoTable.PricingGroupCodeHeader);
+            
+            //filter by the Customer
+            qbds = custPreviewQuery.dataSourceTable(tableNum(CustTable));
+            if(qbds)
+            {
+                qbr = SysQuery::findOrCreateRange(qbds, fieldNum(CustTable, AccountNum));
+                qbr.value(queryValue(_priceChangeTracking.PriceDiscAccountRelation));
+            }
+
+            custAccountSet = this.buildCustValues(custPreviewQuery, pricingRuleCopyCustHeader);
+        }
+            
+        if(LinePricingRule != LinePricingRulePrevious)
+        {
+            pricingRuleCopy.initFromPricingRule(GUPPricingRule::find(linePricingRule));
+            productPreviewQuery = this.buildProductQueryBase(pricingRuleCopy);
+            
+            //filter by the Item
+            qbds = productPreviewQuery.dataSourceTable(tableNum(InventTable));
+            if(qbds)
+            {
+                qbr = SysQuery::findOrCreateRange(qbds, fieldNum(InventTable, ItemId));
+                qbr.value(queryValue(_priceChangeTracking.ItemId));
+            }
+
+            inventItemSet = this.buildItemValues(productPreviewQuery, pricingRuleCopy);
+        }
+            
+        if(inventItemSet.in(_priceChangeTracking.ItemId) && custAccountSet.in(_priceChangeTracking.PriceDiscAccountRelation))
+        {
+            startDate  = this.getFromDate(_markupAutoLine.FromDate);
+
+            if(!METPriceDataFeed::existForCustItem(_priceChangeTracking.PriceDiscAccountRelation, 
+                                                        _priceChangeTracking.ItemId, 
+                                                        _priceChangeTracking.InventSiteId, 
+                                                        _priceChangeTracking.UnitId, 
+                                                        startDate,
+                                                        _priceChangeTracking.QuantityAmountFrom))
+            {
+                buf2Buf(_priceChangeTracking, priceChangeTrackingUpdate);
+                //update priceChangeTracking values for processing, but dont committ to DB
+                priceChangeTrackingUpdate.FromDate = startDate;
+                this.createPriceDataFeedRelated(priceChangeTrackingUpdate);
+            }
+        }
+
+        pricingRuleHeaderPrevious = pricingRuleHeader;
+        linePricingRulePrevious = linePricingRule;
+
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

@@ -60,7 +60,7 @@ public class METPriceChangeTrackDiscountDisabled extends METPriceChangeTrack
         while select TrackingId, LineNumber
             from    priceChangeTrackingDetail
             group by TrackingId, LineNumber 
-            where   priceChangeTrackingDetail.TrackingId   == priceChangeTracking.TrackingId
+            where   priceChangeTrackingDetail.TrackingId   == priceChangeTrackingOrig.TrackingId
         {
             this.processDetails(priceChangeTrackingDetail.TrackingId, priceChangeTrackingDetail.LineNumber);
         }
@@ -133,12 +133,13 @@ public class METPriceChangeTrackDiscountDisabled extends METPriceChangeTrack
     /// <param name = "_inventItemSet">Items</param>
     /// <param name = "_inventSiteId">Inventory site</param>
     /// <param name = "_unitOfMeasure">Unit of measure</param>
+    /// <param name = "_lineNumber">Line number</param>
     public void processMulti(Set _custAccountSet, Set _inventItemSet, InventSiteId _inventSiteId, METUnitOfMeasure _unitOfMeasure, LineNumber _lineNumber)
     {
         SetEnumerator       custAccountEnumerator, inventItemEnumerator;
         AccountNum          custAccount;
         ItemId              inventItem;
-        
+        METPriceChangeTracking priceChangeTrackingUpdate;
         Set                 custAccountSet  = _custAccountSet;
         Set                 inventItemSet   = _inventItemSet;
         boolean             validityCheck;
@@ -163,7 +164,7 @@ public class METPriceChangeTrackDiscountDisabled extends METPriceChangeTrack
                 inventItem  = inventItemEnumerator.current();
 
                 //1. Is there an Entry in Price Feed previously for Item number, Customer, Site, Unit of measure, From date, From quantity
-                if(!METPriceDataFeed::existForCustItem(custAccount, inventItem, inventSiteId, unitOfMeasure, priceChangeTracking.FromDate, priceChangeTracking.QuantityAmountFrom))
+                if(!METPriceDataFeed::existForCustItem(custAccount, inventItem, inventSiteId, unitOfMeasure, priceChangeTrackingOrig.FromDate, priceChangeTrackingOrig.QuantityAmountFrom))
                 {
                     //2.Execute the Item/Site validity check
                     validityCheck = this.ItemSiteValidation(inventItem, inventSiteId);
@@ -173,14 +174,16 @@ public class METPriceChangeTrackDiscountDisabled extends METPriceChangeTrack
                                             
                     if(validityCheck)
                     {
+                        buf2Buf(priceChangeTrackingOrig, priceChangeTrackingUpdate);
+                        
                         //update priceChangeTracking values for processing, but dont committ to DB
-                        priceChangeTracking.PriceDiscAccountRelation = custAccount;
-                        priceChangeTracking.ItemId                  = inventItem;
-                        priceChangeTracking.InventSiteId            = inventSiteId;
-                        priceChangeTracking.UnitId                  = unitOfMeasure;
+                        priceChangeTrackingUpdate.PriceDiscAccountRelation = custAccount;
+                        priceChangeTrackingUpdate.ItemId                  = inventItem;
+                        priceChangeTrackingUpdate.InventSiteId            = inventSiteId;
+                        priceChangeTrackingUpdate.UnitId                  = unitOfMeasure;
 
-                        this.createPriceDataFeed(_lineNumber);
-                        this.createRelatedComponents();
+                        this.createPriceDataFeed(priceChangeTrackingUpdate, _lineNumber);
+                        this.createRelatedComponents(priceChangeTrackingUpdate);
                         
                     }
                 }
@@ -196,11 +199,13 @@ public class METPriceChangeTrackDiscountDisabled extends METPriceChangeTrack
     /// <summary>
     /// Create a Price data feed record
     /// </summary>
-    public void createPriceDataFeed(LineNumber _lineNumber)
+    /// <param name = "_priceChangeTracking">Price change tracking</param>
+    /// <param name = "_lineNumber">Line number</param>
+    public void createPriceDataFeed(METPriceChangeTracking _priceChangeTracking, LineNumber _lineNumber)
     {
-        this.createPriceDataFeedBase();
+        this.createPriceDataFeedBase(_priceChangeTracking);
 
-        priceDataFeed.ChangeCode        = priceChangeTracking.DiscountCode;
+        priceDataFeed.ChangeCode        = _priceChangeTracking.DiscountCode;
         priceDataFeed.ChangeCodeLineNum = _lineNumber;
         priceDataFeed.CreationType      = METCreationType::Original;
 
@@ -216,11 +221,13 @@ public class METPriceChangeTrackDiscountDisabled extends METPriceChangeTrack
     /// <summary>
     /// Create a Price data feed record
     /// </summary>
-    public void createPriceDataFeedRelated(RetailPeriodicDiscountLine _retailPeriodicDiscountLine)
+    /// <param name = "_priceChangeTracking">Price change tracking</param>
+    /// <param name = "_retailPeriodicDiscountLine">Discount line</param>
+    public void createPriceDataFeedRelated(METPriceChangeTracking _priceChangeTracking, RetailPeriodicDiscountLine _retailPeriodicDiscountLine)
     {
-        this.createPriceDataFeedBase();
+        this.createPriceDataFeedBase(_priceChangeTracking);
 
-        priceDataFeed.ChangeCode        = priceChangeTracking.DiscountCode;
+        priceDataFeed.ChangeCode        = _priceChangeTracking.DiscountCode;
         priceDataFeed.ChangeCodeLineNum = _retailPeriodicDiscountLine.LineNum;
         priceDataFeed.CreationType      = METCreationType::RelatedDiscount;
 
@@ -236,8 +243,10 @@ public class METPriceChangeTrackDiscountDisabled extends METPriceChangeTrack
     /// <summary>
     /// Create a Price data feed records from Related components
     /// </summary>
-    public void createRelatedComponents()
+    /// <param name = "_priceChangeTracking">Price change tracking</param>
+    public void createRelatedComponents(METPriceChangeTracking _priceChangeTracking)
     {
+        METPriceChangeTracking      priceChangeTrackingUpdate;
         RetailPeriodicDiscount      retailPeriodicDiscount;
         RetailPeriodicDiscountLine  retailPeriodicDiscountLine;
         InventDim                   inventDim;
@@ -247,12 +256,13 @@ public class METPriceChangeTrackDiscountDisabled extends METPriceChangeTrack
         GUPPricingRuleCopy          pricingRuleCopyCustHeader, pricingRuleCopy;
         Set                         custAccountSet, inventItemSet;
         TransDate                   startDate;
+        QueryBuildDataSource        qbds;
+        QueryBuildRange             qbr;
 
-
-        while select OfferId, HeaderPricingRule, ValidFrom
+        while select OfferId, HeaderPricingRule, ValidFrom, HeaderPricingGroupCode
             from    retailPeriodicDiscount
-            where   retailPeriodicDiscount.OfferId      != priceChangeTracking.DiscountCode
-            &&      retailPeriodicDiscount.ValidTo      > priceChangeTracking.FromDate
+            where   retailPeriodicDiscount.OfferId      != _priceChangeTracking.DiscountCode
+            &&      retailPeriodicDiscount.ValidTo      > _priceChangeTracking.FromDate
             &&      retailPeriodicDiscount.PeriodicDiscountType in discountTypesCon
             &&      retailPeriodicDiscount.Status       == RetailDisabledEnabled::Enabled
             &&      retailPeriodicDiscount.IsGUPDiscount == NoYes::Yes
@@ -261,7 +271,7 @@ public class METPriceChangeTrackDiscountDisabled extends METPriceChangeTrack
             where   retailPeriodicDiscountLine.OfferId  == retailPeriodicDiscount.OfferId
         exists join InventDim
             where   InventDim.InventDimId               == retailPeriodicDiscountLine.InventDimId
-            &&      InventDim.InventSiteId              == priceChangeTracking.InventSiteId
+            &&      InventDim.InventSiteId              == _priceChangeTracking.InventSiteId
         {
             pricingRuleHeader   = retailPeriodicDiscount.HeaderPricingRule;
             LinePricingRule     = retailPeriodicDiscountLine.LinePricingRule;
@@ -269,7 +279,16 @@ public class METPriceChangeTrackDiscountDisabled extends METPriceChangeTrack
             if(pricingRuleHeader != pricingRuleHeaderPrevious)
             {
                 pricingRuleCopyCustHeader.initFromPricingRule(GUPPricingRule::find(retailPeriodicDiscount.HeaderPricingRule));
-                custPreviewQuery = this.buildCustQuery(pricingRuleCopyCustHeader, priceChangeTracking.InventSiteId);
+                custPreviewQuery = this.buildCustQuery(pricingRuleCopyCustHeader, _priceChangeTracking.InventSiteId, retailPeriodicDiscount.HeaderPricingGroupCode);
+                
+                //filter by the Customer
+                qbds = custPreviewQuery.dataSourceTable(tableNum(CustTable));
+                if(qbds)
+                {
+                    qbr = SysQuery::findOrCreateRange(qbds, fieldNum(CustTable, AccountNum));
+                    qbr.value(queryValue(_priceChangeTracking.PriceDiscAccountRelation));
+                }
+                
                 custAccountSet = this.buildCustValues(custPreviewQuery, pricingRuleCopyCustHeader);
             }
             
@@ -277,24 +296,32 @@ public class METPriceChangeTrackDiscountDisabled extends METPriceChangeTrack
             {
                 pricingRuleCopy.initFromPricingRule(GUPPricingRule::find(retailPeriodicDiscountLine.LinePricingRule));
                 productPreviewQuery = this.buildProductQueryBase(pricingRuleCopy);
+                
+                //filter by the Item
+                qbds = productPreviewQuery.dataSourceTable(tableNum(InventTable));
+                if(qbds)
+                {
+                    qbr = SysQuery::findOrCreateRange(qbds, fieldNum(InventTable, ItemId));
+                    qbr.value(queryValue(_priceChangeTracking.ItemId));
+                }
+                
                 inventItemSet = this.buildItemValues(productPreviewQuery, pricingRuleCopy);
             }
             
-            if(inventItemSet.in(priceChangeTracking.ItemId) && custAccountSet.in(priceChangeTracking.PriceDiscAccountRelation))
+            if(inventItemSet.in(_priceChangeTracking.ItemId) && custAccountSet.in(_priceChangeTracking.PriceDiscAccountRelation))
             {
                 startDate  = retailPeriodicDiscount.ValidFrom ?  retailPeriodicDiscount.ValidFrom : todayDate;
-                
-                //update priceChangeTracking values for processing, but dont committ to DB
-                priceChangeTracking.FromDate = startDate;
 
-                if(!METPriceDataFeed::existForCustItem(priceChangeTracking.PriceDiscAccountRelation, 
-                                                        priceChangeTracking.ItemId, 
-                                                        priceChangeTracking.InventSiteId, 
-                                                        priceChangeTracking.UnitId, 
-                                                        priceChangeTracking.FromDate,
-                                                        priceChangeTracking.QuantityAmountFrom))
+                if(!METPriceDataFeed::existForCustItem(_priceChangeTracking.PriceDiscAccountRelation,
+                                                        _priceChangeTracking.ItemId,
+                                                        _priceChangeTracking.InventSiteId,
+                                                        _priceChangeTracking.UnitId,
+                                                        startDate,
+                                                        _priceChangeTracking.QuantityAmountFrom))
                 {
-                    this.createPriceDataFeedRelated(retailPeriodicDiscountLine);
+                    buf2Buf(_priceChangeTracking, priceChangeTrackingUpdate);
+                    priceChangeTrackingUpdate.FromDate = startDate;
+                    this.createPriceDataFeedRelated(priceChangeTrackingUpdate, retailPeriodicDiscountLine);
                 }
             }
 
