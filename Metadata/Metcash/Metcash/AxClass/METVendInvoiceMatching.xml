@@ -1,0 +1,309 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METVendInvoiceMatching</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class METVendInvoiceMatching
+{
+    VendInvoiceInfoTable vendInvoiceInfoTable;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>parmVendInvoiceInfoTable</Name>
+				<Source><![CDATA[
+    public VendInvoiceInfoTable parmVendInvoiceInfoTable(VendInvoiceInfoTable _vendInvoiceInfoTable = vendInvoiceInfoTable)
+    {
+        vendInvoiceInfoTable = _vendInvoiceInfoTable;
+
+        return vendInvoiceInfoTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static METVendInvoiceMatching construct()
+    {
+        return new METVendInvoiceMatching();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateFailureMatchingLines</Name>
+				<Source><![CDATA[
+    public void generateFailureMatchingLines()
+    {
+        VendInvoiceInfoLine     vendInvoiceInfoLine;
+        VendInvoiceInfoSubLine  vendInvoiceInfoSubLine;
+
+        boolean                 failureLinesRun;
+
+        ttsbegin;
+
+        while select forupdate vendInvoiceInfoLine
+                where   vendInvoiceInfoLine.ParmId          == vendInvoiceInfoTable.ParmId &&
+                        vendInvoiceInfoLine.TableRefId      == vendInvoiceInfoTable.TableRefId
+            exists join vendInvoiceInfoSubLine
+                where   vendInvoiceInfoSubLine.LineRefRecId == vendInvoiceInfoLine.RecId
+        {
+            if(vendInvoiceInfoLine.matchingVarianceStatus(vendInvoiceInfoTable) == LastMatchVarianceOptions::Warning &&
+                !vendInvoiceInfoLine.MetAutoApprove)
+            {
+                if(vendInvoiceInfoLine.MetMultiple)
+                {
+                    this.createFailureMatchingLine(vendInvoiceInfoLine, true, true);
+                    this.createFailureMatchingLine(vendInvoiceInfoLine, false, true);
+
+                    vendInvoiceInfoLine.resetReceiptedInvoiceLine();
+                }
+                else
+                {
+                    if(vendInvoiceInfoLine.priceVarianceStatus() == LastMatchVarianceOptions::Warning)
+                    {
+                        this.createFailureMatchingLine(vendInvoiceInfoLine, false);
+
+                        vendInvoiceInfoLine.resetReceiptedInvoiceLine();
+                    }
+                    else if(vendInvoiceInfoLine.checkIfQuantityMatch() == LastMatchVarianceOptions::Warning &&
+                            (vendInvoiceInfoLine.ReceiveNow > vendInvoiceInfoLine.purchQtyMatched() ||
+                                vendInvoiceInfoLine.PdsCWReceiveNow > vendInvoiceInfoLine.pdsCWQtyMatched()))
+                    {
+                        this.createFailureMatchingLine(vendInvoiceInfoLine, true);
+
+                        vendInvoiceInfoLine.resetReceiptedInvoiceLine();
+                    }
+                }
+            }
+
+            if(!failureLinesRun)
+                failureLinesRun = true;
+        }
+
+
+        if(failureLinesRun)
+        {
+            this.updateMarkupTransTaxItemGroup();
+            this.createVarianceInvoiceLines();
+            this.updateMarkupTransTaxItemGroup();
+            this.updateVarianceApproved();
+        }
+
+        ttscommit;
+
+        this.saveInvoices();
+        this.updateVendInvoiceTableMatchStatus();
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateVendInvoiceTableMatchStatus</Name>
+				<Source><![CDATA[
+    private void updateVendInvoiceTableMatchStatus()
+    {
+        PurchTotals purchTotals = PurchTotals::newParmTable(vendInvoiceInfoTable, PurchUpdate::All, vendInvoiceInfoTable.ParmId, '', vendInvoiceInfoTable.Ordering);
+        purchTotals.calc();
+        
+        if(vendInvoiceInfoTable.checkIfMatchedTotals())
+        {
+            if (vendInvoiceInfoTable.LastMatchVariance != LastMatchVarianceOptions::OK)
+            {
+                vendInvoiceInfoTable.LastMatchVariance = LastMatchVarianceOptions::OK;
+                vendInvoiceInfoTable.doUpdate();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateVarianceApproved</Name>
+				<Source><![CDATA[
+    private void updateVarianceApproved()
+    {
+        VendInvoiceInfoLine vendInvoiceInfoLine;
+
+        select firstonly vendInvoiceInfoLine
+            where   vendInvoiceInfoLine.ParmId      == vendInvoiceInfoTable.ParmId &&
+                    vendInvoiceInfoLine.TableRefId  == vendInvoiceInfoTable.TableRefId &&
+                    vendInvoiceInfoLine.MetAutoApprove;
+
+        if(vendInvoiceInfoLine)
+        {
+            vendInvoiceInfoTable.selectForUpdate(true);
+            vendInvoiceInfoTable.VarianceApproved = NoYes::Yes;
+            vendInvoiceInfoTable.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>saveInvoices</Name>
+				<Source><![CDATA[
+    private void saveInvoices()
+    {
+        PurchParmUpdate purchParmUpdateLocal;
+        
+        purchParmUpdateLocal = PurchParmUpdate::find(vendInvoiceInfoTable.ParmId, true);
+        if (purchParmUpdateLocal.numberOfTables() == 1)
+        {
+            purchParmUpdateLocal.delete();
+        }
+        VendInvoiceInfoTable::moveFromActiveToSaved(vendInvoiceInfoTable);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createFailureMatchingLine</Name>
+				<Source><![CDATA[
+    private void createFailureMatchingLine(VendInvoiceInfoLine _vendInvoiceInfoLine, boolean _isQtyFailure, boolean _multipleFailure = false)
+    {
+        ReasonTable             reason;
+        VendInvoiceInfoLine     failureInvoiceLine;
+        boolean                 useCatchWeight          = _vendInvoiceInfoLine.PdsCWReceiveNow ? true : false;
+        VendPackingSlipTrans    vendPackingSlipTrans    = _vendInvoiceInfoLine.getVendPackingSlip();
+        PurchLine               purchLine               = _vendInvoiceInfoLine.purchLine();
+
+        if(_multipleFailure)
+        {
+            Query query = _vendInvoiceInfoLine.metInvoiceMatchingReasonQuery(!_isQtyFailure, _isQtyFailure, useCatchWeight, _multipleFailure);
+
+            if(query)
+            {
+                QueryRun queryRun = new QueryRun(query);
+
+                if(queryRun.next())
+                {
+                    reason = queryRun.get(tableNum(ReasonTable));
+                }
+            }
+        }
+        else
+        {
+            reason = ReasonTable::find(ReasonTableRef::find(_vendInvoiceInfoLine.ReasonTableRef).Reason);
+        }
+
+        if(reason)
+        {
+            failureInvoiceLine.initPriceFailureMatchingLine(_vendInvoiceInfoLine, reason, _isQtyFailure, useCatchWeight);
+            
+            if(failureInvoiceLine.validateWrite())
+            {
+                failureInvoiceLine.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMarkupTransTaxItemGroup</Name>
+				<Source><![CDATA[
+    protected void updateMarkupTransTaxItemGroup()
+    {
+        VendInvoiceInfoLine vendInvoiceInfoLine;
+        MarkupTrans         markupTrans;
+
+        while select forupdate markupTrans
+                where markupTrans.TransTableId  == tableNum(VendInvoiceInfoLine) &&
+                      markupTrans.TaxItemGroup  == ''
+            join vendInvoiceInfoLine
+                where markupTrans.TransRecId            == vendInvoiceInfoLine.RecId &&
+                      vendInvoiceInfoLine.ParmId        == vendInvoiceInfoTable.ParmId &&
+                      vendInvoiceInfoLine.TableRefId    == vendInvoiceInfoTable.TableRefId
+        {
+            markupTrans.TaxItemGroup = vendInvoiceInfoLine.TaxItemGroup;
+            markupTrans.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createVarianceInvoiceLines</Name>
+				<Source><![CDATA[
+    protected void createVarianceInvoiceLines()
+    {
+        VendParameters      vendParameters = VendParameters::find();
+        MetVariance         varianceAmount = vendInvoiceInfoTable.displayMetVariance();
+        ReasonTable         reasonTable    = ReasonTable::find(vendParameters.METReasonCode);
+
+        VendInvoiceInfoLine vendInvoiceInfoLine, varianceLine;
+        Amount              amount;
+        InventDim           inventDim;
+
+        if(varianceAmount)
+        {
+            while select TaxItemGroup, sum(LineAmount) from vendInvoiceInfoLine
+                group by TaxItemGroup
+            where
+                vendInvoiceInfoLine.ParmId      == vendInvoiceInfoTable.ParmId &&
+                vendInvoiceInfoLine.TableRefId  == vendInvoiceInfoTable.TableRefId
+            {
+                amount = (vendInvoiceInfoLine.LineAmount/vendInvoiceInfoTable.MetImportAmount) * varianceAmount;
+
+                varianceLine.clear();
+                varianceLine.initValue();
+
+                varianceLine.ParmId                 = vendInvoiceInfoTable.ParmId;
+                varianceLine.TableRefId             = vendInvoiceInfoTable.TableRefId;
+                varianceLine.currencyCode           = vendInvoiceInfoTable.currencyCode;
+                varianceLine.AddressRefRecId        = vendInvoiceInfoTable.AddressRefRecId;
+                varianceLine.AddressRefTableId      = vendInvoiceInfoTable.AddressRefTableId;
+                varianceLine.DeliveryName           = vendInvoiceInfoTable.DeliveryName;
+                varianceLine.DeliveryPostalAddress  = vendInvoiceInfoTable.DeliveryPostalAddress;
+        
+                varianceLine.ItemId                 = vendParameters.METVarianceItem;
+                varianceLine.modifiedField(fieldNum(VendInvoiceInfoLine, ItemId));
+
+                varianceLine.MetClaimLine           = NoYes::Yes;
+                varianceLine.MetExtComment          = reasonTable.MetExtComment;
+            
+                varianceLine.TaxGroup               = vendInvoiceInfoTable.purchTable().TaxGroup;
+                varianceLine.TaxItemGroup           = vendInvoiceInfoLine.TaxItemGroup;
+                //varianceLine.DefaultDimension       = vendInvoiceInfoTable.purchTable().DefaultDimension;
+
+                inventDim.InventSiteId              = vendInvoiceInfoTable.purchTable().InventSiteId;
+                inventDim.InventLocationId          = vendInvoiceInfoTable.purchTable().InventLocationId;
+            
+                varianceLine.InventDimId            = InventDim::findOrCreate(inventDim).inventDimId;
+
+                varianceLine.ReasonTableRef         = ReasonTableRef::createReasonTableRef(reasonTable.Reason, reasonTable.Description);
+
+                varianceLine.PurchPrice             = abs(amount);
+                varianceLine.modifiedField(fieldNum(VendInvoiceInfoLine, PurchPrice));
+
+                varianceLine.ReceiveNow = amount > 0 ? 1 : -1;
+
+                varianceLine.vendDocumentLineInterface().modifiedReceiveNowWithPromptDefault(UnknownNoYes::Yes);
+
+                if(varianceLine.validateWrite())
+                {
+                    varianceLine.insert();
+                }
+
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
