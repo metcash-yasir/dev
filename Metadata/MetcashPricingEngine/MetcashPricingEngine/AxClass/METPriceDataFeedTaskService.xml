@@ -20,8 +20,7 @@ class METPriceDataFeedTaskService extends SysOperationServiceBase
     TransDate       todayDate;
 
     METPriceDataFeedContract    dataContract;
-    RecordInsertList            priceReportItemTaskInsertList;
-
+    
 }
 ]]></Declaration>
 		<Methods>
@@ -320,7 +319,15 @@ class METPriceDataFeedTaskService extends SysOperationServiceBase
             metPriceListToBeKept.add(tmpPriceReportValues.RecId, [tmpPriceReportValues.FromDate, tmpPriceReportValues.ToDate]);
         }
 
-        RecordInsertList metListOfPriceDataExtract = new RecordInsertList(tableNum(METPriceDataExtract));
+        RecordSortedList metListOfPriceDataExtract = new RecordSortedList(tableNum(METPriceDataExtract));
+        metListOfPriceDataExtract.sortOrder(fieldNum(METPriceDataExtract, CustAccount),
+                                    fieldNum(METPriceDataExtract, ItemId),
+                                    fieldNum(METPriceDataExtract, InventSiteId),
+                                    fieldNum(METPriceDataExtract, UnitOfMeasure),
+                                    fieldNum(METPriceDataExtract, StartDate),
+                                    fieldNum(METPriceDataExtract, Qty),
+                                    fieldNum(METPriceDataExtract, EventId));
+
 
         ValidFromDate   metFromDate;
         ValidToDate     metToDate;
@@ -345,10 +352,22 @@ class METPriceDataFeedTaskService extends SysOperationServiceBase
 
                 priceDataExtract.initFromTmpPriceList(metTmpFinalPriceReportValues);
                 priceDataExtract.enhanceFromPriceDataFeed(priceDataFeed);
-                priceDataExtract = this.updateChargeCodes(priceDataExtract, priceDataFeed);
-                priceDataExtract.updateTax();
+                
+                //Is the record going to be a duplicate?
+                if(!METPriceDataExtract::existForCustItem(priceDataExtract.CustAccount,
+                                                            priceDataExtract.ItemId,
+                                                            priceDataExtract.InventSiteId,
+                                                            priceDataExtract.UnitOfMeasure,
+                                                            priceDataExtract.StartDate,
+                                                            priceDataExtract.Qty,
+                                                            priceDataExtract.EventId))
+                {
+                    this.updateChargeCodes(priceDataExtract, priceDataFeed);
+                    priceDataExtract.reread();
+                    priceDataExtract.updateTax();
 
-                metListOfPriceDataExtract.add(priceDataExtract);
+                    metListOfPriceDataExtract.ins(priceDataExtract);
+                }
             }
         }
 
@@ -424,12 +443,81 @@ class METPriceDataFeedTaskService extends SysOperationServiceBase
     /// <summary>
     /// Calculate and populate the Charge codes
     /// </summary>
-    public METPriceDataExtract updateChargeCodes(METPriceDataExtract _priceDataExtract, METPriceDataFeed _priceDataFeed)
+    public void updateChargeCodes(METPriceDataExtract _priceDataExtract, METPriceDataFeed _priceDataFeed)
     {
         METPriceDataExtract         priceDataExtract = _priceDataExtract;
         METSimulatedAutoCharges     simulatedAutoCharges;
         SalesTable                  salesTable;
         SalesLine                   salesLine;
+        
+        salesTable = this.BuildSalesTableTmp(_priceDataExtract);
+        salesLine  = this.BuildSalesLineTmp(_priceDataExtract, salesTable);
+            
+        simulatedAutoCharges = METSimulatedAutoCharges::newFromSalesTmp(salesTable, salesLine);
+        
+        this.updateLineChargeCodes(simulatedAutoCharges, _priceDataExtract, salesTable, salesLine);
+            
+        //TODO: incomplete
+        //this.updateHeaderChargeCodes(simulatedAutoCharges, _priceDataExtract, salesTable, salesLine);
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateHeaderChargeCodes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate and populate the Charge codes
+    /// </summary>
+    public void updateHeaderChargeCodes(METSimulatedAutoCharges _simulatedAutoCharges,
+                                        METPriceDataExtract _priceDataExtract,
+                                        SalesTable _salesTable,
+                                        SalesLine _salesLine)
+    {
+        METPriceDataExtract         priceDataExtract = _priceDataExtract;
+        List                        matchedAutoChargeHeaderRecIdList;
+        ListEnumerator              enumerator;
+        MarkupAutoLine              markupAutoLine;
+        MarkupAutoTable             markupAutoTable;
+        MarkupTable                 markupTable;
+        MarkupTrans                 markupTrans;
+
+        matchedAutoChargeHeaderRecIdList = _simulatedAutoCharges.getMarkupAutoHeaders();
+
+        enumerator = matchedAutoChargeHeaderRecIdList.getEnumerator();
+        
+        while (enumerator.moveNext())
+        {
+            markupAutoTable = MarkupAutoTable::metFindByRecId(str2int64(enumerator.current()));
+            
+            QueryRun qr = new QueryRun(this.buildMarkupAutoLineQuery(markupAutoTable, _simulatedAutoCharges.parameters));
+        
+            while (qr.next())
+            {
+                markupAutoLine = qr.get(tableNum(MarkupAutoLine));
+                
+                markupTrans = _simulatedAutoCharges.initializeMarkupTransFromParent(markupAutoLine);
+
+                markupTable = MarkupTable::find(markupTrans.ModuleType, markupTrans.MarkupCode);
+
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLineChargeCodes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate and populate the Charge codes
+    /// </summary>
+    public void updateLineChargeCodes(METSimulatedAutoCharges _simulatedAutoCharges, 
+                                        METPriceDataExtract _priceDataExtract, 
+                                        SalesTable          _salesTable, 
+                                        SalesLine           _salesLine)
+    {
         List                        matchedAutoChargeLineRecIdList;
         ListEnumerator              enumerator;
         MarkupAutoLine              markupAutoLine;
@@ -439,49 +527,44 @@ class METPriceDataFeedTaskService extends SysOperationServiceBase
         MarkupAmount                calculatedAmount;
         TaxAmount                   calculatedTaxAmount;
 
-        if(_priceDataFeed.ChangeType == METPriceChangeType::AutoChargeEnabled || _priceDataFeed.ChangeType == METPriceChangeType::AutoChargeDisabled)
-        {
-            salesTable = this.BuildSalesTableTmp(_priceDataExtract);
-            salesLine  = this.BuildSalesLineTmp(_priceDataExtract, salesTable);
+        METPriceDataExtract         priceDataExtract = _priceDataExtract;
             
-            simulatedAutoCharges = METSimulatedAutoCharges::newFromSalesTmp(salesTable, salesLine);
-            
-            matchedAutoChargeLineRecIdList = simulatedAutoCharges.getMarkupAutoLines();
+        matchedAutoChargeLineRecIdList = _simulatedAutoCharges.getMarkupAutoLines();
 
-            enumerator = matchedAutoChargeLineRecIdList.getEnumerator();
+        enumerator = matchedAutoChargeLineRecIdList.getEnumerator();
         
-            while (enumerator.moveNext())
-            {
-                markupAutoLine = MarkupAutoLine::metFindByRecId(str2int64(enumerator.current()));
+        while (enumerator.moveNext())
+        {
+            markupAutoLine = MarkupAutoLine::metFindByRecId(str2int64(enumerator.current()));
             
-                markupTrans = simulatedAutoCharges.initializeMarkupTransFromParent(markupAutoLine);
+            markupTrans = _simulatedAutoCharges.initializeMarkupTransFromParent(markupAutoLine);
 
-                markupTable = MarkupTable::find(markupTrans.ModuleType, markupTrans.MarkupCode);
+            markupTable = MarkupTable::find(markupTrans.ModuleType, markupTrans.MarkupCode);
 
-                calculatedAmount = Markup::calcTrans(markupTrans,
-                                                    salesLine.SalesQty,
-                                                    salesLine.SalesPrice,
+            calculatedAmount = Markup::calcTrans(markupTrans,
+                                                    _salesLine.SalesQty,
+                                                    _salesLine.SalesPrice,
                                                     0,      // Intercompany price requirements
                                                     todayDate);
 
-                calculatedTaxAmount = Tax::calcTaxAmount(_priceDataExtract.TaxGroup,
+            calculatedTaxAmount = Tax::calcTaxAmount(_priceDataExtract.TaxGroup,
                                                             markupTable.TaxItemGroup,
                                                             todayDate,
-                                                            salesTable.currencyCode,
+                                                            _salesTable.currencyCode,
                                                             calculatedAmount,
                                                             TaxModuleType::Sales);
 
-                priceDataExtract.LineTotalChargeAmount      += calculatedAmount;
-                priceDataExtract.LineTotalChargeTaxAmount   += calculatedTaxAmount;
+            priceDataExtract.LineTotalChargeAmount      += calculatedAmount;
+            priceDataExtract.LineTotalChargeTaxAmount   += calculatedTaxAmount;
 
-                priceDataExtract.LineChargeCode     = this.pipeConcatenate(priceDataExtract.LineChargeCode, markupTrans.MarkupCode);
-                priceDataExtract.LineChargeAmount   = this.pipeConcatenate(priceDataExtract.LineChargeAmount, this.numToString(calculatedAmount));
-                priceDataExtract.LineChargeTaxCode  = this.pipeConcatenate(priceDataExtract.LineChargeTaxCode, markupTable.TaxItemGroup);
-                priceDataExtract.LineChargeTaxAmount = this.pipeConcatenate(priceDataExtract.LineChargeTaxAmount, this.numToString(calculatedTaxAmount));
+            priceDataExtract.LineChargeCode     = this.pipeConcatenate(priceDataExtract.LineChargeCode, markupTrans.MarkupCode);
+            priceDataExtract.LineChargeAmount   = this.pipeConcatenate(priceDataExtract.LineChargeAmount, this.numToString(calculatedAmount));
+            priceDataExtract.LineChargeTaxCode  = this.pipeConcatenate(priceDataExtract.LineChargeTaxCode, markupTable.TaxItemGroup);
+            priceDataExtract.LineChargeTaxAmount = this.pipeConcatenate(priceDataExtract.LineChargeTaxAmount, this.numToString(calculatedTaxAmount));
 
-            }
+            priceDataExtract.LineAmount += calculatedAmount;
+            priceDataExtract.NetAmount  = this.numToString(priceDataExtract.LineAmount);
         }
-        return priceDataExtract;
     }
 
 ]]></Source>
@@ -566,6 +649,69 @@ class METPriceDataFeedTaskService extends SysOperationServiceBase
     public str  numToString(real _number)
     {
         return num2Str(_number, 4, 2, DecimalSeparator::Dot, ThousandSeparator::Comma);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildMarkupAutoLineQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build query for <c>MarkupAutoLine</c> records
+    /// </summary>
+    /// <param name = "_markupAutoTable">The <c>MarkupAutoTable</c> value</param>
+    /// <returns>Query generated for <c>MarkupAutoLine</c> table based on table <c>MarkupAutoTable</c> and parameters</returns>
+    public Query buildMarkupAutoLineQuery(MarkupAutoTable _markupAutoTable, MarkupTransInsertParameters _parameters)
+    {
+        Query ret = new Query();
+
+        QueryBuildDataSource qbds = ret.addDataSource(tableNum(MarkupAutoLine));
+
+        qbds.addRange(fieldNum(MarkupAutoLine, TableTableId)).value(queryValue(_markupAutoTable.TableId));
+        qbds.addRange(fieldNum(MarkupAutoLine, TableRecId)).value(queryValue(_markupAutoTable.RecId));
+        qbds.addRange(fieldNum(MarkupAutoLine, CurrencyCode)).value(queryValue(_parameters.Currency));
+        qbds.addRange(fieldNum(MarkupAutoLine, MCRReturnMarkup)).value(queryValue(_parameters.McrReturnMarkup));
+
+        qbds.addRange(fieldNum(MarkupAutoLine, InventSiteId)).value(queryRangeConcat(queryValue(_parameters.InventSiteId), SysQuery::valueEmptyString()));
+        qbds.addRange(fieldNum(MarkupAutoLine, InventLocationId)).value(queryRangeConcat(queryValue(_parameters.InventLocationId), SysQuery::valueEmptyString()));
+            
+        str amountFilterStr;
+            
+        if (_parameters.TotalAmount <= 0)  //if _totalAmount is not positive we do not apply tiers charges
+        {
+            amountFilterStr = strfmt('((%1 == %3) && (%2 == %4))',
+                    fieldstr(MarkupAutoLine, FromAmount),
+                    fieldstr(MarkupAutoLine, ToAmount),
+                    SysQuery::value(0),
+                    SysQuery::value(0));
+        }
+        else if (_parameters.TotalAmount > 0)  //if _totalAmount is not positive we do apply tiers charges
+        {
+            amountFilterStr = strfmt('((%1 <= %3) && ((%2 > %4) || ((%2 == %5) && (%1 != %6))))',
+                    fieldstr(MarkupAutoLine, FromAmount),
+                    fieldstr(MarkupAutoLine, ToAmount),
+                    SysQuery::value(_parameters.TotalAmount),
+                    SysQuery::value(_parameters.TotalAmount),
+                    SysQuery::value(0), //ToAmount == 0 means that we have no upper limit.
+                    SysQuery::value(0)); //but it is only in the case if FromAmount is defined (not 0). Otherwise it is not a tier charge.
+        }
+
+        qbds.addRange(fieldNum(MarkupAutoLine, FromAmount)).value(amountFilterStr);
+        
+        PriceDate priceDate;
+        str formatedDateRange;
+
+        priceDate = todayDate;
+
+        formatedDateRange = strFmt('(((%1 <= %3) || (%1 == %4)) && ((%2 >= %3) || (%2 == %4)))',
+                                            fieldStr(MarkupAutoLine, FromDate), //%1: FromDate
+                                            fieldStr(MarkupAutoLine, ToDate),   //%2: ToDate
+                                            date2StrXpp(priceDate),             //%3: salesDate
+                                            date2StrXpp(dateNull()));           //%4: dateNull
+
+        qbds.addRange(fieldNum(MarkupAutoLine, FromDate)).value(formatedDateRange);
+
+        return ret;
     }
 
 ]]></Source>
