@@ -25,95 +25,92 @@ final class METSalesOrderLineCDSV2Entity_Extension
     /// <returns>true of false</returns>
     public boolean insertEntityDataSource(DataEntityRuntimeContext _entityCtx, DataEntityDataSourceRuntimeContext _dataSourceCtx)
     {
-        SalesLine                       salesLine;
-        SalesTable                      salesTable;
-        METSalesTable                   metSalesTable;
-        PurchLine                       purchLine;
-        PurchTable                      purchTable;
-        METPurchTable                   metPurchTable;
-        InventTransOrigin               inventTransOriginSales;
-        InventTransOrigin               inventTransOriginPurch;
-        METSalesPurchLineShipDateTmp    purchLineShipDateTmp;
-        SalesQty                        qtyRemain;
-        METSalesOrderAutoReserve        metSalesOrderAutoReserve;
-        SalesLine                       newSalesLine;
+        SalesLine                       metSalesLineStd;
+        SalesTable                      metSalesTableStd;        
+        METSalesLine                    metSalesLine;
+        InventDim                       metInventDimStd;
+        boolean                         modified;
 
-        boolean ret = next insertEntityDataSource(_entityCtx, _dataSourceCtx);
-
-        if (_dataSourceCtx.name() == dataentitydatasourcestr(SalesOrderLineV2Entity, SalesLine))
+        if (_dataSourceCtx.name() == dataentitydatasourcestr(SalesOrderLineCDSV2Entity, SalesOrderLineEntity) &&
+            _entityCtx.isDatabaseOperationInsert())
         {
-            salesLine   = _dataSourceCtx.getBuffer() as SalesLine;
-            salesTable  = salesLine.salesTable();            
+            SalesOrderLineV2Entity salesorderLineEntity = _dataSourceCtx.getBuffer();
+            metSalesTableStd  = SalesTable::find(salesorderLineEntity.SalesOrderNumber);
+
+            if (metSalesTableStd.Reservation == ItemReservation::Automatic && metSalesTableStd.metSubstitutionActive())
+            {
+                metInventDimStd.InventSiteId        = salesorderLineEntity.ShippingSiteId;
+                metInventDimStd.InventLocationId    = salesorderLineEntity.ShippingWarehouseId;
+                metInventDimStd   = InventDim::findOrCreate(metInventDimStd);
+
+                InventQty   inventQty = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(salesorderLineEntity.ItemNumber,
+                                                                                              metInventDimStd.inventDimId,
+                                                                                              salesorderLineEntity.OrderedSalesQuantity,
+                                                                                              salesorderLineEntity.SalesUnitSymbol,
+                                                                                              InventTable::find(salesorderLineEntity.ItemNumber).inventUnitId(),
+                                                                                              NoYes::Yes);
+
+                inventQty = decRound(inventQty,InventTable::inventDecimals(salesorderLineEntity.ItemNumber));
+
+                METSalesItemSubstitution metSalesItemSubstitution = METSalesItemSubstitution::construct();
+
+                boolean found    = metSalesItemSubstitution.findSubstitutionItem(salesorderLineEntity.ItemNumber, 
+                                                                                 metInventDimStd,
+                                                                                 metSalesTableStd.CustAccount,
+                                                                                 metSalesTableStd.custTable_CustAccount().CustGroup,
+                                                                                 inventQty);
+                metSalesLine    = metSalesItemSubstitution.parmMetSalesLine();                    
+
+                if (found && metSalesLine.SubstituteReplacementItemID != '' && 
+                    salesorderLineEntity.ItemNumber != metSalesLine.SubstituteReplacementItemID)
+                {
+                    UnitOfMeasureSymbol salesUnit   = metSalesItemSubstitution.substitutionItemSalesUnit(metSalesLine.SubstituteReplacementItemID, metSalesTableStd.InventSiteId);
+                    SalesQty    salesQty    = metSalesItemSubstitution.substitutionItemSalesQty(salesorderLineEntity.ItemNumber,
+                                                                                                metSalesLine.SubstituteReplacementItemID,
+                                                                                                metSalesTableStd.InventSiteId,
+                                                                                                salesUnit,
+                                                                                                salesorderLineEntity.OrderedSalesQuantity,
+                                                                                                metSalesItemSubstitution.parmRounding());
+
+                    salesorderLineEntity.ItemNumber             = metSalesLine.SubstituteReplacementItemID;
+                    salesorderLineEntity.OrderedSalesQuantity   = salesQty;
+                    salesorderLineEntity.SalesUnitSymbol        = salesUnit;
+
+                    salesorderLineEntity.METSubstituteOriginalItemID        = metSalesLine.SubstituteOriginalItemID;
+                    salesorderLineEntity.METSubstituteReplacementItemID     = metSalesLine.SubstituteReplacementItemID;
+                    salesorderLineEntity.METSubstituteParentItemID          = metSalesLine.SubstituteParentItemID;
+                    salesorderLineEntity.METSubstitutionType                = metSalesLine.SubstitutionType;
+                    salesorderLineEntity.METSubstitutionCode                = metSalesLine.SubstitutionCode;
+                    salesorderLineEntity.METSubstitutionSetupRefRecID       = metSalesLine.SubstitutionSetupRefRecID; 
+                    salesorderLineEntity.METOrderExtractStatus              = METOrderExtractStatus::None;
+                    modified = true;
+
+                    _dataSourceCtx.setBuffer(salesorderLineEntity);
+                }
+            }            
+        }
+
+        boolean ret = next insertEntityDataSource(_entityCtx, _dataSourceCtx);        
+
+        if (modified && _dataSourceCtx.name() == dataentitydatasourcestr(SalesOrderLineCDSV2Entity, SalesOrderLineEntity))
+        {
+            SalesOrderLineV2Entity salesorderLineEntity = _dataSourceCtx.getBuffer();
             
-            if (salesLine.Reservation == ItemReservation::Automatic)
+
+            metSalesLineStd = SalesLine::findInventTransId(salesorderLineEntity.InventoryLotId);
+            METSalesLine    METSalesLineUpdate = METSalesLine::find(metSalesLineStd.RecId);
+
+            if (METSalesLineUpdate.RecId)
             {
-                metSalesOrderAutoReserve    = new METSalesOrderAutoReserve();
-                newSalesLine    = metSalesOrderAutoReserve.applySubstitution(salesLine, METSalesLine::find(salesLine.RecId), salesLine.inventDim());
+                ttsbegin;
 
-                if (newSalesLine.RecId)
-                {
-                    salesLine   = newSalesLine;
-                }
-            }
+                METSalesLineUpdate.selectForUpdate(true);
+                metSalesLineUpdate.OrderExtractStatus   = METOrderExtractStatus::Open;                
+                metSalesLineUpdate.update();
 
-            if (salesLine.Reservation == ItemReservation::None && 
-                MetSalesOrderTypes::find(salesTable.METSalesOrderType).OrderReserve == NoYes::Yes)
-            {
-                metSalesTable   = METSalesTable::findByRefRecId(salesTable.RecId);
-                qtyRemain   = salesLine.SalesQty;
-
-                insert_recordset purchLineShipDateTmp (RefRecId, ShippingDate)
-                select RecId, ConfirmedDlv from purchLine
-                    where purchLine.ItemId == salesLine.ItemId
-                        && purchLine.InventDimId == salesLine.InventDimId
-                        && purchLine.ConfirmedDlv != dateNull()
-                    exists join purchTable
-                        where purchTable.PurchId == purchLine.PurchId
-                        exists join metPurchTable
-                            where metPurchTable.PurchTable == purchTable.RecId
-                                && metPurchTable.EventID == metSalesTable.EventID;
-
-                insert_recordset purchLineShipDateTmp (RefRecId, ShippingDate)
-                select RecId, DeliveryDate from purchLine
-                    where purchLine.ItemId == salesLine.ItemId
-                        && purchLine.InventDimId == salesLine.InventDimId
-                        && purchLine.ConfirmedDlv == dateNull()
-                    exists join purchTable
-                        where purchTable.PurchId == purchLine.PurchId
-                        exists join metPurchTable
-                            where metPurchTable.PurchTable == purchTable.RecId
-                                && metPurchTable.EventID == metSalesTable.EventID;
-
-                while select purchLine order by purchLineShipDateTmp.ShippingDate
-                    where purchLine.ItemId == salesLine.ItemId
-                        && purchLine.InventDimId == salesLine.InventDimId
-                    join purchLineShipDateTmp
-                        where purchLineShipDateTmp.RefRecId == purchLine.RecId
-                    exists join purchTable
-                        where purchTable.PurchId == purchLine.PurchId
-                        exists join metPurchTable
-                            where metPurchTable.PurchTable == purchTable.RecId
-                                && metPurchTable.EventID == metSalesTable.EventID
-                {
-                    select firstonly RecId from inventTransOriginSales
-                        where inventTransOriginSales.InventTransId == salesLine.InventTransId;
-
-                    select firstonly RecId from inventTransOriginPurch
-                        where inventTransOriginPurch.InventTransId == purchLine.InventTransId;
-
-                    qtyRemain   -= InventTransOrigin::updateMarking(inventTransOriginSales.RecId, inventTransOriginPurch.RecId, -1 * qtyRemain);
-
-                    if (qtyRemain > 0)
-                    {
-                        continue;
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
-            }
-        }     
+                ttscommit;
+            }            
+        }
     
         return ret;
     }
