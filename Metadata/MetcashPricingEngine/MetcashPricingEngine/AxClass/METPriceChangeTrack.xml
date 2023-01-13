@@ -12,6 +12,7 @@ using Microsoft.Dynamics.AX.Platform.Extensibility;
 abstract class METPriceChangeTrack
 {
     const public str        blankValue = '';
+    const public Qty        qtyOne = 1;
     METPriceChangeTracking  priceChangeTrackingOrig;
     RecordSortedList        priceDataFeedList;
     METPriceDataFeed        priceDataFeed;
@@ -831,6 +832,7 @@ abstract class METPriceChangeTrack
     /// <param name = "_changeCodeRelated">Related code</param>
     /// <param name = "_changeCodeLineNumRelated">Related line</param>
     /// <param name = "_eventId">Event id</param>
+    /// <param name = "_quantityAmountFrom">From qty</param>
     public void createRelatedComponentsBase(METPriceChangeTracking  _priceChangeTracking,
                                             LineNumber              _lineNumberOrig,
                                             RefRecId                _pricingRuleHeader,
@@ -840,14 +842,15 @@ abstract class METPriceChangeTrack
                                             METCreationType         _creationType,
                                             METChangeCodeRelated    _changeCodeRelated,
                                             METChangeCodeLineNumRelated _changeCodeLineNumRelated,
-                                            METEventId              _eventId)
+                                            METEventId              _eventId,
+                                            METQuantityAmountFrom   _quantityAmountFrom)
     {
         METPriceChangeTracking      priceChangeTrackingUpdate;
         Query                       custPreviewQuery;
         Query                       productPreviewQuery;
         GUPPricingRuleCopy          pricingRuleCopyCustHeader, pricingRuleCopy;
         QueryBuildDataSource        qbds;
-        QueryBuildRange             qbr;
+        QueryFilter                 qf;
 
         if(_pricingRuleHeader != pricingRuleHeaderPrevious)
         {
@@ -859,8 +862,9 @@ abstract class METPriceChangeTrack
             
             if(qbds)
             {
-                qbr = SysQuery::findOrCreateRange(qbds, fieldNum(CustTable, AccountNum));
-                qbr.value(queryValue(_priceChangeTracking.PriceDiscAccountRelation));
+                qf = custPreviewQuery.addQueryFilter(qbds, fieldStr(CustTable, AccountNum)); //fieldNum(CustTable, AccountNum));
+                qf.value(queryValue(_priceChangeTracking.PriceDiscAccountRelation));
+
             }
 
             custAccountRelatedSet = this.buildCustValues(custPreviewQuery, pricingRuleCopyCustHeader);
@@ -876,8 +880,9 @@ abstract class METPriceChangeTrack
             
             if(qbds)
             {
-                qbr = SysQuery::findOrCreateRange(qbds, fieldNum(InventTable, ItemId));
-                qbr.value(queryValue(_priceChangeTracking.ItemId));
+                qf = productPreviewQuery.addQueryFilter(qbds, fieldStr(InventTable, ItemId));
+                qf.value(queryValue(_priceChangeTracking.ItemId));
+
             }
 
             inventItemRelatedSet = this.buildItemValues(productPreviewQuery, pricingRuleCopy);
@@ -893,7 +898,7 @@ abstract class METPriceChangeTrack
                                                         _priceChangeTracking.InventSiteId,
                                                         _priceChangeTracking.UnitId,
                                                         _startDate,
-                                                        _priceChangeTracking.QuantityAmountFrom,
+                                                        _quantityAmountFrom,
                                                         _eventId))
             {
                 buf2Buf(_priceChangeTracking, priceChangeTrackingUpdate);
@@ -901,6 +906,7 @@ abstract class METPriceChangeTrack
                 //update priceChangeTracking values for processing, but dont committ to DB
                 priceChangeTrackingUpdate.FromDate          = _startDate;
                 priceChangeTrackingUpdate.PricingRuleHeader = _pricingRuleHeader;
+                priceChangeTrackingUpdate.QuantityAmountFrom = _quantityAmountFrom;
 
                 this.createPriceDataFeed(_creationType, priceChangeTrackingUpdate, _lineNumberOrig, _eventId, _changeCodeRelated, _changeCodeLineNumRelated);
             }
@@ -933,8 +939,9 @@ abstract class METPriceChangeTrack
         RefRecId                    pricingRuleHeader, linePricingRule;
         TransDate                   startDate;
         METEventId                  eventId;
+        RetailQtyLowest             fromQty;
 
-        while select OfferId, HeaderPricingRule, ValidFrom, HeaderPricingGroupCode
+        while select OfferId, HeaderPricingRule, ValidFrom, HeaderPricingGroupCode, PeriodicDiscountType
             from    retailPeriodicDiscount
             where   retailPeriodicDiscount.OfferId      != this.getChangeCode(_priceChangeTracking)
             &&      retailPeriodicDiscount.ValidTo      > _priceChangeTracking.FromDate
@@ -952,17 +959,88 @@ abstract class METPriceChangeTrack
             linePricingRule     = retailPeriodicDiscountLine.LinePricingRule;
             startDate           = this.getFromDate(retailPeriodicDiscount.ValidFrom);
             eventId             = this.getEventId(retailPeriodicDiscount.HeaderPricingRule);
+            
+            if (retailPeriodicDiscount.PeriodicDiscountType == RetailDiscountOfferTypeBase::Multibuy)
+            {
+                this.createRelatedPriceAdjMulti(_priceChangeTracking,
+                                                _lineNumberOriginal,
+                                                pricingRuleHeader,
+                                                linePricingRule,
+                                                retailPeriodicDiscount.HeaderPricingGroupCode,
+                                                startDate,
+                                                _creationType,
+                                                retailPeriodicDiscount.OfferId,
+                                                retailPeriodicDiscountLine.LineNum,
+                                                eventId);
+            }
+            else
+            {
+                fromQty             = qtyOne;
+                
+                this.createRelatedComponentsBase(_priceChangeTracking, 
+                                                _lineNumberOriginal,
+                                                pricingRuleHeader, 
+                                                linePricingRule, 
+                                                retailPeriodicDiscount.HeaderPricingGroupCode, 
+                                                startDate, 
+                                                _creationType,
+                                                retailPeriodicDiscount.OfferId,
+                                                retailPeriodicDiscountLine.LineNum,
+                                                eventId,
+                                                fromQty);
+            }
+        }
+    }
 
-            this.createRelatedComponentsBase(_priceChangeTracking, 
-                                            _lineNumberOriginal,
-                                            pricingRuleHeader, 
-                                            linePricingRule, 
-                                            retailPeriodicDiscount.HeaderPricingGroupCode, 
-                                            startDate, 
-                                            _creationType,
-                                            retailPeriodicDiscount.OfferId,
-                                            retailPeriodicDiscountLine.LineNum,
-                                            eventId);
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRelatedPriceAdjMulti</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a Price data feed records from Related components
+    /// </summary>
+    /// <param name = "_priceChangeTracking">Change Tracking record</param>
+    /// <param name = "_lineNumberOrig">Line numbner</param>
+    /// <param name = "_pricingRuleHeader">Header price rule</param>
+    /// <param name = "_linePricingRule">Line price rule</param>
+    /// <param name = "_groupAll">Group All</param>
+    /// <param name = "_startDate">Start date</param>
+    /// <param name = "_creationType">creation type</param>
+    /// <param name = "_changeCodeRelated">Related code</param>
+    /// <param name = "_changeCodeLineNumRelated">Related line</param>
+    /// <param name = "_eventId">Event id</param>
+    public void createRelatedPriceAdjMulti( METPriceChangeTracking  _priceChangeTracking,
+                                            LineNumber              _lineNumberOrig,
+                                            RefRecId                _pricingRuleHeader,
+                                            RefRecId                _linePricingRule,
+                                            GUPGroupAll             _groupAll,
+                                            TransDate               _startDate,
+                                            METCreationType         _creationType,
+                                            METChangeCodeRelated    _changeCodeRelated,
+                                            METChangeCodeLineNumRelated _changeCodeLineNumRelated,
+                                            METEventId              _eventId)
+    {
+        RetailMultibuyDiscountLine  retailMultibuyDiscountLine;
+        RetailQtyLowest             fromQty;
+
+        while select QtyLowest
+            from    retailMultibuyDiscountLine
+            where   retailMultibuyDiscountLine.multibuyId == _changeCodeRelated
+        {
+            fromQty             = this.getFromQty(retailMultibuyDiscountLine.qtyLowest);
+                
+            this.createRelatedComponentsBase(_priceChangeTracking,
+                                             _lineNumberOrig,
+                                             _pricingRuleHeader,
+                                             _linePricingRule,
+                                             _groupAll,
+                                             _startDate,
+                                             _creationType,
+                                             _changeCodeRelated,
+                                             _changeCodeLineNumRelated,
+                                             _eventId,
+                                             fromQty);
         }
     }
 
@@ -972,7 +1050,7 @@ abstract class METPriceChangeTrack
 				<Name>createRelatedAutoCharge</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Create a Price data feed records from Related components
+    /// Create a Price data feed record from Related components
     /// </summary>
     /// <param name = "_priceChangeTracking">Change Tracking record</param>
     /// <param name = "_lineNumberOrig">Line number</param>
@@ -983,7 +1061,8 @@ abstract class METPriceChangeTrack
         RefRecId                pricingRuleHeader, linePricingRule;
         TransDate               startDate;
         QueryBuildDataSource    qbdsLine;
-        
+        RetailQtyLowest         fromQty;
+
         Query   query = new Query(queryStr(METMarkupAutoLineHeader));
 
         QueryRun    qr;
@@ -1011,6 +1090,7 @@ abstract class METPriceChangeTrack
             pricingRuleHeader       = markupAutoLine.pricingRuleHeader ? markupAutoLine.pricingRuleHeader : markupAutoTable.PricingRuleHeader;
             linePricingRule         = markupAutoLine.PricingRuleLine ? markupAutoLine.PricingRuleLine : markupAutoTable.PricingRuleLine;
             startDate               = this.getFromDate(markupAutoLine.FromDate);
+            fromQty                 = this.getFromQty(markupAutoLine.FromAmount);
 
             this.createRelatedComponentsBase(_priceChangeTracking,
                                             _lineNumberOrig,
@@ -1021,7 +1101,8 @@ abstract class METPriceChangeTrack
                                             METCreationType::RelatedAutoCharge,
                                             markupAutoTable.description,
                                             markupAutoLine.LineNum,
-                                            "");
+                                            "",
+                                            fromQty);
         }
     }
 
@@ -1206,6 +1287,25 @@ abstract class METPriceChangeTrack
 
         return priceDataFeedList;
 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the From Qty
+    /// </summary>
+    /// <param name = "_fromQty">From qty</param>
+    /// <returns>Updated from Qty</returns>
+    public FromQty  getFromQty(FromQty _fromQty)
+    {
+        FromQty fromQty;
+
+        fromQty = _fromQty ? _fromQty : 1;
+
+        return fromQty;
     }
 
 ]]></Source>
