@@ -4,19 +4,15 @@
 	<SourceCode>
 		<Declaration><![CDATA[
 /// <summary>
-/// The <c>WHSReleaseToWarehouseService</c> class exposes services for auto shipment creation.
+/// The <c>MetTransferOrderAutoShipService</c> class exposes services for auto shipment creation.
 /// </summary>
 public class MetTransferOrderAutoShipService
 {
     #OCCRetryCount
 
-    WHSReleaseToWarehouseRetrieveRTWId  retrieveRTWId;
-    WHSTmpReleaseToWarehouse            releaseToWarehouse;
-    private WHSReleaseToWarehouseId     releaseToWarehouseIdGlobal;
-    private boolean                     errorsFound;
+    private boolean                             errorsFound;
+    container                                   transferOrderShipCon;
 
-   
-   
 
 }
 ]]></Declaration>
@@ -31,15 +27,58 @@ public class MetTransferOrderAutoShipService
         setPrefix(strFmt("@SYP4860552", _transferTable.TransferId));
         
         try
-        {
-            ttsBegin;
-            ttscommit;
+        { 
+            int recordCount;
+            MetTransferShipmentTable    metTransferShipmentTable;
+            MetTransferShipmentLine     metTransferShipmentLine;
+            NumberSeq                   numberSeqShipmentId,numberSeqLoadId;
+            MetShipmentId               metShipmentId;
+            MetLoadId                   metLoadID;
+            InventTransferTable         inventTransferTable;
+            METInventTransferTableExt   metInventTransferTableExt;
+            InventTransferId            inventTransferId;
 
+            numberSeqShipmentId = NumberSeq::newGetNum(WHSParameters::numRefMetShippingID());
+            metShipmentId = numberSeqShipmentId.num();
 
+            numberSeqLoadId = NumberSeq::newGetNum(WHSParameters::numRefMetLoadID());
+            metLoadID       = numberSeqLoadId.num();
+        
+            for(recordCount = 1; recordCount <= conLen(transferOrderShipCon); recordCount++)
+            {
+                if(recordCount == 1)
+                {
+                    inventTransferId    = conPeek(transferOrderShipCon,recordCount);
+                    inventTransferTable = InventTransferTable::find(inventTransferId);
+
+                    select  metInventTransferTableExt where
+                    metInventTransferTableExt.InventTransferTable   == inventTransferTable.RecId;
+
+                    metTransferShipmentTable.MetShipmentId      = metShipmentId;
+                    metTransferShipmentTable.MetLoadId          = metLoadID;
+                    metTransferShipmentTable.MetShipmentStatus  = MetShipmentStatus::Open;
+                    metTransferShipmentTable.FromWarehouse      = inventTransferTable.InventLocationIdFrom;
+                    metTransferShipmentTable.ToWarehouse        = inventTransferTable.InventLocationIdTo;
+                    metTransferShipmentTable.ShipDate           = inventTransferTable.ShipDate;
+                    metTransferShipmentTable.Route              = metInventTransferTableExt.Route;
+                    metTransferShipmentTable.RouteStop          = metInventTransferTableExt.RouteStop;
+                    metTransferShipmentTable.insert();
+                }
+
+                metTransferShipmentline.MetShipmentId       = metShipmentId;
+                metTransferShipmentline.TransferId          = inventTransferId;
+                metTransferShipmentline.LineNum            += 1;
+                metTransferShipmentline.HazardousMaterial   =  this.checkIfHazardousMaterial(inventTransferId);
+                metTransferShipmentline.insert();
+
+                //update Trandfer order pending
+
+                //dataContract.parmMetShipmentId(metShipmentId);
+            }
+      
         }
         catch (Exception::Error)
         {
-            //error(WHSWarehouseRelease::cannotReleaseTransferMessage(_transferTable));
             errorsFound = true;
         }
         catch (Exception::Deadlock)
@@ -58,15 +97,7 @@ public class MetTransferOrderAutoShipService
             }
             retry;
         }
-        catch
-        {
-            if (appl.ttsLevel() != 0)
-            {
-                throw error(strFmt("@SYS330665", funcName()));
-            }
-
-            exceptionTextFallThrough();
-        }
+       
 
     }
 
@@ -90,50 +121,78 @@ public class MetTransferOrderAutoShipService
     public void autoShipTransferOrders(MetTransferOrderAutoShipContract _contract)
     {
         errorsFound = false;
+        InventTransferTable inventTransferTable;
 
         if (!_contract.validate())
         {
             throw error("@SYS78886");
         }
 
-        this.checkTTSLevel();
 
-
-        QueryRun queryRunTransfers = new QueryRun(this.finalTransferOrdersReleaseQuery(_contract));
-                  
+        QueryRun queryRunTransfers = new QueryRun(this.transferOrdersShipQuery(_contract));
        
-        int processedTransferOrders = 0;
         while (queryRunTransfers.next())
         {
-            InventTransferTable inventTransferTable = queryRunTransfers.get(tableNum(InventTransferTable));
-           // this.autoReleaseTransferOrder(inventTransferTable, _contract);
-
-            processedTransferOrders++;
+            inventTransferTable      = queryRunTransfers.get(tableNum(InventTransferTable));
+            transferOrderShipCon     = conIns(transferOrderShipCon, conLen(transferOrderShipCon) + 1, inventTransferTable.TransferId);
         }
 
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>checkTTSLevel</Name>
-				<Source><![CDATA[
-    private void checkTTSLevel()
-    {
-        if (appl.ttsLevel() != 0)
+        if(conLen(transferOrderShipCon))
         {
-            // The auto release job is using transaction management for rolling back reservations in cases of release failure.
-            // Also infinite loop problems can happen when running the auto release functionality within a transaction scope.
-            throw error(Error::wrongUseOfFunction(funcName()));
+           this.autoTransferShipmentCreation(inventTransferTable, _contract);
         }
+        else
+        {
+            warning("@MET:NoTransferOrderToProcess");
+        }
+
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>finalTransferOrdersReleaseQuery</Name>
+				<Name>checkIfHazardousMaterial</Name>
 				<Source><![CDATA[
-    private Query finalTransferOrdersReleaseQuery(MetTransferOrderAutoShipContract _contract)
+    /// <summary>
+    /// Check Hazardous material
+    /// </summary>
+    /// <param name = "_transferid">TransferId</param>
+    /// <returns>NoYes</returns>
+    public NoYes checkIfHazardousMaterial(InventTransferId _transferid)
+    {
+        InventTransferLine          inventTransferLine;
+        InventTable                 InventTable;
+
+        select inventTransferLine
+                    where inventTransferLine.TransferId == _transferid
+          exists join InventTable
+                    where InventTable.ItemId == inventTransferLine.ItemId
+                     && InventTable.HMIMIndicator == NoYes::Yes;
+
+        if(inventTransferLine)
+        {
+            return NoYes::Yes;
+        }
+        else
+        {
+            return NoYes::No;
+
+        }
+
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>transferOrdersShipQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get the query 
+    /// </summary>
+    /// <param name = "_contract">atuoshipContract</param>
+    /// <returns>Query</returns>
+    private Query transferOrdersShipQuery(MetTransferOrderAutoShipContract _contract)
     {
         Query query = _contract.parmQuery();
         ////QueryBuildDataSource  dsTransferLines = query.dataSourceTable(tableNum(InventTransferTable)).addDataSource(tableNum(InventTransferLine));
