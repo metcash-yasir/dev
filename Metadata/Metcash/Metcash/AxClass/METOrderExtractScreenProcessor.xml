@@ -8,26 +8,18 @@
 /// </summary>
 public class METOrderExtractScreenProcessor
 {
-    METOrderExtractScreenTmp                metOrderExtractScreenTmp;
+    MetOrderExtractScreenTmp                metOrderExtractScreenTmp;
     MEtOrderExtractScreenParameters         metOrderExtractScreenParameters;
     SalesTable                              salesTable;
     SalesLine                               salesLine;
-    SalesLine                               salesLineIns;
+    METSalesLine                            metSalesLine;
     MetItemSiteSettingsSetup                itemSiteSettings;
-    METWHSPhysDimUOMSite                    metWHSPhysDimUOMSite;
-    METWHSPhysDimUOMSite                    metWHSPhysDimUOMSiteJoin;
     InventDim                               inventDim;
-    METOrderExtractScreenUOMView            metOrderExtractScreenUOMView;
-    METOrderExtractScreenPhysDimView        metOrderExtractScreenPhysDimView;
-    WHSPhysDimUOM                           whsPhysDimUOM;
-    WHSPhysDimUOM                           whsPhysDimUOMJoin;
-    METOrderExtractScreenUOMViewTmp         metOrderExtractScreenUOMViewTmp;
     ReqItemTable                            reqItemTable;
     METReqItemTable                         metReqItemTable;        
     InventDim                               inventDimReq;
     METInventLocation                       metInventLocation;
 
-    Factor                                  factor;
     InventQty                               cases;
     InventSiteId                            site;
     InventLocationId                        warehouse;
@@ -42,7 +34,6 @@ public class METOrderExtractScreenProcessor
     Map                                     volumeMap;
     Map                                     itemTypeMap;
     MapEnumerator                           mapEnum;
-    container                               salesIdCon;
 
 }
 ]]></Declaration>
@@ -170,6 +161,7 @@ public class METOrderExtractScreenProcessor
         #OCCRetryCount
         try
         {
+            this.initParams();
             totalPallets = this.parmTotalpallets();
             metOrderExtractScreenTmp.linkPhysicalTableInstance(_metOrderExtractScreenTmp);
 
@@ -177,163 +169,18 @@ public class METOrderExtractScreenProcessor
             update_recordset metOrderExtractScreenTmp
                 setting weight = 0, Volume = 0, Cases = 0, BrokenCase = 0;
 
-            delete_from metOrderExtractScreenUOMViewTmp;
-
-            //METOrderExtractScreenUOMView holds UOM data from custom physical dimensions by site form  by salesId, category, site & warehouse
-            //so we insert to temp table for grouping by SalesId & Category
-            insert_recordset metOrderExtractScreenUOMViewTmp (SalesId, Category, Weight, Volume)
-                select SalesId, Category, sum(Weight), sum(Volume) from metOrderExtractScreenUOMView group by SalesId, category
-                    where  (!site || metOrderExtractScreenUOMView.InventSiteId == site)
-                    && (!warehouse || metOrderExtractScreenUOMView.InventLocationId == warehouse);
-
-            //Case2: Update weight, volume for Case1 records where Item, Site & UOM matches
-            update_recordset metOrderExtractScreenTmp
-                setting weight = metOrderExtractScreenUOMViewTmp.Weight,
-                        Volume = metOrderExtractScreenUOMViewTmp.Volume
-                join Weight, Volume from metOrderExtractScreenUOMViewTmp
-                    where metOrderExtractScreenUOMViewTmp.SalesId == metOrderExtractScreenTmp.SalesId
-                    && metOrderExtractScreenUOMViewTmp.Category == metOrderExtractScreenTmp.FilterCodeOne;
-
-            
-            //Case3: Update weight, volume for Case1 records where Item & Site matches. Conversion required
-            while select metOrderExtractScreenTmp
-                join  ItemId, SalesQty, SalesUnit, InventDimId from salesLine
-                    where  salesLine.SalesStatus == SalesStatus::Backorder
-                    && salesLine.SalesQty > 0
-                    && salesLine.SalesId == metOrderExtractScreenTmp.SalesId
-                join InventSiteId from inventDim
-                    where inventDim.inventDimId == salesLine.InventDimId
-                    && (!site || inventDim.InventSiteId == site)
-                    && (!warehouse || inventDim.InventLocationId == warehouse)
-                join firstonly metWHSPhysDimUOMSite
-                    where metWHSPhysDimUOMSite.ItemId == salesLine.ItemId
-                    && metWHSPhysDimUOMSite.SiteId == inventDim.InventSiteId
-                    && metWHSPhysDimUOMSite.UOM != salesLine.SalesUnit
-                exists join itemSiteSettings 
-                    where itemSiteSettings.ItemId == salesLine.ItemId
-                    &&  itemSiteSettings.InventSiteId == inventDim.InventSiteId
-                    &&  itemSiteSettings.FilterCode1 == metOrderExtractScreenTmp.FilterCodeOne
-                notexists join metWHSPhysDimUOMSiteJoin //Tow sales lines with same category and different site UOM
-                    where metWHSPhysDimUOMSiteJoin.ItemId == salesLine.ItemId
-                    && metWHSPhysDimUOMSiteJoin.SiteId == inventDim.InventSiteId
-                    && metWHSPhysDimUOMSiteJoin.UOM == salesLine.SalesUnit
-            {
-                ttsbegin;
-                metOrderExtractScreenTmp.reread();
-                metOrderExtractScreenTmp.selectForUpdate(true);
-                factor = EcoResProductUnitConverter::convertForReleasedProduct(
-                        metWHSPhysDimUOMSite.ItemId,
-                        salesLine.inventDimId,
-                        1,
-                        EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(metWHSPhysDimUOMSite.UOM),
-                        EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(salesLine.SalesUnit),
-                        NoYes::No,
-                        NoYes::No);
-
-                if (factor)
-                {
-                    metOrderExtractScreenTmp.Weight += salesLine.SalesQty * (metWHSPhysDimUOMSite.Weight/factor);
-                    metOrderExtractScreenTmp.Volume += salesLine.SalesQty * (metWHSPhysDimUOMSite.displayVolume()/factor);
-                }
-                metOrderExtractScreenTmp.update();
-                ttscommit;
-            }
-            
-            delete_from metOrderExtractScreenUOMViewTmp;
-            //METOrderExtractScreenPhysDimView holds UOM data from standard Physical dimensions form by salesId, category, site & warehouse
-            //so we insert to temp table for grouping by SalesId & Category
-            insert_recordset metOrderExtractScreenUOMViewTmp (SalesId, Category, Weight, Volume)
-                select SalesId, Category, sum(Weight), sum(Volume) from metOrderExtractScreenPhysDimView group by SalesId, category
-                    where  (!site || metOrderExtractScreenPhysDimView.InventSiteId == site)
-                    && (!warehouse || metOrderExtractScreenPhysDimView.InventLocationId == warehouse)
-                exists join  salesLine
-                    where  salesLine.SalesStatus == SalesStatus::Backorder
-                    && salesLine.SalesQty > 0
-                    && salesLine.ItemId == metOrderExtractScreenPhysDimView.ItemId
-                    && salesLine.SalesId == metOrderExtractScreenPhysDimView.SalesId
-                    && salesLine.SalesUnit == metOrderExtractScreenPhysDimView.SalesUnit
-                exists join itemSiteSettings
-                    where itemSiteSettings.ItemId == salesLine.ItemId
-                    &&  itemSiteSettings.InventSiteId == metOrderExtractScreenPhysDimView.InventSiteId
-                    &&  itemSiteSettings.FilterCode1 == metOrderExtractScreenPhysDimView.Category
-                exists join whsPhysDimUOMJoin
-                    where whsPhysDimUOMJoin.ItemId == metOrderExtractScreenPhysDimView.ItemId
-                    && whsPhysDimUOMJoin.UOM == salesLine.SalesUnit
-                notexists join metWHSPhysDimUOMSiteJoin
-                    where metWHSPhysDimUOMSiteJoin.ItemId == salesLine.ItemId
-                    && metWHSPhysDimUOMSiteJoin.SiteId == metOrderExtractScreenPhysDimView.InventSiteId;
-
-            
-            //Case4: Update weight, volume for Case1 records where Item, Site & UOM matches
-            update_recordset metOrderExtractScreenTmp
-                setting weight = metOrderExtractScreenTmp.weight + metOrderExtractScreenUOMViewTmp.Weight,
-                        Volume = metOrderExtractScreenTmp.Volume + metOrderExtractScreenUOMViewTmp.Volume
-                join Weight, Volume from metOrderExtractScreenUOMViewTmp
-                    where metOrderExtractScreenUOMViewTmp.SalesId == metOrderExtractScreenTmp.SalesId
-                    && metOrderExtractScreenUOMViewTmp.Category == metOrderExtractScreenTmp.FilterCodeOne;
-
-
-            //Case5: Update weight, volume for records where Item & Site matches. Conversion required
-            while select metOrderExtractScreenTmp
-                join  ItemId, SalesQty, SalesUnit, InventDimId from salesLine
-                    where  salesLine.SalesStatus == SalesStatus::Backorder
-                    && salesLine.SalesQty > 0
-                    && salesLine.SalesId == metOrderExtractScreenTmp.SalesId
-                join InventSiteId from inventDim
-                    where inventDim.inventDimId == salesLine.InventDimId
-                    && (!site || inventDim.InventSiteId == site)
-                    && (!warehouse || inventDim.InventLocationId == warehouse)
-                join whsPhysDimUOM
-                    where whsPhysDimUOM.ItemId == salesLine.ItemId
-                    && whsPhysDimUOM.UOM != salesLine.SalesUnit
-                exists join itemSiteSettings
-                    where itemSiteSettings.ItemId == salesLine.ItemId
-                    &&  itemSiteSettings.InventSiteId == inventDim.InventSiteId
-                    &&  itemSiteSettings.FilterCode1 == metOrderExtractScreenTmp.FilterCodeOne
-                notexists join metWHSPhysDimUOMSite
-                    where metWHSPhysDimUOMSite.ItemId == salesLine.ItemId
-                    && metWHSPhysDimUOMSite.SiteId == inventDim.InventSiteId
-            {
-
-                metOrderExtractScreenTmp.reread();
-                //notexists join is not working and so a seperate call is made
-                select firstonly RecId from whsPhysDimUOMJoin
-                    where whsPhysDimUOMJoin.ItemId == salesLine.ItemId
-                    && whsPhysDimUOMJoin.UOM == salesLine.SalesUnit;
-                if (whsPhysDimUOMJoin.RecId)
-                {
-                    continue;
-                }
-
-                ttsbegin;
-                metOrderExtractScreenTmp.selectForUpdate(true);
-                factor = EcoResProductUnitConverter::convertForReleasedProduct(
-                            whsPhysDimUOM.ItemId,
-                            salesLine.inventDimId,
-                            1,
-                            EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(whsPhysDimUOM.UOM),
-                            EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(salesLine.SalesUnit),
-                            NoYes::No,
-                            NoYes::No);
-                if (factor)
-                {
-                    metOrderExtractScreenTmp.Weight += salesLine.SalesQty * (whsPhysDimUOM.Weight/factor);
-                    metOrderExtractScreenTmp.Volume += salesLine.SalesQty * (whsPhysDimUOM.displayVolume()/factor);
-                }
-                metOrderExtractScreenTmp.update();
-                ttscommit;
-            }
             
             METItemTypes        itemTypes;
             volumeMap           = new Map (Types::String, Types::Real);
             itemTypeMap         = new Map (Types::String, Types::String);  
         
-            //Case5: Update ItemType, Case, Broken case
             while select metOrderExtractScreenTmp
                 join  ItemId, SalesQty, SalesUnit, InventDimId from salesLine
                     where  salesLine.SalesStatus == SalesStatus::Backorder
                     && salesLine.SalesQty > 0
                     && salesLine.SalesId == metOrderExtractScreenTmp.SalesId
+                join SalesUnitVolume, SalesUnitWeight from metSalesLine
+                    where metSalesLine.SalesLine == salesLine.RecId
                 join InventSiteId, InventLocationId from inventDim
                     where inventDim.inventDimId == salesLine.InventDimId
                     && (!site || inventDim.InventSiteId == site)
@@ -342,21 +189,7 @@ public class METOrderExtractScreenProcessor
                     where itemSiteSettings.ItemId == salesLine.ItemId
                     &&  itemSiteSettings.InventSiteId == inventDim.InventSiteId
                     &&  itemSiteSettings.FilterCode1 == metOrderExtractScreenTmp.FilterCodeOne
-            {
-                if (!conFind(salesIdCon, metOrderExtractScreenTmp.SalesId))
-                {
-                    salesIdCon += metOrderExtractScreenTmp.SalesId;
-                    //Calculate volume by warehouse. This will be required to calculate total pallets.
-                    if (volumeMap.exists(inventDim.InventLocationId))
-                    {
-                        volumeMap.insert(inventDim.InventLocationId, metOrderExtractScreenTmp.Volume +  volumeMap.lookup(inventDim.InventLocationId));
-                    }
-                    else
-                    {
-                        volumeMap.insert(inventDim.InventLocationId, metOrderExtractScreenTmp.Volume);
-                    }
-                }
-
+            {              
                 //If there are multiple items in the order with different item type then show Multiple*
                 if (itemTypeMap.exists(metOrderExtractScreenTmp.SalesId)
                     && itemTypeMap.lookup(metOrderExtractScreenTmp.SalesId) != itemSiteSettings.ItemType)
@@ -369,14 +202,27 @@ public class METOrderExtractScreenProcessor
                     itemTypeMap.insert(metOrderExtractScreenTmp.SalesId, itemSiteSettings.ItemType);
                     itemTypes = itemSiteSettings.ItemType;
                 }
+
                 ttsbegin;
                 metOrderExtractScreenTmp.reread();
                 metOrderExtractScreenTmp.selectForUpdate(true);
+                metOrderExtractScreenTmp.Weight     += salesLine.SalesQty * metSalesLine.SalesUnitWeight;
+                metOrderExtractScreenTmp.Volume     += salesLine.SalesQty * metSalesLine.SalesUnitVolume;
                 metOrderExtractScreenTmp.ItemType   =   itemTypes;
                 metOrderExtractScreenTmp.Cases      +=  salesLine.displayMETcases();
                 metOrderExtractScreenTmp.BrokenCase +=  salesLine.displayMETBrokenCase();
                 metOrderExtractScreenTmp.update();
                 ttscommit;
+
+                //Calculate volume by warehouse. This will be required to calculate total pallets.
+                if (volumeMap.exists(inventDim.InventLocationId))
+                {
+                    volumeMap.insert(inventDim.InventLocationId, metOrderExtractScreenTmp.Volume +  volumeMap.lookup(inventDim.InventLocationId));
+                }
+                else
+                {
+                    volumeMap.insert(inventDim.InventLocationId, metOrderExtractScreenTmp.Volume);
+                }
             }
             
             //Calculate total pallets
