@@ -1,0 +1,384 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METVendClaimJournalService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Vendor claim process service
+/// </summary>
+internal final class METVendClaimJournalService extends SysOperationServiceBase implements BatchRetryable
+{
+    LedgerJournalTable      journalTable;
+    LedgerJournalName       journalName;
+    AmountCur               claimAmount;
+    VendAccount             vendAccountCurrent, vendAccountPrev;
+    METVendClaimJournalContract contract;
+    GUPParameters           gupParameters;
+    METVendorClaimType      claimType;
+    InvoiceDate             invoiceDate;
+    LedgerDimensionAccount  offsetAccount;
+
+    InventSiteId            siteId;
+    METVendorClaimRegister  vendorClaimRegister;
+
+    #OCCRetryCount
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Entry point operation method for processing claims
+    /// </summary>
+    /// <param name = "_contract">Data contract</param>
+    public void processOperation(METVendClaimJournalContract _contract)
+    {
+        contract = _contract;
+        gupParameters = GUPParameters::find();
+        if(_contract.parmProcessDutyVarianceClaim())
+        {
+            this.processClaims(METVendorClaimType::ExciseVFD);
+        }
+
+        if(_contract.parmProcessExciseDutyClaim())
+        {
+            this.processClaims(METVendorClaimType::FreeItemExcise);
+        }
+
+        if(_contract.parmProcessStandardCostClaim())
+        {
+            this.processClaims(METVendorClaimType::StandardCost);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParameters</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialise variables
+    /// </summary>
+    /// <param name = "_claimType">Claim type</param>
+    private void initParameters(METVendorClaimType _claimType)
+    {
+        journalTable.clear();
+        claimAmount = 0;
+        claimType = _claimType;
+        vendAccountCurrent = METConstants::emptyString;
+        vendAccountPrev = METConstants::emptyString;
+        invoiceDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+
+        switch(_claimType)
+        {
+            case METVendorClaimType::FreeItemExcise:
+                journalName = LedgerJournalName::find(gupParameters.METVendClaimJournalNameFreeItem);
+                break;
+            case METVendorClaimType::ExciseVFD:
+                journalName = LedgerJournalName::find(gupParameters.METVendClaimJournalNameDutyVariance);
+                break;
+            case METVendorClaimType::StandardCost:
+                journalName = LedgerJournalName::find(gupParameters.METVendClaimJournalNameStandardCost);
+                break;
+        }
+
+        offsetAccount = journalName.OffsetLedgerDimension;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processClaims</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process claim for specific claim type
+    /// </summary>
+    /// <param name = "_claimType">Claim type</param>
+    private void processClaims(METVendorClaimType _claimType)
+    {
+        this.initParameters(_claimType);
+        
+        if(!journalName)
+        {
+            checkFailed(strFmt("@MET:ClaimJournalSetupMissingMsg", claimType));
+        }
+        
+        InventSite inventSite;
+        QueryRun qr = new QueryRun(contract.getQuery());
+
+        
+        while (qr.next())
+        {
+            inventSite = qr.get(tableNum(InventSite));
+
+            try
+            {
+                ttsbegin;
+                journalTable = null;
+
+                this.createClaimJournalForSite(inventSite.SiteId);
+                ttscommit;
+                //Split transaction blocks to separate journal creation and posting. In case posting fails, journal will remain in system and manual posting can be done
+                ttsbegin;
+                if(journalTable.RecId)
+                {
+                    journalTable.selectForUpdate(true);
+
+                    if(contract.parmPostClaim())
+                    {
+                        if(journalTable.numOfLines() > 0)
+                        {
+                            this.postClaimJournal();
+                            Info(strFmt("@MET:ClaimJournalPostedMsg", journalTable.JournalNum, claimType));
+                        }
+                        else
+                        {
+                            journalTable.delete();
+                            checkFailed(strFmt("@MET:ClaimJournalDeleteMsg", journalTable.JournalNum, claimType));
+                        }
+                    }
+                    else
+                    {
+                        Info(strFmt("@MET:ClaimJournalCreateMsg", journalTable.JournalNum, claimType, siteId));
+                    }
+                }
+
+                ttscommit;
+            }
+            catch (Exception::Error)
+            {
+                error (strFmt("@MET:ClaimProcessingErrorMsg", _claimType, siteId));
+                
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error (strFmt("@MET:ClaimProcessingErrorMsg", _claimType, siteId));
+                    error("@Subledger:DeadlockErrorThrown");
+                    
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        error (strFmt("@MET:ClaimProcessingErrorMsg", _claimType, siteId));
+                        error("@Subledger:UpdateConflictErrorThrown");
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    error (strFmt("@MET:ClaimProcessingErrorMsg", _claimType, siteId));
+                    error("@Subledger:UpdateConflictErrorThrown");
+                }
+            }
+        }
+       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createClaimJournalForSite</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// 
+    /// </summary>
+    /// <param name = "_siteId"></param>
+    private void createClaimJournalForSite(InventSiteId _siteId)
+    {
+        siteId = _siteId;
+        
+        if(!METVendorClaimRegister::existClaimLinesToProcess(claimType, _siteId))
+            return;
+
+        while select sum(ClaimAmount), VendAccount
+            from vendorClaimRegister
+            group by vendorClaimRegister.ClaimType, vendorClaimRegister.VendAccount, vendorClaimRegister.SiteId, vendorClaimRegister.ItemId
+            where vendorClaimRegister.SiteId == _siteId 
+            &&      vendorClaimRegister.ClaimType == ClaimType
+            &&      vendorClaimRegister.Claimed == NoYes::No
+            &&      vendorClaimRegister.ClaimStatus == METVendorClaimStatus::Approved
+        {
+            if(!journalTable)
+            {
+                this.createLedgerJournalTable();
+            }
+            claimAmount = vendorClaimRegister.ClaimAmount;
+            this.createLedgerJournalTrans();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLedgerJournalTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create journal for each site
+    /// </summary>
+    private void createLedgerJournalTable()
+    {
+        journalTable = journalTable.pdsInitFromledgerJournalName(journalName);
+        journalTable.insert();
+
+        journalTable.Name = strFmt('%1-%2', journalTable.Name, siteId);
+        JournalTable.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLedgerJournalTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create journal lines for claims
+    /// </summary>
+    private void createLedgerJournalTrans()
+    {
+        LedgerJournalTrans ledgerJournalTrans;
+       
+        if (claimAmount == 0)
+        {
+            return;
+        }
+       
+        ledgerJournalTrans.clear();
+        ledgerJournalTrans.initValue();
+     
+        ledgerJournalTrans.Txt                   = strFmt("@MET:ClaimTransTxtModifier", siteId, claimType, vendorClaimRegister.ItemId);
+        ledgerJournalTrans.JournalNum            = journalTable.JournalNum;
+        ledgerJournalTrans.Voucher               = this.getClaimJournalVoucherNumberSeq().voucher();
+        ledgerJournalTrans.Invoice               = this.getClaimInvoiceNumberSeq().num();
+        ledgerJournalTrans.DocumentDate          = invoiceDate;
+        ledgerJournalTrans.TransDate             = invoiceDate;
+        ledgerJournalTrans.CurrencyCode          = journalTable.CurrencyCode;
+        ledgerJournalTrans.AmountCurDebit        = claimAmount > 0 ? claimAmount : 0;
+        ledgerJournalTrans.AmountCurCredit       = claimAmount > 0 ? 0 : -claimAmount;
+        ledgerJournalTrans.TaxGroup              = VendTable::find(vendorClaimRegister.VendAccount).TaxGroup;
+        ledgerJournalTrans.TaxItemGroup          = InventTableModule::find(vendorClaimRegister.ItemId, ModuleInventPurchSales::Purch).TaxItemGroupId;
+        ledgerJournalTrans.Approved              = NoYes::Yes;
+        ledgerJournalTrans.Approver              = HcmWorker::userId2Worker(curUserId());
+        ledgerJournalTrans.ExchRate              = ExchangeRateHelper::exchRate(ledgerJournalTrans.CurrencyCode, ledgerJournalTrans.TransDate);
+        ledgerJournalTrans.ExchRateSecond        = ExchangeRateHelper::exchRateSecond(ledgerJournalTrans.CurrencyCode, ledgerJournalTrans.TransDate);
+        ledgerJournalTrans.AccountType           = LedgerJournalACType::Vend;
+        ledgerJournalTrans.parmAccount(vendorClaimRegister.VendAccount);
+
+        ledgerJournalTrans.OffsetAccountType = LedgerJournalACType::Ledger;
+        ledgerJournalTrans.OffsetLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(journalName.OffsetLedgerDimension);
+        
+        ledgerJournalTrans.insert();
+
+        if((LedgerjournalTrans.RecId != 0))
+        {
+            this.updateClaimDetails(ledgerJournalTrans.Invoice, ledgerJournalTrans.DocumentDate);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getClaimJournalVoucherNumberSeq</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the claim voucher number sequence
+    /// </summary>
+    /// <returns>Voucher numebr sequence</returns>
+    private NumberSeq getClaimJournalVoucherNumberSeq()
+    {
+        return NumberSeq::newGetVoucherFromCode(NumberSequenceTable::find(journalName.NumberSequenceTable).NumberSequence,
+                                                NumberSeqScopeFactory::createDefaultScope(),
+                                                false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getClaimInvoiceNumberSeq</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the claim invoice number sequence
+    /// </summary>
+    /// <returns>invoice numebr sequence</returns>
+    private NumberSeq getClaimInvoiceNumberSeq()
+    {
+        return NumberSeq::newGetNumFromId(gupParameters.METVendClaimInvoiceNumberSequenceTable);
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateClaimDetails</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update claim details in the vendor claim register against respective claim lines
+    /// </summary>
+    /// <param name = "_invoiceId">Invoice number</param>
+    /// <param name = "_invoiceDate">Invoice date</param>
+    private void updateClaimDetails(VendInvoiceId _invoiceId, InvoiceDate _invoiceDate)
+    {
+        METVendorClaimRegister vendorClaimRegisterUpd;
+
+        update_recordset vendorClaimRegisterUpd
+            Setting ClaimInvoiceId  = _invoiceId,
+                    ClaimDate       = _invoiceDate,
+                    Claimed         = NoYes::Yes,
+                    JournalId       = journalTable.JournalNum,
+                    LedgerDimension = journalName.OffsetLedgerDimension
+            where vendorClaimRegisterUpd.SiteId == siteId
+            &&      vendorClaimRegisterUpd.ClaimType == ClaimType
+            &&      vendorClaimRegisterUpd.Claimed == NoYes::No
+            &&      vendorClaimRegisterUpd.ClaimStatus == METVendorClaimStatus::Approved
+            &&      vendorClaimRegisterUpd.VendAccount == vendorClaimRegister.VendAccount
+            &&      vendorClaimRegisterUpd.ItemId == vendorClaimRegister.ItemId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postClaimJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Posts the claim journal
+    /// </summary>
+    private void postClaimJournal()
+    {
+        if (journalTable)
+        {
+            LedgerJournalPost::postJournal(journalTable, NoYes::Yes);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Control whether batch task should retry in case of SQL transient errors.
+    /// </summary>
+    /// <returns>true if task should be retried; otherwise, false.</returns>
+    public boolean isRetryable()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
