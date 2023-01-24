@@ -34,7 +34,7 @@ public class METVendCrossDocFeeService extends SysOperationServiceBase
         LedgerJournalId                 journalId;
         LedgerJournalCheckPost          ledgerJournalCheckPost;
         
-
+        #OCCRetryCount
         flag = true;
 
         try
@@ -48,9 +48,14 @@ public class METVendCrossDocFeeService extends SysOperationServiceBase
 
             
             while select metVendCrossDocFee
-                join Invoice from vendTrans
-                    where vendTrans.AccountNum  == metVendCrossDocFee.AccountNum 
-                        && metVendCrossDocFee.RecordStatus ==  METRecordStatus::New  
+                // User Story 47012: XDOC fees transactions from closed periods
+                // Could be scenarios with multiple vendor transactions and the same invoice id causing update conflict BIG time (created when invoice is paid)!
+                //join Invoice from vendTrans
+                exists join vendTrans
+                    where vendTrans.AccountNum  == metVendCrossDocFee.AccountNum
+                        // filter only vendTrans with transaction type = vendor
+                        && vendTrans.TransType == LedgerTransType::Vend
+                        && metVendCrossDocFee.RecordStatus ==  METRecordStatus::New
                         && metVendCrossDocFee.Invoice == vendTrans.Invoice + METConstants::crossDocInvoiceSuffix
             {
                 if (flag)
@@ -58,9 +63,32 @@ public class METVendCrossDocFeeService extends SysOperationServiceBase
                     journalId = this.createJournalTable(_dataContract.getLedgerName(), metVendCrossDocFee.Description);
                     flag = false;
                 }
-                this.createJournalLines(journalId,
-                                        _dataContract.getLedgerName(),
-                                        metVendCrossDocFee);
+
+                // User Story 47012: XDOC fees transactions from closed periods
+                // if journal header not created throw an erro
+                if (journalId)
+                {
+                    try
+                    {
+                        this.createJournalLines(journalId,
+                                                _dataContract.getLedgerName(),
+                                                metVendCrossDocFee);
+                    }
+                    // User Story 47012: XDOC fees transactions from closed periods
+                    // Adding exception hanlding for deadlock and update conflict
+                    catch (Exception::UpdateConflict)
+                    {
+                        // don't do anything go to the next record
+                    }
+                    catch (Exception::UpdateConflictNotRecovered)
+                    {
+                        // don't do anything go to the next record
+                    }
+                }
+                else
+                {
+                    throw error("@MET:VendCrossDocFeeServiceHeaderError");
+                }
                 
             }
 
@@ -72,13 +100,13 @@ public class METVendCrossDocFeeService extends SysOperationServiceBase
 
                 if(ledgerJournalTransCount.RecId)
                 {
-                    //Validating the journal
+                    //Validating the journal                    
                     ledgerJournalCheckPost = ledgerJournalCheckPost::newLedgerJournalTable(journalHeader, NoYes::Yes);
                     if (ledgerJournalCheckPost.validate())
                     {
                         //Posting the journal
                         ledgerJournalCheckPost.runOperation();
-                    }
+                    } 
                 }
                 else    
                 {
@@ -86,8 +114,7 @@ public class METVendCrossDocFeeService extends SysOperationServiceBase
                     journalHeader.delete();
                     ttscommit;
                 }
-            }
-            
+            }            
         }
         catch(Exception::CLRError)
         {
@@ -208,6 +235,7 @@ public class METVendCrossDocFeeService extends SysOperationServiceBase
         Voucher                 voucherNum;
         str                     mainAccount = _metVendCrossDocFees.OffsetDefaultDimensionDisplayValue;
 
+        #OCCRetryCount
         LedgerJournalName   ledgerJournalName = LedgerJournalName::find(_ledgerJournalName);
 
         try
@@ -276,6 +304,30 @@ public class METVendCrossDocFeeService extends SysOperationServiceBase
             _metVendCrossDocFees.RecordStatus = METRecordStatus::Processed;
             _metVendCrossDocFees.update();
             ttscommit;
+        }  
+        // User Story 47012: XDOC fees transactions from closed periods
+        // Adding exception hanlding for deadlock and update conflict
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
         }
         catch
         {
