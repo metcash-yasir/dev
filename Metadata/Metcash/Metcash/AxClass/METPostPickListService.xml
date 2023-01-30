@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPostPickListService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The service class for the batch job
+/// </summary>
+/// 
+class METPostPickListService extends SysOperationServiceBase
+{
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The process method for the post picking list registration batch job
+    /// </summary>
+    /// <param name = "_contract">The data contract object</param>    
+    public void processOperation(METPostPickListDataContract _contract)
+    {
+        METPickList metPickList;
+        SalesLine salesLine;
+        WMSOrderTrans wmsOrderTrans;
+        
+        int bundlesize, numOfOrders, task, totalTasks, i;        
+        Set orderList = new Set(Types::String);
+
+        this.updateStaging();
+
+        numOfOrders = this.getNumOfOrders();
+        task = 1;
+        totalTasks = _contract.parmTasks();
+
+        if (totalTasks <= 0)
+        {
+            totalTasks = 1;
+        }
+
+        bundleSize = real2int(roundUp((numOfOrders / totalTasks), 1.0));
+
+        BatchHeader batchHeader = this.getCurrentBatchHeader();
+
+        if (batchHeader == null)
+        {
+            batchHeader = batchHeader::construct();
+        }
+
+        batchHeader.parmCaption("@MET:METAutoPostPickList");
+
+        while select metPickList order by metPickList.PickListNumber
+            where metPickList.Error == NoYes::No
+        {           
+            if (!orderList.in(metPickList.PickListNumber))
+            {                
+                if (i == bundlesize)
+                {
+                    SysOperationServiceController postPackingSlipRegistrationController = new SysOperationServiceController(
+                                                            classStr(METPostPickListSubTask),
+                                                            methodStr(METPostPickListSubTask, postPackingSlipRegistrationSubTask));
+
+                    postPackingSlipRegistrationController.parmDialogCaption(strFmt("@MET:PostPackingSlipSubTask", task));
+
+                    METPostPickListDataContract metPostPackingSlipDataContract = postPackingSlipRegistrationController.getDataContractObject() as METPostPickListDataContract;
+                    metPostPackingSlipDataContract.parmOrderList(orderList);
+
+                    batchHeader.addRuntimeTask(postPackingSlipRegistrationController, this.getCurrentBatchTask().RecId);
+                    orderList = new Set(Types::String);
+                    task++;
+                    i = 0;
+                }
+            }
+        }           
+        
+        
+        batchHeader.save();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getNumOfOrders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the number of orders
+    /// </summary>
+    /// <returns>Total number of orders to be processed by a Batch job</returns>
+    private int getNumOfOrders()
+    {
+        METPickList metPickList;        
+
+        select count(RecId) from metPickList
+            group by TransRefId;
+
+        return metPickList.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateStaging</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the staging table
+    /// </summary>
+    private void updateStaging()
+    {   
+        ttsbegin;
+
+        this.updateInventoryReference();
+        this.updateErrorMessages();
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateErrorMessages</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the error messages
+    /// </summary>
+    private void updateErrorMessages()
+    {
+        METPickList metPickList, metPickListForSelect;
+        WMSPickingRoute wmsPickingRoute;
+        WMSOrderTrans wmsOrderTrans;
+
+        // We have updated inventory references already. Empty reference means invalid pick list number.
+        update_recordset metPickList setting
+            Error = NoYes::Yes,
+            ErrorMsg = '@MET:METPickListDoesNotExist'
+        where metPickList.TransRefId == METConstants::emptyString; 
+
+        // We have updated inventory references already. Empty original line number means invalid line number.
+        update_recordset metPickList setting
+            Error = NoYes::Yes,
+            ErrorMsg = '@MET:METPickListLineDoesNotExist'
+        where metPickList.OriginalLineNumber != metPickList.LineNumber; 
+
+        // Check if valid Item number has been passed 
+        update_recordset metPickList setting
+            Error = NoYes::Yes,
+            ErrorMsg = '@MET:METPickListProductDoesNotExist'
+        notexists join wmsOrderTrans
+            where wmsOrderTrans.routeId == metPickList.PickListNumber            
+            && wmsOrderTrans.ItemId == metPickList.ItemNumber;
+            
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateInventoryReference</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the inventory references
+    /// </summary>
+    private void updateInventoryReference()
+    {
+        METPickList metPickList;
+        WMSPickingRoute wmsPickingRoute;
+        SalesLine salesLine;
+        InventTransferLine inventTransferLine;
+
+        // Update inventory reference - Sales Id or Transfer order number
+        update_recordset metPickList setting 
+            TransRefId = wmsPickingRoute.transRefId,
+            TransType = wmsPickingRoute.transType
+        join wmsPickingRoute
+            where wmsPickingRoute.pickingRouteID == metPickList.PickListNumber;
+
+        // Update Line number from SalesLine table for Sales picking lists
+        update_recordset metPickList setting
+            OriginalLineNumber = salesLine.LineNum,
+            LineInventTransId = salesLine.InventTransId
+        join salesLine
+            where salesLine.salesId == metPickList.TransRefId
+            && salesLine.LineNum == metPickList.LineNumber
+            && salesLine.ItemId == metPickList.ItemNumber
+            && metPickList.TransType == InventTransType::Sales;
+
+        // Update Line number from Transfer order table for Transfer picking lists
+        update_recordset metPickList setting
+            OriginalLineNumber = inventTransferLine.LineNum
+        join inventTransferLine
+            where inventTransferLine.TransferId == metPickList.TransRefId
+            && inventTransferLine.ItemId == metPickList.ItemNumber
+            && inventTransferLine.LineNum == metPickList.LineNumber
+            && (metPickList.TransType == InventTransType::TransferOrderReceive || metPickList.TransType == InventTransType::TransferOrderShip);
+
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

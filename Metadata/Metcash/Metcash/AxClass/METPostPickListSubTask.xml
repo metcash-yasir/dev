@@ -1,0 +1,587 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPostPickListSubTask</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Sub Task service to process pick list results multi threaded.
+/// </summary>
+class METPostPickListSubTask
+{
+    #OCCRetryCount
+    Map selectedLines;
+    Set salesTableSet = new Set(Types::Record);
+    Set routeIdsSet = new Set(Types::String);
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>postPackingSlipRegistrationSubTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processing method for different threads
+    /// </summary>
+    /// <param name = "_contract">Data contract object</param>
+    public void postPackingSlipRegistrationSubTask(METPostPickListDataContract _contract)
+    {
+        METPickList metPickList;
+        Set orderList = new Set(Types::String);
+        SetEnumerator enumerator;
+        
+        InventTransRefId inventTransRefId;
+        InventTransId inventTransId;
+
+        WMSRouteId pickListNumber;
+        WMSPickingRoute wmsPickingRoute;
+        WMSOrderTrans wmsOrderTrans;
+
+        orderList = _contract.parmOrderList();
+        enumerator = orderList.getEnumerator();
+
+        while (enumerator.moveNext())
+        {
+            pickListNumber = enumerator.current();
+            
+            while select forupdate metPickList 
+                where metPickList.PickListNumber == pickListNumber
+            join wmsPickingRoute
+                where wmsPickingRoute.pickingRouteID ==metPickList.PickListNumber
+            {
+                if (wmsPickingRoute.transType == InventTransType::Sales)
+                {
+                    this.processSalesOrder(metPickList, wmsPickingRoute.transRefId, wmsPickingRoute);
+                }
+                else if(wmsPickingRoute.transType == InventTransType::TransferOrderShip || wmsPickingRoute.transType == InventTransType::TransferOrderReceive)
+                {
+                    this.processTransferOrder(metPickList, wmsPickingRoute.transRefId, wmsPickingRoute);
+                }
+            }
+        }
+
+        this.completeRegistrationAll();
+        this.processDeliveryRemainders();
+        this.confirmSalesOrder();
+        this.deleteProcessedRecords();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the sales order picking list
+    /// </summary>
+    /// <param name = "_pickListNumber">Pick list number</param>
+    /// <param name = "_salesId">The Sales order number</param>
+    /// <param name = "_wmsPickingRoute">The Picking route number</param>
+    private void processSalesOrder(MetPickList _metPickList, SalesId _salesId, WMSPickingRoute _wmsPickingRoute)
+    {
+        SalesLine salesLine;
+        Salestable salesTable;
+        WMSOrderTrans wmsOrderTrans;
+        InventQty regQty;
+        boolean isProcessed;
+        System.Exception ex;
+        
+        salesTableSet = new Set (Types::Record);
+   
+        select salesLine
+            where salesLine.SalesId == _salesId
+            && salesLine.InventTransId == _metPickList.LineInventTransId
+        join forupdate wmsOrderTrans
+            where wmsOrderTrans.routeId == _metPickList.PickListNumber
+            && wmsOrderTrans.inventTransId == salesLine.InventTransId
+        join salesTable
+            where salesTable.SalesId == salesLine.SalesId;
+
+        selectedLines = new Map(Types::Int64,Types::Container);
+
+        try
+        {
+            isProcessed = false;
+
+            if (_metPickList.PickListType != METConstants::Threek7) // Type is 8011 or 3006
+            {
+                ttsbegin;
+
+                regQty = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+                    salesLine.ItemId,
+                    salesLine.InventDimId,
+                    _metPickList.Quantity,
+                    salesLine.SalesUnit,
+                    salesLine.inventTable().inventUnitId(),
+                    NoYes::Yes);
+
+                wmsOrderTrans.qty = wmsOrderTrans.qty - regQty;
+                wmsOrderTrans.update();
+
+                selectedLines.insert(wmsOrderTrans.RecId, [wmsOrderTrans.OrderId, wmsOrderTrans.RecVersion]);
+                isProcessed = true;
+               
+                ttscommit;
+                    
+                // Below try block should execute outside of transaction to catch the exception if occurs
+                try
+                {
+                    selectedLines.insert(wmsOrderTrans.RecId, [wmsOrderTrans.OrderId, wmsOrderTrans.RecVersion]);
+                    this.completeRegistrationSelected(); // Type is not 3007 - Pick selected only
+                }
+                catch(ex)
+                {
+                    isProcessed = false;
+                    this.updateError(NoYes::Yes, strFmt(ex.Message), _metPickList.RecId);
+
+                    ttsbegin;
+
+                    wmsOrderTrans.reread();
+                    wmsOrderTrans.qty = wmsOrderTrans.qty + regQty;  // Revert the last update.
+                    wmsOrderTrans.update();
+                                   
+                    ttscommit;
+                }
+            }
+            else // Type is 3007
+            {
+                if (this.checkType3006And8011Exist(_metPickList.PickListNumber))
+                {
+                    this.updateError(NoYes::Yes, '@MET:METPickListPending', _metPickList.RecId);
+                }
+
+                if (PdsGlobal::pdsIsCWItem(_metPickList.ItemNumber))
+                {
+                    Global::exceptionTextFallThrough(); // Skip without error log
+                }
+                    
+                if (!salesTableSet.in(salesTable))
+                {
+                    salesTableSet.add(salesTable); //Add to set for SO confirmation
+                }
+
+                if (!routeIdsSet.in(_wmsPickingRoute.PickingRouteID))
+                {
+                    routeIdsSet.add(_wmsPickingRoute.PickingRouteID); //Add to set for pick list registration
+                }
+
+                isProcessed = true;
+            }
+                
+            if (isProcessed)
+            {
+                ttsbegin;
+                _metPickList.IsProcessed = NoYes::Yes;
+                _metPickList.update();
+                ttscommit;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                this.updateError(NoYes::Yes, '@MET:METPickListErrorOccured', _metPickList.RecId);
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    this.updateError(NoYes::Yes, '@MET:METPickListErrorOccured', _metPickList.RecId);
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                this.updateError(NoYes::Yes, '@MET:METPickListErrorOccured', _metPickList.RecId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTransferOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the transfer order picking list
+    /// </summary>
+    /// <param name = "_pickListNumber">Pick list number</param>
+    /// <param name = "_transferId">The Transfer Order Id order number</param>
+    /// <param name = "_wmsPickingRoute">The Picking route number</param>
+    private void processTransferOrder(MetPickList _metPickList, InventTransferId _transferId, WMSPickingRoute _wmsPickingRoute)
+    {
+        METPickList metPickList;
+        InventTransferLine inventTransferLine;
+        WMSOrderTrans wmsOrderTrans;
+        InventQty regQty;
+        boolean isProcessed;
+        System.Exception ex;
+        
+        select inventTransferLine
+            where inventTransferLine.TransferId == _transferId
+            && inventTransferLine.InventTransId == _metPickList.LineInventTransId
+        join forupdate wmsOrderTrans
+            where wmsOrderTrans.routeId == _metPickList.PickListNumber
+            && wmsOrderTrans.inventTransId == inventTransferLine.InventTransId;
+
+        isProcessed = false;
+
+        try
+        {
+            if (_metPickList.PickListType != METConstants::Threek7) // Type is 8011 or 3006
+            {
+                ttsbegin;
+
+                regQty = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+                        inventTransferLine.ItemId,
+                        inventTransferLine.InventDimId,
+                        _metPickList.Quantity,
+                        inventTransferLine.UnitId,
+                        InventTableModule::find(inventTransferLine.ItemId, ModuleInventPurchSales::Invent).UnitId,                    
+                        NoYes::Yes);
+
+                wmsOrderTrans.qty = wmsOrderTrans.qty - regQty;
+                wmsOrderTrans.update();
+
+                selectedLines.insert(wmsOrderTrans.RecId, [wmsOrderTrans.OrderId, wmsOrderTrans.RecVersion]);
+                isProcessed = true;
+               
+                ttscommit;
+                    
+                // Below try block should execute outside of transaction to catch the exception if occurs
+                try
+                {
+                    selectedLines.insert(wmsOrderTrans.RecId, [wmsOrderTrans.OrderId, wmsOrderTrans.RecVersion]);
+                    this.completeRegistrationSelected(); // Type is not 3007 - Pick selected only
+                }
+                catch(ex)
+                {
+                    isProcessed = false;
+                    this.updateError(NoYes::Yes, strFmt(ex.Message), _metPickList.RecId);
+
+                    ttsbegin;
+
+                    wmsOrderTrans.reread();
+                    wmsOrderTrans.qty = wmsOrderTrans.qty + regQty; // Revert the last update.
+                    wmsOrderTrans.update();
+               
+                    ttscommit;
+                }
+            }
+            else // Type is 3007
+            {
+                if (this.checkType3006And8011Exist(_metPickList.PickListNumber))
+                {
+                    this.updateError(NoYes::Yes, '@MET:METPickListPending', _metPickList.RecId);
+                }
+
+                if (PdsGlobal::pdsIsCWItem(_metPickList.ItemNumber))
+                {
+                    Global::exceptionTextFallThrough(); // Skip without error log
+                }
+
+                if (!routeIdsSet.in(_wmsPickingRoute.PickingRouteID))
+                {
+                    routeIdsSet.add(_wmsPickingRoute.PickingRouteID); //Add to set for pick list registration
+                }
+
+                isProcessed = true;
+            }
+                
+            if (isProcessed)
+            {
+                ttsbegin;
+                _metPickList.IsProcessed = NoYes::Yes;
+                _metPickList.update();
+                ttscommit;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                this.updateError(NoYes::Yes, '@MET:METPickListErrorOccured', _metPickList.RecId);
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    this.updateError(NoYes::Yes, '@MET:METPickListErrorOccured', _metPickList.RecId);
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                this.updateError(NoYes::Yes, '@MET:METPickListErrorOccured', _metPickList.RecId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>completeRegistrationAll</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Complete the registration of all the pick lists processed
+    /// </summary>
+    private void completeRegistrationAll()
+    {
+        METPickList metPickList;
+        List routeIdsList = new List(Types::String);
+        SetEnumerator se;
+        System.Exception ex;
+
+        se = routeIdsSet.getEnumerator();
+        se.reset();
+
+        while (se.moveNext())
+        {
+            routeIdsList = new List(Types::String);
+            routeIdsList.addEnd(se.current());
+
+            try
+            {
+                WMSPickingRoute::finishMulti(routeIdsList.pack());
+            }
+            catch(ex)
+            {
+                ttsbegin;
+
+                update_recordset metPickList setting
+                    Error = NoYes::Yes,
+                    ErrorMsg = ex.Message,
+                    IsProcessed = NoYes::No
+                where metPickList.PickListNumber == se.current()                  
+                    && metPickList.PickListType == METConstants::Threek7;
+
+                ttscommit;
+            }
+        }       
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>completeRegistrationSelected</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Complete the registration fo the selected pick list lines
+    /// </summary>
+    private void completeRegistrationSelected()
+    {
+        WMSOrderTransType::finishPickingLinesMulti(selectedLines.pack());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processDeliveryRemainders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancel the deliver remainder of Sales order lines if SO is a backorder
+    /// </summary>
+    private void processDeliveryRemainders()
+    {
+        SetEnumerator se;
+        SalesTable localSalesTable;
+        SalesLine localSalesLine;
+        METSalesLine metSalesLine;
+        SalesFormLetter salesFormLetter;
+        SalesUpdateRemain salesUpdateRemain = SalesUpdateRemain::construct();
+        System.Exception ex;
+        METPickList metPickList;
+
+        if (!salesTableSet.empty())
+        {
+            se = salesTableSet.getEnumerator();
+            se.reset();
+
+            while (se.moveNext())
+            {
+                localSalesTable = se.current();
+
+                if (localSalesTable.SalesStatus != SalesStatus::Backorder)
+                {
+                    while select localSalesLine
+                        where localSalesLine.SalesId == localSalesTable.SalesId
+                    join forupdate metSalesLine
+                        where metSalesLine.SalesLine == localSalesLine.RecId
+                    {
+                        try
+                        {
+                            salesUpdateRemain.updateDeliverRemainder(
+                                    localSalesLine,
+                                    0,
+                                    0,
+                                    0);
+
+                            ttsbegin;
+                            metSalesLine.ReasonId = METConstants::reasonCodeTOS;
+                            metSalesLine.update();
+                            ttscommit;
+                        }
+                        catch(ex)
+                        {
+                            ttsbegin;
+
+                            update_recordset metPickList setting
+                                Error = NoYes::Yes,
+                                ErrorMsg = '@MET:METDeliveryRemainderErr',
+                                IsProcessed = NoYes::No
+                            where metPickList.TransRefId == localSalesTable.SalesId
+                                && metPickList.LineInventTransId == localSalesLine.InventTransId
+                                && metPickList.PickListType == METConstants::Threek7;
+
+                            ttscommit;
+                        }
+                    }
+                }   
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>confirmSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Confirms the Sales order and send to customer using print management settings.
+    /// </summary>
+    /// <param name = "_salesTable">The Sales Order to confirm</param>
+    private void confirmSalesOrder()
+    {
+        SetEnumerator se;
+        SalesTable salesTable;
+        SalesFormLetter salesFormLetter;
+        METPickList metPickList;
+        System.Exception ex;
+
+        if (!salesTableSet.empty())
+        {
+            se = salesTableSet.getEnumerator();
+            se.reset();
+
+            while (se.moveNext())
+            {
+                salesTable = se.current();
+
+                try
+                {
+                    salesFormLetter = SalesFormLetter::construct(DocumentStatus::Confirmation);                    
+                    salesFormLetter.update(salesTable, systemDateGet(), SalesUpdate::All);
+                }
+                catch(ex)
+                {
+                    ttsbegin;
+
+                    update_recordset metPickList setting
+                        Error = NoYes::Yes,
+                        ErrorMsg = ex.Message,
+                        IsProcessed = NoYes::No
+                    where metPickList.TransRefId == salesTable.SalesId
+                        && metPickList.PickListType == METConstants::Threek7;
+
+                    ttscommit;
+                }
+
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteProcessedRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delete the record which are successfully processed
+    /// </summary>
+    private void deleteProcessedRecords()
+    {
+        METPickList metPickList;
+        
+        ttsbegin;
+
+        delete_from metPickList where metPickList.IsProcessed == NoYes::Yes
+                && metPickList.Error == NoYes::No;
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkType3006And8011Exist</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if a pick list exist
+    /// </summary>
+    /// <param name = "_pickListNumber">The pick list number</param>
+    /// <returns>True or false</returns>
+    private boolean checkType3006And8011Exist(METPickListNumber _pickListNumber)
+    {
+        METPickList metPickList;
+        boolean ret;
+
+        select firstonly RecId from metPickList
+                where METPickList.PickListNumber == _pickListNumber
+                && (metPickList.PickListType == METConstants::Eightk11 || metPickList.PickListType == METConstants::Threek6);
+
+        if (metPickList.RecId)
+        {
+            ret = true;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateError</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the error log
+    /// </summary>
+    /// <param name = "_errorFlag">Yes or No</param>
+    /// <param name = "_errorMsg">The error message to update</param>
+    /// <param name = "_recId">The Record Id</param>
+    private void updateError(NoYes _errorFlag, METError _errorMsg, RefRecId _recId)
+    {
+        METPickList metPickList = METPickList::findRecId(_recId, true);
+
+        ttsbegin;
+        metPickList.Error = _errorFlag;
+        metPickList.ErrorMsg = _errorMsg;
+        metPickList.IsProcessed = NoYes::No;
+        metPickList.update();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
