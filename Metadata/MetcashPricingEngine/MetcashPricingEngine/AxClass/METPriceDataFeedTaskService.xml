@@ -17,6 +17,7 @@ class METPriceDataFeedTaskService extends SysOperationServiceBase
     METTaskGuid     taskGuid;
     UserConnection  secondConnection;
     Name            attributeName, attributeTypeName;
+    TransDate       todayDate;
 
     METPriceDataFeedContract    dataContract;
     RecordInsertList            priceReportItemTaskInsertList;
@@ -132,6 +133,7 @@ class METPriceDataFeedTaskService extends SysOperationServiceBase
         taskGuid            = str2Guid(dataContract.parmTaskGuidStr());
         secondConnection    = new UserConnection();
         [attributeName, attributeTypeName] = this.getSalesOrderAttribute();
+        todayDate           = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
 
     }
 
@@ -343,6 +345,7 @@ class METPriceDataFeedTaskService extends SysOperationServiceBase
 
                 priceDataExtract.initFromTmpPriceList(metTmpFinalPriceReportValues);
                 priceDataExtract.enhanceFromPriceDataFeed(priceDataFeed);
+                priceDataExtract = this.updateChargeCodes(priceDataExtract, priceDataFeed);
                 priceDataExtract.updateTax();
 
                 metListOfPriceDataExtract.add(priceDataExtract);
@@ -367,25 +370,15 @@ class METPriceDataFeedTaskService extends SysOperationServiceBase
     {
         GUPParameters                   gupParameters;
         EcoResAttribute                 attributes;
-        EcoResAttributeGroup            attributeGroup;
-        EcoResAttributeGroupAttribute   attributeGroupAttributes;
         EcoResAttributeType             attributeType;
-        GUPEcoResAttributeParameter     attributeParameter;
-  
-        select firstonly Name from attributes
-                group by Name
-            join Name from attributeType
-                group by Name
-                where   attributeType.RecId                     == attributes.AttributeType
-            exists join attributeGroupAttributes
-                where   attributeGroupAttributes.Attribute      == attributes.RecId
-            exists join attributeGroup
-                where   attributeGroup.RecId                    == attributeGroupAttributes.AttributeGroup
+
+        select firstonly Name from attributeType 
+                
+            join Name from attributes
+                where   attributes.AttributeType == attributeType.RecId
+            
             exists join gupParameters
-                where   gupParameters.SalesOrderAttributeGroup  == attributeGroup.RecId
-            exists join attributeParameter
-                where   attributeParameter.Attribute            == attributes.RecId
-                &&      attributeParameter.IsEnabledAsPricingAttribute == NoYes::Yes;
+                where gupParameters.METSalesEventAttribute  == attributes.RecId;
 
         return[attributes.Name, attributeType.Name];
     }
@@ -421,6 +414,158 @@ class METPriceDataFeedTaskService extends SysOperationServiceBase
         InventDim.InventSiteId  = _inventSiteId;
 
         return InventDim::findOrCreate(inventDim).inventDimId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateChargeCodes</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate and populate the Charge codes
+    /// </summary>
+    public METPriceDataExtract updateChargeCodes(METPriceDataExtract _priceDataExtract, METPriceDataFeed _priceDataFeed)
+    {
+        METPriceDataExtract         priceDataExtract = _priceDataExtract;
+        METSimulatedAutoCharges     simulatedAutoCharges;
+        SalesTable                  salesTable;
+        SalesLine                   salesLine;
+        List                        matchedAutoChargeLineRecIdList;
+        ListEnumerator              enumerator;
+        MarkupAutoLine              markupAutoLine;
+
+        MarkupTrans                 markupTrans;
+        MarkupTable                 markupTable;
+        MarkupAmount                calculatedAmount;
+        TaxAmount                   calculatedTaxAmount;
+
+        if(_priceDataFeed.ChangeType == METPriceChangeType::AutoChargeEnabled || _priceDataFeed.ChangeType == METPriceChangeType::AutoChargeDisabled)
+        {
+            salesTable = this.BuildSalesTableTmp(_priceDataExtract);
+            salesLine  = this.BuildSalesLineTmp(_priceDataExtract, salesTable);
+            
+            simulatedAutoCharges = METSimulatedAutoCharges::newFromSalesTmp(salesTable, salesLine);
+            
+            matchedAutoChargeLineRecIdList = simulatedAutoCharges.getMarkupAutoLines();
+
+            enumerator = matchedAutoChargeLineRecIdList.getEnumerator();
+        
+            while (enumerator.moveNext())
+            {
+                markupAutoLine = MarkupAutoLine::metFindByRecId(str2int64(enumerator.current()));
+            
+                markupTrans = simulatedAutoCharges.initializeMarkupTransFromParent(markupAutoLine);
+
+                markupTable = MarkupTable::find(markupTrans.ModuleType, markupTrans.MarkupCode);
+
+                calculatedAmount = Markup::calcTrans(markupTrans,
+                                                    salesLine.SalesQty,
+                                                    salesLine.SalesPrice,
+                                                    0,      // Intercompany price requirements
+                                                    todayDate);
+
+                calculatedTaxAmount = Tax::calcTaxAmount(_priceDataExtract.TaxGroup,
+                                                            markupTable.TaxItemGroup,
+                                                            todayDate,
+                                                            salesTable.currencyCode,
+                                                            calculatedAmount,
+                                                            TaxModuleType::Sales);
+
+                priceDataExtract.LineTotalChargeAmount      += calculatedAmount;
+                priceDataExtract.LineTotalChargeTaxAmount   += calculatedTaxAmount;
+
+                priceDataExtract.LineChargeCode     = this.pipeConcatenate(priceDataExtract.LineChargeCode, markupTrans.MarkupCode);
+                priceDataExtract.LineChargeAmount   = this.pipeConcatenate(priceDataExtract.LineChargeAmount, this.numToString(calculatedAmount));
+                priceDataExtract.LineChargeTaxCode  = this.pipeConcatenate(priceDataExtract.LineChargeTaxCode, markupTable.TaxItemGroup);
+                priceDataExtract.LineChargeTaxAmount = this.pipeConcatenate(priceDataExtract.LineChargeTaxAmount, this.numToString(calculatedTaxAmount));
+
+            }
+        }
+        return priceDataExtract;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildSalesTableTmp</Name>
+				<Source><![CDATA[
+    public SalesTable buildSalesTableTmp(METPriceDataExtract _priceDataExtract)
+    {
+        SalesTable  salesTable;
+
+        salesTable.clear();
+        salesTable.initValue();
+        salesTable.SalesId       = guid2Str(newGuid()); //dont consume genuine salesId from Number seq as this is only a temp record.
+        salesTable.CustAccount   = _priceDataExtract.CustAccount;
+        salesTable.initFromCustTable();
+        salesTable.CurrencyCode  = _priceDataExtract.CurrencyCode ? _priceDataExtract.CurrencyCode : salesTable.CurrencyCode;
+
+        return salesTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildSalesLineTmp</Name>
+				<Source><![CDATA[
+    public SalesLine buildSalesLineTmp(METPriceDataExtract _priceDataExtract, SalesTable _salesTable)
+    {
+        SalesLine   salesLine;
+
+        salesLine.clear();
+        salesLine.salesId    = _salesTable.SalesId;
+        salesLine.ItemId     = _priceDataExtract.itemId;
+        
+        salesLine.initFromSalesTable(_salesTable, false);
+        salesLine.initLineFromItemOrCategory();
+        salesLine.InventDimId = this.getInventDimId(_priceDataExtract.InventSiteId);
+        salesLine.SalesQty    = _priceDataExtract.Qty;
+        salesLine.LineAmount  = _priceDataExtract.LineAmount;               //total per the qty
+        salesLine.SalesPrice  = salesLine.LineAmount / salesLine.SalesQty;  //unit price
+        salesLine.InventTransId = guid2Str(newGuid());                      //dont consume genuine InventTransId from Number seq as this is only a temp record.
+
+        return salesLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pipeConcatenate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Join strings togther with Pipe seperator
+    /// </summary>
+    /// <param name = "_originalValue">Original String</param>
+    /// <param name = "_newValue">Additional String</param>
+    /// <returns>Real as a String</returns>
+    public str pipeConcatenate(str _originalValue, str _newValue)
+    {
+        str updatedValue;
+
+        if(_originalValue)
+        {
+            updatedValue = _originalValue + strFmt("@MET:Concatenate", "@MET:Pipe", _newValue);
+        }
+        else
+        {
+            updatedValue = _newValue;
+        }
+        return updatedValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>numToString</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Convert Real to String
+    /// </summary>
+    /// <param name = "_number">Real</param>
+    /// <returns>Real as a String</returns>
+    public str  numToString(real _number)
+    {
+        return num2Str(_number, 4, 2, DecimalSeparator::Dot, ThousandSeparator::Comma);
     }
 
 ]]></Source>
