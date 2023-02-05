@@ -23,6 +23,110 @@ class METRebateExcludeForPaymentService extends SysOperationServiceBase
     /// <param name = "_contract"> METRebateExcludeForPaymentContract </param>
     public void processOperation(METRebateExcludeForPaymentContract _contract)
     {
+        FeatureManagementState      featureManagementState;
+
+        select firstonly1 featureManagementState where featureManagementState.Name == METConstants::UnifiedPricingFeature;
+        if(featureManagementState.IsEnabled == NoYes::Yes)
+        {
+            this.unifiedPricingEnabledExclude(_contract);
+        }
+        else
+        {
+            this.unifiedPricingNotEnabledExclude(_contract);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unifiedPricingEnabledExclude</Name>
+				<Source><![CDATA[
+    protected void unifiedPricingEnabledExclude(METRebateExcludeForPaymentContract _contract)
+    {
+        TAMRebateDeal               rebateDealContract;
+        QueryRun                    queryRun;
+        QueryBuildDataSource        qbdsRebateTrans, qbdsRebateTable, qbdsExcludeForPayment;
+
+        const Amount rebateAmountMultiplier = 0.0;
+
+        Query query = new Query();
+        rebateDealContract  =   _contract.parmTAMRebateDeal();
+
+        qbdsRebateTrans = query.addDataSource(tableNum(TAMRebateTrans));
+        qbdsRebateTrans.addSortField(fieldNum(TAMRebateTrans, RebateId), SortOrder::Ascending);
+
+        qbdsRebateTable = qbdsRebateTrans.addDataSource(tableNum(TAMRebateTable));
+        qbdsRebateTable.relations(false);
+        qbdsRebateTable.fetchMode(QueryFetchMode::One2One);
+        qbdsRebateTable.addLink(fieldNum(TAMRebateTrans, RebateId), fieldNum(TAMRebateTable, RebateId));
+        qbdsRebateTable.addRange(fieldNum(TAMRebateTable, RebateDeal)).value(SysQuery::value(rebateDealContract.RecId));
+
+        qbdsExcludeForPayment = qbdsRebateTable.addDataSource(tableNum(METExcludeForPaymentProducts));
+        qbdsExcludeForPayment.relations(false);
+        qbdsExcludeForPayment.fetchMode(QueryFetchMode::One2One);
+        qbdsExcludeForPayment.joinMode(JoinMode::ExistsJoin);
+        qbdsExcludeForPayment.addRange(fieldNum(METExcludeForPaymentProducts, RuleId)).value(strFmt('((%1.%2 = %3.%4) && (%1.%5 = %6.%7))',
+            qbdsExcludeForPayment.name(),
+            fieldStr(METExcludeForPaymentProducts, RuleId),
+            qbdsRebateTable.name(),
+            fieldStr(TAMRebateTable, PricingRuleLine),
+            fieldStr(METExcludeForPaymentProducts, ItemId),
+            qbdsRebateTrans.name(),
+            fieldStr(TAMRebateTrans, ItemId)));
+
+        queryRun = new QueryRun(query);
+
+        while(queryRun.next())
+        {
+            TAMRebateTrans  rebateTrans     =   queryRun.get(tableNum(TAMRebateTrans));
+
+            try
+            {
+                ttsbegin;
+                rebateTrans.selectForUpdate(true);
+                rebateTrans.RebateAmount    =   rebateTrans.RebateAmount * rebateAmountMultiplier;
+                rebateTrans.Claimed         =   NoYes::No;
+                rebateTrans.modifiedField(fieldNum(TAMRebateTrans, Claimed));
+                if(rebateTrans.validateWrite())
+                {
+                    rebateTrans.update(true);
+                }
+                ttscommit;
+            }
+            catch(Exception::UpdateConflict)
+            {
+                Info("@MET:METExcludeUpdateConflict", rebateTrans.ItemId);
+                throw Exception::UpdateConflictNotRecovered;
+            }
+            catch(Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                retry;
+            }
+            catch(Exception::CLRError)
+            {
+                System.Exception netExcepn;
+                info("@MET:METRebateCLRException");
+                netExcepn = CLRInterop::getLastException();
+                info(netExcepn.ToString());
+            }
+            catch(Exception::Error)
+            {
+                Info("@MET:METRebateError");
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unifiedPricingNotEnabledExclude</Name>
+				<Source><![CDATA[
+    protected void unifiedPricingNotEnabledExclude(METRebateExcludeForPaymentContract _contract)
+    {
         TAMRebateDeal               rebateDealContract;
         TAMRebateTrans              rebateTrans;
         
@@ -42,7 +146,7 @@ class METRebateExcludeForPaymentService extends SysOperationServiceBase
         qbdsRebateTable.relations(false);
         qbdsRebateTable.fetchMode(QueryFetchMode::One2One);
         qbdsRebateTable.addLink(fieldNum(TAMRebateTrans, RebateId), fieldNum(TAMRebateTable, RebateId));
-        qbdsRebateTable.addRange(fieldNum(TAMRebateTable, RebateDeal)).value(SysQuery::value(rebateDealContract.RecId));       
+        qbdsRebateTable.addRange(fieldNum(TAMRebateTable, RebateDeal)).value(SysQuery::value(rebateDealContract.RecId));
        
         qbdsInventTable = qbdsRebateTrans.addDataSource(tableNum(InventTable));
         qbdsInventTable.relations(false);
@@ -55,7 +159,7 @@ class METRebateExcludeForPaymentService extends SysOperationServiceBase
         qbdsRebateGroupLink.addLink(fieldNum(TAMRebateTable, ItemRelation), fieldNum(TAMRebateGroupLink,RebateGroupId));
         qbdsRebateGroupLink.addRange(fieldNum(TAMRebateGroupLink, ModuleInventCustVend)).value(enum2Str(ModuleInventCustVend::Invent));
         qbdsRebateGroupLink.addRange(fieldnum(TAMRebateGroupLink, METExcludeForPayment)).value(enum2Str(NoYes::Yes));
-        qbdsRebateGroupLink.addRange(fieldnum(TAMRebateGroupLink,RefRecId)).value(strFmt('((%1.%2 = %3.%4) && (%1.%5 = %3.%6))',
+        qbdsRebateGroupLink.addRange(fieldnum(TAMRebateGroupLink, RefRecId)).value(strFmt('((%1.%2 = %3.%4) && (%1.%5 = %3.%6))',
             qbdsRebateGroupLink.name(),
             fieldStr(TAMRebateGroupLink, RefRecId),
             qbdsInventTable.name(),
