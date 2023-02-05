@@ -1,0 +1,633 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPriceDataFeedTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_24248 Pricing Data Extract DCP 28/07/2022
+/// </summary>
+class METPriceDataFeedTaskService extends SysOperationServiceBase
+{
+    Batch           batchTask;
+    Batch           batchTaskCurrent;
+    BatchHeader     batchHeader;
+    RefRecId        batchJobId;
+    RefRecId        headerTaskId;
+    boolean         isExecutingInBatch, isMainBatchTask;
+    METBundleCount  bundleCount;
+    METTaskGuid     taskGuid;
+    UserConnection  secondConnection;
+ 
+    METPriceDataFeedContract    dataContract;
+    RecordInsertList            priceReportItemTaskInsertList;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// processing logic
+    /// </summary>
+    /// <param name = "_dataContract">The data contract</param>
+    public void process(METPriceDataFeedContract _dataContract)
+    {
+        #OCCRetryCount
+
+        try
+        {
+            this.initialise(_dataContract);
+
+            if(!this.validate())
+            {
+                error("@MET:PriceDataFeedBatchTaskFailed");
+                
+                if(isExecutingInBatch)
+                {
+                    //ensure batch status is "Error"
+                    throw Exception::Error;
+                }
+                else
+                {
+                    //dont throw error when run from GUI
+                    return;
+                }
+            }
+
+            this.cleanup();
+            this.processTask(true);
+
+            if(isMainBatchTask)
+            {
+                //last run of main task thread to make sure all customers have been processed
+                this.processTask(false);
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error("@MET:PriceDataFeedBatchTaskFailed");
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error("@MET:PriceDataFeedBatchTaskFailed");
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error("@MET:PriceDataFeedBatchTaskFailed");
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error("@MET:PriceDataFeedBatchTaskFailed");
+                throw Exception::Deadlock;
+            }
+        }
+        catch
+        {
+            error("@MET:PriceDataFeedBatchTaskFailed");
+            throw Exception::Error;
+            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>Initialise global variables</summary>
+    /// <param name = "_dataContract">The data contract</param>
+    public void initialise(METPriceDataFeedContract _dataContract)
+    {
+        dataContract        = _dataContract;
+        
+        isMainBatchTask     = dataContract.parmIsMainBatchTask();
+        bundleCount         = dataContract.parmBundleCount();
+        batchTaskCurrent    = this.getCurrentBatchTask();
+        batchJobId          = batchTaskCurrent.BatchJobId;
+        headerTaskId        = batchTaskCurrent.RecId;
+        batchHeader         = BatchHeader::construct(batchJobId);
+        isExecutingInBatch  = batchTaskCurrent ? true : false;
+        taskGuid            = str2Guid(dataContract.parmTaskGuidStr());
+        secondConnection    = new UserConnection();
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>Check that process should run</summary>
+    /// <returns>The result of the validation</returns>
+    public boolean validate()
+    {
+        boolean Ok = true;
+
+        if(!taskGuid)
+        {
+            Ok = checkFailed("@MET:TaskGuidMissing");
+        }
+
+        return Ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    /// <summary>Process the batch tasks</summary>
+    /// <param name = "_readPast">Table read past setting</param>
+    public void processTask(boolean _readPast)
+    {
+        boolean                 recordFound;
+        METPriceDataFeed        priceDataFeed;	            //table used for top pick list
+        METPriceDataFeedWorking priceDataFeedWorking;	    //table used for working
+        RecordInsertList        priceDataFeedWorkingList = new RecordInsertList(tableNum(METPriceDataFeedWorking));
+        
+        priceDataFeed.setConnection(secondConnection);
+        priceDataFeed.readPast(_readPast);              // skip or don't skip locked records
+
+        do
+        {
+            secondConnection.ttsbegin();
+
+            for(int i=1 ; i<=bundleCount ;i++)
+            {
+                recordFound = false;
+                            
+                select firstOnly pessimisticlock priceDataFeed;
+
+                if(priceDataFeed)
+                {
+                    priceDataFeedWorking.clear();
+                    priceDataFeedWorking.custAccount    = priceDataFeed.CustAccount;
+                    priceDataFeedWorking.ItemId         = priceDataFeed.ItemId;
+                    priceDataFeedWorking.InventSiteId   = priceDataFeed.InventSiteId;
+                    priceDataFeedWorking.UnitOfMeasure  = priceDataFeed.UnitOfMeasure;
+                    priceDataFeedWorking.Quantity       = priceDataFeed.Quantity;
+                    priceDataFeedWorking.EventId        = priceDataFeed.EventId;
+                    priceDataFeedWorking.StartDate      = priceDataFeed.StartDate;
+                    priceDataFeedWorking.EndDate        = priceDataFeed.EndDate ? priceDataFeed.EndDate : priceDataFeed.StartDate;
+
+                    priceDataFeedWorking.taskGuid       = taskGuid;
+
+                    priceDataFeedWorkingList.add(priceDataFeedWorking);
+
+                    priceDataFeed.delete();
+
+                    recordFound = true;
+                }
+
+                i = recordFound ? i : bundleCount; //early breakout if there are no records left
+            }
+
+            priceDataFeedWorkingList.insertDatabase();
+
+            secondConnection.ttscommit();
+
+            //Process the priceDataFeedWorking record here
+            this.processPriceDataFeedWorking();
+        }
+        while(recordFound);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>Constuct new object</summary>
+    /// <returns>New Service Object</returns>
+    public static METPriceDataFeedTaskService construct()
+    {
+        return new METPriceDataFeedTaskService();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processAsync</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constuct and run a METPriceDataFeedTaskService. Used when process is run from GUI (not in Batch mode)
+    /// </summary>
+    /// <param name = "_serializedContractCon">Serialised data contract</param>
+    public static void processAsync(container _serializedContractCon)	//must have Container as parameter
+    {
+        METPriceDataFeedTaskService     priceDataFeedTaskService;
+        METPriceDataFeedContract        dataContract;
+        Object  				        deserializedContract;
+        str                             serializedContract;
+
+        serializedContract      = conPeek(_serializedContractCon,1);
+        deserializedContract    = FormJsonSerializer::deserializeObject(classIdGet(dataContract), serializedContract);
+        dataContract            = deserializedContract as METPriceDataFeedContract;
+
+        PriceDataFeedTaskService = METPriceDataFeedTaskService::construct();
+        PriceDataFeedTaskService.process(dataContract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processPriceDataFeedWorking</Name>
+				<Source><![CDATA[
+    /// <summary>Process the Price data feed working records</summary>
+    public void processPriceDataFeedWorking()
+    {
+        InventSiteId    custSiteId;
+        UnitQty         salesUnit;
+        ValidFromDate   fromDate;
+        ValidTodate     toDate;
+        guid            sessionGuid;
+        Set             itemSet;
+        Set             customerSet;
+        boolean         foundAnyWithActiveProductDimensions, buildActiveProductDimensions;
+
+        GUPPriceReportTask      priceReportTask;
+        METPriceDataFeedWorking priceDataFeedWorking;
+
+        Container       parameterCon;
+        List            parameterConList = new List(Types::Container);     
+        ListEnumerator  enumerator;
+
+        //Record Bundle lacks uniformity, group records by characteristics for processing
+        while select CustAccount, InventSiteId, Quantity, StartDate, EndDate
+            from    priceDataFeedWorking
+            group by CustAccount, InventSiteId, Quantity, StartDate, EndDate
+            where   priceDataFeedWorking.taskGuid == taskGuid
+        {
+            parameterCon = [priceDataFeedWorking.CustAccount, priceDataFeedWorking.InventSiteId, priceDataFeedWorking.Quantity, priceDataFeedWorking.StartDate, priceDataFeedWorking.EndDate];
+            parameterConList.addEnd(parameterCon);
+        }
+
+        enumerator = parameterConList.getEnumerator();
+
+        //Process records grouped by characteristics for performance
+        while(enumerator.moveNext())
+        {
+            parameterCon = enumerator.current();
+
+            customerSet                     = new Set(Types::String);
+            itemSet                         = new Set(Types::String);
+            priceReportItemTaskInsertList   = new RecordInsertList(tableNum(GUPriceReportItemTask));
+            buildActiveProductDimensions    = false;
+
+            while select priceDataFeedWorking
+                where   priceDataFeedWorking.taskGuid       == taskGuid
+                &&      priceDataFeedWorking.CustAccount    == any2Str(conPeek(parameterCon,1))
+                &&      priceDataFeedWorking.InventSiteId   == any2Str(conPeek(parameterCon,2))
+                &&      priceDataFeedWorking.Quantity       == any2Real(conPeek(parameterCon,3))
+                &&      priceDataFeedWorking.StartDate      == any2Date(conPeek(parameterCon,4))
+                &&      priceDataFeedWorking.EndDate        == any2Date(conPeek(parameterCon,5))
+            {
+                //single parameters
+                custSiteId  = priceDataFeedWorking.InventSiteId;
+                salesUnit   = priceDataFeedWorking.Quantity;
+                fromDate    = priceDataFeedWorking.StartDate;
+                toDate      = priceDataFeedWorking.EndDate;
+                sessionGuid = taskGuid;
+
+                //multi parameters
+                //Build Customer List, effectively contains only 1  customer. 
+                if(!customerSet.in(priceDataFeedWorking.CustAccount))
+                {
+                    customerSet.add(priceDataFeedWorking.CustAccount);
+                }
+                                
+                //Build GUPriceReportItemTask records
+                if(!itemSet.in(priceDataFeedWorking.ItemId))
+                {
+                    itemSet.add(priceDataFeedWorking.ItemId);
+                    foundAnyWithActiveProductDimensions = this.addGUPriceReportItemTask(priceDataFeedWorking);
+                }
+
+                if(!buildActiveProductDimensions && foundAnyWithActiveProductDimensions)
+                {
+                    buildActiveProductDimensions = true;
+                }
+            }
+
+            ttsbegin;
+            priceReportItemTaskInsertList.insertDatabase();
+
+            if(buildActiveProductDimensions)
+            {
+                //Build GUPriceReportItemTaskWithDimensions records
+                this.buildGUPriceReportItemTasksWithDimensions();
+            }
+            ttscommit;
+
+            priceReportTask = GUPPriceReportTask::newParameters(custSiteId,
+                                                                salesUnit,
+                                                                fromDate,
+                                                                toDate,
+                                                                sessionGuid,
+                                                                this.customerList(customerSet));
+        
+            priceReportTask.parmUserConnection(new UserConnection());
+            priceReportTask.executeTask();
+            priceReportTask.metPopulatePriceDataExtract();
+
+            this.enhancePriceDataExtract(parameterCon);
+
+            this.cleanup();
+
+            this.deletePriceDataFeedWorking(parameterCon);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addGUPriceReportItemTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create GUPriceReportItemTask record
+    /// Logic copied from GUPGeneratePriceReportDialog.preparePriceReportTasks()
+    /// </summary>
+    /// <param name = "_priceDataFeedWorking">priceDataFeedWorking table buffer</param>
+    /// <returns>True if GUPriceReportItemTaskWithDimensions records need to be created</returns>
+    public boolean addGUPriceReportItemTask(METPriceDataFeedWorking _priceDataFeedWorking)
+    {
+        InventTable     localInventTable;
+        boolean         foundAnyWithActiveProductDimensions;
+
+        GUPriceReportItemTask   priceReportItemTask;
+
+        localInventTable = InventTable::find(_priceDataFeedWorking.ItemId);
+
+        if (localInventTable.ItemId)
+        {
+            priceReportItemTask.clear();
+            priceReportItemTask.ItemId                      = localInventTable.ItemId;
+            priceReportItemTask.hasActiveProductDimensions  = localInventTable.hasProductDimensions();
+            priceReportItemTask.SessionGuid                 = taskGuid;
+            
+            priceReportItemTask.InventDimId                 = this.getInventDimId(_priceDataFeedWorking.InventSiteId);
+            
+            priceReportItemTaskInsertList.add(priceReportItemTask);
+
+            if (!foundAnyWithActiveProductDimensions && priceReportItemTask.hasActiveProductDimensions)
+            {
+                foundAnyWithActiveProductDimensions = true;
+            }
+        }
+
+        return foundAnyWithActiveProductDimensions;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildGUPriceReportItemTasksWithDimensions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create GUPriceReportItemTaskWithDimensions records
+    /// Logic copied from GUPGeneratePriceReportDialog.preparePriceReportTasksWithDimensions()
+    /// </summary>
+    public void buildGUPriceReportItemTasksWithDimensions()
+    {
+        GUPriceReportItemTask               priceReportItemTask;
+        GUPriceReportItemTaskWithDimensions priceReportItemTaskWithDimensions;
+        InventTable                         localInventTable;
+        InventDimCombination                inventDimCombination;
+        InventDim                           inventDimCombinationDim;
+        InventDim                           inventDimCombinationDimWithProdDim;
+
+        RecordInsertList priceReportItemTaskWithDimensionsInsertList = new RecordInsertList(tableNum(GUPriceReportItemTaskWithDimensions));
+
+        InventDistinctProduct inventDistinctProduct;
+
+        while select priceReportItemTask 
+            order by priceReportItemTask.ItemId, inventDistinctProduct.Level desc
+            where   priceReportItemTask.SessionGuid                 == taskGuid
+                &&  priceReportItemTask.HasActiveProductDimensions  == NoYes::Yes
+            join TableId 
+                from inventDimCombination
+                where inventDimCombination.ItemId == priceReportItemTask.ItemId
+            join inventDimCombinationDim
+                where inventDimCombinationDim.InventDimId == inventDimCombination.InventDimId
+            join Level 
+                from inventDistinctProduct
+                where inventDistinctProduct.ItemId      == priceReportItemTask.ItemId
+                &&    inventDistinctProduct.ItemId      == inventDimCombination.ItemId
+                &&    inventDistinctProduct.InventDimId == inventDimCombination.InventDimId
+            exists join localInventTable
+                where localInventTable.ItemId == priceReportItemTask.ItemId
+        {
+            priceReportItemTaskWithDimensions.clear();
+            priceReportItemTaskWithDimensions.initFromFindPriceTask(priceReportItemTask);
+
+            inventDimCombinationDimWithProdDim.clear();
+            inventDimCombinationDimWithProdDim.data(inventDimCombinationDim);
+            inventDimCombinationDimWithProdDim = InventDim::findOrCreate(inventDimCombinationDimWithProdDim);
+
+            PriceReportItemTaskWithDimensions.InventDimId = inventDimCombinationDimWithProdDim.InventDimId;
+            priceReportItemTaskWithDimensionsInsertList.add(priceReportItemTaskWithDimensions);
+        }
+
+        priceReportItemTaskWithDimensionsInsertList.insertDatabase();
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>customerList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Convert Customer Set into customer List. Set is used for performance and to remove duplicates, List is required by framework
+    /// </summary>
+    /// <param name = "_customerSet">Set of customers</param>
+    /// <returns>List of customers</returns>
+    public List customerList(Set _customerSet)
+    {
+        List            customerList = new List(Types::String);
+        SetEnumerator   customerSetEnumerator;
+    
+        customerSetEnumerator = _customerSet.getEnumerator();
+
+        while (customerSetEnumerator.moveNext())
+        {
+            customerList.addEnd(customerSetEnumerator.current());
+        }
+
+        return customerList;
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>enhancePriceDataExtract</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Enhance the METPriceDataExtract records with additional values not created by pricing report framework
+    /// </summary>
+    /// <param name = "_parameterCon">Container of grouping characteristics</param>
+    public void enhancePriceDataExtract(container _parameterCon)
+    {
+        METPriceDataExtract     metPriceDataExtract;
+        CustTable               custTable;
+        InventSiteId            inventSiteId;
+        InventTableModule       inventTableModule;
+
+        //populate additional values that are not created by standard
+        metPriceDataExtract.setConnection(secondConnection);
+
+        //update customer Invent Site
+        inventSiteId = any2Str(conPeek(_parameterCon,2));
+        
+        if(inventSiteId)
+        {
+            secondConnection.ttsbegin();
+
+            update_recordset metPriceDataExtract
+                setting InventSiteId = inventSiteId
+                where   metPriceDataExtract.taskGuid    == taskGuid
+                &&      metPriceDataExtract.Enhanced    == NoYes::No;
+
+            secondConnection.ttscommit();
+        }
+   
+        //update customer Tax group
+        secondConnection.ttsbegin();
+
+        update_recordset metPriceDataExtract
+            setting TaxGroup = custTable.TaxGroup
+            where   metPriceDataExtract.taskGuid    == taskGuid
+            &&      metPriceDataExtract.Enhanced    == NoYes::No
+            
+            join custTable
+            where   metPriceDataExtract.CustAccount == custTable.AccountNum;
+       
+        secondConnection.ttscommit();
+
+        //update Item Tax group
+        secondConnection.ttsbegin();
+
+        update_recordset metPriceDataExtract
+            setting TaxItemGroup = inventTableModule.taxItemGroupId
+            where   metPriceDataExtract.taskGuid    == taskGuid
+            &&      metPriceDataExtract.Enhanced    == NoYes::No
+
+            join inventTableModule
+            where   inventTableModule.ItemId        == metPriceDataExtract.ItemId
+            &&      inventTableModule.ModuleType    == ModuleInventPurchSales::Sales;
+
+        secondConnection.ttscommit();
+
+        //update Item Tax amount
+        secondConnection.ttsbegin();
+
+        while select forupdate metPriceDataExtract
+            where   metPriceDataExtract.taskGuid    == taskGuid
+            &&      metPriceDataExtract.Enhanced    == NoYes::No
+        {
+            metPriceDataExtract.updateTax();
+            metPriceDataExtract.update();
+        }
+
+        secondConnection.ttscommit();
+        
+        //mark as enhanced complete
+        secondConnection.ttsbegin();
+
+        update_recordset metPriceDataExtract
+            setting Enhanced    = NoYes::Yes
+                where   metPriceDataExtract.taskGuid    == taskGuid
+                &&      metPriceDataExtract.Enhanced    == NoYes::No;
+
+        secondConnection.ttscommit();
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deletePriceDataFeedWorking</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delete METPriceDataFeedWorking records that have been processed
+    /// </summary>
+    /// <param name = "_parameterCon">Values used for grouping</param>
+    public Void deletePriceDataFeedWorking(container _parameterCon)
+    {
+        METPriceDataFeedWorking priceDataFeedWorking;
+
+        ttsbegin;
+
+        delete_from priceDataFeedWorking
+            where   priceDataFeedWorking.taskGuid       == taskGuid
+            &&      priceDataFeedWorking.CustAccount    == any2Str(conPeek(_parameterCon,1))
+            &&      priceDataFeedWorking.InventSiteId   == any2Str(conPeek(_parameterCon,2))
+            &&      priceDataFeedWorking.Quantity       == any2Real(conPeek(_parameterCon,3))
+            &&      priceDataFeedWorking.StartDate      == any2Date(conPeek(_parameterCon,4))
+            &&      priceDataFeedWorking.EndDate        == any2Date(conPeek(_parameterCon,5));
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cleanUp</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// In case this Task is being rerun by Batch framework due to a previous error. clean up intermediate tables.
+    /// </summary>
+    public void cleanUp()
+    {
+        METPriceDataFeedHelper::cleanUp(taskGuid, secondConnection);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInventDimId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get an invent dim id
+    /// </summary>
+    /// <param name = "_inventSiteId">Invent site id</param>
+    /// <returns>The invent dim id</returns>
+    public InventDimId getInventDimId(InventSiteId _inventSiteId)
+    {
+        InventDim   inventDim;
+
+        inventDim.clear();
+        InventDim.InventSiteId  = _inventSiteId;
+
+        return InventDim::findOrCreate(inventDim).inventDimId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
