@@ -1,0 +1,231 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPriceChangeTrackTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_24248 Pricing Data Extract DCP 28/07/2022
+/// </summary>
+class METPriceChangeTrackTaskService extends SysOperationServiceBase
+{
+    Batch           batchTask;
+    Batch           batchTaskCurrent;
+    BatchHeader     batchHeader;
+    RefRecId        batchJobId;
+    RefRecId        headerTaskId;
+    boolean         isExecutingInBatch, isMainBatchTask;
+    METBundleCount  bundleCount;
+    METTaskGuid     taskGuid;
+    UserConnection  secondConnection;
+ 
+    METPriceChangeTrackContract    dataContract;
+    RecordInsertList            priceReportItemTaskInsertList;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// processing logic
+    /// </summary>
+    /// <param name = "_dataContract">The data contract</param>
+    public void process(METPriceChangeTrackContract _dataContract)
+    {
+        #OCCRetryCount
+
+        try
+        {
+            this.initialise(_dataContract);
+
+            if(!this.validate())
+            {
+                error("@MET:PriceChangeTrackBatchTaskFailed");
+                
+                if(isExecutingInBatch)
+                {
+                    //ensure batch status is "Error"
+                    throw Exception::Error;
+                }
+                else
+                {
+                    //dont throw error when run from GUI
+                    return;
+                }
+            }
+
+            this.processTask(true);
+
+            if(isMainBatchTask)
+            {
+                //last run of main task thread to make sure all records have been processed
+                this.processTask(false);
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error("@MET:PriceChangeTrackBatchTaskFailed");
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error("@MET:PriceChangeTrackBatchTaskFailed");
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error("@MET:PriceChangeTrackBatchTaskFailed");
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error("@MET:PriceChangeTrackBatchTaskFailed");
+                throw Exception::Deadlock;
+            }
+        }
+        catch
+        {
+            error("@MET:PriceChangeTrackBatchTaskFailed");
+            throw Exception::Error;
+            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>Initialise global variables</summary>
+    /// <param name = "_dataContract">The data contract</param>
+    public void initialise(METPriceChangeTrackContract _dataContract)
+    {
+        dataContract        = _dataContract;
+        
+        isMainBatchTask     = dataContract.parmIsMainBatchTask();
+        bundleCount         = dataContract.parmBundleCount();
+        batchTaskCurrent    = this.getCurrentBatchTask();
+        batchJobId          = batchTaskCurrent.BatchJobId;
+        headerTaskId        = batchTaskCurrent.RecId;
+        batchHeader         = BatchHeader::construct(batchJobId);
+        isExecutingInBatch  = batchTaskCurrent ? true : false;
+        taskGuid            = str2Guid(dataContract.parmTaskGuidStr());
+        secondConnection    = new UserConnection();
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>Check that process should run</summary>
+    /// <returns>The result of the validation</returns>
+    public boolean validate()
+    {
+        boolean Ok = true;
+
+        if(!taskGuid)
+        {
+            Ok = checkFailed("@MET:TaskGuidMissing");
+        }
+
+        return Ok;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    /// <summary>Process the batch tasks</summary>
+    /// <param name = "_readPast">Table read past setting</param>
+    public void processTask(boolean _readPast)
+    {
+        METPriceChangeTracking  priceChangeTracking;	       //table used for top pick list
+        
+        priceChangeTracking.setConnection(secondConnection);
+        priceChangeTracking.readPast(_readPast);              // skip or don't skip locked records
+
+        do
+        {
+            secondConnection.ttsbegin();
+                            
+            select firstOnly pessimisticlock priceChangeTracking;
+
+            if(priceChangeTracking)
+            {
+                METPriceChangeTrack priceChangeTrack = METPriceChangeTrackFactory::newFromPriceChangeType(priceChangeTracking.ChangeType);
+                priceChangeTrack.initInstanceChange(priceChangeTracking);
+                priceChangeTrack.processChange();
+
+                priceChangeTracking.delete();
+                
+            }   
+
+            secondConnection.ttscommit();
+        }
+        while(priceChangeTracking);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>Constuct new object</summary>
+    /// <returns>New Service Object</returns>
+    public static METPriceChangeTrackTaskService construct()
+    {
+        return new METPriceChangeTrackTaskService();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processAsync</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constuct and run a METPriceChangeTrackTaskService. Used when process is run from GUI (not in Batch mode)
+    /// </summary>
+    /// <param name = "_serializedContractCon">Serialised data contract</param>
+    public static void processAsync(container _serializedContractCon)	//must have Container as parameter
+    {
+        METPriceChangeTrackTaskService  PriceChangeTrackTaskService;
+        METPriceChangeTrackContract     dataContract;
+        Object  				        deserializedContract;
+        str                             serializedContract;
+
+        serializedContract      = conPeek(_serializedContractCon,1);
+        deserializedContract    = FormJsonSerializer::deserializeObject(classIdGet(dataContract), serializedContract);
+        dataContract            = deserializedContract as METPriceChangeTrackContract;
+
+        PriceChangeTrackTaskService = METPriceChangeTrackTaskService::construct();
+        PriceChangeTrackTaskService.process(dataContract);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
