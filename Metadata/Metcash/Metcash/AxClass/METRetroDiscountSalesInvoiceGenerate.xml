@@ -1,0 +1,254 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METRetroDiscountSalesInvoiceGenerate</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// class of METRetroDiscountSalesInvoiceGenerate
+/// </summary>
+internal final class METRetroDiscountSalesInvoiceGenerate
+{
+    private RetailOfferIdEx3       offerId;
+    private FromDate               fromDate;
+    private ToDate                 toDate;
+    private SalesPriceDateType     dateType;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// New
+    /// </summary>
+    /// <param name = "_offerId">offerId</param>
+    /// <param name = "_fromDate">fromDate</param>
+    /// <param name = "_toDate">toDate</param>
+    /// <param name = "_dateType">dateType</param>
+    internal void new(
+        RetailOfferIdEx3       _offerId,
+        FromDate               _fromDate,
+        ToDate                 _toDate,
+        SalesPriceDateType     _dateType)
+    {
+        this.offerId    = _offerId;
+        this.fromDate   = _fromDate;
+        this.toDate     = _toDate ? _toDate : dateMax();
+        this.dateType   = _dateType;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// run the logic
+    /// </summary>
+    internal void run()
+    {
+        this.generateTransactionRecords();
+
+        Args    args = new Args(formstr(METRetroDiscountSalesInvoiceTransaction));
+        args.parmObject(this);
+
+        FormRun formRun = classFactory.formRunClass(args);
+
+        formRun.init();
+        formRun.run();
+ 
+        if (!formRun.closed())
+        {
+            formrun.wait(true);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateTransactionRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// GenerateTransactionRecords
+    /// </summary>
+    private void generateTransactionRecords()
+    {
+        SalesTable                  salesTable;
+        SalesLine                   salesLine;
+        RetailSalesLine             retailSalesLine;
+        Map                         salesLineDiscountMap;
+        MapEnumerator               enumerator;
+        InventTransId               inventTransId;
+        CustInvoiceJour             invoiceJour;
+        CustInvoiceTrans            invoiceTrans;
+        RetailPeriodicDiscountLine  discountLine;
+
+        Microsoft.Dynamics.Commerce.Runtime.DataModel.DiscountLine  crtDiscountLine;
+        METRetroDiscountSalesInvoiceTransaction trans;
+        RecordInsertList                        transList = new RecordInsertList(tableNum(METRetroDiscountSalesInvoiceTransaction));
+        utcdatetime fromDateTime = DateTimeUtil::newDateTime(fromDate, 0);
+        utcdatetime toDateTime = DateTimeUtil::newDateTime(toDate + 1, 0);
+
+        while select forupdate salesTable
+            where salesTable.SalesStatus == SalesStatus::Invoiced
+                && salesTable.CreatedDateTime >= fromDateTime
+                && salesTable.CreatedDateTime < toDateTime
+        {
+            ttsbegin;
+
+            salesTable.SalesStatus = SalesStatus::Backorder;
+            salesTable.MCROrderStopped = NoYes::Yes;
+            salesTable.doUpdate();
+
+            while select forupdate salesLine
+                where salesLine.SalesId == salesTable.SalesId
+            {
+                salesLine.SalesStatus = SalesStatus::Backorder;
+                salesLine.doUpdate();
+            }
+
+            retailSalesLine.skipDataMethods(true);
+            retailSalesLine.skipEvents(true);
+            retailSalesLine.skipDatabaseLog(true);
+            update_recordset retailSalesLine
+                setting IsPriceLocked = NoYes::No
+                exists join salesLine
+                    where salesLine.SalesId == salesTable.SalesId
+                        && salesLine.RecId == retailSalesLine.salesLine;
+
+            GUPSalesOrderCalculator retailCalculator = GUPSalesOrderCalculator::constructDefaultWithDateType(salesTable.SalesId, null, SalesPriceDateType::CreatedDate);
+            salesLineDiscountMap = retailCalculator.metGetRetroDiscount(offerId);
+
+            ttsabort;
+
+            enumerator = new MapEnumerator(salesLineDiscountMap);
+            while(enumerator.moveNext())
+            {
+                inventTransId   = enumerator.currentKey();
+                crtDiscountLine = enumerator.currentValue();
+
+                delete_from trans
+                    where trans.OfferId == crtDiscountLine.get_OfferId()
+                        && trans.InventTransId == inventTransId
+                        && trans.Posted == NoYes::No;
+
+                while select invoiceTrans
+                    where invoiceTrans.InventTransId == inventTransId
+                    join InvoiceAccount from invoiceJour
+                        where invoiceJour.InvoiceId == invoiceTrans.InvoiceId
+                {
+                    select firstonly discountLine
+                        where discountLine.OfferId == crtDiscountLine.get_OfferId()
+                            && discountLine.LineNum == crtDiscountLine.get_LineNumber();
+
+                    trans = this.generateRetroDiscountSalesInvoiceTrans(
+                        salesTable,
+                        SalesLine::findInventTransId(inventTransId),
+                        invoiceTrans,
+                        discountLine as RetailDiscountLineOffer,
+                        invoiceJour.InvoiceAccount);
+
+                    transList.add(trans);
+                }
+            }
+        }
+
+        transList.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateRetroDiscountSalesInvoiceTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// GenerateRetroDiscountSalesInvoiceTrans
+    /// </summary>
+    /// <param name = "_salesTable">salesTable</param>
+    /// <param name = "_salesLine">salesLine</param>
+    /// <param name = "_invoiceTrans">invoiceTrans</param>
+    /// <param name = "_discountLineOffer">discountLineOffer</param>
+    /// <param name = "_invoiceAccount">invoiceAccount</param>
+    /// <returns>METRetroDiscountSalesInvoiceTransaction</returns>
+    private METRetroDiscountSalesInvoiceTransaction generateRetroDiscountSalesInvoiceTrans(
+        SalesTable                                  _salesTable,
+        SalesLine                                   _salesLine,
+        CustInvoiceTrans                            _invoiceTrans,
+        RetailDiscountLineOffer                     _discountLineOffer,
+        CustInvoiceAccount                          _invoiceAccount)
+    {
+        METRetroDiscountSalesInvoiceTransaction trans;
+
+        RetailPeriodicDiscount discount = RetailPeriodicDiscount::findByOfferId(_discountLineOffer.OfferId);
+
+        trans.Posted                  = NoYes::No;
+
+        trans.InvoiceId               = _invoiceTrans.InvoiceId;
+        trans.CustAccount             = _salesTable.CustAccount;
+        trans.InventSiteId            = _salesTable.InventSiteId;
+        trans.InvoiceAccount          = _invoiceAccount;
+        trans.SalesId                 = _salesTable.SalesId;
+        trans.OrderDate               = _salesTable.CreatedDateTime;
+        trans.InvoiceDate             = _invoiceTrans.InvoiceDate;
+        trans.ItemId                  = _salesLine.ItemId;
+        trans.InvoiceQty              = _invoiceTrans.Qty;
+        trans.SalesUnit               = _salesLine.SalesUnit;
+        trans.SalesPrice              = _salesLine.SalesPrice;
+        trans.CurrencyCode            = _salesLine.CurrencyCode;
+        trans.OfferId                 = _discountLineOffer.OfferId;
+        trans.Name                    = discount.Name;
+        trans.PriceComponentCodeName  = discount.PriceComponentCodeName;
+        trans.ValidFrom               = discount.ValidFrom;
+        trans.ValidTo                 = discount.ValidTo;
+        trans.DiscountMethod          = _discountLineOffer.discountMethod;
+        trans.DiscPct                 = _discountLineOffer.discPct;
+        trans.DiscAmount              = _discountLineOffer.discAmount;
+        trans.OfferPrice              = _discountLineOffer.offerPrice;
+
+        switch (_discountLineOffer.discountMethod)
+        {
+            case RetailDiscountOfferLineDiscMethodBase::AmountOff:
+                trans.RetroDiscountAmount = _discountLineOffer.discAmount * trans.InvoiceQty;
+                break;
+
+            case RetailDiscountOfferLineDiscMethodBase::PercentOff:
+                trans.RetroDiscountAmount = _salesLine.SalesPrice * _discountLineOffer.discPct * 0.01 * trans.InvoiceQty;
+                break;
+
+            case RetailDiscountOfferLineDiscMethodBase::Price:
+                trans.RetroDiscountAmount = (_salesLine.SalesPrice - _discountLineOffer.offerPrice) * trans.InvoiceQty;
+                break;
+
+            default:
+                break;
+        }
+
+        trans.InventDimId           = _salesLine.InventDimId;
+        trans.InventTransId         = _salesLine.InventTransId;
+        trans.DiscountLineRefRecId  = _discountLineOffer.RecId;
+        
+        return trans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmOfferId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// OfferId
+    /// </summary>
+    /// <param name = "_offerId">offerId</param>
+    /// <returns>offerId</returns>
+    public RetailOfferIdEx3 parmOfferId(RetailOfferIdEx3 _offerId = offerId)
+    {
+        offerId = _offerId;
+        return offerId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
