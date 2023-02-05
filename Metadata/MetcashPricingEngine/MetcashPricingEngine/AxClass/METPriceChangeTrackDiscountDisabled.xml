@@ -1,0 +1,301 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPriceChangeTrackDiscountDisabled</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MPJ_24248 Pricing Data Extract
+/// Process Price Change tracking records for Discounts and create Price Data Feed records
+/// </summary>
+using System.ComponentModel.Composition;
+
+[Export(identifierStr(Dynamics.AX.Application.METPriceChangeTrack))]
+[ExportMetadata(enumStr(METPriceChangeType), enumLiteralStr(METPriceChangeType, DiscountDisabled))]
+public class METPriceChangeTrackDiscountDisabled extends METPriceChangeTrack
+{
+    container   discountTypesCon;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>setInternals</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set internal variables
+    /// </summary>
+    /// <param name = "_priceChangeTracking">Price change tracking record</param>
+    public void setInternals(METPriceChangeTracking _priceChangeTracking)
+    {
+        super(_priceChangeTracking);
+        discountTypesCon = [RetailDiscountOfferTypeBase::Multibuy, RetailDiscountOfferTypeBase::DiscountOffer];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPriceChangeType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the Price change type
+    /// </summary>
+    /// <returns>Price change type</returns>
+    public METPriceChangeType getPriceChangeType()
+    {
+        return METPriceChangeType::DiscountDisabled;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the Change tracking record and create a Price data feed record
+    /// </summary>
+    public void process()
+    {
+        METPriceChangeTrackingDetail    priceChangeTrackingDetail;
+
+        while select TrackingId, LineNumber
+            from    priceChangeTrackingDetail
+            group by TrackingId, LineNumber 
+            where   priceChangeTrackingDetail.TrackingId   == priceChangeTracking.TrackingId
+        {
+            this.processDetails(priceChangeTrackingDetail.TrackingId, priceChangeTrackingDetail.LineNumber);
+        }
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processDetails</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the Change tracking record and create a Price data feed record
+    /// </summary>
+    /// <param name = "_trackingId">Tracing Id</param>
+    /// <param name = "_lineNumber">Line number</param>
+    public void processDetails(METPriceChangeTrackingId _trackingId, LineNumber _lineNumber)
+    {
+        METPriceChangeTrackingDetail    priceChangeTrackingDetail;
+        InventSiteId                    inventSiteId;
+        METUnitOfMeasure                unitOfMeasure;
+        Set                             custAccountSet, inventItemSet;
+
+        custAccountSet = new Set(Types::String);
+        inventItemSet = new Set(Types::String);
+                        
+        priceDataFeedCount = 0;
+        priceDataFeedList = new RecordInsertList(tableNum(METPriceDataFeed));
+
+        while select priceChangeTrackingDetail
+            where   priceChangeTrackingDetail.TrackingId    == _trackingId
+            &&      priceChangeTrackingDetail.LineNumber    == _lineNumber
+        {
+            switch(priceChangeTrackingDetail.PriceTrackDetailType)
+            {
+                case METPriceTrackDetailType::SiteId :
+                    inventSiteId = priceChangeTrackingDetail.PriceTrackDetailCode;  //should only be one value
+                    break;
+                case METPriceTrackDetailType::UnitId :
+                    unitOfMeasure = priceChangeTrackingDetail.PriceTrackDetailCode;  //should only be one value
+                    break;
+                case METPriceTrackDetailType::Customer :
+                    custAccountSet.add(priceChangeTrackingDetail.PriceTrackDetailCode);
+                    break;
+                case METPriceTrackDetailType::Product :
+                    inventItemSet.add(priceChangeTrackingDetail.PriceTrackDetailCode);
+                    break;
+            }
+        }
+
+        this.processMulti(custAccountSet, inventItemSet, inventSiteId, unitOfMeasure);
+
+        if(priceDataFeedCount)
+        {
+            ttsbegin;
+            priceDataFeedList.insertDatabase();
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processMulti</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the Change tracking record
+    /// </summary>
+    /// <param name = "_custAccountSet">Customer Accounts</param>
+    /// <param name = "_inventItemSet">Items</param>
+    /// <param name = "_inventSiteId">Inventory site</param>
+    /// <param name = "_unitOfMeasure">Unit of measure</param>
+    public void processMulti(Set _custAccountSet, Set _inventItemSet, InventSiteId _inventSiteId, METUnitOfMeasure _unitOfMeasure)
+    {
+        SetEnumerator       custAccountEnumerator, inventItemEnumerator;
+        AccountNum          custAccount;
+        ItemId              inventItem;
+        
+        Set                 custAccountSet  = _custAccountSet;
+        Set                 inventItemSet   = _inventItemSet;
+        boolean             validityCheck;
+        
+        InventSiteId        inventSiteId = _inventSiteId;
+        METUnitOfMeasure    unitOfMeasure = _unitOfMeasure;
+
+        custAccountSet  = _custAccountSet;
+        inventItemSet   = _inventItemSet;
+
+        custAccountEnumerator = custAccountSet.getEnumerator();
+
+        while(custAccountEnumerator.moveNext())
+        {
+            custAccount = custAccountEnumerator.current();
+
+            inventItemEnumerator = inventItemSet.getEnumerator();
+
+            while(inventItemEnumerator.moveNext())
+            {
+                validityCheck = true;
+                inventItem  = inventItemEnumerator.current();
+
+                //1. Is there an Entry in Price Feed previously for Item number, Customer, Site, Unit of measure, From date, From quantity
+                if(!METPriceDataFeed::existForCustItem(custAccount, inventItem, inventSiteId, unitOfMeasure, priceChangeTracking.FromDate, priceChangeTracking.QuantityAmountFrom))
+                {
+                    //2.Execute the Item/Site validity check
+                    validityCheck = this.ItemSiteValidation(inventItem, inventSiteId);
+
+                    //3. Execute the Customer/Item validity check
+                    validityCheck = validityCheck && this.CustomerItemValidation(custAccount, inventItem);
+                                            
+                    if(validityCheck)
+                    {
+                        //update priceChangeTracking values for processing, but dont committ to DB
+                        priceChangeTracking.PriceDiscAccountRelation = custAccount;
+                        priceChangeTracking.ItemId                  = inventItem;
+                        priceChangeTracking.InventSiteId            = inventSiteId;
+                        priceChangeTracking.UnitId                  = unitOfMeasure;
+
+                        this.createPriceDataFeed();
+                        this.createRelatedComponents();
+                        
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPriceDataFeed</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a Price data feed record
+    /// </summary>
+    public void createPriceDataFeed()
+    {
+        this.createPriceDataFeedBase();
+        priceDataFeedList.add(priceDataFeed);
+        priceDataFeedCount++;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPriceDataFeedRelated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a Price data feed record
+    /// </summary>
+    public void createPriceDataFeedRelated()
+    {
+        this.createPriceDataFeedBase();
+        priceDataFeedList.add(priceDataFeed);
+        priceDataFeedCount++;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRelatedComponents</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create a Price data feed records from Related components
+    /// </summary>
+    public void createRelatedComponents()
+    {
+        RetailPeriodicDiscount      retailPeriodicDiscount;
+        RetailPeriodicDiscountLine  retailPeriodicDiscountLine;
+        InventDim                   inventDim;
+        RefRecId                    pricingRuleHeaderPrevious, pricingRuleHeader, linePricingRulePrevious, linePricingRule;
+        Query                       custPreviewQuery;
+        Query                       productPreviewQuery;
+        GUPPricingRuleCopy          pricingRuleCopyCustHeader, pricingRuleCopy;
+        Set                         custAccountSet, inventItemSet;
+        TransDate                   startDate;
+
+
+        while select OfferId, HeaderPricingRule, ValidFrom
+            from    retailPeriodicDiscount
+            where   retailPeriodicDiscount.OfferId      != priceChangeTracking.DiscountCode
+            &&      retailPeriodicDiscount.ValidTo      > priceChangeTracking.FromDate
+            &&      retailPeriodicDiscount.PeriodicDiscountType in discountTypesCon
+            &&      retailPeriodicDiscount.Status       == RetailDisabledEnabled::Enabled
+            &&      retailPeriodicDiscount.IsGUPDiscount == NoYes::Yes
+        join LinePricingRule
+            from    retailPeriodicDiscountLine
+            where   retailPeriodicDiscountLine.OfferId  == retailPeriodicDiscount.OfferId
+        exists join InventDim
+            where   InventDim.InventDimId               == retailPeriodicDiscountLine.InventDimId
+            &&      InventDim.InventSiteId              == priceChangeTracking.InventSiteId
+        {
+            pricingRuleHeader   = retailPeriodicDiscount.HeaderPricingRule;
+            LinePricingRule     = retailPeriodicDiscountLine.LinePricingRule;
+
+            if(pricingRuleHeader != pricingRuleHeaderPrevious)
+            {
+                pricingRuleCopyCustHeader.initFromPricingRule(GUPPricingRule::find(retailPeriodicDiscount.HeaderPricingRule));
+                custPreviewQuery = this.buildCustQuery(pricingRuleCopyCustHeader, priceChangeTracking.InventSiteId);
+                custAccountSet = this.buildCustValues(custPreviewQuery);
+            }
+            
+            if(LinePricingRule != LinePricingRulePrevious)
+            {
+                pricingRuleCopy.initFromPricingRule(GUPPricingRule::find(retailPeriodicDiscountLine.LinePricingRule));
+                productPreviewQuery = this.buildProductQueryBase(pricingRuleCopy);
+                inventItemSet = this.buildItemValues(productPreviewQuery);
+            }
+            
+            if(inventItemSet.in(priceChangeTracking.ItemId) && custAccountSet.in(priceChangeTracking.PriceDiscAccountRelation))
+            {
+                startDate  = retailPeriodicDiscount.ValidFrom ?  retailPeriodicDiscount.ValidFrom : todayDate;
+                
+                //update priceChangeTracking values for processing, but dont committ to DB
+                priceChangeTracking.FromDate = startDate;
+
+                if(!METPriceDataFeed::existForCustItem(priceChangeTracking.PriceDiscAccountRelation, 
+                                                        priceChangeTracking.ItemId, 
+                                                        priceChangeTracking.InventSiteId, 
+                                                        priceChangeTracking.UnitId, 
+                                                        priceChangeTracking.FromDate,
+                                                        priceChangeTracking.QuantityAmountFrom))
+                {
+                    this.createPriceDataFeedRelated();
+                }
+            }
+
+            pricingRuleHeaderPrevious = pricingRuleHeader;
+            linePricingRulePrevious = linePricingRule;
+        }
+
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
