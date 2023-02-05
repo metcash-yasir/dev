@@ -15,8 +15,6 @@ public class METPriceChangeEventDiscountDisabled extends METPriceChangeEvent
 {
     RetailPeriodicDiscount  retailPeriodicDiscount;
     RecordInsertList        priceChangeTrackingDetailList;
-    LineNumber              lineNumber;
-    RetailOfferIdEx3        OfferIdPrev;
 
 }
 ]]></Declaration>
@@ -76,7 +74,7 @@ public class METPriceChangeEventDiscountDisabled extends METPriceChangeEvent
     {
         if(retailPeriodicDiscount.PeriodicDiscountType == RetailDiscountOfferTypeBase::DiscountOffer)
         {
-            this.processSingle();
+            this.processSingle(qtyOne);
         }
         else if (retailPeriodicDiscount.PeriodicDiscountType == RetailDiscountOfferTypeBase::Multibuy)
         {
@@ -93,30 +91,36 @@ public class METPriceChangeEventDiscountDisabled extends METPriceChangeEvent
     /// Process the base record that triggered the change and create Price Change Track record
     /// </summary>
     /// <param name = "_fromQty">From Quantity</param>
-    public void processSingle(RetailQtyLowest _fromQty = 1)
+    public void processSingle(RetailQtyLowest _fromQty)
     {
         FromDate                    fromDate;
         RetailQtyLowest             fromQty;
         boolean                     skipCreation;
+        Counter                     insertCount;
 
-        fromDate = retailPeriodicDiscount.ValidFrom ? retailPeriodicDiscount.ValidFrom : todayDate;
-        fromQty = _fromQty;
+        fromDate = this.getFromDate(retailPeriodicDiscount.ValidFrom);
+        fromQty = this.getFromQty(_fromQty);
 
         skipCreation = this.preProcess(fromDate, fromQty, sourceCrud);
 
         if(!SkipCreation)
         {
             ttsbegin;
-
-            this.processTrans(fromDate, fromQty, this.getPriceChangeType());
+            this.processTrans(fromDate, fromQty);
             priceChangeTracking.insert();
-
-            priceChangeTrackingDetailList = new RecordInsertList(tableNum(METPriceChangeTrackingDetail));
-            this.processDetail();
-            priceChangeTrackingDetailList.insertDatabase();
-
             ttscommit;
 
+            ttsbegin;
+            priceChangeTrackingDetailList = new RecordInsertList(tableNum(METPriceChangeTrackingDetail));
+            this.processDetail();
+            insertCount = priceChangeTrackingDetailList.insertDatabase();
+
+            if(!insertCount) //no detail record was created
+            {
+                priceChangeTracking.selectForUpdate(true);
+                priceChangeTracking.delete();
+            }
+            ttscommit;
         }
     }
 
@@ -136,9 +140,7 @@ public class METPriceChangeEventDiscountDisabled extends METPriceChangeEvent
         while select retailMultibuyDiscountLine
             where   retailMultibuyDiscountLine.multibuyId == retailPeriodicDiscount.OfferId
         {
-            fromQty  = retailMultibuyDiscountLine.qtyLowest ? retailMultibuyDiscountLine.qtyLowest : 1;
-
-            this.processSingle(fromQty);
+            this.processSingle(retailMultibuyDiscountLine.qtyLowest);
         }
     }
 
@@ -152,15 +154,16 @@ public class METPriceChangeEventDiscountDisabled extends METPriceChangeEvent
     /// </summary>
     /// <param name = "_fromDate">From Date</param>
     /// <param name = "_fromQty">From Quantity</param>
-    /// <param name = "_priceChangeType">Price change type</param>
-    /// <param name = "_crud">DB operation</param>
-    public void processTrans(FromDate _fromDate, RetailQtyLowest _fromQty, METPriceChangeType _priceChangeType)
+    public void processTrans(FromDate _fromDate, RetailQtyLowest _fromQty)
     {
-        this.setStandardValues();
+        priceChangeTracking.clear();
+        this.setCommonValues(retailPeriodicDiscount);
+        priceChangeTracking.pricingRuleHeader       = retailPeriodicDiscount.HeaderPricingRule;
+        priceChangeTracking.DiscountCode            = retailPeriodicDiscount.offerId;
+        priceChangeTracking.ToDate                  = retailPeriodicDiscount.ValidTo;
         priceChangeTracking.Activation              = NoYes::No;
         priceChangeTracking.QuantityAmountFrom      = _fromQty;
         priceChangeTracking.FromDate                = _fromDate;
-
     }
 
 ]]></Source>
@@ -174,6 +177,7 @@ public class METPriceChangeEventDiscountDisabled extends METPriceChangeEvent
     public void processDetail()
     {
         RetailPeriodicDiscountLine  retailPeriodicDiscountLine;
+        InventDim                   inventDim;
         Query               custPreviewQuery;
         Query               productPreviewQuery;
         GUPPricingRuleCopy  pricingRuleCopyCustHeader, pricingRuleCopy;
@@ -187,13 +191,16 @@ public class METPriceChangeEventDiscountDisabled extends METPriceChangeEvent
         
         while select RecId, OfferId, LinePricingRule, InventDimId, UnitOfMeasure, LineNum
             from    retailPeriodicDiscountLine
-            where   retailPeriodicDiscountLine.OfferId == priceChangeTracking.DiscountCode
+            where   retailPeriodicDiscountLine.OfferId == retailPeriodicDiscount.OfferId
+            exists join InventDim
+            where   InventDim.InventDimId               == retailPeriodicDiscountLine.InventDimId
+            &&      InventDim.InventSiteId
         {
             pricingRuleCopy.initFromPricingRule(GUPPricingRule::find(retailPeriodicDiscountLine.LinePricingRule));
         
             inventSiteId = InventDim::find(retailPeriodicDiscountLine.InventDimId).InventSiteId;
 
-            custPreviewQuery = priceChangeTrack.buildCustQuery(pricingRuleCopyCustHeader, InventSiteId);
+            custPreviewQuery = priceChangeTrack.buildCustQuery(pricingRuleCopyCustHeader, InventSiteId, retailPeriodicDiscount.HeaderPricingGroupCode);
             custAccountSet = priceChangeTrack.buildCustValues(custPreviewQuery, pricingRuleCopyCustHeader);
             
             productPreviewQuery = priceChangeTrack.buildProductQueryBase(pricingRuleCopy);
@@ -226,25 +233,35 @@ public class METPriceChangeEventDiscountDisabled extends METPriceChangeEvent
         custAccountSet  = _custAccountSet;
         inventItemSet   = _inventItemSet;
 
-        inventSiteId = InventDim::find(_retailPeriodicDiscountLine.InventDimId).InventSiteId;
-        this.processDetailTrans(METPriceTrackDetailType::SiteId, inventSiteId, _retailPeriodicDiscountLine.LineNum);
-
-        unitId = UnitOfMeasure::find(_retailPeriodicDiscountLine.UnitOfMeasure).Symbol;
-        this.processDetailTrans(METPriceTrackDetailType::UnitId, unitId, _retailPeriodicDiscountLine.LineNum);
-
-        custAccountEnumerator = custAccountSet.getEnumerator();
-        while(custAccountEnumerator.moveNext())
+        if(custAccountSet && inventItemSet) //must have atleast 1 customer and 1 Item to proceed
         {
-            custAccount = custAccountEnumerator.current();
-            this.processDetailTrans(METPriceTrackDetailType::Customer, custAccount, _retailPeriodicDiscountLine.LineNum);
+            custAccountEnumerator = custAccountSet.getEnumerator();
+            while(custAccountEnumerator.moveNext())
+            {
+                custAccount = custAccountEnumerator.current();
+                this.processDetailTrans(METPriceTrackDetailType::Customer, custAccount, _retailPeriodicDiscountLine.LineNum);
+            }
+
+            inventItemEnumerator = inventItemSet.getEnumerator();
+            while(inventItemEnumerator.moveNext())
+            {
+                inventItem  = inventItemEnumerator.current();
+                this.processDetailTrans(METPriceTrackDetailType::Product, inventItem, _retailPeriodicDiscountLine.LineNum);
+            }
+
+            if(_retailPeriodicDiscountLine.InventDimId)
+            {
+                inventSiteId = InventDim::find(_retailPeriodicDiscountLine.InventDimId).InventSiteId;
+                this.processDetailTrans(METPriceTrackDetailType::SiteId, inventSiteId, _retailPeriodicDiscountLine.LineNum);
+            }
+
+            if(_retailPeriodicDiscountLine.UnitOfMeasure)
+            {
+                unitId = UnitOfMeasure::find(_retailPeriodicDiscountLine.UnitOfMeasure).Symbol;
+                this.processDetailTrans(METPriceTrackDetailType::UnitId, unitId, _retailPeriodicDiscountLine.LineNum);
+            }
         }
-        
-        inventItemEnumerator = inventItemSet.getEnumerator();
-        while(inventItemEnumerator.moveNext())
-        {
-            inventItem  = inventItemEnumerator.current();
-            this.processDetailTrans(METPriceTrackDetailType::Product, inventItem, _retailPeriodicDiscountLine.LineNum);
-        }
+
     }
 
 ]]></Source>
@@ -271,23 +288,6 @@ public class METPriceChangeEventDiscountDisabled extends METPriceChangeEvent
         priceChangeTrackingDetail.PriceTrackDetailCode = _priceTrackDetailCode;
 
         priceChangeTrackingDetailList.add(priceChangeTrackingDetail);
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>setStandardValues</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Set standard values
-    /// </summary>
-    public void setStandardValues()
-    {
-        priceChangeTracking.clear();
-        this.setCommonValues(retailPeriodicDiscount);
-        priceChangeTracking.pricingRuleHeader       = retailPeriodicDiscount.HeaderPricingRule;
-        priceChangeTracking.DiscountCode            = retailPeriodicDiscount.offerId;
-        priceChangeTracking.ToDate                  = retailPeriodicDiscount.ValidTo;
     }
 
 ]]></Source>
@@ -325,34 +325,6 @@ public class METPriceChangeEventDiscountDisabled extends METPriceChangeEvent
         ttscommit;
         
         return ret;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>cleanup</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// remove existing records to avoid duplicate processing and churn
-    /// </summary>
-    /// <param name = "_fromDate">from date</param>
-    /// <param name = "_fromQty">qty from</param>
-    /// <param name = "_crud">CRUD operation</param>
-    public void cleanup(FromDate _fromDate, RetailQtyLowest _fromQty, SysAppCRUDOperation _crud)
-    {
-        METPriceChangeTracking      priceChangeTrackingLoc;
-        
-        //if a record of the same type exists remove it.
-        ttsbegin;
-        
-        delete_from priceChangeTrackingLoc
-            where   priceChangeTrackingLoc.DiscountCode    == retailPeriodicDiscount.OfferId
-            &&      priceChangeTrackingLoc.FromDate        == _fromDate
-            &&      priceChangeTrackingLoc.QuantityAmountFrom  == _fromQty
-            &&      priceChangeTrackingLoc.ChangeType      == METPriceChangeType::DiscountDisabled
-            &&      priceChangeTrackingLoc.Activation      == NoYes::No;
-
-        ttscommit;
     }
 
 ]]></Source>
