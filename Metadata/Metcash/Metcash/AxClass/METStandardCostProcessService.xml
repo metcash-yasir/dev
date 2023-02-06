@@ -1,0 +1,330 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METStandardCostProcessService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Standard cost version process service
+/// Creates standard cost version from inventory base price versions and generate claim lines
+/// </summary>
+internal final class METStandardCostProcessService extends SysOperationServiceBase implements BatchRetryable
+{
+
+    boolean createCostClaims;
+    RecordInsertList risVendorClaimRegister;
+    GUPParameters       gupParameters;
+    CostingVersion      costingVersion;
+    GUPItemBasePrice itemBasePrice;
+    GUPItemBasePriceCurrentActive itemBasePriceCurrentActive;
+    TransDate       dateToday;
+
+    NumberSeq               numberSeq;
+   
+    #OCCRetryCount
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Entry point operation method for processing claims
+    /// </summary>
+    /// <param name = "_contract">Data contract</param>
+    public void processOperation(METStandardCostProcessContract _contract)
+    {
+        createCostClaims = _contract.parmGenerateClaimLines() == NoYes::Yes;
+
+        this.initParameters();
+
+        while select forupdate itemBasePrice
+            join itemBasePriceCurrentActive
+            where itemBasePrice.ItemId == itemBasePriceCurrentActive.ItemId
+            &&      itemBasePrice.InventDimId == itemBasePriceCurrentActive.InventDimId
+            &&      itemBasePrice.PriceType == itemBasePriceCurrentActive.PriceType
+            &&      itemBasePrice.PriceType == GUPBasePriceType::BasePriceInventoryCost
+            &&      itemBasePrice.CreatedDateTime == itemBasePriceCurrentActive.MaxCreatedDateTime
+            &&      itemBasePrice.METCostVersionProcessed == NoYes::No
+        {
+            try
+            {
+                ttsbegin;
+                this.createInventItemPriceSim();
+
+                if(itemBasePrice.METVendClaimEnabled)
+                {
+                    this.createVendorClaimRegisterLine();
+                }
+
+                itemBasePrice.METCostVersionProcessed = NoYes::Yes;
+                itemBasePrice.update();
+                ttscommit;
+            }
+            catch (Exception::Error)
+            {
+                error (strFmt("@MET:StdCostVersionLineProcessErrorMsg", "@SYS24667", itemBasePrice.ItemId));
+                
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error (strFmt("@MET:StdCostVersionLineProcessErrorMsg", "@SYS59280", itemBasePrice.ItemId));
+                    
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        error (strFmt("@MET:StdCostVersionLineProcessErrorMsg", "@SYS107548", itemBasePrice.ItemId));
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    error (strFmt("@MET:StdCostVersionLineProcessErrorMsg", "@SYS107548", itemBasePrice.ItemId));
+                }
+            }
+        }
+
+
+        this.activateCostVersion();
+
+        risVendorClaimRegister.insertDatabase();
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParameters</Name>
+				<Source><![CDATA[
+    private void initParameters()
+    {
+        
+        this.getClaimLineIdNumberSeq();
+        gupParameters = GUPParameters::find();
+        risVendorClaimRegister = new RecordInsertList(tableNum(METVendorClaimRegister));
+        costingVersion = CostingVersion::find(gupParameters.METCostingVersionId);
+        dateToday = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+
+        if(!costingVersion)
+        {
+            throw Error(strFmt("@MET:CostingVersionNotSetMsg", "@GlobalUnifiedPricing:GUPParameters", fieldPName(GUPParameters, METCostingVersionId)));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createInventItemPriceSim</Name>
+				<Source><![CDATA[
+    private void createInventItemPriceSim()
+    {
+        InventItemPriceSim itemPriceSim;
+
+        itemPriceSim.clear();
+
+        itemPriceSim.initFromCostingVersion(costingVersion);
+
+        itemPriceSim.ItemId = itemBasePrice.ItemId;
+        itemPriceSim.InventDimId = itemBasePrice.InventDimId;
+        itemPriceSim.PriceType = CostingVersionPriceType::Cost;
+        itemPriceSim.UnitID = itemBasePrice.UnitId;
+        itemPriceSim.Price = itemBasePrice.Price / itemBasePrice.PriceQty;
+        itemPriceSim.PriceUnit = itemBasePrice.PriceQty / itemBasePrice.PriceQty;
+        itemPriceSim.FromDate = itemBasePrice.FromDate;
+        itemPriceSim.defaultRow();
+
+        itemPriceSim.insert();
+
+        if(itemPriceSim)
+        {
+            itemBasePrice.METCostVersionProcessed = NoYes::Yes;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>activateCostVersion</Name>
+				<Source><![CDATA[
+    private void activateCostVersion()
+    {
+        try
+        {
+            ttsbegin;
+            InventItemPriceActivationJob inventItemPriceActivationJob = InventItemPriceActivationJob::construct();
+            inventItemPriceActivationJob.parmCostPrice(NoYes::Yes);
+            inventItemPriceActivationJob.getLast();
+            inventItemPriceActivationJob.parmFromCostingVersion(costingVersion.VersionId);
+           
+            inventItemPriceActivationJob.runOperation();
+            ttscommit;
+        }
+        catch (Exception::Error)
+        {
+            error (strFmt("@MET:StdCostVersionActivationErrorMsg", "@SYS24667", itemBasePrice.ItemId));
+                
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                error (strFmt("@MET:StdCostVersionActivationErrorMsg", "@SYS59280", itemBasePrice.ItemId));
+                    
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error (strFmt("@MET:StdCostVersionActivationErrorMsg", "@SYS107548", itemBasePrice.ItemId));
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error (strFmt("@MET:StdCostVersionActivationErrorMsg", "@SYS107548", itemBasePrice.ItemId));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createVendorClaimRegisterLine</Name>
+				<Source><![CDATA[
+    private void createVendorClaimRegisterLine()
+    {
+        METVendorClaimRegister  vendorClaimRegister;
+        InventDim               inventDim = InventDim::find(itemBasePrice.InventDimId);
+        VendAccount             defaultVendor = ReqItemTable::find(itemBasePrice.ItemId, itemBasePrice.InventDimId).VendId;
+        METAmountCurNew newPrice = itemBasePrice.Price / itemBasePrice.PriceQty;
+        METAmountCurOld oldPrice = this.getItemBasePriceOldPrice(itemBasePrice.ItemId, inventDim);
+
+        if (oldPrice > newPrice && defaultVendor)
+        {
+            vendorClaimRegister.clear();
+
+            vendorClaimRegister.ClaimLineId = numberSeq.num();
+            vendorClaimRegister.ClaimType = METVendorClaimType::StandardCost;
+            vendorClaimRegister.SiteId = inventDim.InventSiteId;
+            vendorClaimRegister.ItemId = itemBasePrice.ItemId;
+            vendorClaimRegister.modifiedField(fieldNum(METVendorClaimRegister, ItemId));
+
+            vendorClaimRegister.UnitId = InventTableModule::find(itemBasePrice.ItemId, ModuleInventPurchSales::Invent).UnitId;
+            vendorClaimRegister.Qty = this.inventoryOnHand(itemBasePrice.ItemId, inventDim);
+            vendorClaimRegister.OldPrice = oldPrice;
+            vendorClaimRegister.NewPrice = newPrice;
+            vendorClaimRegister.VendAccount = defaultVendor;
+        
+            vendorClaimRegister.setClaimAmount();
+
+            risVendorClaimRegister.add(vendorClaimRegister);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Control whether batch task should retry in case of SQL transient errors.
+    /// </summary>
+    /// <returns>true if task should be retried; otherwise, false.</returns>
+    public boolean isRetryable()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>inventoryOnHand</Name>
+				<Source><![CDATA[
+    private Qty inventoryOnHand(ItemId _itemId, InventDim _inventDim)
+    {
+        InventOnhand    inventOnhand;
+        InventDimParm   inventDimParm;
+
+        inventDimParm.initFromInventDim(_inventDim);
+        inventOnhand = InventOnhand::newParameters(_itemId, _inventDim, inventDimParm);
+        return inventOnhand.availPhysical();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getItemBasePriceOldPrice</Name>
+				<Source><![CDATA[
+    private METAmountCurOld getItemBasePriceOldPrice(ItemId _itemId, InventDim _inventDim)
+    {
+        InventItemPrice inventItemPriceCurrent = InventItemPrice::findCurrent(_itemId, CostingVersionPriceType::Cost, _inventDim.InventDimId, dateToday, _inventDim.InventSiteId, InventItemCostingType::Standard);
+        METAmountCurOld amountCurOld;
+
+        if(inventItemPriceCurrent)
+        {
+            amountCurOld = inventItemPriceCurrent.Price/inventItemPriceCurrent.PriceUnit; //get the unit price
+        }
+
+        return amountCurOld;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getClaimLineIdNumberSeq</Name>
+				<Source><![CDATA[
+    private void getClaimLineIdNumberSeq()
+    {        
+        NumberSequenceReference numberSequenceReference;
+        NumberSequenceTable     numberSequenceTable;
+
+        numberSequenceReference = GUPParameters::numRefMETVendClaimLineId();
+        numberSequenceTable = NumberSequenceTable::find(numberSequenceReference.NumberSequenceId);
+
+        if (numberSequenceTable)
+        {
+            if (numberSequenceTable.Manual == NoYes::Yes)
+            {
+                throw error(strFmt("@SYS131762", "@MET:VendorClaimLineId"));
+            }
+            else
+            {
+                numberSeq = NumberSeq::newGetNum(numberSequenceReference);
+            }
+        }
+
+        if (numberSeq == null)
+        {
+            throw error(strfmt("@GLS111556", new DictType(extendedtypenum(METVendClaimLineId)).label(), "@GlobalUnifiedPricing:GUPParameters"));
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
