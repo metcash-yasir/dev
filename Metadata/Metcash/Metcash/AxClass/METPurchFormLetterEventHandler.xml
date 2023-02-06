@@ -24,109 +24,55 @@ class METPurchFormLetterEventHandler
     {
         PurchFormLetter             purchFormLetter = _args.getThis();
         boolean                     ret;
-        UnitOfMeasureSymbol         warehouseUnit;
-        InventDim                   inventDim;
-        Qty                         warehouseQty;
-        METPurchLine                metPurchLine;
-        PurchTable                  PurchTable = PurchFormLetter.purchTable();
-        METPurchTable               metPurchTable;
-        purchLine                   purchLine;
-        boolean                     conversionFound = true;
 
         ret = _args.getReturnValue();
 
         DocumentStatus documentStatus = purchFormLetter.documentStatus();
         if (ret && (documentStatus == DocumentStatus::PurchaseOrder))
         {
-            select firstonly RecId from metPurchLine
-                join RecId from purchLine
-                    where purchLine.RecId == metPurchLine.PurchLine
-                exists join metPurchTable
-                    where purchLine.PurchId == PurchTable.PurchId       &&
-                          purchLine.PurchId == metPurchTable.PurchId    &&
-                    ! purchLine.IsDeleted                               &&
-                    purchLine.Blocked       == NoYes::No                &&
-                    !metPurchLine.PromotionIHG                    &&
-                    metPurchTable.POPromotionIHG;
-                    
-            if(metPurchLine.RecId)
+            if(ret && !(PurchFormLetter.METparmServiceConfirmation()))
             {
-                ret = checkFailed("@MET:METPOPromotionValidation");
-            }
+                PurchTable                      purchtableLoc;
+                METPurchTable                   METPurchTableLoc;
+                Valid                           isWarningPOBelowMinSetting;
+                AmountCur                       subTotalAmount = 0;
+                PurchTotals                     purchTotals;
+                SystemNotificationDataContract  notification;
+                QueryRun                        queryRunLoc = new QueryRun(purchFormLetter.parmQueryUsed());
 
-            if(ret)
-            {
-                while select metPurchLine
-                    join PurchUnit, ItemId, PurchQty, PurchId from purchLine
-                        where purchLine.PurchId == PurchTable.PurchId
-                           && purchLine.RecId == metPurchLine.PurchLine
-                    join InventLocationId, InventSiteId from inventDim
-                        where inventDim.inventDimId == purchLine.InventDimId
+                while (queryRunLoc.next())
                 {
-                
-                    [conversionFound, warehouseQty, warehouseUnit] = PurchLine::getWarehouseUnitAndQty(purchLine, inventDim.InventLocationId, inventDim.InventSiteId);
-                    if(!conversionFound)
-                    {
-                        break;
-                    }
-                    else
-                    {
-                        ttsbegin;
-                        metPurchLine.selectForUpdate(true);
-                        metPurchLine.WarehouseUnitId = warehouseUnit;
-                        metPurchLine.WarehouseQty = warehouseQty;
-                        metPurchLine.doUpdate();
-                        ttscommit;
+                    purchtableLoc   = queryRunLoc.get(tableNum(PurchTable));
+
+                    METPurchTableLoc = METPurchTable::find(purchtableLoc.purchid);
+                    isWarningPOBelowMinSetting = purchtableLoc.getVendSiteSettingsSetupFieldValues(fieldNum(METVendSiteSettingsSetup, WarningPOBelowMinSetting));
+
+                    //Validation on PO minimum order value
+                    // Initializing PurhTotals
+                    purchTotals = PurchTotals::newPurchTable(purchtableLoc);
+                    // Calculating values
+                    purchTotals.calc();
+
+                    // SubTotal Amount
+                    subTotalAmount  = purchTotals.purchBalance();
+
+                    if( isWarningPOBelowMinSetting == NoYes::Yes &&  subTotalAmount < METPurchTableLoc.POMinimumOrderValue )
+                    {                        
+                        // Set up the notification
+                        notification = new SystemNotificationDataContract();
+                        notification.Users().value(1, curUserId());
+                        notification.Title(strFmt("@ProcurementAndSourcing:PurchStatusConsistencyCheck_PurchaseOrderLogSectionTitle", purchtableLoc.purchid));
+                        notification.RuleId('POMinOrderValueWarning');
+                        notification.Message(strFmt("@MET:POMinOrderValueWarning", purchtableLoc.purchid));
+                        notification.Severity(SystemNotificationSeverity::Warning);
+                        notification.ExpirationDateTime(DateTimeUtil::addHours(DateTimeUtil::utcNow(), 48));
+                        SystemNotificationsManager::AddSystemNotification(notification);
                     }
                 }
-                if(!conversionFound)
-                {
-                    ret = ret && checkFailed(strFmt("@MET:POWarehouseUnitValidation", purchLine.ItemId));
-                }
-                
-                if(ret && !(PurchFormLetter.METparmServiceConfirmation() || Global::isSystemAdministrator()))
-                {
-                    PurchTable                      purchtableLoc;
-                    METPurchTable                   METPurchTableLoc;
-                    Valid                           isWarningPOBelowMinSetting;
-                    AmountCur                       subTotalAmount = 0;
-                    PurchTotals                     purchTotals;
-                    SystemNotificationDataContract  notification;
-                    QueryRun                        queryRunLoc = new QueryRun(purchFormLetter.parmQueryUsed());
 
-                    while (queryRunLoc.next())
-                    {
-                        purchtableLoc   = queryRunLoc.get(tableNum(PurchTable));
-
-                        METPurchTableLoc = METPurchTable::find(purchtableLoc.purchid);
-                        isWarningPOBelowMinSetting = purchtableLoc.getVendSiteSettingsSetupFieldValues(fieldNum(METVendSiteSettingsSetup, WarningPOBelowMinSetting));
-
-                        //Validation on PO minimum order value
-                        // Initializing PurhTotals
-                        purchTotals = PurchTotals::newPurchTable(purchtableLoc);
-                        // Calculating values
-                        purchTotals.calc();
-
-                        // SubTotal Amount
-                        subTotalAmount  = purchTotals.purchBalance();
-
-                        if( isWarningPOBelowMinSetting == NoYes::Yes &&  subTotalAmount < METPurchTableLoc.POMinimumOrderValue )
-                        {                        
-                            // Set up the notification
-                            notification = new SystemNotificationDataContract();
-                            notification.Users().value(1, curUserId());
-                            notification.Title(strFmt("@ProcurementAndSourcing:PurchStatusConsistencyCheck_PurchaseOrderLogSectionTitle", purchtableLoc.purchid));
-                            notification.RuleId('POMinOrderValueWarning');
-                            notification.Message(strFmt("@MET:POMinOrderValueWarning", purchtableLoc.purchid));
-                            notification.Severity(SystemNotificationSeverity::Warning);
-                            notification.ExpirationDateTime(DateTimeUtil::addHours(DateTimeUtil::utcNow(), 48));
-                            SystemNotificationsManager::AddSystemNotification(notification);
-                        }
-                    }
-
-                }
             }
         }
+
         _args.setReturnValue(ret);
     }
 
