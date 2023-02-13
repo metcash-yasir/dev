@@ -27,101 +27,124 @@ final class METSalesOrderLineCDSV2Entity_Extension
     {
         SalesLine                       metSalesLineStd;
         SalesTable                      metSalesTableStd;        
-        METSalesLine                    metSalesLine;
         InventDim                       metInventDimStd;
-        boolean                         modified;
+        METSalesOrderCDSEntityHelper    metSalesOrderCDSEntityHelper   = new METSalesOrderCDSEntityHelper();
+        boolean                         metModified;
+        boolean                         metCancelSalesLine;
 
         if (_dataSourceCtx.name() == dataentitydatasourcestr(SalesOrderLineCDSV2Entity, SalesOrderLineEntity) &&
             _entityCtx.isDatabaseOperationInsert())
         {
-            SalesOrderLineV2Entity salesorderLineEntity = _dataSourceCtx.getBuffer();
-            metSalesTableStd  = SalesTable::find(salesorderLineEntity.SalesOrderNumber);
+            SalesOrderLineV2Entity  metSalesorderLineEntityStd   = _dataSourceCtx.getBuffer();
+            metSalesTableStd  = SalesTable::find(metSalesorderLineEntityStd.SalesOrderNumber);
 
-            if (metSalesTableStd.Reservation == ItemReservation::Automatic && metSalesTableStd.metSubstitutionActive())
+            metInventDimStd.InventSiteId        = metSalesorderLineEntityStd.ShippingSiteId;
+            metInventDimStd.InventLocationId    = metSalesorderLineEntityStd.ShippingWarehouseId;
+            metInventDimStd   = InventDim::findOrCreate(metInventDimStd);
+
+            UnitOfMeasureSymbol     metInventUnit  = InventTable::find(metSalesorderLineEntityStd.ItemNumber).inventUnitId();
+            InventQty               metOrderedQty  = metSalesOrderCDSEntityHelper.calculateInventoryQty(metSalesorderLineEntityStd,
+                                                                                                     metInventDimStd.inventDimId,
+                                                                                                     metInventUnit);
+            
+            metModified = metSalesOrderCDSEntityHelper.substituteItem(metSalesorderLineEntityStd, 
+                                                                      metInventDimStd, 
+                                                                      metOrderedQty);
+
+            if (metModified)
             {
-                metInventDimStd.InventSiteId        = salesorderLineEntity.ShippingSiteId;
-                metInventDimStd.InventLocationId    = salesorderLineEntity.ShippingWarehouseId;
-                metInventDimStd   = InventDim::findOrCreate(metInventDimStd);
+                metInventUnit  = InventTable::find(metSalesorderLineEntityStd.ItemNumber).inventUnitId();
+                metOrderedQty  = metSalesOrderCDSEntityHelper.calculateInventoryQty(metSalesorderLineEntityStd,
+                                                                                    metInventDimStd.inventDimId,
+                                                                                    metInventUnit);
+            }
+             
 
-                InventQty   inventQty = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(salesorderLineEntity.ItemNumber,
-                                                                                              metInventDimStd.inventDimId,
-                                                                                              salesorderLineEntity.OrderedSalesQuantity,
-                                                                                              salesorderLineEntity.SalesUnitSymbol,
-                                                                                              InventTable::find(salesorderLineEntity.ItemNumber).inventUnitId(),
-                                                                                              NoYes::Yes);
-
-                inventQty = decRound(inventQty,InventTable::inventDecimals(salesorderLineEntity.ItemNumber));
-
-                METSalesItemSubstitution metSalesItemSubstitution = METSalesItemSubstitution::construct();
-
-                boolean found    = metSalesItemSubstitution.findSubstitutionItem(salesorderLineEntity.ItemNumber, 
-                                                                                 metInventDimStd,
-                                                                                 metSalesTableStd.CustAccount,
-                                                                                 metSalesTableStd.custTable_CustAccount().CustGroup,
-                                                                                 inventQty);
-                metSalesLine    = metSalesItemSubstitution.parmMetSalesLine();                    
-
-                if (found && metSalesLine.SubstituteReplacementItemID != '' && 
-                    salesorderLineEntity.ItemNumber != metSalesLine.SubstituteReplacementItemID)
+            if (metSalesOrderCDSEntityHelper.checkOrderGuides(metSalesorderLineEntityStd, metSalesTableStd.CustAccount))
+            {
+                if (metSalesOrderCDSEntityHelper.applyPalletRounding(metSalesorderLineEntityStd,
+                                                                     metInventDimStd, 
+                                                                     metInventUnit, 
+                                                                     metOrderedQty))
                 {
-                    UnitOfMeasureSymbol salesUnit   = metSalesItemSubstitution.substitutionItemSalesUnit(metSalesLine.SubstituteReplacementItemID, metSalesTableStd.InventSiteId);
-                    SalesQty    salesQty    = metSalesItemSubstitution.substitutionItemSalesQty(salesorderLineEntity.ItemNumber,
-                                                                                                metSalesLine.SubstituteReplacementItemID,
-                                                                                                metSalesTableStd.InventSiteId,
-                                                                                                salesUnit,
-                                                                                                salesorderLineEntity.OrderedSalesQuantity,
-                                                                                                metSalesItemSubstitution.parmRounding());
+                    metModified     = true;
 
-                    salesorderLineEntity.ItemNumber             = metSalesLine.SubstituteReplacementItemID;
-                    salesorderLineEntity.OrderedSalesQuantity   = salesQty;
-                    salesorderLineEntity.SalesUnitSymbol        = salesUnit;
-
-                    salesorderLineEntity.METSubstituteOriginalItemID        = metSalesLine.SubstituteOriginalItemID;
-                    salesorderLineEntity.METSubstituteReplacementItemID     = metSalesLine.SubstituteReplacementItemID;
-                    salesorderLineEntity.METSubstituteParentItemID          = metSalesLine.SubstituteParentItemID;
-                    salesorderLineEntity.METSubstitutionType                = metSalesLine.SubstitutionType;
-                    salesorderLineEntity.METSubstitutionCode                = metSalesLine.SubstitutionCode;
-                    salesorderLineEntity.METSubstitutionSetupRefRecID       = metSalesLine.SubstitutionSetupRefRecID; 
-                    salesorderLineEntity.METOrderExtractStatus              = METOrderExtractStatus::None;
-                    modified = true;
-
-                    _dataSourceCtx.setBuffer(salesorderLineEntity);
+                    metOrderedQty  = metSalesOrderCDSEntityHelper.calculateInventoryQty(metSalesorderLineEntityStd,
+                                                                                        metInventDimStd.inventDimId,
+                                                                                        metInventUnit);
                 }
-            }            
+
+                if (metSalesTableStd.Reservation == ItemReservation::Automatic && 
+                    metSalesOrderCDSEntityHelper.onHandInventory(metSalesorderLineEntityStd.ItemNumber, metInventDimStd) < metOrderedQty)
+                {
+                    if (metSalesOrderCDSEntityHelper.substituteItem(metSalesorderLineEntityStd, 
+                                                                    metInventDimStd, 
+                                                                    metOrderedQty, 
+                                                                    true,
+                                                                    false))
+                        
+                    {
+                        metModified     = true;
+
+                        if (metSalesOrderCDSEntityHelper.checkOrderGuides(metSalesorderLineEntityStd, metSalesTableStd.CustAccount))
+                        {
+                            metSalesOrderCDSEntityHelper.applyPalletRounding(metSalesorderLineEntityStd,
+                                                                             metInventDimStd,
+                                                                             metInventUnit,
+                                                                             metOrderedQty);
+                        }
+                        else
+                        {
+                            metCancelSalesLine  = true;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                metModified         = true;
+                metCancelSalesLine  = true;
+            }
+
+            if (metModified)
+            {
+                metSalesorderLineEntityStd.METOrderExtractStatus    = METOrderExtractStatus::None;
+            }
+
+            _dataSourceCtx.setBuffer(metSalesorderLineEntityStd);
         }
 
-        boolean ret = next insertEntityDataSource(_entityCtx, _dataSourceCtx);        
+        boolean ret = next insertEntityDataSource(_entityCtx, _dataSourceCtx); 
 
         if (_dataSourceCtx.name() == dataentitydatasourcestr(SalesOrderLineCDSV2Entity, SalesOrderLineEntity))
         {
             
-            SalesOrderLineV2Entity  salesorderLineEntity = _dataSourceCtx.getBuffer();   
-            METSalesLine            METSalesLineUpdate;
+            SalesOrderLineV2Entity  metSalesorderLineEntityStd  = _dataSourceCtx.getBuffer();
+            METSalesLine            metSalesLineUpdate;
 
             select firstonly metSalesLineStd
-                where metSalesLineStd.InventTransId == salesorderLineEntity.InventoryLotId
+                where metSalesLineStd.InventTransId == metSalesorderLineEntityStd.InventoryLotId
                 outer join METSalesLineUpdate
-                where METSalesLineUpdate.SalesLine  == metSalesLineStd.RecId;
+                    where METSalesLineUpdate.SalesLine  == metSalesLineStd.RecId;
 
-            if(modified)
+            if(metCancelSalesLine || ReasonTable::find(metSalesLineUpdate.ReasonId).METCancelLineOnCreation)
             {
-                if (METSalesLineUpdate.RecId)
-                {
-                    ttsbegin;
-
-                    METSalesLineUpdate.selectForUpdate(true);
-                    metSalesLineUpdate.OrderExtractStatus   = METOrderExtractStatus::Open;                
-                    metSalesLineUpdate.update();
-
-                    ttscommit;
-                }   
-            }
-            if(ReasonTable::find(METSalesLineUpdate.ReasonId).METCancelLineOnCreation)
-            {
+                ttsbegin;
                 metSalesLineStd.selectForUpdate(true);
-                SalesUpdateRemain::updateDeliveryRemainder(metSalesLineStd, 0, 0);
+                SalesUpdateRemain::construct().updateDeliverRemainder(metSalesLineStd, 0, 0);
+                ttscommit;
             }
-       
+
+            if(metModified && metSalesLineUpdate.RecId)
+            {
+                ttsbegin;
+
+                metSalesLineUpdate.selectForUpdate(true);
+                metSalesLineUpdate.OrderExtractStatus   = METOrderExtractStatus::Open;
+                metSalesLineUpdate.update();
+
+                ttscommit;                
+            }                   
         }
     
         return ret;
