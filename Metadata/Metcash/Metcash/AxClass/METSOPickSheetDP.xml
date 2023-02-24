@@ -1,0 +1,178 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSOPickSheetDP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[SRSReportParameterAttribute(classStr(METSOPickSheetContract))]
+class METSOPickSheetDP extends SRSReportDataProviderBase
+{
+    // Contains Agreement header data.
+    METSOPickSheetHeader  METSOPickSheetHeader;
+    
+    // Contains Agreement lines data.
+    METSOPickSheetLine    METSOPickSheetLine;
+ 
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getMETSOPickSheetHeader</Name>
+				<Source><![CDATA[
+    [SRSReportDataSetAttribute(tablestr(METSOPickSheetHeader))]
+    public METSOPickSheetHeader getMETSOPickSheetHeader()
+    {
+        select METSOPickSheetHeader;
+        return METSOPickSheetHeader;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMETSOPickSheetLine</Name>
+				<Source><![CDATA[
+    [SRSReportDataSetAttribute(tablestr(METSOPickSheetLine))]
+    public METSOPickSheetLine getMETSOPickSheetLine()
+    {
+        select METSOPickSheetLine;
+        return METSOPickSheetLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processReport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process report data.
+    /// </summary>
+    public void processReport()
+    {
+        METSOPickSheetContract      contract;
+        InventTransType             InventTransType;
+        MetItemSiteSettingsSetup    metItemSiteSettings;
+        inventTable                 inventTable;
+        METInventTable              METInventTable;
+        InventDim                   InventDim;
+ 
+        contract = this.parmDataContract() as METSOPickSheetContract;
+
+        WMSPickingRoute WMSPickingRoute = WMSPickingRoute::find(contract.parmWMSPickingRouteID());
+        SalesTable      salesTable;
+        METSalesTable   METSalesTable;
+        select firstonly wmsPickingRoute
+            index hint IdIdx
+            where wmsPickingRoute.PickingRouteID == contract.parmWMSPickingRouteID()
+            join salesTable where  salesTable.SalesId == WMSPickingRoute.transRefId
+            outer join METSalesTable where METSalesTable.SalesId == salesTable.SalesId;
+
+        METSOPickSheetHeader.SalesId = WMSPickingRoute.transRefId;
+        METSOPickSheetHeader.AccountNum= WMSPickingRoute.customer;
+        METSOPickSheetHeader.WarehouseName = InventLocation::find(WMSPickingRoute.inventLocationId).Name;
+        METSOPickSheetHeader.SalesOrderType = salesTable.METSalesOrderType;
+        METSOPickSheetHeader.CustomerName = salesTable.customerName();
+        METSOPickSheetHeader.SpecialInstructions = METSalesTable.DeliveryInstructions;
+        METSOPickSheetHeader.ShipDate = WMSPickingRoute.DlvDate;
+        METSOPickSheetHeader.Route = SalesTable.METRoute;
+        METSOPickSheetHeader.RouteStop = int2Str(SalesTable.METRouteStopNum);
+        METSOPickSheetHeader.IsPickSheet = contract.parmIsPickSheet();
+
+        METSOPickSheetHeader.insert();
+
+        SalesLine       salesLine;
+        METSalesLine    metSalesLine;
+        WMSOrderTrans   WMSOrderTrans;
+        inventDimParm   inventDimParm;
+        METReqItemTable METReqItemTable;
+        ReqItemTable    ReqItemTable;
+        InventDim       metInventDimSlotArea;
+
+        while select sum(qty), ItemId, inventTransId from WMSOrderTrans group by routeId,ItemId,inventTransId 
+            where WMSOrderTrans.routeId == wmsPickingRoute.PickingRouteID            
+        {
+            select  salesLine where salesLine.InventTransId == WMSOrderTrans.inventTransId
+            outer join metSalesLine where metSalesLine.SalesLine == salesLine.RecId
+            join InventDim where InventDim.inventDimId == salesLine.InventDimId
+            join inventTable where inventTable.ItemId == salesLine.ItemId
+            outer join METInventTable where METInventTable.ItemId == inventTable.ItemId
+            outer join metItemSiteSettings
+            where   metItemSiteSettings.ItemId          == salesLine.ItemId
+                &&      metItemSiteSettings.InventSiteId    == InventDim.InventSiteId;
+
+            METSOPickSheetLine.clear();
+            inventDimParm.initFromInventDim(inventDim);
+
+            METSOPickSheetLine.Name                 = inventTable.productName(SystemParameters::getSystemLanguageId());
+            METSOPickSheetLine.ItemId               = SalesLine.ItemId;
+            METSOPickSheetLine.LineNumber           = SalesLine.LineNum;
+            METSOPickSheetLine.SalesUnitTxt         = SalesLine.SalesUnit;
+            METSOPickSheetLine.ItemSize             = METInventTable.ItemSize;
+            METSOPickSheetLine.QtyShipped           = WMSOrderTrans.qty;
+            METSOPickSheetLine.QtyOnHand            = InventOnHand::newItemDim(salesLine.ItemId, inventDim, inventDimParm).availPhysical();
+            METSOPickSheetLine.QtyNotShipped        = SalesLine.QtyOrdered - WMSOrderTrans.qty; 
+            METSOPickSheetLine.Ti                   = metItemSiteSettings.CartonPerLayer;
+            METSOPickSheetLine.Hi                   = metItemSiteSettings.Layers;
+            METSOPickSheetLine.PalletQty            = metItemSiteSettings.PalletQty;
+
+            int Qtyroundup, Reportcnt;
+            Reportcnt = contract.parmReportCount();
+            if( metItemSiteSettings.PalletQty && WMSOrderTrans.qty > metItemSiteSettings.PalletQty && contract.parmIsPickSheet())
+            {
+                Qtyroundup = roundUp(WMSOrderTrans.qty / metItemSiteSettings.PalletQty, 1);
+
+                if(Qtyroundup == Reportcnt)
+                {                    
+                    METSOPickSheetLine.QtyShipped  = WMSOrderTrans.qty - metItemSiteSettings.PalletQty * (Qtyroundup-1);
+                }
+                else if(Qtyroundup < Reportcnt)
+                {
+                    METSOPickSheetLine.QtyShipped = 0;
+                }
+                else
+                {
+                    METSOPickSheetLine.QtyShipped = metItemSiteSettings.PalletQty;
+                }
+            }
+            else if(Reportcnt > 1)
+            {
+                METSOPickSheetLine.QtyShipped = 0;
+            }
+
+            if(SalesLine.SalesUnit == 'EA')
+            {
+               if( roundUp(UnitOfMeasureConversion::findByConversion(
+                                UnitOfMeasure::findBySymbol(SalesLine.SalesUnit).RecId,
+                                UnitOfMeasure::findBySymbol('KEG').RecId,
+                                EcoResProduct::findByProductNumber(SalesLine.ItemId).RecId).Factor, 0) == 1)
+                {
+                    METSOPickSheetLine.PickUOM = 'KEG';
+                }
+                else
+                {
+                    METSOPickSheetLine.PickUOM = 'UNIT';
+
+                }
+            }
+            else
+            {
+                METSOPickSheetLine.PickUOM = 'CASE';
+            }
+
+            metInventDimSlotArea.InventSiteId        = inventDim.InventSiteId;
+            metInventDimSlotArea.InventLocationId    = inventDim.InventLocationId;
+
+            metInventDimSlotArea = InventDim::findOrCreate(metInventDimSlotArea);
+
+            METSOPickSheetLine.SlotArea = METReqItemTable::find(ReqItemTable::find(salesLine.ItemId, metInventDimSlotArea.inventDimId).RecId).SlotLoc1Area;
+
+            METSOPickSheetLine.insert();
+
+        }
+        
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
