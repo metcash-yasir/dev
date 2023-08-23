@@ -1,0 +1,359 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METBlobStorageHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using Microsoft.WindowsAzure.Storage;
+using Microsoft.WindowsAzure.Storage.Blob;
+using Microsoft.WindowsAzure.Storage.Auth;
+
+/// <summary>
+/// MPJ_30779_PaymentPlus
+/// Helper class for Azure Blob Storage and calling encrypt/decrypt service (Azure function)
+/// </summary>
+public class METBlobStorageHelper
+{
+    const str urlEncoded = 'application/x-www-form-urlencoded';
+    const str textPlain = 'text/plain';
+    const str post = 'POST';
+    const str authorization = 'Authorization';
+    const str clientCredentials = 'client_credentials';
+    const str bearer = 'Bearer %1';
+
+    // Encrypt
+    const str remoteContainer = '?RemoteContainer=';
+    const str remotePath = '&RemotePath=';
+    const str storageAccountName = '&StorageAccountName=';
+    const str encrypt = '&encrypt=True';
+
+    // Decrypt
+    const str fileurl = '?fileurl=';
+    const str decrypt = '&decrypt=True';
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>upload</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Helper method to upload a file in a blob storage
+    /// </summary>
+    /// <param name = "_stream">File stream</param>
+    /// <param name = "_fileName">File name</param>
+    /// <param name = "_docuTypeId">MET Azure storage document type for upload</param>
+    /// <param name = "_isEncrypted">Encrypt the file or not</param>
+    /// <returns>container with status and message</returns>
+    public static container upload(System.IO.Stream _stream, str _fileName, DocuTypeId _docuTypeId, boolean _isEncrypted)
+    {
+        container ret;
+        DocuType docuType = DocuType::find(_docuTypeId);
+
+        if (_isEncrypted)
+        {
+            // call the encrypt service
+            ret = METBlobStorageHelper::blobEncrypt(_stream, _fileName, docuType);
+
+        }
+        // else upload the file without encryption
+        else
+        {                                 
+            try
+            {
+                StorageCredentials credentials = new StorageCredentials(docuType.METAzureStorageAccountName, docuType.METAzureStorageSecret);
+                CloudStorageAccount storageAccount = new CloudStorageAccount(credentials, true);
+
+                CloudBlobClient blobClient = storageAccount.CreateCloudBlobClient();
+           
+                CloudBlobContainer rootContainer = blobClient.GetContainerReference(docuType.METAzureStorageContainerName);
+            
+                if(!rootContainer.Exists(null, null))
+                {
+                    throw error("@MET:RootContainerError");
+                }
+
+                CloudBlobDirectory directory = rootContainer.GetDirectoryReference(docuType.METAzureStorageFolder);
+
+                CloudBlockBlob blockBlob = directory.GetBlockBlobReference(_fileName);
+
+                if (_stream.CanSeek)
+                {
+                    _stream.Seek(0, System.IO.SeekOrigin::Begin);
+                }
+                    
+                blockBlob.UploadFromStream(_stream, null, null, null);
+
+                ret = [true, strFmt("@ApplicationFoundation:DocuFileSaveInfo", blockBlob.SnapshotQualifiedUri.AbsoluteUri)];
+            }
+            catch (Exception::CLRError)
+            {
+                // A CLR error occurred while uploading file to blob storage
+                throw error("@MET:CLRErrorUploadBlobStorage");
+            }
+
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>download</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Helper method to download a file from a blob storage
+    /// </summary>
+    /// <param name = "_blob">CloudBlockBlob</param>
+    /// <param name = "_docuType">MET Azure storage document type for download</param>
+    /// <param name = "_isDecrypted">Decrypt the file or not</param>
+    /// <returns>File stream</returns>
+    public static System.IO.Stream download(CloudBlockBlob _blob, DocuType _docuType, boolean _isDecrypted)
+    {
+        System.IO.Stream ret;
+        //System.Net.HttpStatusCode statusCode;
+
+        // call Azure function for decryption
+        if (_isDecrypted)    
+        {                    
+            // call azure function to decyrpt and save the decrypted string as a System.IO.Stream
+            ret = METBlobStorageHelper::blobDecrypt(_blob.SnapshotQualifiedUri.AbsoluteUri, _docuType);
+
+        }
+        // else download the file without encryption
+        else
+        {                
+            try
+            {
+                ret = _blob.OpenRead(null,null,null);
+            }
+            catch (Exception::CLRError)
+            {
+                // A CLR error occurred while downloading file from blob storage
+                throw error("@MET:CLRErrorDownloadBlobStorage");
+            }
+        }
+            
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAADToken</Name>
+				<Source><![CDATA[
+    private static str getAADToken()
+    {
+        str                         accessToken;
+        str                         url;
+        str                         jsonmsg;
+        str                         msgStatusCode;
+        System.Net.HttpWebRequest   request;
+        System.IO.StringWriter      stringWriter;
+        System.IO.StreamWriter      streamWrite;
+        System.IO.StreamReader      streamRead;
+        System.Net.HttpWebResponse  response;        
+        METIntegrationParameters    integrationParameters = METIntegrationParameters::find();
+
+        const str postDataParameters = 'grant_type=%1&client_id=%2&client_secret=%3&scope=%4';
+
+        url = integrationParameters.AADTokenURL;
+        request = System.Net.WebRequest::Create(url);
+        request.set_Method(post);
+        request.set_KeepAlive(true);
+
+        str postData = strFmt(postDataParameters, clientCredentials
+                                                , integrationParameters.AADClientId
+                                                , integrationParameters.AADClientSecretKey
+                                                , integrationParameters.AADScope);
+            
+
+        request.set_ContentType(urlEncoded);
+
+        stringWriter = new System.IO.StringWriter();
+        streamWrite = new System.IO.StreamWriter(request.GetRequestStream());
+        streamWrite.Write(postData);
+        streamWrite.Flush();
+        streamWrite.Close();
+
+        response = request.GetResponse();
+        streamRead = new System.IO.StreamReader(response.GetResponseStream());
+        jsonmsg = streamRead.ReadToEnd().ToString();
+
+        msgStatusCode = response.StatusCode.ToString();
+            
+        METAzureADTokenContract result = FormJsonSerializer::deserializeObject(classNum(METAzureADTokenContract), jsonmsg);
+
+        accessToken = result.parmAccessToken();
+
+        return accessToken;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>blobEncrypt</Name>
+				<Source><![CDATA[
+    private static container blobEncrypt(System.IO.Stream _stream, str _fileName, DocuType _docuType)
+    {
+        container ret;
+        str accessToken;
+        str url;
+        System.Net.HttpWebRequest request;
+        System.IO.StringWriter          stringWriter;
+        System.IO.StreamWriter          streamWrite;
+        System.IO.StreamReader streamRead;
+        System.Net.HttpWebResponse      response;
+        str                             jsonmsg;
+        str                             msgStatusCode;
+        System.Net.WebHeaderCollection  headers = new System.Net.WebHeaderCollection();
+        System.Net.ServicePoint         servicePoint;
+        str  fileContentStr;
+        METIntegrationParameters    integrationParameters = METIntegrationParameters::find();
+
+        // get the access token for encrypt Azure function
+        try
+        {
+            accessToken = METBlobStorageHelper::getAADToken();
+        }
+        catch (Exception::CLRError)
+        {
+            // A CLR error occurred while getting AAD token for encryption service
+            throw error("@MET:CLRErrorAADTokenEncrypt");
+        }
+
+        try
+        {
+
+            if (_stream.CanSeek)
+            {
+                _stream.Seek(0, System.IO.SeekOrigin::Begin);
+            }
+            streamRead = new System.IO.StreamReader(_stream);
+            fileContentStr = streamRead.ReadToEnd();
+
+            url = integrationParameters.EncryptServiceURL + remoteContainer + _docuType.METAzureStorageContainerName +
+                    remotePath + _docuType.METAzureStorageFolder + _fileName +
+                    storageAccountName + _docuType.METAzureStorageAccountName +
+                    encrypt;
+
+            request = System.Net.WebRequest::Create(url);
+            request.set_Method(post);
+            request.set_KeepAlive(true);
+
+            headers.Add(authorization, strFmt(bearer, accessToken));
+            request.set_Headers(headers);
+            request.set_Accept(textPlain);
+            request.set_ContentType(textPlain);
+           
+            servicePoint = request.get_ServicePoint();
+            servicePoint.set_Expect100Continue(false);
+
+            stringWriter = new System.IO.StringWriter();
+            streamWrite = new System.IO.StreamWriter(request.GetRequestStream());
+            streamWrite.Write(fileContentStr);
+            streamWrite.Flush();
+            streamWrite.Close();
+
+            response = request.GetResponse();
+            streamRead = new System.IO.StreamReader(response.GetResponseStream());
+            jsonmsg = streamRead.ReadToEnd().ToString();
+
+            msgStatusCode = response.StatusCode.ToString();
+        }
+        catch (Exception::CLRError)
+        {
+            // A CLR error occurred while calling the encryption service
+            throw error("@MET:CLRErrorEncryptService");
+        }
+
+        ret = [true, strFmt("@MET:FileSavedAndEncrypted", jsonmsg)];
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>blobDecrypt</Name>
+				<Source><![CDATA[
+    private static System.IO.Stream blobDecrypt(str _fileurl, DocuType _docuType)
+    {
+        //System.IO.Stream ret;
+        System.IO.Stream responseStream;
+        str accessToken;
+        str url;
+        System.Net.HttpWebRequest request;
+        //System.IO.StringWriter          stringWriter;
+        //System.IO.StreamWriter          streamWrite;
+        //System.IO.StreamReader streamRead;
+        System.Net.HttpWebResponse      response;
+        //str                             jsonmsg;
+        str                             msgStatusCode;
+        System.Net.WebHeaderCollection  headers = new System.Net.WebHeaderCollection();
+        System.Net.ServicePoint         servicePoint;
+        //str  fileContentStr;
+        METIntegrationParameters    integrationParameters = METIntegrationParameters::find();
+        System.IO.MemoryStream memoryStream;
+
+        // get the access token for encrypt Azure function
+        try
+        {
+            accessToken = METBlobStorageHelper::getAADToken();
+        }
+        catch (Exception::CLRError)
+        {
+            // A CLR error occurred while getting AAD token for decryption service
+            throw error("@MET:CLRErrorAADTokenDecrypt");
+        }
+
+        try
+        {
+            url = integrationParameters.DecryptServiceURL + fileurl + _fileurl +                  
+                    storageAccountName + _docuType.METAzureStorageAccountName +
+                    decrypt;
+
+            request = System.Net.WebRequest::Create(url);
+            request.set_Method(post);
+            request.set_KeepAlive(true);
+
+            headers.Add(authorization, strFmt(bearer, accessToken));
+            request.set_Headers(headers);
+            request.set_Accept(textPlain);
+            request.set_ContentType(textPlain);
+           
+            servicePoint = request.get_ServicePoint();
+            servicePoint.set_Expect100Continue(false);
+
+            response = request.GetResponse();
+            responseStream = response.GetResponseStream();
+
+            if (responseStream.CanSeek)
+            {
+                responseStream.Seek(0, System.IO.SeekOrigin::Begin);
+            }
+
+            memoryStream = new System.IO.MemoryStream();
+            responseStream.CopyTo(memoryStream);
+
+            if (memoryStream.CanSeek)
+            {
+                memoryStream.Seek(0, System.IO.SeekOrigin::Begin);
+            }
+
+            msgStatusCode = response.StatusCode.ToString();     
+        }
+        catch (Exception::CLRError)
+        {
+            // A CLR error occurred while calling the decryption service
+            throw error("@MET:CLRErrorDecryptService");
+        }
+
+        return memoryStream;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
