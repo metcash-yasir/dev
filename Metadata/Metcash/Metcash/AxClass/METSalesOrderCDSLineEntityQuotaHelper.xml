@@ -8,9 +8,122 @@
 /// </summary>
 internal final class METSalesOrderCDSLineEntityQuotaHelper 
 {
+    AgreementLine       agreementLine;
+
+
 }
 ]]></Declaration>
 		<Methods>
+			<Method>
+				<Name>applyQuotaOnSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method used to apply quantity and value based quota
+    /// CB_202 SalesQuota changes by Akshay
+    /// </summary>
+    /// <param name = "_salesOrderLineV2Entity">Sales order line v2 entity reference</param>
+    /// <returns>AgreementLine reference</returns>
+    public static AgreementLine applyQuotaOnSalesLine(SalesOrderLineV2Entity    _salesOrderLineV2Entity)
+    {
+        SalesAgreementHeader        salesAgreementHeader;
+        SalesTable                  salesTable;
+        METSalesTable               metSalesTable;
+        SalesLine                   salesLineUpdate;
+        TransDate                   receiptDate;
+        ReasonCode                  reasonCode;
+        AgreementLine               agreementLine;
+
+        salesTable = SalesTable::find(_salesOrderLineV2Entity.SalesOrderNumber, true);
+        metSalesTable = METSalesTable::findByRefRecId(salesTable.recId);
+
+        receiptDate = salesTable.receiptDate();
+
+        _salesOrderLineV2Entity.METOrderedQuantity = _salesOrderLineV2Entity.OrderedSalesQuantity;
+
+        select firstonly agreementLine
+                where agreementLine.ItemId == _salesOrderLineV2Entity.ItemNumber
+            join salesAgreementHeader
+                where salesAgreementHeader.RecId == agreementLine.Agreement                 &&
+                    salesAgreementHeader.AgreementState == AgreementState::Effective        &&
+                    salesAgreementHeader.CustAccount    == salesTable.CustAccount           &&
+                    salesAgreementHeader.DefaultAgreementLineEffectiveDate <= receiptDate   &&
+                    salesAgreementHeader.DefaultAgreementLineExpirationDate >= receiptDate;
+
+        reasonCode = AgreementClassification::find(salesAgreementHeader.AgreementClassification).METCustReason;
+
+        salesLineUpdate = SalesLine::findInventTransId(_salesOrderLineV2Entity.InventoryLotId);
+
+        if (agreementLine.agreementHeader().DefaultAgreementLineType == CommitmentType::ProductVolume)
+        {
+            Amount      remainingAmountInAgreementLine = agreementLine.METgetAgreementLineRemainingAmount();
+            
+            if (remainingAmountInAgreementLine < _salesOrderLineV2Entity.SalesPrice)
+            {
+                _salesOrderLineV2Entity.SalesOrderLineStatus    = SalesStatus::Canceled;
+                _salesOrderLineV2Entity.METReducedQuantity      = _salesOrderLineV2Entity.OrderedSalesQuantity;
+                _salesOrderLineV2Entity.METReasonId             = reasonCode;
+            }
+            else if (salesLineUpdate.RecId != 0 && _salesOrderLineV2Entity.LineAmount > remainingAmountInAgreementLine && _salesOrderLineV2Entity.SalesPrice != 0)
+            {
+                int     reducedQty = remainingAmountInAgreementLine / _salesOrderLineV2Entity.SalesPrice;
+
+                _salesOrderLineV2Entity.OrderedSalesQuantity    = reducedQty;
+                _salesOrderLineV2Entity.SalesPrice              = _salesOrderLineV2Entity.SalesPrice;
+                _salesOrderLineV2Entity.LineAmount              = _salesOrderLineV2Entity.SalesPrice * reducedQty;
+                _salesOrderLineV2Entity.METReasonId             = reasonCode;
+                _salesOrderLineV2Entity.METReducedQuantity      = _salesOrderLineV2Entity.METOrderedQuantity - _salesOrderLineV2Entity.OrderedSalesQuantity;
+            }
+        }
+        else if(agreementLine.agreementHeader().DefaultAgreementLineType == CommitmentType::ProductQuantity)
+        {
+            Qty qtyRemainInAgreementLine = agreementLine.METgetAgreementLineRemainingInventQty();
+            
+            if (salesLineUpdate.MatchingAgreementLine)
+            {
+                if (salesLineUpdate.QtyOrdered >= _salesOrderLineV2Entity.OrderedSalesQuantity)
+                {
+                    _salesOrderLineV2Entity.METReducedQuantity      = _salesOrderLineV2Entity.OrderedSalesQuantity;
+                    _salesOrderLineV2Entity.METReasonId             = reasonCode;
+                }
+                else if (salesLineUpdate.QtyOrdered <= _salesOrderLineV2Entity.OrderedSalesQuantity)
+                {
+                    Qty     leftOverQty = qtyRemainInAgreementLine + salesLineUpdate.QtyOrdered;
+
+                    if (leftOverQty <= _salesOrderLineV2Entity.OrderedSalesQuantity)
+                    {
+                        _salesOrderLineV2Entity.OrderedSalesQuantity    = leftOverQty;
+                        _salesOrderLineV2Entity.METReasonId             = reasonCode;
+                        _salesOrderLineV2Entity.METReducedQuantity      = _salesOrderLineV2Entity.METOrderedQuantity - _salesOrderLineV2Entity.OrderedSalesQuantity;
+                    }
+                }
+
+                return agreementLine;
+            }
+            if (qtyRemainInAgreementLine == 0)
+            {
+                _salesOrderLineV2Entity.SalesOrderLineStatus    = SalesStatus::Canceled;
+                _salesOrderLineV2Entity.METReducedQuantity      = _salesOrderLineV2Entity.OrderedSalesQuantity;
+                _salesOrderLineV2Entity.METReasonId             = reasonCode;
+            }
+            else if (salesLineUpdate.RecId == 0 && qtyRemainInAgreementLine != 0)
+            {
+                _salesOrderLineV2Entity.METReducedQuantity      = _salesOrderLineV2Entity.METOrderedQuantity - _salesOrderLineV2Entity.OrderedSalesQuantity;
+                _salesOrderLineV2Entity.METReasonId             = reasonCode;
+
+            }
+            else if (qtyRemainInAgreementLine != 0 && qtyRemainInAgreementLine < _salesOrderLineV2Entity.OrderedSalesQuantity)
+            {
+                _salesOrderLineV2Entity.OrderedSalesQuantity    = qtyRemainInAgreementLine;
+                _salesOrderLineV2Entity.METReasonId             = reasonCode;
+                _salesOrderLineV2Entity.METReducedQuantity      = _salesOrderLineV2Entity.METOrderedQuantity - _salesOrderLineV2Entity.OrderedSalesQuantity;
+            }
+        }
+
+        return agreementLine;
+    }
+
+]]></Source>
+			</Method>
 			<Method>
 				<Name>updateQuotaQty</Name>
 				<Source><![CDATA[
@@ -18,6 +131,7 @@ internal final class METSalesOrderCDSLineEntityQuotaHelper
     /// updates the ordered quantity based on the sales agreement line fulfillment
     /// </summary>
     /// <param name = "_salesOrderLineV2Entity">Sales order line V2 entity buffer</param>
+    /// <returns>Boolean value</returns>
     public boolean updateQuotaQty(SalesOrderLineV2Entity _salesOrderLineV2Entity)
     {
         boolean quotaUpdated = true;
@@ -40,7 +154,6 @@ internal final class METSalesOrderCDSLineEntityQuotaHelper
                         return false;
                     }
                 }
-                
             }
             else
             {
@@ -55,6 +168,7 @@ internal final class METSalesOrderCDSLineEntityQuotaHelper
 
             if(matchingAgreementLine.agreementHeader().DefaultAgreementLineType == CommitmentType::ProductQuantity)
             {
+                
                 Qty qtyRemainInAgreementLine = this.getAgreementLineRemainingInventQty(matchingAgreementLine);
 
                 if(qtyRemainInAgreementLine < _salesOrderLineV2Entity.OrderedSalesQuantity)
@@ -80,7 +194,7 @@ internal final class METSalesOrderCDSLineEntityQuotaHelper
     /// <returns>Qty to be fulfilled</returns>
     public Qty getAgreementLineRemainingInventQty(AgreementLine _agreementLine)
     {
-        SalesQty salesQtyRemainAgreement;
+        SalesQty                        salesQtyRemainAgreement;
         #AgreementsRemains
         container fulfillmentValues = AgreementLine::calculateFulfillmentForLine(_agreementLine);
 
@@ -101,18 +215,18 @@ internal final class METSalesOrderCDSLineEntityQuotaHelper
     /// <returns>Best matched agreement line</returns>
     public AgreementLine getAgreementLineForSalesLine(SalesLine _salesLine)
     {
-        AgreementLine agreementLine;
+        AgreementLine agreementLineLocal;
         if(_salesLine.MatchingAgreementLine)
         {
-            agreementLine = AgreementLine::find(_salesLine.MatchingAgreementLine);
+            agreementLineLocal = AgreementLine::find(_salesLine.MatchingAgreementLine);
         }
         else
         {
             AgreementAutolinkHelperSalesLine agreementAutoLinkHelper = new AgreementAutolinkHelperSalesLine();
-            agreementLine = agreementAutoLinkHelper.findLineForAutoMatch(_salesLine, false);
+            agreementLineLocal = agreementAutoLinkHelper.findLineForAutoMatch(_salesLine, false);
         }
        
-        return agreementLine;
+        return agreementLineLocal;
     }
 
 ]]></Source>
@@ -120,13 +234,15 @@ internal final class METSalesOrderCDSLineEntityQuotaHelper
 			<Method>
 				<Name>calculateInventoryQty</Name>
 				<Source><![CDATA[
-    /// <summary>
+   /// <summary>
     /// Calculates inventory quantity from sales quantity.
-    /// </summary>
-    /// <param name = "_salesorderLineEntity">SalesorderLineEntity</param>
-    /// <param name = "_inventDimId">Inventory dimension Id</param>
-    /// <param name = "_inventUnit">Inventory unit</param>
-    /// <returns>Inventory quantity</returns>
+   /// </summary>
+   /// <param name = "_itemId">ItemId reference</param>
+   /// <param name = "_inventDimId">InventDimId reference</param>
+   /// <param name = "_inventUnit">Invent unit reference</param>
+   /// <param name = "_salesUnit">Sales unit reference</param>
+   /// <param name = "_salesQty">Sales qty reference</param>
+   /// <returns>Invent qty</returns>
     public InventQty calculateInventoryQty(ItemId               _itemId,
                                            InventDimId          _inventDimId,
                                            UnitOfMeasureSymbol  _inventUnit,
@@ -267,6 +383,23 @@ internal final class METSalesOrderCDSLineEntityQuotaHelper
         salesLine.InventDimId 					= inventDim.inventDimId;
 
         return salesLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmAgreementLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Parameter method to pass agreement line reference
+    /// </summary>
+    /// <param name = "_agreementLine">Agreement line reference</param>
+    /// <returns>AgreementLine reference</returns>
+    public AgreementLine parmAgreementLine(AgreementLine     _agreementLine = agreementLine)
+    {
+        agreementLine = _agreementLine;
+
+        return agreementLine;
     }
 
 ]]></Source>

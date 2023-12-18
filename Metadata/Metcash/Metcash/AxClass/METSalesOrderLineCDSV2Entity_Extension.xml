@@ -26,10 +26,10 @@ final class METSalesOrderLineCDSV2Entity_Extension
     public boolean insertEntityDataSource(DataEntityRuntimeContext _entityCtx, DataEntityDataSourceRuntimeContext _dataSourceCtx)
     {
         SalesLine                       metSalesLineStd;
-        SalesTable                      metSalesTableStd;        
+        SalesTable                      metSalesTableStd;
+        METSalesTable                   metSalesTable;
         InventDim                       metInventDimStd;
         METSalesOrderCDSEntityHelper    metSalesOrderCDSEntityHelper   = new METSalesOrderCDSEntityHelper();
-        METSalesOrderCDSLineEntityQuotaHelper quotaHelpder = new METSalesOrderCDSLineEntityQuotaHelper();
         boolean                         metModified;
         boolean                         metCancelSalesLine;
 
@@ -38,8 +38,9 @@ final class METSalesOrderLineCDSV2Entity_Extension
         {
             SalesOrderLineV2Entity  metSalesorderLineEntityStd   = _dataSourceCtx.getBuffer();
             metSalesTableStd  = SalesTable::find(metSalesorderLineEntityStd.SalesOrderNumber);
+            metSalesTable     = METSalesTable::findByRefRecId(metSalesTableStd.RecId);
 
-            if(!quotaHelpder.updateQuotaQty(metSalesorderLineEntityStd))
+            if(metSalesTable.LinkedSalesAgreement == false)
             {
                 metInventDimStd.InventSiteId        = metSalesorderLineEntityStd.ShippingSiteId;
                 metInventDimStd.InventLocationId    = metSalesorderLineEntityStd.ShippingWarehouseId;
@@ -122,6 +123,19 @@ final class METSalesOrderLineCDSV2Entity_Extension
 
                 _dataSourceCtx.setBuffer(metSalesorderLineEntityStd);
             }
+            else if (this.isFieldModified(fieldNum(SalesOrderLineCDSEntity, SalesPrice)))
+            {
+                /// CB_202 SalesQuota changes by Akshay
+                //Calling quota function in insert 
+                //This is to handle the standard behaviour of sales order, if new lines created on a link sales order then system by default considering the sales agreement qty
+
+                METSalesOrderCDSLineEntityQuotaHelper::applyQuotaOnSalesLine(metSalesorderLineEntityStd);
+
+                if (metSalesorderLineEntityStd.SalesOrderLineStatus == SalesStatus::Canceled)
+                {
+                    metCancelSalesLine = true;
+                }
+            }
 
             // CB246_LicenseChecks
             // New field to trigger cancel after insert
@@ -135,7 +149,6 @@ final class METSalesOrderLineCDSV2Entity_Extension
 
         if (_dataSourceCtx.name() == dataentitydatasourcestr(SalesOrderLineCDSV2Entity, SalesOrderLineEntity))
         {
-            
             SalesOrderLineV2Entity  metSalesorderLineEntityStd  = _dataSourceCtx.getBuffer();
             METSalesLine            metSalesLineUpdate;
 
@@ -144,12 +157,9 @@ final class METSalesOrderLineCDSV2Entity_Extension
                 outer join METSalesLineUpdate
                     where METSalesLineUpdate.SalesLine  == metSalesLineStd.RecId;
 
-            if(metCancelSalesLine || METSalesLineStatus::find(metSalesLineUpdate.ReasonId).ApplyLogic)
+            if(metCancelSalesLine|| METSalesLineStatus::find(metSalesLineUpdate.ReasonId).ApplyLogic)
             {
-                ttsbegin;
-                metSalesLineStd.selectForUpdate(true);
-                SalesUpdateRemain::construct().updateDeliverRemainder(metSalesLineStd, 0, 0);
-                ttscommit;
+                metSalesLineStd.metCancelSalesOrderLine();
                 
                 // CB246_LicenseChecks
                 // reflect the cancelled status in the output payload
@@ -200,24 +210,51 @@ final class METSalesOrderLineCDSV2Entity_Extension
     /// <returns>true of false</returns>
     public boolean updateEntityDataSource(DataEntityRuntimeContext _entityCtx, DataEntityDataSourceRuntimeContext _dataSourceCtx)
     {
-        SalesLine                       metSalesLineStd;
         SalesTable                      metSalesTableStd;
-        InventDim                       metInventDimStd;
-        METSalesOrderCDSEntityHelper    metSalesOrderCDSEntityHelper   = new METSalesOrderCDSEntityHelper();
-        METSalesOrderCDSLineEntityQuotaHelper quotaHelpder = new METSalesOrderCDSLineEntityQuotaHelper();
-        boolean                         metModified;
         boolean                         metCancelSalesLine;
+        AgreementLine                   agreementLine;
 
+        /// CB_202 SalesQuota changes by Akshay
         if (_dataSourceCtx.name() == dataentitydatasourcestr(SalesOrderLineCDSV2Entity, SalesOrderLineEntity) &&
             _entityCtx.isDatabaseOperationUpdate())
         {
             SalesOrderLineV2Entity  metSalesorderLineEntityStd   = _dataSourceCtx.getBuffer();
             metSalesTableStd  = SalesTable::find(metSalesorderLineEntityStd.SalesOrderNumber);
 
-            quotaHelpder.updateQuotaQty(metSalesorderLineEntityStd);
+            METSalesTable           metSalesTable = METSalesTable::findByRefRecId(metSalesTableStd.RecId);
+            SalesLine               salesLine = SalesLine::findInventTransId(metSalesorderLineEntityStd.InventoryLotId, true);
+
+            if (metSalesTable.LinkedSalesAgreement == true && salesLine.SalesPrice != metSalesorderLineEntityStd.salesPrice )
+            {
+                agreementLine = METSalesOrderCDSLineEntityQuotaHelper::applyQuotaOnSalesLine(metSalesorderLineEntityStd);
+
+                if (metSalesorderLineEntityStd.SalesOrderLineStatus == SalesStatus::Canceled)
+                {
+                    metCancelSalesLine = true;
+                }
+                else if (metSalesTable.LinkedSalesAgreement == true && salesLine.MatchingAgreementLine == 0 && agreementLine.RecId) /// CB_202 SalesQuota changes by Akshay
+                {
+                    ttsbegin;
+                    SalesTableForm::createAgreementLinkServer(salesLine, agreementLine);
+                    ttscommit;
+                }
+            }
         }
 
         boolean ret = next updateEntityDataSource(_entityCtx, _dataSourceCtx);
+
+
+        if (_dataSourceCtx.name() == dataentitydatasourcestr(SalesOrderLineCDSV2Entity, SalesOrderLineEntity) &&
+            _entityCtx.isDatabaseOperationUpdate())
+        {
+            SalesOrderLineV2Entity  metSalesorderLineEntityStd   = _dataSourceCtx.getBuffer();
+            SalesLine               salesLine = SalesLine::findInventTransId(metSalesorderLineEntityStd.InventoryLotId, true);
+
+            if (metCancelSalesLine)
+            {
+                salesLine.metCancelSalesOrderLine();
+            }
+        }
 
         return ret;
     }
