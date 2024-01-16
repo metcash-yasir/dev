@@ -1,0 +1,361 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPurchaseOrderReceiptService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The service class for Purchase order product receipt process. CB256
+/// </summary>
+class METPurchaseOrderReceiptService extends SysOperationServiceBase
+{
+    #OCCRetryCount
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>postProductReceipt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// cancels the Purchase order.
+    /// </summary>
+    /// <param name="purchaseOrderLineIntegrationStatusRequest">
+    /// The contract instance
+    /// </param>
+    /// <returns>
+    /// The response <c>METPurchaseOrderResponseContract</c>
+    /// </returns>
+    [AifCollectionType('purchaseOrderProductReceiptRequest', Types::Class, classStr(METPurchaseOrderReceiptRequestContract))]
+    public METPurchaseOrderReceiptResponseContract postProductReceipt(List purchaseOrderProductReceipt)
+    {
+        METProcessingStatus result;
+        Description255      message = "@MET:NoRecordsUpdated"; //default message
+
+        [result, message] = this.processProductReceipt(purchaseOrderProductReceipt);
+        
+        return METPurchaseOrderReceiptResponseContract::newFromParameters(result, message);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processProductReceipt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the Purchase order lines
+    /// </summary>
+    /// <param name="_purchaseOrderLineIntegrationStatusRequest">List of contracts</param>
+    /// <returns>Container of Results</returns>
+    public container processProductReceipt(List _purchaseOrderProductReceiptList)
+    {
+        ListEnumerator      purchaseOrderReceiptEnumerator = _purchaseOrderProductReceiptList.getEnumerator();
+
+        PurchTable          purchTable;
+        PurchLine           purchLine;
+        InventTable         inventTable;
+        PurchId             purchId;
+        ItemId              itemId;
+        METProcessingStatus result;
+        Description255      message = "@MET:NoRecordsUpdated";
+        DataAreaId          dataAreaId;
+        container           valiationCon;
+        boolean             packingSlipPosted = false;
+
+        METPurchaseOrderReceiptRequestContract metPurchaseOrderReceiptRequestContract;
+        
+        try
+        {
+            while(purchaseOrderReceiptEnumerator.moveNext())
+            {
+                ttsbegin;
+
+                metPurchaseOrderReceiptRequestContract = purchaseOrderReceiptEnumerator.current() as METPurchaseOrderReceiptRequestContract;
+
+                purchId     = metPurchaseOrderReceiptRequestContract.parmPurchId();
+                dataAreaId  = metPurchaseOrderReceiptRequestContract.parmDataAreaId();
+                itemId      = metPurchaseOrderReceiptRequestContract.parmItemId();
+
+                changecompany(dataAreaId)
+                {
+                    valiationCon = this.validatePurchaseOrder(purchId, itemId);
+                
+                    result = conPeek(valiationCon, 1);
+                    message = conPeek(valiationCon, 2);
+
+                    if (result != METProcessingStatus ::Error)
+                    {
+                        packingSlipPosted = this.purchPackingSlipPost(metPurchaseOrderReceiptRequestContract);
+
+                        if (packingSlipPosted)
+                        {
+                            result = METProcessingStatus::Success;
+                            message = "@MET:PurchOrderReceiptPostSuccess";
+                        }
+
+                    }
+                    else if(result == METProcessingStatus::Error)
+                    {
+                        throw error(message);
+                    }
+                } 
+                ttscommit;
+            }
+
+        }
+        catch (Exception::Deadlock)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    Error("@MET:POReceiptDBDeadlock");
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                Error("@MET:POReceiptDBDeadlock");
+                throw Exception::Deadlock;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    Error("@MET:POReceiptUpdateConflict");
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                Error("@MET:POReceiptUpdateConflict");
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch 
+        {
+            Error("@MET:POReceiptFail");
+            throw Exception::Error;
+        }
+        
+        return [result, message];
+       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validatePurchaseOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validation method for purchare order before performing product receipt
+    /// </summary>
+    /// <param name = "_purchId">Purchase order reference</param>
+    /// <param name = "_itemId">ItemId reference</param>
+    /// <returns>Container</returns>
+    public container validatePurchaseOrder(PurchId        _purchId, ItemId        _itemId)
+    {
+        METProcessingStatus result;
+        Description255      message = "@MET:NoRecordsUpdated";
+        PurchTable          purchTable = PurchTable::find(_purchId);
+        InventTable         inventTable = InventTable::find(_itemId);
+        PurchLine           purchLine;
+        
+        if (purchTable.RecId && inventTable.RecId)
+        {
+            select firstonly purchLine
+                where purchLine.PurchId == _purchId     &&
+                    purchLine.IsDeleted == NoYes::No    &&
+                    purchLine.ItemId == _itemId;
+        }
+        
+        if (purchTable.RecId == 0)
+        {
+            result = METProcessingStatus::Error;
+            message = strFmt("@MET:PONotFound", _purchId);
+        }
+        else if (inventTable.RecId == 0)
+        {
+            result = METProcessingStatus::Error;
+            message = strFmt("@MET:POItemNotFound", _purchId);
+        }
+        else if(purchTable.DocumentState != VersioningDocumentState::Confirmed)
+        {
+            result = METProcessingStatus::Error;
+            message = strFmt("@MET:PONotConfirmed", _purchId);
+        }
+        else if(purchTable.PurchStatus == PurchStatus::Received)
+        {
+            result = METProcessingStatus::Error;
+            message = strFmt("@MET:POReceived", _purchId);
+        }
+        else if(purchTable.PurchStatus == PurchStatus::Invoiced)
+        {
+            result = METProcessingStatus::Error;
+            message = strFmt("@MET:POInvoiced", _purchId);
+        }
+        else if (purchLine.RecId == 0)
+        {
+            result = METProcessingStatus::Error;
+            message = strFmt("@MET:POItemNotExists", _purchId, _itemId);
+        }
+        else if (purchLine.PurchStatus == PurchStatus::Received)
+        {
+            result = METProcessingStatus::Error;
+            message = strFmt("@MET:POLineReceived", _purchId, _itemId);
+        }
+
+        return [result, message];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>purchPackingSlipPost</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Post product receipt
+    /// </summary>
+    /// <param name = "_productReceiptRequestContract">Contract class reference</param>
+    /// <returns>Boolean</returns>
+    public boolean purchPackingSlipPost(METPurchaseOrderReceiptRequestContract _productReceiptRequestContract)
+    {
+        PurchFormLetter             purchFormLetter;
+        PurchFormletterParmData     purchFormLetterParmData;
+        PurchParmUpdate             purchParmUpdate;
+        PurchParmTable              purchParmTable;
+        PurchParmLine               purchParmLine;
+        PurchTable                  purchTable;
+        PurchLine                   purchLine;
+        PurchId                     purchId;
+        Num                         packingSlipId;
+        InventDim                   inventDim;
+        InventQty                   totalQty;
+        Counter                     totalPOLines = 0;
+        Counter                     lineCreated = 0;
+        ItemId                      itemId;
+        InventBatchId               inventBatchId;
+
+        purchId         = _productReceiptRequestContract.parmPurchId();
+        packingSlipId   = _productReceiptRequestContract.parmProductReceipt();
+        totalQty        = _productReceiptRequestContract.parmQuantity();
+        itemId          = _productReceiptRequestContract.parmItemId();
+        inventBatchId   = _productReceiptRequestContract.parmInventBatchId();
+        purchTable      = PurchTable::find(purchId);
+
+        ttsBegin;
+
+        purchFormLetterParmData = PurchFormletterParmData::newData(DocumentStatus::PackingSlip, VersioningUpdateType::Initial);
+    
+        purchFormLetterParmData.parmOnlyCreateParmUpdate(true);
+        purchFormLetterParmData.createData(false);
+        purchParmUpdate = purchFormLetterParmData.parmParmUpdate();
+
+        purchParmTable.clear();
+        purchParmTable.TransDate                = _productReceiptRequestContract.parmProductReceiptDate();
+        purchParmTable.Ordering                 = DocumentStatus::PackingSlip;
+        purchParmTable.ParmJobStatus            = ParmJobStatus::Waiting;
+        purchParmTable.Num                      = packingSlipId;
+        purchParmTable.PurchId                  = purchTable.PurchId;
+        purchParmTable.PurchName                = purchTable.PurchName;
+        purchParmTable.DeliveryName             = purchTable.DeliveryName;
+        purchParmTable.DeliveryPostalAddress    = purchTable.DeliveryPostalAddress;
+        purchParmTable.OrderAccount             = purchTable.OrderAccount;
+        purchParmTable.CurrencyCode             = purchTable.CurrencyCode;
+        purchParmTable.InvoiceAccount           = purchTable.InvoiceAccount;
+        purchParmTable.ParmId                   = purchParmUpdate.ParmId;
+        purchParmTable.insert();
+
+        select count(RecId) from purchLine
+             where purchLine.PurchId == purchTable.purchId      &&
+                purchLine.IsDeleted == NoYes::No                &&
+                purchLine.RemainPurchPhysical > 0               &&
+                purchLine.ItemId == _productReceiptRequestContract.parmItemId();
+
+        totalPOLines = purchLine.RecId;
+
+        while select purchLine
+            order by RemainPurchPhysical desc
+            where purchLine.PurchId == purchTable.purchId       &&
+                purchLine.IsDeleted == NoYes::No                &&
+                purchLine.RemainPurchPhysical > 0               &&
+                purchLine.ItemId == itemId
+            exists join inventDim
+                where inventDim.inventDimId == purchLine.InventDimId    &&
+                    inventDim.inventBatchId == inventBatchId
+        {
+            lineCreated++;
+
+            purchParmLine.InitFromPurchLine(purchLine);
+
+            purchParmLine.PdsCWReceiveNow = _productReceiptRequestContract.parmCatchWeightQty();
+
+            if (totalQty >= purchline.RemainPurchPhysical)
+            {
+                if (lineCreated == totalPOLines) // To map the leftover qty on last PO line, assumption is PO line will always we setup with overdelivery.
+                {
+                    purchParmLine.ReceiveNow = totalQty;
+                }
+                else
+                {
+                    purchParmLine.ReceiveNow = purchline.RemainPurchPhysical;
+
+                    totalQty = totalQty - purchLine.RemainPurchPhysical;
+                }
+            }
+            else 
+            {
+                purchParmLine.ReceiveNow = totalQty;
+            }
+            
+            purchParmLine.ParmId        = purchParmTable.ParmId;
+            purchParmLine.TableRefId    = purchParmTable.TableRefId;
+            purchParmLine.setQty(DocumentStatus::PackingSlip, false, true);
+            purchParmLine.setLineAmount();
+            purchParmLine.insert();
+        }
+
+        purchFormLetter = PurchFormLetter::construct(DocumentStatus::PackingSlip);
+        purchFormLetter.transDate(_productReceiptRequestContract.parmProductReceiptDate());
+        purchFormLetter.proforma(false);
+        purchFormLetter.specQty(PurchUpdate::All);
+        purchFormLetter.purchTable(purchTable);
+        purchFormLetter.parmParmTableNum(purchParmTable.ParmId);
+        purchFormLetter.parmId(purchParmTable.ParmId);
+        purchFormLetter.purchParmUpdate(purchFormLetterParmData.parmParmUpdate());
+        purchFormLetter.run();
+
+        ttsCommit;
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct method to create new instance
+    /// </summary>
+    /// <returns>METPurchaseOrderReceiptService</returns>
+    Public static METPurchaseOrderReceiptService construct()
+    {
+        return new METPurchaseOrderReceiptService();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
