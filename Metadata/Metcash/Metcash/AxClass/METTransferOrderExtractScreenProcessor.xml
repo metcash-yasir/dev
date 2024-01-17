@@ -36,11 +36,11 @@ public  class METTransferOrderExtractScreenProcessor
     METFilterCodeone                        category;
     Volume                                  totalVolume;
 
-    METTotalPallets                         totalPallets;
+    METTotalPallets                         totalPallets,totalActualPallets;
 
-    Map                                     volumeMap;
+    Map                                     volumeMap,actualVolumeMap;
     Map                                     itemTypeMap;
-    MapEnumerator                           mapEnum;
+    MapEnumerator                           mapEnum,actualMapEnum;
     container                               transferOrderCon;
 
 }
@@ -52,12 +52,36 @@ public  class METTransferOrderExtractScreenProcessor
     /// <summary>
     /// Sets total pallets
     /// </summary>
-    /// <param name = "_pallets">Total palletslume</param>
-    /// <returns>Pallets</returns>
+    /// <param name = "_pallets">
+    /// Total pallets
+    /// </param>
+    /// <returns>
+    /// Pallets
+    /// </returns>
     public METTotalPallets parmTotalpallets(METTotalPallets _pallets = totalPallets)
     {
         totalPallets = _pallets;
         return totalPallets;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmTotalActualpallets</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets total actual pallets
+    /// </summary>
+    /// <param name = "_actualPallets">
+    /// Total actual pallets
+    /// </param>
+    /// <returns>
+    /// Actual Pallets
+    /// </returns>
+    public METTotalPallets parmTotalActualpallets(METTotalPallets _actualPallets = totalActualPallets)
+    {
+        totalActualPallets = _actualPallets;
+        return totalActualPallets;
     }
 
 ]]></Source>
@@ -146,6 +170,21 @@ public  class METTransferOrderExtractScreenProcessor
             && InventDimReq.InventLocationId == inventDim.InventLocationId
             && inventDimReq.inventDimId == reqItemTable.CovInventDimId;
 
+        //Update staging lane & Door
+        update_recordset metTransferOrderExtractScreenTmp
+            setting Door = metInventTransferTableExt.Door
+        join RecId,TransferId from inventTransferTable
+            where inventTransferTable.TransferId == metTransferOrderExtractScreenTmp.TransferId
+        join InventTransferTable,Door from metInventTransferTableExt
+            where metInventTransferTableExt.InventTransferTable == inventTransferTable.RecId;
+
+        update_recordset metTransferOrderExtractScreenTmp
+            setting StagingLane = metInventTransferTableExt.StagingLane
+        join RecId,TransferId from inventTransferTable
+            where inventTransferTable.TransferId == metTransferOrderExtractScreenTmp.TransferId
+        join InventTransferTable,StagingLane from metInventTransferTableExt
+            where metInventTransferTableExt.InventTransferTable == inventTransferTable.RecId;
+
     }
 
 ]]></Source>
@@ -154,18 +193,37 @@ public  class METTransferOrderExtractScreenProcessor
 				<Name>calculate</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Calculates the sum of Weight, Volume, Case and Broken case values of the orders extracted.
+    /// Calculates the data for temporary table records
     /// </summary>
-    /// <param name = "_metTransferOrderExtractScreenTmp"><c>METTransferOrderExtractScreenTmp</c> table instance</param>
-    public void calculate(METTransferOrderExtractScreenTmp  _metTransferOrderExtractScreenTmp)
+    /// <param name = "_metTransferOrderExtractScreenTmp">
+    /// The temporary table buffer
+    /// </param>
+    /// <param name = "_fds">
+    /// Form data source
+    /// </param>
+    public void calculate(METTransferOrderExtractScreenTmp  _metTransferOrderExtractScreenTmp,FormDataSource    _fds)    
     {
+        InventTrans                         inventTrans;
+        InventTransOrigin                   inventTransOrigin;
+        UnitOfMeasureFromRecId              fromUnit,toUnit;        
+        Qty                                 reservedQty;        
+        METTransferOrderExtractScreenTmp    tmpLocal;
+        Factor                              conversionFactor;
+
         #OCCRetryCount
         try
         {
             this.initParams();
             totalPallets = this.parmTotalpallets();
-            metTransferOrderExtractScreenTmp.linkPhysicalTableInstance(_metTransferOrderExtractScreenTmp);
+            totalActualPallets = this.parmTotalActualpallets();
 
+            metTransferOrderExtractScreenTmp = _metTransferOrderExtractScreenTmp;
+            
+            /*for(tmpLocal = _fds.getFirst(1); tmpLocal ; tmpLocal = _fds.getNext())
+            {
+                info(tmpLocal.TransferId);
+            }*/
+            
             //Clear computed values before calculating.
             update_recordset metTransferOrderExtractScreenTmp
                 setting weight = 0, Volume = 0, Cases = 0, BrokenCase = 0;
@@ -173,20 +231,43 @@ public  class METTransferOrderExtractScreenProcessor
             METItemTypes        itemTypes;
             volumeMap           = new Map (Types::String, Types::Real);
             itemTypeMap         = new Map (Types::String, Types::String);
-
-            //Case5: Update ItemType, Case, Broken case
-            while select forupdate metTransferOrderExtractScreenTmp
-                join  ItemId, QtyTransfer, UnitId, InventDimId from inventTransferLine
-                    where  inventTransferLine.TransferId == metTransferOrderExtractScreenTmp.TransferId
-                join TOUnitVolume,TOUnitWeight from metInventTransferLine
-                    where metInventTransferLine.inventTransferLine == inventTransferLine.RecId
-                join InventSiteId, InventLocationId from inventDim
-                    where inventDim.inventDimId == inventTransferLine.InventDimId
-                join ItemType from itemSiteSettings
-                    where itemSiteSettings.ItemId == inventTransferLine.ItemId
-                    &&  itemSiteSettings.InventSiteId == inventDim.InventSiteId
-                    &&  itemSiteSettings.FilterCode1 == metTransferOrderExtractScreenTmp.FilterCodeOne
+            actualVolumeMap     = new Map (Types::String, Types::Real);
+                    
+            for(tmpLocal = _fds.getFirst(1); tmpLocal ; tmpLocal = _fds.getNext())
             {
+                metTransferOrderExtractScreenTmp = tmpLocal;
+                metTransferOrderExtractScreenTmp.selectForUpdate(true);
+            //Case5: Update ItemType, Case, Broken case
+                select inventTransferLine
+                    where  inventTransferLine.TransferId == metTransferOrderExtractScreenTmp.TransferId
+                    join metInventTransferLine
+                        where metInventTransferLine.inventTransferLine == inventTransferLine.RecId
+                    join inventDim
+                        where inventDim.inventDimId == inventTransferLine.InventDimId
+                    outer join itemSiteSettings
+                        where itemSiteSettings.ItemId == inventTransferLine.ItemId
+                        &&  itemSiteSettings.InventSiteId == inventDim.InventSiteId
+                        &&  itemSiteSettings.FilterCode1 == metTransferOrderExtractScreenTmp.FilterCodeOne;
+            //{            
+                select firstonly Qty from inventTrans
+                    exists join inventTransOrigin
+                    where inventTransOrigin.RecId == inventTrans.InventTransOrigin
+                    && inventTransOrigin.InventTransId == inventTransferLine.InventTransId
+                    && inventTrans.StatusIssue == StatusIssue::ReservPhysical
+                    && inventTransOrigin.ReferenceCategory == InventTransType::TransferOrderShip;
+
+                reservedQty         = abs(inventTrans.Qty);
+                fromUnit            =   UnitOfMeasure::unitOfMeasureIdBySymbol(metInventTransferLine.WarehouseUnitId);
+                toUnit              =   UnitOfMeasure::unitOfMeasureIdBySymbol(inventTransferLine.UnitId);
+
+                conversionFactor    = EcoResProductUnitConverter::convertForReleasedProduct(
+                                    inventTransferLine.ItemId,
+                                    inventTransferLine.inventDimId,
+                                    1,
+                                    fromUnit,
+                                    toUnit,
+                                    NoYes::No,
+                                    NoYes::No);
 
                 //If there are multiple items in the order with different item type then show Multiple*
                 if (itemTypeMap.exists(metTransferOrderExtractScreenTmp.TransferId)
@@ -202,12 +283,27 @@ public  class METTransferOrderExtractScreenProcessor
                 }
 
                 ttsbegin;
+                
                 metTransferOrderExtractScreenTmp.reread();
-                metTransferOrderExtractScreenTmp.ItemType   =   itemTypes;
-                metTransferOrderExtractScreenTmp.Volume     =   inventTransferLine.QtyTransfer * metInventTransferLine.TOUnitVolume;
-                metTransferOrderExtractScreenTmp.Weight     =   inventTransferLine.QtyTransfer * metInventTransferLine.TOUnitWeight;
-                metTransferOrderExtractScreenTmp.Cases      +=  inventTransferLine.displayMETcases();
-                metTransferOrderExtractScreenTmp.BrokenCase +=  inventTransferLine.displayMETBrokenCase();
+                //metTransferOrderExtractScreenTmp.selectForUpdate(true);
+                metTransferOrderExtractScreenTmp.ItemType       =   itemTypes;
+                //metTransferOrderExtractScreenTmp.Volume     =   inventTransferLine.QtyTransfer * metInventTransferLine.TOUnitVolume;
+                //metTransferOrderExtractScreenTmp.Weight     =   inventTransferLine.QtyTransfer * metInventTransferLine.TOUnitWeight;                
+                //metTransferOrderExtractScreenTmp.Cases      +=  inventTransferLine.displayMETcases();
+                //metTransferOrderExtractScreenTmp.BrokenCase +=  inventTransferLine.displayMETBrokenCase();
+                metTransferOrderExtractScreenTmp.Volume         = metInventTransferLine.TotalVolume;
+                metTransferOrderExtractScreenTmp.Weight         = metInventTransferLine.TotalWeight;
+                metTransferOrderExtractScreenTmp.Cases          = metInventTransferLine.Cases;
+                metTransferOrderExtractScreenTmp.BrokenCase     = metInventTransferLine.BrokenCase;
+
+                if(conversionFactor)
+                {
+                    metTransferOrderExtractScreenTmp.ActualCases        = reservedQty / conversionFactor;
+                    metTransferOrderExtractScreenTmp.ActualBrokenCase   = reservedQty - (metTransferOrderExtractScreenTmp.ActualCases * conversionFactor);
+                    metTransferOrderExtractScreenTmp.ActualWeight       = (reservedQty / conversionFactor) * metInventTransferLine.TOUnitWeight;
+                    metTransferOrderExtractScreenTmp.ActualVolume       = (reservedQty / conversionFactor) * metInventTransferLine.TOUnitVolume;
+                }
+                
                 metTransferOrderExtractScreenTmp.update();
                 ttscommit;
 
@@ -220,6 +316,17 @@ public  class METTransferOrderExtractScreenProcessor
                 else
                 {
                     volumeMap.insert(inventDim.InventLocationId, metTransferOrderExtractScreenTmp.Volume);
+                }
+
+                
+                //Calculate actual volume by warehouse. This will be required to calculate total actual pallets.
+                if (actualVolumeMap.exists(inventDim.InventLocationId))
+                {
+                    actualVolumeMap.insert(inventDim.InventLocationId, metTransferOrderExtractScreenTmp.ActualVolume +  actualVolumeMap.lookup(inventDim.InventLocationId));
+                }
+                else
+                {
+                    actualVolumeMap.insert(inventDim.InventLocationId, metTransferOrderExtractScreenTmp.ActualVolume);
                 }
             }
 
@@ -240,6 +347,25 @@ public  class METTransferOrderExtractScreenProcessor
                 }
             }
             this.parmTotalpallets(totalPallets);
+
+            //Calculate total actual pallets
+            if (actualVolumeMap && actualVolumeMap.elements())
+            {
+                totalActualPallets = 0;
+                actualMapEnum = actualVolumeMap.getEnumerator();
+
+                while (actualMapEnum.moveNext())
+                {
+                    //Calculate total actual pallets
+                    metInventLocation = METInventLocation::findByInventLocationId(actualMapEnum.currentKey());
+                    if (metInventLocation.WHSPalletVolume)
+                    {
+                        totalActualPallets += roundUp((actualMapEnum.currentValue()/metInventLocation.WHSPalletVolume), 1);
+                    }
+                }
+            }
+
+            this.parmTotalActualpallets(totalActualPallets);
         }
         catch (Exception::Error)
         {
@@ -274,23 +400,23 @@ public  class METTransferOrderExtractScreenProcessor
 				<Source><![CDATA[
     /// <summary>
     /// Constructs the transfer order extract screen.
-    /// </summary>
-    /// <param name="_metTransferOrderExtractScreenTmp">
-    /// The <c>METTransferOrderExtractScreenTmp</c> instance.
-    /// </param>
+    /// </summary>    
     /// <param name="_metTransferOrderExtractScreenParameters">
     /// An instance of <c>METTransferOrderExtractScreenParameters</c> to filter the order extract screen form.
     /// </param>
-    /// <returns>METTransferOrderExtractScreenProcessor class instance.</returns>
-    public static METTransferOrderExtractScreenProcessor construct(
-        METTransferOrderExtractScreenTmp                _metTransferOrderExtractScreenTmp,
-        METTransferOrderExtractScreenParameters         _metTransferOrderExtractScreenParameters)
+    /// <returns>
+    /// METTransferOrderExtractScreenProcessor class instance.
+    /// </returns>
+    public static METTransferOrderExtractScreenProcessor construct(METTransferOrderExtractScreenParameters         _metTransferOrderExtractScreenParameters)
     {
         METTransferOrderExtractScreenProcessor   metTransferOrderExtractScreenProcessor;
 
         metTransferOrderExtractScreenProcessor = new METTransferOrderExtractScreenProcessor();
 
-        metTransferOrderExtractScreenProcessor.populateOrderExtractScreen(_metTransferOrderExtractScreenTmp, _metTransferOrderExtractScreenParameters);
+        metTransferOrderExtractScreenProcessor.parmMETTransferOrderExtractScreenParams(_metTransferOrderExtractScreenParameters);
+        //metTransferOrderExtractScreenProcessor.parmMETTransferOrderExtractScreenTmp(_metTransferOrderExtractScreenTmp);
+        metTransferOrderExtractScreenProcessor.initParams();
+        //metTransferOrderExtractScreenProcessor.populateOrderExtractScreen(_metTransferOrderExtractScreenTmp, _metTransferOrderExtractScreenParameters);
 
         return metTransferOrderExtractScreenProcessor;
     }
@@ -320,26 +446,73 @@ public  class METTransferOrderExtractScreenProcessor
 				<Name>populateOrderExtractScreen</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Populates <c>METTransferOrderExtractScreenTmp</c> table for the grid on the order extract screen form.
+    /// Populates the extract screen form by inserting records based on filters
     /// </summary>
-    /// <param name="_metTransferOrderExtractScreenTmp">
-    /// The <c>METTransferOrderExtractScreenTmp</c> instance.
-    /// </param>
-    /// <param name="_metTransferOrderExtractScreenParameters">
-    /// An instance of <c>METTransferOrderExtractScreenParameters</c> to filter the order extract screen form.
-    /// </param>
-    public void populateOrderExtractScreen(METTransferOrderExtractScreenTmp                _metTransferOrderExtractScreenTmp,
-                                            METTransferOrderExtractScreenParameters         _metTransferOrderExtractScreenParameters)
+    /// <returns>
+    /// METTransferOrderExtractScreenTmp table buffer
+    /// </returns>    
+    public METTransferOrderExtractScreenTmp populateOrderExtractScreen()
     {
-        METTransferOrderExtractScreenProcessor           metTransferOrderExtractScreenProcessor;
+        METTransferOrderExtractScreenTmp    metExtractScreenTmp;        
 
-        metTransferOrderExtractScreenProcessor = new METTransferOrderExtractScreenProcessor();
+        //Case1: Insert records group by SalesId & Category
+        insert_recordset metExtractScreenTmp(TransferId, LineNum, FilterCodeOne)
+            select TransferId, minof(LineNum) from inventTransferLine group by inventTransferLine.TransferId, itemSiteSettings.FilterCode1
+            join inventTransferTable
+                where inventTransferTable.TransferId == inventTransferLine.TransferId
+                && inventTransferTable.TransferStatus == InventTransferStatus::Created
+                && (!fromWarehouse  || inventTransferTable.InventLocationIdFrom == fromWarehouse)
+                && (!toWarehouse  || inventTransferTable.InventLocationIdTo == toWarehouse)
+                && (inventTransferTable.ShipDate >=  shippingDateFrom && inventTransferTable.ShipDate <=  shippingDateTo)
+            join metInventTransferTableExt
+                where metInventTransferTableExt.InventTransferTable == inventTransferTable.RecId
+                && metInventTransferTableExt.OrderExtractStatus == extracted
+                && (!route  || metInventTransferTableExt.Route == route)
+            join inventDim
+                where inventDim.inventDimId == inventTransferLine.InventDimId
+            join FilterCode1 from itemSiteSettings
+                where itemSiteSettings.ItemId == inventTransferLine.ItemId
+                &&  itemSiteSettings.InventSiteId == inventDim.InventSiteId
+                &&  (!category || itemSiteSettings.FilterCode1 == category);
 
-        metTransferOrderExtractScreenProcessor.parmMETTransferOrderExtractScreenParams(_metTransferOrderExtractScreenParameters);
-        metTransferOrderExtractScreenProcessor.parmMETTransferOrderExtractScreenTmp(_metTransferOrderExtractScreenTmp);
-        metTransferOrderExtractScreenProcessor.initParams();
-        metTransferOrderExtractScreenProcessor.insertOrders();
-        this.parmTotalpallets(metTransferOrderExtractScreenProcessor.parmTotalpallets());
+        //Update order split category code
+        update_recordset metExtractScreenTmp
+            setting OSCCode = metReqItemTable.OSCCode
+        join RecId from inventTransferLine
+             where inventTransferLine.TransferId == metExtractScreenTmp.TransferId
+            && inventTransferLine.LineNum == metExtractScreenTmp.LineNum
+       join RecId from inventDim
+            where inventDim.inventDimId == inventTransferLine.InventDimId
+        join ItemType from itemSiteSettings
+            where itemSiteSettings.ItemId == inventTransferLine.ItemId
+            &&  itemSiteSettings.InventSiteId == inventDim.InventSiteId
+            &&  itemSiteSettings.FilterCode1 == metExtractScreenTmp.FilterCodeOne
+        join Recid from reqItemTable
+            where reqItemTable.ItemId == inventTransferLine.ItemId
+        join OSCCode from metReqItemTable
+            where metReqItemTable.RefRecId == reqItemTable.RecId
+         exists join inventDimReq
+            where inventDimReq.InventSiteId == inventDim.InventSiteId
+            && InventDimReq.InventLocationId == inventDim.InventLocationId
+            && inventDimReq.inventDimId == reqItemTable.CovInventDimId;
+
+        //CB715_TransferOrderExtract - Start
+        //Update staging lane & Door
+        update_recordset metExtractScreenTmp
+            setting Door = metInventTransferTableExt.Door
+        join RecId,TransferId from inventTransferTable
+            where inventTransferTable.TransferId == metExtractScreenTmp.TransferId
+        join InventTransferTable,Door from metInventTransferTableExt
+            where metInventTransferTableExt.InventTransferTable == inventTransferTable.RecId;
+
+        update_recordset metExtractScreenTmp
+            setting StagingLane = metInventTransferTableExt.StagingLane
+        join RecId,TransferId from inventTransferTable
+            where inventTransferTable.TransferId == metExtractScreenTmp.TransferId
+        join InventTransferTable,StagingLane from metInventTransferTableExt
+            where metInventTransferTableExt.InventTransferTable == inventTransferTable.RecId;
+        //CB715_TransferOrderExtract - End
+        return metExtractScreenTmp;
     }
 
 ]]></Source>
