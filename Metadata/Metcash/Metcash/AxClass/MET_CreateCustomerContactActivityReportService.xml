@@ -1,0 +1,194 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>MET_CreateCustomerContactActivityReportService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MET_86267_CustomerStatementReport developed by ydavapa on 16th Oct 2023.
+/// Service class to copy activity customer email from statement email
+/// </summary>
+public class MET_CreateCustomerContactActivityReportService extends SysOperationServiceBase
+{
+    #Define.LocationRoleName('Customer Transaction')
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    public void processOperation(MET_CustomerStatmentReportContract _contract)
+    {
+        #File
+        container               currentLine;
+        CommaTextStreamIo       localStream;
+        AccountNum              accountNum;
+
+        if (_contract.parmStorageResult() != conNull())
+        {
+            FileUploadTemporaryStorageResult fileUploadResult = new FileUploadTemporaryStorageResult();
+
+            fileUploadResult.unpack(_contract.parmStorageResult());
+
+            if (fileUploadResult != null)
+            {
+                try
+                {
+                    localStream = CommaTextStreamIo::constructForRead(File::UseFileFromURL(fileUploadResult.getDownloadUrl()));
+
+                    if (localStream.status() != IO_Status::Ok)
+                    {
+                        throw error(strfmt('@MET:UploadFileError',enum2str(localStream.status())));
+                    }
+   
+                    localStream.inFieldDelimiter("\,");
+                    localStream.inRecordDelimiter("\n");
+   
+                    currentLine = localStream.read();
+   
+                    while(currentLine)
+                    {
+                        accountNum = strRem(conPeek(currentLine, 1),'\r');
+
+                        MET_CreateCustomerContactActivityReportService::createAndUpdateCustomerContactEmail(_contract.parmIncludeAllCustomer(), accountNum);
+            
+                        currentLine = localStream.read();
+                    }
+                }
+                catch (Exception::Error)
+                {
+                    error("@RET433");
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAndUpdateCustomerContactEmail</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create customer actitity email
+    /// Activity line present but customer actitity email have blank value, update customer actitity email
+    /// </summary>
+    /// <param name = "_accountNum">Customer account number</param>
+    public static void createAndUpdateCustomerContactEmail(boolean _includeAllCustomer, AccountNum _accountNum)
+    {
+        CustTable                  custTable, custTableUpdate;
+        LogisticsElectronicAddress logisticsElectronicAddress, updateLogisticsElectronicAddress;
+        LogisticsLocationRole      locationRole;
+        DirPartyLocation           dirPartyLocation;
+        Map                        locationRoleMap;
+        container                  locationRoleCon;
+        str                        customerUpdate = '';
+        int                        totalCustomerUpdateCount = 0; 
+        
+        locationRoleMap = new Map(Types::Int64, Types::String);
+        locationRole = LogisticsLocationRole::findByName(#LocationRoleName);
+         
+        if (locationRole)
+        {
+            while select accountNum,Party, MET_IsActivitySync, recId from custTable
+                where !custTable.MET_IsActivitySync && ((_includeAllCustomer && custTable.AccountNum != '') || (!_includeAllCustomer && custTable.AccountNum == _accountNum))
+            {
+                locationRoleMap.insert(locationRole.RecId, locationRole.description());
+                locationRoleCon = map2Con(locationRoleMap);
+                    
+                select firstonly location from dirPartyLocation where
+                    dirPartyLocation.Party == custTable.Party && dirPartyLocation.IsLocationOwner && dirPartyLocation.IsPostalAddress == 0;
+                    
+                LogisticsElectronicAddress logisticsElectronicAddressForStatement =
+                    MET_CreateCustomerContactActivityReportService::getLogisticsElectronicAddress(dirPartyLocation.Location, LogisticsLocationRoleType::Statement);
+
+                if(logisticsElectronicAddressForStatement.Locator)
+                {
+                    LogisticsElectronicAddress logisticsElectronicAddressForActivity =
+                        MET_CreateCustomerContactActivityReportService::getLogisticsElectronicAddress(dirPartyLocation.Location, LogisticsLocationRoleType::None);
+                    if(logisticsElectronicAddressForActivity.RecId == 0)
+                    {
+                        ttsBegin;
+                        logisticsElectronicAddress.clear();
+                        logisticsElectronicAddress.Type        = LogisticsElectronicAddressMethodType::Email;
+                        logisticsElectronicAddress.Locator     = logisticsElectronicAddressForStatement.Locator;
+                        logisticsElectronicAddress.Location    = DirPartyLocation::findOrCreate(CustTable.Party, 0).Location;
+                        logisticsElectronicAddress.Description = "@MET:ActivityEmail";
+                        logisticsElectronicAddress.IsPrimary   = NoYes::No;
+                        logisticsElectronicAddress.insert();
+
+                        select firstonly forupdate custTableUpdate
+                                where custTableUpdate.RecId == custTable.RecId;
+                        if(custTableUpdate.RecId)
+                        {
+                            custTableUpdate.MET_IsActivitySync = true;
+                            custTableUpdate.update();
+                        }
+
+                        LogisticsEntityLocationRoleMap::createEntityLocationRoles(tableNum(LogisticsElectronicAddressRole), logisticsElectronicAddress.RecId, conPeek(locationRoleCon, 1), true);
+                        ttsCommit;
+                        totalCustomerUpdateCount++;
+                        customerUpdate = customerUpdate + ',' + custTable.AccountNum;
+                        info(strFmt("@MET:ActityEmailCreationMessage", logisticsElectronicAddress.Locator, custTable.AccountNum));
+                    }
+                    else if(logisticsElectronicAddressForActivity.RecId != 0 && logisticsElectronicAddressForActivity.Locator == '')
+                    {
+                        select firstonly forupdate updateLogisticsElectronicAddress
+                            where updateLogisticsElectronicAddress.RecId == logisticsElectronicAddressForActivity.RecId;
+                        if(updateLogisticsElectronicAddress.RecId)
+                        {
+                            ttsbegin;
+                            updateLogisticsElectronicAddress.Locator = logisticsElectronicAddressForStatement.Locator;
+                            updateLogisticsElectronicAddress.update();
+
+                            select firstonly forupdate custTableUpdate
+                                where custTableUpdate.RecId == custTable.RecId;
+                            if(custTableUpdate.RecId)
+                            {
+                                custTableUpdate.MET_IsActivitySync = true;
+                                custTableUpdate.update();
+                            }
+
+                            totalCustomerUpdateCount++;
+                            customerUpdate = customerUpdate + ',' + custTable.AccountNum;
+                            ttscommit;
+                        }
+                    }
+                }
+            }
+            info(strFmt("@MET:CustomerCopyCount", totalCustomerUpdateCount,customerUpdate));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLogisticsElectronicAddress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get LogisticsElectronicAddress table
+    /// </summary>
+    /// <param name = "_location">Location</param>
+    /// <param name = "_purposeType">Purpose</param>
+    /// <returns>LogisticsElectronicAddress</returns>
+    public static LogisticsElectronicAddress getLogisticsElectronicAddress(LogisticsLocationRecId _location, LogisticsLocationRoleType _purposeType)
+    {
+        LogisticsElectronicAddress      logisticsElectronicAddress;
+        LogisticsElectronicAddressRole  logisticsElectronicAddressRole;
+        LogisticsLocationRole           logisticsLocationRole;
+
+        select firstonly logisticsElectronicAddress join logisticsElectronicAddressRole
+            order by logisticsElectronicAddress.IsPrimary desc
+            where logisticsElectronicAddress.Location == _location
+                && logisticsElectronicAddress.Type == LogisticsElectronicAddressMethodType::Email
+                && logisticsElectronicAddressRole.ElectronicAddress == logisticsElectronicAddress.RecId
+                join logisticsLocationRole
+                    where logisticsLocationRole.RecId == logisticsElectronicAddressRole.LocationRole
+                        && logisticsLocationRole.Type == _purposeType;
+
+        return logisticsElectronicAddress;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
