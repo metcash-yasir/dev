@@ -1,0 +1,450 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSysOperationService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// CB233_TOReceiptDetails
+/// The class to implement the sys operartion job.
+/// </summary>
+abstract class METSysOperationService extends SysOperationServiceBase
+{
+    METSysOperationTaskDataContract dataContract;
+    Batch                           batchTask;
+    Batch                           batchTaskCurrent;
+    BatchHeader                     batchHeader;
+    RefRecId                        batchJobId;
+    RefRecId                        headerTaskId;
+    boolean                         isExecutingInBatch;
+    Counter                         maxThreadCount;
+    Counter                         minThreadCount = 1;
+    METThreadCount                  threadCount;
+    METBundleCount                  bundleCount;
+    container                       guidCon;    //task giud container used in clean up process at end of main batch
+    List                            serviceList = new List(Types::Class);
+    str                             errorMsg;
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getTaskServiceClass</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns name of the task service class.
+    /// </summary>
+    /// <returns>Task service class name</returns>
+    protected abstract str getTaskServiceClass()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTaskServiceClassMethod</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns name of the task service class method.
+    /// </summary>
+    /// <returns>Task service class method name</returns>
+    protected abstract str getTaskServiceClassMethod()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTaskServiceCaption</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns caption of the task service class.
+    /// </summary>
+    /// <returns>Task service class caption</returns>
+    protected str getTaskServiceCaption()
+    {
+        return '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processInternal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Implements process logic.
+    /// </summary>
+    /// <param name = "_dataContract">Data contract parameter</param>
+    protected void processInternal(METSysOperationTaskDataContract _dataContract)
+    {
+        #OCCRetryCount
+
+        try
+        {
+            dataContract = _dataContract;
+            this.initialise();
+        
+            if(!dataContract.validate())
+            {
+                error(errorMsg);
+                
+                if(isExecutingInBatch)
+                {
+                    //ensure batch status is "Error"
+                    throw Exception::Error;
+                }
+                else
+                {
+                    //dont throw error when run from GUI
+                    return;
+                }
+            }
+
+            this.processTasks();
+            this.waitTaskFinished();
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error(errorMsg);
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error(errorMsg);
+                throw Exception::Deadlock;
+            }
+        }
+        catch
+        {
+            error(errorMsg);
+            throw Exception::Error;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>Initialise global variables</summary>
+    /// <param name = "_dataContract">Data contract</param>
+    public void initialise()
+    {
+        batchTaskCurrent    = this.getCurrentBatchTask();
+        batchJobId          = batchTaskCurrent.BatchJobId;
+        headerTaskId        = batchTaskCurrent.RecId;
+        batchHeader         = BatchHeader::construct(batchJobId);
+        isExecutingInBatch  = batchTaskCurrent ? true : false;
+        threadCount         = dataContract.parmThreadCount();
+        bundleCount         = dataContract.parmBundleCount();
+        errorMsg           = strFmt('@MET:BatchFailedErr', classId2Name(classIdGet(this)));
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTaskDataContract</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the task data contract.
+    /// </summary>
+    /// <param name = "_taskDataContract">task data contract</param>
+    protected void initTaskDataContract(METSysOperationTaskDataContract _taskDataContract)
+    {
+        _taskDataContract.parmBundleCount(bundleCount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>taskDataContractObject</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Provides task data contract.
+    /// </summary>
+    /// <returns>task data contract</returns>
+    protected METSysOperationTaskDataContract taskDataContractObject()
+    {
+        return new METSysOperationTaskDataContract();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates sub tasks for processing.
+    /// </summary>
+    public void processTasks()
+    {
+        counter                         threadCountLoc;
+        SysOperationServiceController   controller;
+        METSysOperationTaskDataContract taskDataContract;
+        str                             serializedContract;
+        METTaskGuid                     taskGuid;
+
+        threadCountLoc = threadCount;
+
+        if (isExecutingInBatch)
+        {
+            for (int i = 1; i <= threadCountLoc; i++)
+            {
+                controller = new SysOperationServiceController(this.getTaskServiceClass(), this.getTaskServiceClassMethod());
+                controller.parmDialogCaption(this.getTaskServiceCaption());
+
+                // grab contract instance from controller, use same contract
+                taskDataContract = controller.getDataContractObject();
+                this.initTaskDataContract(taskDataContract);
+                taskDataContract.parmIsMainBatchTask(i==1);
+
+                batchHeader.addTask(controller);
+            }
+            
+            batchHeader.parmCaption(this.getTaskServiceCaption());
+            batchHeader.save();
+        }
+        else
+        {
+            //process run from GUI
+            for (int i = 1; i <= threadCountLoc; i++)
+            {
+                taskDataContract = this.taskDataContractObject();
+                this.initTaskDataContract(taskDataContract);
+                taskDataContract.parmIsMainBatchTask(i==1);
+                
+                serializedContract = FormJsonSerializer::serializeClass(taskDataContract); //convert Contract class to string for use in Container
+                
+                System.Threading.Tasks.Task task = Global::runAsync(classNum(METSysOperationService),
+                                                                    staticMethodStr(METSysOperationService, processAsync),
+                                                                    [serializedContract, this.getTaskServiceClass(), this.getTaskServiceClassMethod(), classIdGet(taskDataContract)]);
+                serviceList.addEnd(task);
+
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processAsync</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs task service. Used when process is run from GUI (not in Batch mode)
+    /// </summary>
+    /// <param name = "_conSerializedContract">Serialised data contract</param>
+    public static void processAsync(container _conSerializedContract)	//must have Container as parameter
+    {
+        DictClass  taskClass;
+        Object     taskServiceObj;
+        Object     deserializedContract;
+        ClassName  taskClassName;
+        MethodName taskClassMethodName;
+        ClassId    taskContractClassNum;
+        str        serializedContract;
+
+        serializedContract   = conPeek(_conSerializedContract, 1);
+        taskClassName        = conPeek(_conSerializedContract, 2);
+        taskClassMethodName  = conPeek(_conSerializedContract, 3);
+        taskContractClassNum = conPeek(_conSerializedContract, 4);
+        deserializedContract = FormJsonSerializer::deserializeObject(taskContractClassNum, serializedContract);
+
+        taskClass      = new DictClass(className2Id(taskClassName));
+        taskServiceObj = taskClass.makeObject();
+
+        taskClass.callObject(taskClassMethodName, taskServiceObj, deserializedContract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>waitTaskFinishedAsync</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Execute tasks when run from gui AND wait untill all are completed or errored
+    /// </summary>
+    public void waitTaskFinishedAsync()
+    {
+        int                             counter;
+        ListEnumerator                  enumerator;
+        System.Threading.Tasks.Task[]   allTasks;
+        System.Threading.Tasks.Task     task;
+
+        if (serviceList && serviceList.elements() > 0)
+        {
+            allTasks = new System.Threading.Tasks.Task[serviceList.elements()]();
+
+            enumerator = serviceList.getEnumerator();
+            
+            while (enumerator.moveNext())
+            {
+                task = enumerator.current();
+                allTasks.SetValue(task, counter);
+                counter++;
+            }
+
+            //  This will start all Tasks running and wait until they have completed
+            System.Threading.Tasks.Task::WaitAll(allTasks);
+
+            this.handleResults(allTasks);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>handleResults</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// check the result of the running threads
+    /// </summary>
+    /// <param name = "_tasks">Container of Tasks</param>
+    private void handleResults(System.Threading.Tasks.Task[] _tasks)
+    {
+        AsyncTaskResult taskResult;
+
+        if (_tasks)
+        {
+            for (int i = 0; i < _tasks.Length; i++)
+            {
+                taskResult = AsyncTaskResult::getAsyncTaskResult(_tasks.getValue(i));
+                this.processTaskResult(taskResult);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTaskResult</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// check the result of the individual thread
+    /// </summary>
+    /// <param name = "_taskResult">Task result</param>
+    private void processTaskResult(AsyncTaskResult _taskResult)
+    {
+        System.Exception exception;
+        str errorStr = '';
+
+        if (_taskResult != null)
+        {
+            exception = _taskResult.getException();
+            
+            if (exception)
+            {
+                container infologCon = _taskResult.getInfologData();
+                container infoException, infoItem;
+                str ExceptionMsg, ItemMsg;
+                
+                for(int j = 2; j < conLen(infologCon); j += 2)
+                {
+                    infoException = conPeek(infologCon, j);
+                    ExceptionMsg  = conPeek(infoException, 2);
+
+                    infoItem      = conPeek(infologCon, j + 1);
+                    ItemMsg       = conPeek(infoItem, 2);
+
+                    errorStr += strFmt("@MET:ConcatTwoNewLine", ItemMsg, ExceptionMsg);
+                }
+                
+                throw error(errorStr);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>waitTaskFinished</Name>
+				<Source><![CDATA[
+    /// <summary>Start tasks running and wait on all sub tasks to finish</summary>
+    public void waitTaskFinished()
+    {
+        if (isExecutingInBatch)
+        {
+            this.waitTaskFinishedBatch();
+        }
+        else
+        {
+            this.waitTaskFinishedAsync();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>waitTaskFinishedBatch</Name>
+				<Source><![CDATA[
+    /// <summary>Wait until all batch Tasks have completed</summary>
+    public void waitTaskFinishedBatch()
+    {
+        utcDateTime     startDateTime = DateTimeUtil::utcNow();
+        utcDateTime     nowDateTime;
+        METLargeSeconds seconds;
+        const Seconds   maxSeconds = 7200; //2 hours
+        METLargeCounter taskWaitingCount = -1;
+                
+        //wait on all tasks the end.
+        while (taskWaitingCount != 0)
+        {
+            // Fetch the batch records that have NOT finished or are NOT errored out.
+            select count(RecId)
+                from batchTask
+                where   batchTask.BatchJobId == batchJobId
+                &&      batchTask.RecId    != headerTaskId      //not this header task
+                &&      batchTask.Status   != BatchStatus::Error
+                &&      batchTask.Status   != BatchStatus::Finished;
+
+            taskWaitingCount = batchTask.RecId;
+
+            // If we still have tasks processing then wait
+            if (taskWaitingCount != 0)
+            {
+                System.Threading.Thread::Sleep(60000);  //60 seconds
+            }
+
+            //check maximum wait limit exceeded
+            nowDateTime = DateTimeUtil::utcNow();
+                    
+            Seconds = DateTimeUtil::getDifference(nowDateTime, startDateTime);
+
+            if (Seconds >= maxSeconds) //if wait time is longer than 2 hours break out of loop
+            {
+                break;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
