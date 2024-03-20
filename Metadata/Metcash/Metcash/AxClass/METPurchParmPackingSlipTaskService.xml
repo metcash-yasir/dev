@@ -1,0 +1,223 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPurchParmPackingSlipTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// CB256_PurchaseOrderReceiptDetails
+/// Service class for purchase order packing slip posting task.
+/// </summary>
+class METPurchParmPackingSlipTaskService extends METSysOperationTaskService
+{
+    PurchParmTable  purchParmTable;
+    ParmId          parmId;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    /// <param name = "_contract">
+    /// <c>METSysOperationTaskDataContract</c>.
+    /// </param>
+    public void process(METSysOperationTaskDataContract _contract)
+    {
+        this.processInternal(_contract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the batch tasks.
+    /// </summary>
+    /// <param name = "_readPast">Read past table setting.</param>
+    public void processTask(boolean _readPast)
+    {
+        purchParmTable.readPast(_readPast);              
+
+        do
+        {
+            ttsbegin;
+                      
+            select firstOnly pessimisticlock purchParmTable
+                where purchParmTable.METIsIntegration == NoYes::Yes
+                &&    purchParmTable.ParmJobStatus == ParmJobStatus::Waiting
+                &&    purchParmTable.METIntegrationStatus == METIntegrationStatus::ReadyToProcess;
+
+            if (purchParmTable)
+            {
+                this.execute();
+            }
+
+            ttscommit;
+        }
+        while (purchParmTable);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    private void execute()
+    {
+        parmId = purchParmTable.ParmId;
+
+        this.registerPurchLine();
+        this.postPackingSlip();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateOnError</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates <c>PurchParmTable</c> on error.
+    /// </summary>
+    protected void updateOnError()
+    {
+        PurchParmTable  purchParmTableUpdate;
+        ParmJobStatus   jobStatus;
+        int             retryCount,
+                        maxRetry;
+        
+        purchParmTableUpdate = PurchParmTable::find(parmId, parmId);
+
+        if (purchParmTableUpdate)
+        {
+            jobStatus = purchParmTableUpdate.ParmJobStatus;
+            maxRetry = PurchParameters::find().METPOReceiptPostingRetiries;
+
+            retryCount++;
+
+            if (retryCount >= maxRetry)
+            {
+                jobStatus = ParmJobStatus::ContainErrors;
+            }
+
+            ttsbegin;
+
+            purchParmTableUpdate.selectForUpdate(true);
+        
+            purchParmTableUpdate.METIntegrationRetries = retryCount;
+            purchParmTableUpdate.ParmJobStatus = jobStatus;
+            purchParmTableUpdate.update();
+        
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>registerPurchLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Registers <c>PurchLine</c>.
+    /// </summary>
+    private void registerPurchLine()
+    {
+        METInventTransRegisterService registerService;
+        PurchParmLine parmLine;
+        
+        while select parmLine
+            where parmLine.ParmId == purchParmTable.ParmId
+            &&    parmLine.TableRefId == purchParmTable.TableRefId
+            &&    parmLine.PdsCWReceiveNow != 0
+            &&    parmLine.ReceiveNow != 0
+        {
+            registerService = METInventTransRegisterService::contruct(parmLine.InventTransId
+                , parmLine.ReceiveNow
+                , parmLine.PdsCWReceiveNow);
+
+            registerService.register();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postPackingSlip</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Posts packing slip.
+    /// </summary>
+    private void postPackingSlip()
+    {
+        PurchFormLetter         purchFormLetter;
+        PurchParmUpdate         purchParmUpdate;
+        PurchTable              purchTable;
+
+        purchTable = PurchTable::find(purchParmTable.PurchId);
+        purchParmUpdate = this.createPurchParmUpdate();
+
+        purchFormLetter = PurchFormLetter::construct(DocumentStatus::PackingSlip);
+
+        purchFormLetter.transDate(purchParmTable.TransDate);
+        purchFormLetter.proforma(false);
+        purchFormLetter.specQty(PurchUpdate::All);
+        purchFormLetter.purchTable(purchTable);
+        purchFormLetter.parmParmTableNum(purchParmTable.ParmId);
+        purchFormLetter.parmId(purchParmTable.ParmId);
+        purchFormLetter.purchParmUpdate(purchParmUpdate);
+        purchFormLetter.run();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPurchParmUpdate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates <c>PurhcParmUpdate</c> record before posting.
+    /// </summary>
+    /// <returns>
+    /// <c>PurchParmUpdate</c>.
+    /// </returns>
+    private PurchParmUpdate createPurchParmUpdate()
+    {
+        PurchParmUpdate purchParmUpdate;
+        PurchParameters purchParameters;
+        VendParameters  vendParameters;
+
+        purchParameters = PurchParameters::find();
+        vendParameters  = VendParameters::find();
+
+        purchParmUpdate = PurchParmUpdate::find(purchParmTable.ParmId);
+
+        if (!purchParmUpdate.RecId)
+        {
+            purchParmUpdate.ParmId            = purchParmTable.ParmId;
+            purchParmUpdate.DocumentStatus    = purchParmTable.Ordering;
+            purchParmUpdate.SumBy             = purchParameters.SummaryUpdateBy;
+            purchParmUpdate.SumPurchId        = '';
+            purchParmUpdate.SumNum            = '';
+            purchParmUpdate.SumIncludePending = NoYes::Yes;
+            purchParmUpdate.CheckCreditMax    = vendParameters.CreditMaxCheck;
+            purchParmUpdate.Storno            = vendParameters.CreditError;
+            purchParmUpdate.LateSelection     = false;
+            purchParmUpdate.CreditRemaining   = false;
+            purchParmUpdate.Proforma          = false;
+
+            purchParmUpdate.insert();
+        }
+
+        return purchParmUpdate;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
