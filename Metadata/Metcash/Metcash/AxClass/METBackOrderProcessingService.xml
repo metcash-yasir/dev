@@ -14,12 +14,73 @@ class METBackOrderProcessingService extends SysOperationServiceBase
 			<Method>
 				<Name>processOperation</Name>
 				<Source><![CDATA[
+    /// CB425 BuyBackOrders
     /// <summary>
     /// The process method for the back orders processing
     /// </summary>
     /// <param name = "_contract">The data contract object</param>
     public void processOperation(METBackOrderProcessingDataContract _contract)
     {
+        utcdatetime currentDateTime = DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::getSystemDateTime(), DateTimeUtil::getUserPreferredTimezone());
+        
+        date startDate;
+        date endDate =  DateTimeUtil::date(currentDateTime);
+        int totalDays;
+
+        Query query = _contract.getQuery();
+        
+        QueryBuildDataSource qbdsPurchTable = query.dataSourceTable(tableNum(InventSite)).addDataSource(tableNum(PurchTable));
+        qbdsPurchTable.relations(true);
+        qbdsPurchTable.joinMode(JoinMode::InnerJoin);
+        qbdsPurchTable.addRange(fieldNum(PurchTable, PurchStatus)).value(queryValue(PurchStatus::Backorder));
+       
+        qbdsPurchTable.addRange(fieldNum(PurchTable, InventLocationId)).value(SysQuery::valueNotEmptyString());
+        qbdsPurchTable.addRange(fieldNum(PurchTable, InventSiteId)).value(SysQuery::valueNotEmptyString());
+
+        QueryBuildDataSource qbdsMetPurchTable = qbdsPurchTable.addDataSource(tableNum(MetPurchTable));
+        qbdsMetPurchTable.relations(true);
+        qbdsMetPurchTable.joinMode(JoinMode::InnerJoin);
+        
+        QueryRun queryRun = new QueryRun(query);
+
+        while (queryRun.next())
+        {
+            InventSite inventSite = queryRun.get(tableNum(InventSite));
+            PurchTable purchTable = queryRun.get(tableNum(PurchTable));
+            METPurchTable metPurchTable = queryRun.get(tableNum(MetPurchTable));
+            
+            VendPackingSlipJour vendPackingSlipJour;
+
+            select maxOf(DeliveryDate) from vendPackingSlipJour
+                where vendPackingSlipJour.PurchId == purchTable.PurchId;
+            
+            if (metPurchTable.POBackOrderSetting == noyes::Yes)
+            {
+                startDate = vendPackingSlipJour.DeliveryDate;
+                totalDays = endDate - startDate; //Calculate number of days from today to last posted product receipt including weekends.
+                
+                if (totalDays > inventSite.METPOBackOrderBatchJobDays)
+                {
+                    if (vendPackingSlipJour.DeliveryDate != DateTimeUtil::date(DateTimeUtil::minValue()))
+                    {
+                        this.getPurchOrderLinesAndupdateDeliveryRemainder(purchTable.PurchId);
+                    }
+                    else
+                    {
+                        PurchCancel purchCancel = PurchCancel::METConstruct();
+                        purchCancel.parmMetPurchTable(purchTable);
+                        purchCancel.run();
+                    }
+                }
+
+            }
+            else
+            {
+                this.getPurchOrderLinesAndupdateDeliveryRemainder(purchTable.PurchId);
+            }
+        }
+
+        /* CB425 BuyBackOrders -start
         Query query;
         QueryRun queryRun;
         QueryBuildDataSource qbdsPurchTable;
@@ -133,13 +194,15 @@ class METBackOrderProcessingService extends SysOperationServiceBase
                 }
             }            
         }
+        CB425 BuyBackOrders -end */
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>confirmPO</Name>
+				<Name>getPurchOrderLinesAndupdateDeliveryRemainder</Name>
 				<Source><![CDATA[
+    /* CB425 BuyBackOrders -start
     /// <summary>
     /// Confirms the Purchase Order
     /// </summary>
@@ -164,6 +227,61 @@ class METBackOrderProcessingService extends SysOperationServiceBase
             && _purchTable.ChangeRequestRequired)
         {
             versioningPurchaseOrder.confirm();
+        }
+    }
+    CB425 BuyBackOrders -end */
+
+    /// CB425 BuyBackOrders
+    /// <summary>
+    /// Get purch order lines and update delivery remainder for purch order lines
+    /// </summary>
+    /// <param name = "_purchId">Purch id</param>
+    private void getPurchOrderLinesAndupdateDeliveryRemainder(PurchId _purchId)
+    {
+        #OCCRetryCount
+
+        try
+        {
+            PurchLine purchLine;
+
+            ttsbegin;
+            while select forupdate purchLine
+                where purchLine.PurchId == _purchId
+                && purchLine.PurchStatus == PurchStatus::Backorder
+                && purchLine.IsDeleted == NoYes::No
+            {
+                purchLine.reread();
+                purchLine.RemainInventPhysical = 0;
+                purchLine.RemainPurchPhysical = 0;
+                purchLine.Update();
+            }
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Error)
+        {
+            throw error("@SYS93835");
         }
     }
 
