@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METExciseLodgementUpdateService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// CB521_ExciseRegister 
+/// Service class for excise lodgement number update with multithread
+/// </summary>
+class METExciseLodgementUpdateService extends SysOperationServiceBase
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process method to initiate the multi thread for business logic
+    /// </summary>
+    /// <param name = "_contract">Contract class reference</param>
+    public void process(METExciseLodgementUpdateContract     _contract)
+    {
+        BatchHeader                     batchHeader;
+        SysOperationServiceController   runTaskController;
+        METExciseInformationTable       metExciseInformationTable;
+        METExciseRegisterOriginTypes    metExciseRegisterOriginTypes;
+        METExciseLodgementUpdateContract     contract;
+
+        while select InventTransType, ItemId, SiteId from metExciseInformationTable
+            group by ItemId, SiteId, InventTransType
+                where metExciseInformationTable.Lodgement == ''
+            exists join metExciseRegisterOriginTypes
+                where metExciseRegisterOriginTypes.ReferenceId == metExciseInformationTable.InventTransType &&
+                        metExciseRegisterOriginTypes.UpdateLodgement == NoYes::Yes
+        {
+            if (this.isExecutingInBatch())
+            {
+                runTaskController = new SysOperationServiceController(classStr(METExciseLodgementUpdateService), methodStr(METExciseLodgementUpdateService, runExciseLodgementUpdate));
+            
+                contract = runTaskController.getDataContractObject('_contract');
+
+                if (!batchHeader)
+                {
+                    batchHeader = this.getCurrentBatchHeader();
+                }
+
+                contract.parmReferenceId(metExciseInformationTable.InventTransType);
+                contract.parmItemId(metExciseInformationTable.ItemId);
+                contract.parmSiteId(metExciseInformationTable.SiteId);
+
+                batchHeader.addRuntimeTask(runTaskController, this.getCurrentBatchTask().RecId);
+            }
+            else
+            {
+                contract = new METExciseLodgementUpdateContract();
+
+                contract.parmReferenceId(metExciseInformationTable.InventTransType);
+                contract.parmItemId(metExciseInformationTable.ItemId);
+                contract.parmSiteId(metExciseInformationTable.SiteId);
+
+                this.runExciseLodgementUpdate(contract);
+            }
+        }
+
+        if (batchHeader)
+        {
+            batchHeader.save();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runExciseLodgementUpdate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to use to update the lodgement number on Excise information tabel
+    /// </summary>
+    /// <param name = "_contract">Contract class</param>
+    public void runExciseLodgementUpdate(METExciseLodgementUpdateContract     _contract)
+    {
+        METExciseInformationTable       metExciseInformationTablePO;
+        METExciseInformationTable       metExciseInformationTable;
+        METAvailableQty                 purchAvailableQty;
+        METAvailableQty                 purchAvailableQtyOrig;
+        METLodgement                    metLodgement;
+
+        while select forupdate metExciseInformationTable
+            where metExciseInformationTable.InventTransType == _contract.parmReferenceId()  &&
+                metExciseInformationTable.ItemId == _contract.parmItemId()      &&
+                metExciseInformationTable.SiteId == _contract.parmSiteId()      &&
+                metExciseInformationTable.Lodgement == ''
+        {
+            if (metExciseInformationTable.InventTransType == InventTransType::InventCounting)
+            {
+                if (InventJournalTrans::findInventTransId(metExciseInformationTable.InventTransId).CountingReasonCode == VendParameters::find().METExciseRegisterExemptReasonCode)
+                {
+                    //Skipping transaction if reason code for counting journal matches with the parameter
+                    continue;
+                }
+            }
+
+            try
+            {
+                ttsbegin;
+
+                container                       lodgementQtyCon;
+
+                select forupdate metExciseInformationTablePO
+                    order by CreatedDateTime
+                        where metExciseInformationTablePO.InventTransType == InventTransType::Purch      &&
+                            metExciseInformationTablePO.ItemId == metExciseInformationTable.ItemId       &&
+                            metExciseInformationTablePO.SiteId == metExciseInformationTable.SiteId       &&
+                            metExciseInformationTablePO.LodgementClosed == NoYes::No;
+
+                if (metExciseInformationTablePO.RecId != 0)
+                {
+                    purchAvailableQty  =  metExciseInformationTablePO.AvailableQty -  abs(metExciseInformationTable.InventoryQty);
+                    metLodgement = metExciseInformationTablePO.Lodgement;
+
+                    if (purchAvailableQty > 0)
+                    {
+                        lodgementQtyCon += [metExciseInformationTablePO.Lodgement, abs(metExciseInformationTable.InventoryQty)];
+
+                        metExciseInformationTablePO.AvailableQty = purchAvailableQty;
+                        metExciseInformationTablePO.update();
+
+                        metExciseInformationTable.Lodgement = metExciseInformationTablePO.Lodgement;
+                        metExciseInformationTable.LodgementAndQtyCon = lodgementQtyCon;
+                        metExciseInformationTable.update();
+                    }
+                    else
+                    {
+                        lodgementQtyCon += [metExciseInformationTablePO.Lodgement, abs(metExciseInformationTablePO.AvailableQty)];
+
+                        metExciseInformationTablePO.AvailableQty = 0;
+                        metExciseInformationTablePO.LodgementClosed = NoYes::Yes;
+                        metExciseInformationTablePO.update();
+
+                        do
+                        {
+                            next metExciseInformationTablePO;
+
+                            if (metExciseInformationTablePO.RecId == 0)
+                            {
+                                Error(strFmt("@MET:LodgementValidation", metExciseInformationTable.ItemId, metExciseInformationTable.SiteId));
+                                break;
+                            }
+                            purchAvailableQtyOrig = abs(purchAvailableQty);
+                            purchAvailableQty  =  metExciseInformationTablePO.AvailableQty - abs(purchAvailableQty);
+
+                            metLodgement = metLodgement + ','+  metExciseInformationTablePO.Lodgement;
+
+                            if (purchAvailableQty > 0)
+                            {
+                                lodgementQtyCon += [metExciseInformationTablePO.Lodgement, purchAvailableQtyOrig];
+
+                                metExciseInformationTablePO.AvailableQty = purchAvailableQty;
+                                metExciseInformationTablePO.update();
+
+                                break;
+                            }
+                            else
+                            {
+                                lodgementQtyCon += [metExciseInformationTablePO.Lodgement, metExciseInformationTablePO.AvailableQty];
+
+                                metExciseInformationTablePO.AvailableQty = 0;
+                                metExciseInformationTablePO.LodgementClosed = NoYes::Yes;
+                                metExciseInformationTablePO.update();
+                            }
+                        }
+                        while (purchAvailableQty < 0);
+
+                        metExciseInformationTable.Lodgement = metLodgement;
+                        metExciseInformationTable.LodgementAndQtyCon = lodgementQtyCon;
+                        metExciseInformationTable.update();
+                    }
+
+                    info(strFmt("@MET:LodgmentUpdate", metExciseInformationTable.ItemId, metExciseInformationTable.SiteId));
+                }
+                else
+                {
+                    Error(strFmt("@MET:LodgementValidation", metExciseInformationTable.ItemId, metExciseInformationTable.SiteId));
+                }
+                ttscommit;
+            }
+            catch
+            {
+                exceptionTextFallThrough();
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
