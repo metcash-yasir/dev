@@ -120,6 +120,31 @@ final class METPurchPurchaseOrderHeaderV2Entity_Extension
                 PurchPurchaseOrderLineV2Entity::postTargetProcess(locDefinitionGroupExecution);
             }
         }
+       
+        if (_dmfDefinitionGroupExecution.StagingStatus == DMFBatchJobStatus::Finished)  //CB711 - Submit to workflow once all process is completed
+        {
+            PurchPurchaseOrderHeaderV2Staging   purchPurchaseOrderHeaderV2Staging;
+            dmfEntity.clear();
+            dmfParentEntity.clear();
+
+            select firstonly RecId from dmfEntity
+                where dmfEntity.EntityName == _dmfDefinitionGroupExecution.Entity
+            join RecId from dmfParentEntity
+                where dmfParentEntity.EntityName == dmfEntity.ParentEntityName
+                   && dmfParentEntity.EntityType == DMFEntityTypes::CompositEntity;
+
+            if (dmfEntity.RecId) //Execute only for composite entities
+            {
+                while select PurchaseOrderNumber
+                from purchPurchaseOrderHeaderV2Staging
+                    where purchPurchaseOrderHeaderV2Staging.DefinitionGroup == _dmfDefinitionGroupExecution.DefinitionGroup
+                    && purchPurchaseOrderHeaderV2Staging.ExecutionId == _dmfDefinitionGroupExecution.ExecutionId
+                    && purchPurchaseOrderHeaderV2Staging.TransferStatus == DMFTransferStatus::Completed
+                {
+                    PurchPurchaseOrderHeaderV2Entity::metSubmitToWorkflow(purchPurchaseOrderHeaderV2Staging);
+                }
+            }
+        }
     }
 
 ]]></Source>
@@ -341,6 +366,142 @@ final class METPurchPurchaseOrderHeaderV2Entity_Extension
         }
 
         next mapEntityToDataSource(_entityCtx, _dataSourceCtx);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postGetStagingData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method get called before data import and here we have added code to request change
+    /// </summary>
+    /// <param name = "_dmfDefinitionGroupExecution">Type DMFDefinitionGroupExecution</param>
+    public static void postGetStagingData(DMFDefinitionGroupExecution _dmfDefinitionGroupExecution)
+    {
+        PurchPurchaseOrderHeaderV2Staging   purchPurchaseOrderHeaderV2Staging;
+        DMFEntity                           dmfEntity, dmfParentEntity;
+
+        select firstonly RecId from dmfEntity
+                where dmfEntity.EntityName == _dmfDefinitionGroupExecution.Entity
+            join RecId from dmfParentEntity
+                where dmfParentEntity.EntityName == dmfEntity.ParentEntityName
+                   && dmfParentEntity.EntityType == DMFEntityTypes::CompositEntity;
+
+
+        if (dmfEntity.RecId) //Execute only for composite entities
+        {            
+            while select PurchaseOrderNumber 
+                from purchPurchaseOrderHeaderV2Staging
+            where purchPurchaseOrderHeaderV2Staging.DefinitionGroup == _dmfDefinitionGroupExecution.DefinitionGroup
+             && purchPurchaseOrderHeaderV2Staging.ExecutionId == _dmfDefinitionGroupExecution.ExecutionId
+             && purchPurchaseOrderHeaderV2Staging.TransferStatus == DMFTransferStatus::NotStarted
+            {               
+                PurchPurchaseOrderHeaderV2Entity::metRequestChange(purchPurchaseOrderHeaderV2Staging);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metRequestChange</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PO request change if change management is enabled
+    /// </summary>
+    /// <param name = "_purchPurchaseOrderHeaderV2Staging">PurchPurchaseOrderHeaderV2Staging table</param>
+    public static void metRequestChange(PurchPurchaseOrderHeaderV2Staging _purchPurchaseOrderHeaderV2Staging)
+    {
+        #OCCRetryCount
+        PurchTable  purchTable;
+
+        try
+        {
+            purchTable = PurchTable::find(_purchPurchaseOrderHeaderV2Staging.PurchaseOrderNumber, true);
+
+            if (purchTable)
+            {
+                METVersioningPurchaseOrder  versioningPurchaseOrder;
+
+                versioningPurchaseOrder = METVersioningPurchaseOrder::newPurchaseOrder(purchTable);
+                if (versioningPurchaseOrder.canChangeBeRequested())
+                {
+                    versioningPurchaseOrder.createChangeRequest();
+                }
+                
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            // retry on deadlock
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            // try to resolve update conflict
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::UpdateConflictNotRecovered;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch(Exception::Error)
+        {
+            error(strFmt("@MET:PORequestChangeFailed", purchTable.PurchId));
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metSubmitToWorkflow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Submit PO workflow if change management is enabled
+    /// </summary>
+    /// <param name = "_purchPurchaseOrderHeaderV2Staging">PurchPurchaseOrderHeaderV2Staging table</param>
+    public static void metSubmitToWorkflow(PurchPurchaseOrderHeaderV2Staging _purchPurchaseOrderHeaderV2Staging)
+    {        
+        str			                comment;
+        PurchTable                  purchTable;        
+
+        purchTable = PurchTable::find(_purchPurchaseOrderHeaderV2Staging.PurchaseOrderNumber, true);
+        
+
+        if (purchTable.DocumentState == VersioningDocumentState::Draft && purchTable.ChangeRequestRequired)
+        {
+            comment = strFmt("@MET:POWorkFlowSubmittedFromCompositeDE", purchTable.PurchId);
+
+            if (purchTable.checkFullyDistributedAndQualified())
+            {
+                try
+                {
+                    ttsbegin;
+                    purchTable.selectForUpdate(true);
+                    purchTable.submitToWorkflow(workflowTypeStr(PurchTableTemplate), comment, false);
+                    ttscommit;
+
+                    if (purchTable.DocumentState == VersioningDocumentState::InReview)
+                    {
+                        info(strFmt("@MET:POWorkflowSubmitted", purchTable.PurchId));
+                    }
+                }
+                catch (Exception::CLRError)
+                {
+                    System.Exception interopException = CLRInterop::getLastException();
+                    error(strFmt("%1", interopException));
+                }
+                catch (Exception::Error)
+                {                   
+                    error(strFmt("@MET:POWorkFlowSubmissionFailed", purchTable.PurchId));
+                }
+            }
+        }
     }
 
 ]]></Source>
