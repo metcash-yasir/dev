@@ -1,0 +1,383 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METVendorChangeRequestService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// This is a service class which process the business logic for the vendor change request.
+/// </summary>
+class METVendorChangeRequestService
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This process method initiates the business flow orchestration for vendor change requests.
+    /// </summary>
+    /// <param name = "_data">Contract parameters.</param>
+    public void processOperation(METVendorChangeRequestContract _data)
+    {
+        #OCCRetryCount
+        System.Exception netExcepn;
+
+        try
+        {
+            METVendorChangeRequest metVendorChangeRequest;
+            InventSiteId inventSiteId;
+            inventSiteId = _data.parmInventSiteId();
+
+            while select metVendorChangeRequest
+                where metVendorChangeRequest.Status != METVendChangeReqStatus::Completed
+            {
+                if (!inventSiteId || (inventSiteId && (metVendorChangeRequest.SiteId == inventSiteId)))
+                {
+                    ttsbegin;
+                    this.validateVendorChangeRequests(metVendorChangeRequest);
+                    ttscommit;
+                }
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            netExcepn = CLRInterop::getLastException();
+            throw error(netExcepn.ToString());
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch
+        {
+            throw error("@MET:UnhandledError");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateVendorChangeRequests</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// All validations related to the vendor change requests perform here.
+    /// </summary>
+    /// <param name = "_metVendorChangeRequest">metVendorChangeRequest</param>
+    /// <returns>The error log is updated and the status is changed to error if any validation fails.</returns>
+    private boolean validateVendorChangeRequests(METVendorChangeRequest _metVendorChangeRequest)
+    {
+        const str intercomp = "Intercomp";
+        boolean ret = true;
+
+        _metVendorChangeRequest.ChangeRequestLog = '';
+
+        if (DateTimeUtil::utcNow() < _metVendorChangeRequest.ChangeRequestEffectiveDate)
+        {
+            ReqItemTable reqItemTable;
+            InventDim inventDim;
+
+            select firstonly ReqPOType, VendId, RecId from reqItemTable
+                exists join inventDim
+                where inventDim.inventDimId == reqItemTable.CovInventDimId
+                    && reqItemTable.ItemId == _metVendorChangeRequest.ItemId
+                    && inventDim.InventLocationId == _metVendorChangeRequest.InventLocationId
+                && inventDim.InventSiteId == _metVendorChangeRequest.SiteId;
+
+            if (reqItemTable.RecId && reqItemTable.ReqPOType == ReqPOType::Purch &&
+                VendGroup::find(VendTable::find(reqItemTable.VendId).VendGroup).VendGroup != intercomp)
+            {
+                ret = this.validateVendorChangeRequest(_metVendorChangeRequest, reqItemTable);
+               
+                METInventItemOrderSetup metInventItemOrderSetup = METInventItemOrderSetup::findByItemAndSite(_metVendorChangeRequest.ItemId, _metVendorChangeRequest.SiteId);
+                 
+                if (metInventItemOrderSetup.SubrangeId && ret)
+                {
+                    METInventItemOrderSetup metInventItemOrderSetupSubRange;
+
+                    while select ItemId from metInventItemOrderSetupSubRange
+                        where metInventItemOrderSetupSubRange.SubrangeId == metInventItemOrderSetup.SubrangeId
+                    {
+                        ret = this.validateVendorChangeRequest(_metVendorChangeRequest, reqItemTable, metInventItemOrderSetupSubRange.ItemId);
+                    }
+                }
+
+                METSalesItemSubstitutionParentChild child;
+                METSalesItemSubstitutionParentChild parent;
+
+                select firstonly ParentItemID from child
+                    where child.InventSiteId == _metVendorChangeRequest.SiteId
+                    && child.ChildItemID == _metVendorChangeRequest.ItemId;
+
+                if (child.ParentItemID)
+                {
+                    while select  ChildItemID from parent
+                        where parent.ParentItemID == child.ParentItemID
+                    {
+                        this.processNoErrorRecords(_metVendorChangeRequest, reqItemTable, parent.ChildItemID);
+                        this.updateVendorChangeRequestStatus(_metVendorChangeRequest);
+                    }
+                }
+
+                if (ret)
+                {
+                    this.processNoErrorRecords(_metVendorChangeRequest, reqItemTable);
+                    this.updateVendorChangeRequestStatus(_metVendorChangeRequest);
+                }
+            }
+            else if (reqItemTable.RecId && reqItemTable.ReqPOType == ReqPOType::Purch &&
+                VendGroup::find(VendTable::find(reqItemTable.VendId).VendGroup).VendGroup == intercomp)
+            {
+                ReqItemTable reqItemTableTransfer;
+
+                select firstonly RecId from reqItemTableTransfer
+                    exists join inventDim
+                    where inventDim.inventDimId == reqItemTableTransfer.CovInventDimId
+                        && reqItemTableTransfer.ItemId == _metVendorChangeRequest.ItemId
+                        && inventDim.InventSiteId == _metVendorChangeRequest.SiteId
+                        && reqItemTableTransfer.InventLocationIdReqMain == _metVendorChangeRequest.InventLocationId
+                    && reqItemTableTransfer.ReqPOType == ReqPOType::Transfer;
+
+                if (reqItemTableTransfer.RecId)
+                {
+                    this.clearPendingVendorAccountFields(reqItemTable.RecId);
+                }
+            }
+            else if (reqItemTable.ReqPOType == ReqPOType::Transfer)
+            {
+                ReqItemTable reqItemTablePurch;
+
+                while select ReqPOType, VendId, RecId from reqItemTablePurch
+                    exists join inventDim
+                    where inventDim.inventDimId == reqItemTablePurch.CovInventDimId
+                        && reqItemTablePurch.ItemId == _metVendorChangeRequest.ItemId
+                        && inventDim.InventSiteId == _metVendorChangeRequest.SiteId
+                        && reqItemTablePurch.InventLocationIdReqMain == _metVendorChangeRequest.InventLocationId
+                        && reqItemTablePurch.ReqPOType == ReqPOType::Purch
+                {
+                    if (reqItemTablePurch.RecId)
+                    {
+                        this.processNoErrorRecords(_metVendorChangeRequest, reqItemTablePurch);
+                        this.clearPendingVendorAccountFields(reqItemTable.RecId);
+                        this.updateVendorChangeRequestStatus(_metVendorChangeRequest);
+                    }
+                    else
+                    {
+                        _metVendorChangeRequest.selectForUpdate(true);
+                        _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
+                        _metVendorChangeRequest.ChangeRequestLog += "@MET:TransferOrderError";
+                        _metVendorChangeRequest.update();
+                        ret = false;
+                    }
+                }
+            }
+            else if (!reqItemTable.RecId)
+            {
+                _metVendorChangeRequest.selectForUpdate(true);
+                _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
+                _metVendorChangeRequest.ChangeRequestLog += "@MET:NoItemCoverageError";
+                _metVendorChangeRequest.update();
+                ret = false;
+            }
+        }
+        else
+        {
+            _metVendorChangeRequest.selectForUpdate(true);
+            _metVendorChangeRequest.Status = METVendChangeReqStatus::Waiting;
+            _metVendorChangeRequest.update();
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processNoErrorRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This is where all successfully completed records are processed.
+    /// </summary>
+    /// <param name = "_metVendorChangeRequest">METVendorChangeRequest buffer</param>
+    /// <param name = "_reqItemTable">ReqItemTable buffer</param>
+    /// <param name = "_itemId">Item number</param>
+    private void processNoErrorRecords(MetVendorChangeRequest _metVendorChangeRequest, ReqItemTable _reqItemTable, ItemId _itemId = '')
+    {
+        ItemId itemId;
+
+        if (!_itemId)
+        {
+            itemId = _metVendorChangeRequest.ItemId;
+        }
+
+        // Update the item coverage vendor with the pending vendor number.
+        VendAccount vendAccount = _reqItemTable.VendId;
+        VendAccount pendingVendAccount = METReqItemTable::find(_reqItemTable.RecId).PendingVendAccountNumber;
+        _reqItemTable.reread();
+        _reqItemTable.selectForUpdate(true);
+        _reqItemTable.VendId = pendingVendAccount;
+        _reqItemTable.update();
+
+        // Clear the pending vendor number and date.
+        this.clearPendingVendorAccountFields(_reqItemTable.RecId);
+
+        // Pricelist of vendor to close
+        GUPVendPriceAdmTable gupVendPriceAdmTable;
+        GUPVendPriceAdmTrans gupVendPriceAdmTrans;
+
+        while select forupdate gupVendPriceAdmTrans
+            exists join gupVendPriceAdmTable
+            where gupVendPriceAdmTable.JournalNum == gupVendPriceAdmTrans.JournalNum
+            && gupVendPriceAdmTable.InventSiteId == _metVendorChangeRequest.SiteId
+            && gupVendPriceAdmTable.AccountRelation == vendAccount
+            && gupVendPriceAdmTrans.ItemNum == itemId
+        {
+            gupVendPriceAdmTrans.ToDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+            gupVendPriceAdmTrans.update();
+        }
+
+        // Vendor Price term agreements to close.
+        GUPPriceTermJournalTable gupPriceTermJournalTable;
+        GUPPriceTermJournalTrans gupPriceTermJournalTrans;
+
+        while select forupdate gupPriceTermJournalTrans
+            exists join gupPriceTermJournalTable
+           where gupPriceTermJournalTable.AgreementId == gupPriceTermJournalTrans.AgreementId
+            && gupPriceTermJournalTable.InventSiteId == _metVendorChangeRequest.SiteId
+            && gupPriceTermJournalTable.AccountRelation == vendAccount
+        {
+            str priceDetails = gupPriceTermJournalTrans.displayPricingAttributeDescription();
+
+            if (strScan(priceDetails, itemId, 1, strLen(priceDetails)))
+            {
+                gupPriceTermJournalTrans.ValidTo = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+                gupPriceTermJournalTrans.update();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateVendorChangeRequest</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validated the vendor change request and update change request log.
+    /// </summary>
+    /// <param name = "_metVendorChangeRequest">_metVendorChangeRequest</param>
+    /// <param name = "_reqItemTable">_reqItemTable</param>
+    /// <param name = "_itemId">_itemId</param>
+    /// <returns>A boolean value based on success true, Otherwise false</returns>
+    private boolean validateVendorChangeRequest(METVendorChangeRequest _metVendorChangeRequest, ReqItemTable _reqItemTable, ItemId _itemId = '')
+    {
+        boolean ret;
+        PurchLine purchLine;
+        InventDim inventDimLoc;
+        ItemId itemId;
+
+        if (!_itemId)
+        {
+            itemId = _metVendorChangeRequest.ItemId;
+        }
+
+        select firstonly RecId from purchLine
+        exists join inventDimLoc
+            where inventDimLoc.inventDimId == purchLine.InventDimId
+            && purchLine.PurchStatus == PurchStatus::Backorder
+            && purchLine.ItemId == itemId
+            && inventDimLoc.InventLocationId == _metVendorChangeRequest.InventLocationId
+            && inventDimLoc.InventSiteId == _metVendorChangeRequest.SiteId;
+
+        if (purchLine.RecId)
+        {
+            _metVendorChangeRequest.selectForUpdate(true);
+            _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
+            _metVendorChangeRequest.ChangeRequestLog = "@MET:ErrorOpenPO";
+            _metVendorChangeRequest.update();
+            ret = false;
+        }
+
+        METReqItemTable metReqItemTable = METReqItemTable::find(_reqItemTable.RecId);
+
+        if (!metReqItemTable.PendingVendAccountNumber && !metReqItemTable.PendingVendChangeDate)
+        {
+            _metVendorChangeRequest.selectForUpdate(true);
+            _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
+            _metVendorChangeRequest.ChangeRequestLog += "@MET:ErrorPendingVendorMiss";
+            _metVendorChangeRequest.update();
+            ret = false;
+        }
+
+        METInventItemOrderSetup metInventItemOrderSetup = METInventItemOrderSetup::findByItemAndSite(itemId, _metVendorChangeRequest.SiteId);
+
+        if (metInventItemOrderSetup.TempItemPackChg)
+        {
+            _metVendorChangeRequest.selectForUpdate(true);
+            _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
+            _metVendorChangeRequest.ChangeRequestLog += "@MET:ErrorPendingPackChanges";
+            _metVendorChangeRequest.update();
+            ret = false;
+        }
+                 
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateVendorChangeRequestStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the vendor change requesty status to completed.
+    /// </summary>
+    /// <param name = "_metVendorChangeRequest">_metVendorChangeRequest</param>
+    private void updateVendorChangeRequestStatus(MetVendorChangeRequest _metVendorChangeRequest)
+    {
+        // Update the record status
+        _metVendorChangeRequest.selectForUpdate(true);
+        _metVendorChangeRequest.Status = METVendChangeReqStatus::Completed;
+        _metVendorChangeRequest.ChangeRequestLog = strFmt("@MET:VendorUpdateSuccess", DateTimeUtil::utcNow());
+        _metVendorChangeRequest.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearPendingVendorAccountFields</Name>
+				<Source><![CDATA[
+   /// <summary>
+   /// Clears the pending vendor account fields.
+   /// </summary>
+   /// <param name = "_refRecid">Item coverage record id</param>
+    private void clearPendingVendorAccountFields(RefRecId _refRecid)
+    {
+        // Clear the pending vendor number and date.
+        METReqItemTable metReqItemTable = METReqItemTable::find(_refRecid, true);
+        metReqItemTable.PendingVendAccountNumber = '';
+        metReqItemTable.PendingVendChangeDate = utcdatetimenull();
+        metReqItemTable.update();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
