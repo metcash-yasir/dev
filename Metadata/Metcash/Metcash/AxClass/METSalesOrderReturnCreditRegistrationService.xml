@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesOrderReturnCreditRegistrationService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The service class for Return order regisration
+/// </summary>
+class METSalesOrderReturnCreditRegistrationService extends SysOperationServiceBase
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>returnOrderRegister</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Return order register
+    /// </summary>
+    /// <param name="returnOrderRegistrationContract">
+    /// The contract instance
+    /// </param>
+    /// <returns>
+    /// The response <c>METSalesOrderReturnCreditRegistrationResponseContract</c>
+    /// </returns>
+    //[AifCollectionType('returnOrderRegistrationContract', Types::Class, classStr(METSalesOrderReturnCreditRegistrationContract))]
+    public METSalesOrderReturnCreditRegistrationResponseContract returnOrderRegister(METSalesOrderReturnCreditRegistrationContract returnOrderRegistrationContract)
+    {
+        METProcessingStatus result;
+        Description255      message = "@MET:NoRecordsUpdated"; //default message
+
+        [result, message] = this.processReturnOrderRegister(returnOrderRegistrationContract);
+        
+        return METSalesOrderReturnCreditRegistrationResponseContract::newFromParameters(result, message);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processReturnOrderRegister</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the registration of return order lines
+    /// </summary>
+    /// <param name="_returnOrderRegistrationContract">List of contracts</param>
+    /// <returns>Container of Results</returns>
+    public container processReturnOrderRegister(METSalesOrderReturnCreditRegistrationContract _returnOrderRegistrationContract)
+    {
+        METProcessingStatus result;
+        Description255      message = "@MET:NoRecordsUpdated";
+        
+        DataAreaId          dataAreaId;
+        container           resultCon;
+
+        try
+        {
+            dataAreaId = _returnOrderRegistrationContract.parmDataAreaId();
+
+            changecompany(dataAreaId)
+            {
+                resultCon = this.returnOrderLineRegister(_returnOrderRegistrationContract);
+
+                result = conPeek(resultCon, 1);
+                message = conPeek(resultCon, 2);
+            } 
+        }
+        catch
+        {
+            result = METProcessingStatus::Error;
+            message = "@MET:ReturnOrderNotRegistered";
+        }
+        
+        return [result, message];
+       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>returnOrderLineRegister</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Register return order lines
+    /// </summary>
+    /// <param name = "_metSalesOrderReturnCreditRegistrationContract">Contract class reference</param>
+    /// <returns>Container</returns>
+    public container returnOrderLineRegister(metSalesOrderReturnCreditRegistrationContract _metSalesOrderReturnCreditRegistrationContract)
+    {
+        SalesTable                              salesTable;
+        inventTrans                             inventTrans;
+        inventTransOrigin                       inventTransOrigin;
+        TradeOrderLineRegister                  tradeOrderlineRegister;
+        SalesReturnOrderLineRegister            salesReturnOrderLineRegister;
+        InventTransWMS_Register                 inventTransWMS_register;
+        TmpInventTransWMS                       TmpInventTransWMS;
+        SalesLine                               salesLineReg;
+        Args                                    args = new Args();
+        SalesReturnItemNum                      rmaNumber;
+        LineNum                                 lineNumber;
+        ReturnDispositionCodeId                 dispositionCodeId;
+        METProcessingStatus                     result;
+        Description255                          messageLoc;
+
+        rmaNumber = _metSalesOrderReturnCreditRegistrationContract.parmRMANumber();
+        lineNumber = _metSalesOrderReturnCreditRegistrationContract.parmLineNumber();
+        dispositionCodeId = METCustParameters::Find().DispositionCodeRegistration;
+
+        if (dispositionCodeId == '')
+        {
+            result      = METProcessingStatus::Error;
+            messageLoc  = "@MET:DispositionCodeNotConfigured";
+ 
+            return [result, messageLoc];
+        }
+
+        ttsBegin;
+        
+        select firstonly salesTable where salesTable.ReturnItemNum == rmaNumber; // Not using field list because using same buffer in Business event. 
+
+        salesLineReg = SalesLine::find(salesTable.SalesId, lineNumber);
+
+        if (salesLineReg.RecId != 0 && salesLineReg.ReturnStatus == ReturnStatusLine::Awaiting)
+        {
+            args.record(salesLineReg);
+
+            tradeOrderLineRegister = SalesReturnOrderLineRegister::construct();
+            tradeOrderLineRegister.parmArgs(args);
+            tradeOrderLineRegister.init();
+            salesReturnOrderLineRegister = tradeOrderLineRegister;
+            salesReturnOrderLineRegister.runPreSuper();
+
+            //update returnDisposioncode
+            salesLineReg.ReturnDispositionCodeId = dispositionCodeId;
+            salesLineReg.update();
+
+            select firstOnly crossCompany inventTrans
+                join RecId, InventTransId from inventTransOrigin
+                    where inventTransOrigin.InventTransId == salesLineReg.InventTransId
+                    && inventTrans.InventTransOrigin == inventTransOrigin.RecId;
+
+            inventTransWMS_register = inventTransWMS_register::newStandard(tmpInventTransWMS);
+            tmpInventTransWMS.clear();
+            tmpInventTransWMS.initFromInventTrans(inventTrans);
+            tmpInventTransWMS.InventDimId = inventTrans.InventDimId;
+            tmpInventTransWMS.insert();
+            inventTransWMS_register.writeTmpInventTransWMS(tmpInventTransWMS,
+                                                        inventTrans,
+                                                        inventTrans.inventDim());
+            inventTransWMS_register.updateInvent(salesLineReg);
+
+            select firstonly RecId from salesLineReg
+                where salesLineReg.SalesId == salesTable.SalesId    &&
+                    salesLineReg.ReturnStatus != ReturnStatusLine::Registered;
+
+            if (salesLineReg.RecId == 0) // All lines are registered for the RMA
+            {
+                METSOReturnAndClaimsBusinessEvent::newFromSalesTable(salesTable).send();
+            }
+
+            result = METProcessingStatus::Success;
+            messageLoc = "@MET:ReturnLineRegistered";
+        }
+        else
+        {
+            result = METProcessingStatus::Error;
+            messageLoc = "@MET:ReturnOrderLineNotExists";
+        }
+        ttsCommit;
+
+        return [result, messageLoc];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct method to create new instance
+    /// </summary>
+    /// <returns>METPurchaseOrderReceiptService</returns>
+    Public static METPurchaseOrderReceiptService construct()
+    {
+        return new METPurchaseOrderReceiptService();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
