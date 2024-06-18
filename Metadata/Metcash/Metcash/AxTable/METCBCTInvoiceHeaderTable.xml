@@ -9,6 +9,29 @@ public class METCBCTInvoiceHeaderTable extends common
 ]]></Declaration>
 		<Methods>
 			<Method>
+				<Name>validateWrite</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate write for METCBCTInvoiceHeaderTable table record
+    /// </summary>
+    /// <returns>true if record is valid for write, otherwise false</returns>
+    public boolean validateWrite()
+    {
+        boolean ret;
+
+        if (!this.Number)
+        {
+            this.Number = NumberSeq::newGetNum(VendParameters::METnumRefCBCTNumber()).num();
+        }
+
+        ret = super();
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>custTable</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -17,7 +40,9 @@ public class METCBCTInvoiceHeaderTable extends common
     /// <returns>CustTable record if found, null otherwise</returns>
     public CustTable custTable()
     {
-        return CustTable::find(this.CustomerAccount);
+        CustTable   custTable;
+        custTable   = CustTable::find(this.CustomerAccount);
+        return custTable;
     }
 
 ]]></Source>
@@ -44,8 +69,7 @@ public class METCBCTInvoiceHeaderTable extends common
     /// </summary>
     public void initValue()
     {
-        // CB411_412_ChargeThrough currency set from vendor, moved to initFromVendTable
-        //this.CurrencyCode = Ledger::accountingCurrency(CompanyInfo::current());
+        this.CurrencyCode = Ledger::accountingCurrency(CompanyInfo::current());
         this.TransactionDate =  DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
         super();
     }
@@ -62,14 +86,11 @@ public class METCBCTInvoiceHeaderTable extends common
         switch (_fieldId)
         {
             case fieldNum(METCBCTInvoiceHeaderTable, CustomerAccount):
-                this.initFromCustTable(this.custTable());
-                this.assignFinancialDimension();
-                this.setDueDates();
-                break;
             case fieldNum(METCBCTInvoiceHeaderTable, VendorAccount):
-                this.initFromVendTable(this.vendTable());
                 this.assignFinancialDimension();
+                this.setTermsOfPayments();
                 this.setDueDates();
+                this.setCashDiscFields();
                 break;
             case fieldNum(METCBCTInvoiceHeaderTable,CustPaymTermId):
             case fieldNum(METCBCTInvoiceHeaderTable,VendPaymTermId):
@@ -94,12 +115,98 @@ public class METCBCTInvoiceHeaderTable extends common
         if (custTable.RecId && vendTable.RecId)
         {
             this.FinancialDimension = DimensionDefaultFacade::serviceMergeDefaultDimensions(vendTable.DefaultDimension,custTable.DefaultDimension);
+            //Merge profit center dimension from the "Charge Through Customer Profit Centre link" table
+            DimensionValue profitCentreValue = this.defaultProfitCentre();
+            if (profitCentreValue)
+            {
+                this.setProfitCentre(this.FinancialDimension,'ProfitCentre',profitCentreValue);
+            }
         }
         else if (custTable.RecId)
         {
             this.FinancialDimension = custTable.DefaultDimension;
         }
        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setTermsOfPayments</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set terms of payment
+    /// </summary>
+    public void setTermsOfPayments()
+    {
+        /*
+        Steps to determine terms of payments
+        1. Find customer classification
+        2. Find vendor classification
+        3. Find term classification based on combination of customer and vendor classification from "METCBCTCustomerProfitCentreLink" table
+        4. Find matching record of term classification + vendor in "Charge through vendor payment link" table
+        5. Default customer and payment termID based on the matched record
+        6. If no matching record found in "Charge through vendor payment link" table then default from customer and vendor master table
+        */
+        if (this.CustomerAccount && this.VendorAccount)
+        {
+            METCBCTClassificationID                 custClassificationID = METCustTable::find(this.CustomerAccount).CBCTClassificationID;
+            METCBCTClassificationID                 vendClassificationID = METVendTable::find(this.VendorAccount).CBCTClassificationID;
+            METCBCTChargethroughVendorPaymentLink   chargethroughVendorPaymentLink;
+            METCBCTCustomerProfitCentreLink         customerProfitCentreLink;
+
+            select firstonly chargethroughVendorPaymentLink
+                where chargethroughVendorPaymentLink.VendAccount == this.VendorAccount
+                join customerProfitCentreLink
+                 where customerProfitCentreLink.TermClassificationID == chargethroughVendorPaymentLink.TermClassificationID
+                && customerProfitCentreLink.CustClassificationID == custClassificationID
+                && customerProfitCentreLink.VendClassificationID == vendClassificationID
+                && customerProfitCentreLink.TermClassificationID;
+
+            this.CustPaymTermId = chargethroughVendorPaymentLink.CustPaymTermId ? chargethroughVendorPaymentLink.CustPaymTermId : CustTable::find(this.CustomerAccount).PaymTermId;
+            this.VendPaymTermId = chargethroughVendorPaymentLink.VendPaymTermId ? chargethroughVendorPaymentLink.VendPaymTermId : VendTable::find(this.VendorAccount).PaymTermId;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setCashDiscFields</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set settlement discount fields
+    /// </summary>
+    public void setCashDiscFields()
+    {
+        /*
+        Steps to determine terms of payments
+        1. Find customer classification
+        2. Find vendor classification
+        3. Find term classification based on combination of customer and vendor classification from "METCBCTCustomerProfitCentreLink" table
+        4. Find matching record of term classification + vendor in "Charge through vendor payment link" table for the latest from date based on document date
+        5. Default customer and payment termID based on the matched record
+        6. If no matching record found in "Charge through vendor payment link" table then default from customer and vendor master table
+        */
+        if (this.CustomerAccount && this.VendorAccount)
+        {
+            METCBCTClassificationID                 custClassificationID = METCustTable::find(this.CustomerAccount).CBCTClassificationID;
+            METCBCTClassificationID                 vendClassificationID = METVendTable::find(this.VendorAccount).CBCTClassificationID;
+            METCBCTChargethroughVendorPaymentLink   chargethroughVendorPaymentLink;
+            METCBCTCustomerProfitCentreLink         customerProfitCentreLink;
+
+            select firstonly chargethroughVendorPaymentLink order by FromDate Desc
+                where chargethroughVendorPaymentLink.VendAccount == this.VendorAccount
+                    && chargethroughVendorPaymentLink.FromDate <= this.DocumentDate
+                    && chargethroughVendorPaymentLink.ToDate >= this.DocumentDate
+                join customerProfitCentreLink
+                    where customerProfitCentreLink.TermClassificationID == chargethroughVendorPaymentLink.TermClassificationID
+                    && customerProfitCentreLink.CustClassificationID == custClassificationID
+                    && customerProfitCentreLink.VendClassificationID == vendClassificationID
+                    && customerProfitCentreLink.TermClassificationID;
+
+            this.CustCashDisc = chargethroughVendorPaymentLink.CustCashDisc ? chargethroughVendorPaymentLink.CustCashDisc : CustTable::find(this.CustomerAccount).CashDisc;
+            this.VendCashDisc = chargethroughVendorPaymentLink.VendCashDisc ?  chargethroughVendorPaymentLink.VendCashDisc : VendTable::find(this.VendorAccount).CashDisc;
+        }
     }
 
 ]]></Source>
@@ -113,27 +220,35 @@ public class METCBCTInvoiceHeaderTable extends common
     /// </summary>
     public void setDueDates()
     {
-        // CB411_412_ChargeThrough
-        METVendParameters metVendParameters = METVendParameters::find();
-        if(metVendParameters)
-        {            
+        METCBCTParameters   metCBCTParameters = METCBCTParameters::Find();
+        if(metCBCTParameters)
+        {
+        
             if (this.CustPaymTermId)
             {
-                switch(metVendParameters.CustDueDateBasis)
+                switch(metCBCTParameters.CustDueDateBasis)
                 {
-                    case METCBCTCustDueDateBasis::TransactionDate :                      
-                        this.CustDueDate = PaymTerm::find(this.CustPaymTermId).due(this.TransactionDate);
+                    case METCBCTCustDueDateBasis::TransactionDate :
+                        this.CustDueDate = PaymTerm::find(this.CustPaymTermId).due(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
                         break;
                     case METCBCTCustDueDateBasis::VendorInvoiceDate :
-                        this.CustDueDate = PaymTerm::find(this.CustPaymTermId).due(this.DocumentDate);
+                        this.CustDueDate = PaymTerm::find(this.CustPaymTermId).due(this.TransactionDate);
                         break;
                 }
             
             }
             if (this.VendPaymTermId)
             {
-                // Always using the TransactionDate
-                this.VendDueDate = PaymTerm::find(this.VendPaymTermId).due(this.TransactionDate);                
+                switch(metCBCTParameters.VendDueDateBasis)
+                {
+                    case METCBCTVendDueDateBasis::TransactionDate :
+                        this.VendDueDate = PaymTerm::find(this.VendPaymTermId).due(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+                        break;
+                    case METCBCTVendDueDateBasis::VendorInvoiceDate :
+                        this.VendDueDate = PaymTerm::find(this.VendPaymTermId).due(this.TransactionDate);
+                        break;
+                }
+                
             }
         }
     }
@@ -141,7 +256,7 @@ public class METCBCTInvoiceHeaderTable extends common
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>setCostCentre</Name>
+				<Name>setProfitCentre</Name>
 				<Source><![CDATA[
     /// <summary>
     /// Set profit centre
@@ -155,7 +270,7 @@ public class METCBCTInvoiceHeaderTable extends common
     ///  <param name = "_dimensionValue">
     /// Dimension value
     /// </param>
-    public void setCostCentre(DimensionDefault _defaultDimension,
+    public void setProfitCentre(DimensionDefault _defaultDimension,
                                 Name             _dimensionName,
                                 DimensionValue   _dimensionValue)
     {
@@ -183,30 +298,38 @@ public class METCBCTInvoiceHeaderTable extends common
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>defaultCostCentre</Name>
+				<Name>defaultProfitCentre</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Defaults cost centre
+    /// Defaults profit center
     /// </summary>
     /// <returns>
-    /// Cost centre dimension value
+    /// Dimension value
     /// </returns>
-    public DimensionValue defaultCostCentre()
+    public DimensionValue defaultProfitCentre()
     {
-        DimensionValue                              costCentreValue;
+        DimensionValue                      profitCentreValue;
+        METCBCTClassificationID             custClassificationID = METCustTable::find(this.CustomerAccount).CBCTClassificationID;
+        METCBCTClassificationID             vendClassificationID = METVendTable::find(this.VendorAccount).CBCTClassificationID;
+        METCBCTCustomerProfitCentreLink     customerProfitCentreLink =  METCBCTCustomerProfitCentreLink::find(custClassificationID,vendClassificationID);
 
-        METCBCTCustomerSiteOffRemitCostCentreLink   customerSiteOffRemitCostCentreLink;
-        InventSiteId                                inventSiteId = CustTable::find(this.CustomerAccount).InventSiteId;
-
-        select firstonly customerSiteOffRemitCostCentreLink 
-                   where customerSiteOffRemitCostCentreLink.InventSiteId == inventSiteId;
-
-        if (customerSiteOffRemitCostCentreLink.RecId)
+        if (customerProfitCentreLink.recId)
         {
-            costCentreValue = customerSiteOffRemitCostCentreLink.CostCentre;
+            profitCentreValue = customerProfitCentreLink.ProfitCentre;
         }
-        
-        return costCentreValue;
+        else
+        {
+            //find from METCBCTCustomerSiteOffRemitProfitCentreLink table
+            METCBCTCustomerSiteOffRemitProfitCentreLink     customerSiteOffRemitProfitCentreLink;
+            InventSiteId                                    inventSiteId = CustTable::find(this.CustomerAccount).InventSiteId;
+
+            select firstonly customerSiteOffRemitProfitCentreLink where customerSiteOffRemitProfitCentreLink.InventSiteId == inventSiteId;
+            if (customerSiteOffRemitProfitCentreLink.RecId)
+            {
+                profitCentreValue = customerSiteOffRemitProfitCentreLink.ProfitCentre;
+            }
+        }
+        return profitCentreValue;
     }
 
 ]]></Source>
@@ -254,8 +377,9 @@ public class METCBCTInvoiceHeaderTable extends common
     /// </returns>
     public boolean validateVendorAccount()
     {
-        METVendTable metVendTable = METVendTable::find(this.VendorAccount);
-        return metVendTable.AllowChargeThrough || metVendTable.AllowCrossDock ? true : checkFailed("@MET:VendorNotPermittedForChargethrough");
+        boolean ret;
+        ret = METVendTable::find(this.VendorAccount).CBCT ? true : checkFailed("@MET:VendorNotPermittedForChargethrough");
+        return ret;
     }
 
 ]]></Source>
@@ -271,8 +395,9 @@ public class METCBCTInvoiceHeaderTable extends common
     /// </returns>
     public boolean validateCustomerAccount()
     {
-        METCustTable metCustTable = METCustTable::find(this.CustomerAccount);
-        return metCustTable.AllowChargeThrough || metCustTable.AllowCrossDock ? true : checkFailed("@MET:CustomerNotValidForChargethrough");
+        boolean ret;
+        ret = METCustTable::find(this.CustomerAccount).CBCTCustomer? true : checkFailed("@MET:CustomerNotValidForChargethrough");
+        return ret;
     }
 
 ]]></Source>
@@ -286,224 +411,17 @@ public class METCBCTInvoiceHeaderTable extends common
     public void insert()
     {
         this.assignFinancialDimension();
+        this.setTermsOfPayments();
         this.setDueDates();
-
+        this.setCashDiscFields();
+        this.setDueDates();
         super();
-
-        this.autoCreateLines();
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>getCustName</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// CB411_412_ChargeThrough moved from form to table
-    /// Display method for customer name
-    /// </summary>
-    /// <returns> Customer name of the customer account linked to invoice header</returns>
-    [SysClientCacheDataMethodAttribute(true)]
-    public display CustName getCustName()
-    {
-        return CustTable::find(this.CustomerAccount).name();   
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>getVendName</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// CB411_412_ChargeThrough moved from form to table
-    /// Get vendor name
-    /// </summary>
-    /// <returns> Vendor name of the vendor account linked to invoice header</returns>
-    [SysClientCacheDataMethodAttribute(true)]
-    public display VendName getVendName()
-    {
-        return VendTable::find(this.VendorAccount).name();
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>initFromCustTable</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// CB411_412_ChargeThrough
-    /// </summary>
-    /// <param name = "_custTable"><c>CustTable</c> record</param>
-    void initFromCustTable(CustTable _custTable)
-    {
-        this.CustPaymTermId = _custTable.PaymTermId;        
-        this.CustCashDisc = _custTable.CashDisc;        
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>initFromVendTable</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// CB411_412_ChargeThrough
-    /// </summary>
-    /// <param name = "_vendTable"><c>VendTable</c> record</param>
-    void initFromVendTable(VendTable _vendTable)
-    {        
-        this.CurrencyCode = _vendTable.Currency;
-        this.VendPaymTermId = _vendTable.PaymTermId;
-        this.VendCashDisc = _vendTable.CashDisc;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>getGSTPercentage</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// CB411_412_ChargeThrough moved from METCBCTInvoiceLinesCreation to table
-    /// Calculate GST percentage
-    /// </summary>
-    /// <returns>
-    /// return real
-    /// </returns>
-    public  Percent getGSTPercentage()
-    {
-        Percent gstPercent;
-        Amount netAmount = this.VendInvoiceAmtInclGST - this.VendInvoiceGSTAmount;
-        if (netAmount)
-        {
-            gstPercent = (this.VendInvoiceGSTAmount / netAmount) * 100;
-        }
-        return gstPercent;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>find</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// CB411_412_ChargeThrough
-    /// </summary>
-    /// <param name = "_number">Charge through number</param>
-    /// <param name = "_forupdate">Select record for update</param>
-    /// <returns><c>METCBCTInvoiceHeaderTable</c> record if found; otherwise, null.</returns>
-    public static METCBCTInvoiceHeaderTable find(
-        METCBCTNumber   _number,
-        boolean         _forupdate = false)
-    {
-        METCBCTInvoiceHeaderTable  invoiceHeaderTable;
-
-        invoiceHeaderTable.selectForUpdate(_forupdate);
-
-        if (_number)
-        {
-            select firstonly invoiceHeaderTable
-                where invoiceHeaderTable.Number == _number;
-        }
-
-        return invoiceHeaderTable;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>captureFromInfolog</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Capture errors and warnings from infolog
-    /// </summary>
-    /// <param name = "_from">From where to capture infolog messages</param>
-    void captureFromInfolog(int _from)
-    {
-        SysInfologEnumerator        enumerator;
-        SysInfologMessageStruct     msgStruct;
-        Exception                   exceptionLocal;
-
-        // Get error message and warning messages from infolog
-        enumerator = SysInfologEnumerator::newData(infolog.copy(_from, infolog.num(0)));
-
-        while (enumerator.moveNext())
-        {
-            msgStruct = new SysInfologMessageStruct(enumerator.currentMessage());
-            exceptionLocal = enumerator.currentException();
-
-            if (exceptionLocal == Exception::Error
-            ||  exceptionLocal == Exception::Warning)
-            {
-                //errorMessage = strfmt('%1 %2', errorMessage, msgStruct.message());
-                this.captureMessage(msgStruct.message());
-            }
-        }
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>captureMessage</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Capture infolog message in CT ErrorDescription field
-    /// </summary>
-    /// <param name = "_message">Infolog message</param>
-    protected void captureMessage(str _message)
-    {
-        if (!this.ErrorDescription)
-        {
-            this.ErrorDescription = _message + '\r\n';
-        }
-        else
-        {
-            this.ErrorDescription += _message + '\r\n';
-        }
-        this.Error = NoYes::Yes;
-        this.update();
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>autoCreateLines</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Method to auto create CT lines
-    /// </summary>
-    /// <returns>True if all lines sucessfully created; otherwise false.</returns>
-    boolean autoCreateLines()
-    {
-        boolean ret = true;
+        //MPJ_37288_ChargebackChargethrough_extension (MPJ_3587)
         
-        if (this.Status == METCBCTInvoiceStatus::Created)
-        {
-            METCBCTInvoiceLinesCreation ctInvoiceLinesCreation = METCBCTInvoiceLinesCreation::construct();
-            ret = ctInvoiceLinesCreation.createMETCBCTInvoiceLine(this);
-
-            if (FormDataUtil::isFormDataSource(this))
-            {
-                FormDataSource formDataSource = FormDataUtil::getFormDataSource(this);
-                formDataSource.research(true);
-            }
-        }
-
-        return ret;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>existInvoiceId</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Exist method to identify if a pending vendor invoice originated from CT
-    /// </summary>
-    /// <param name = "_invoiceId">Vendor invoice number</param>
-    /// <returns>true if it exists; otherwise, false.</returns>
-    static boolean existInvoiceId(InvoiceId _invoiceId)
-    {
-        return _invoiceId && (select firstonly RecId from METCBCTInvoiceHeaderTable
-                                                    where METCBCTInvoiceHeaderTable.TaxInvoiceNum == _invoiceId).RecId != 0;
+        Args args = new Args(this);
+        args.record(this);
+        METCBCTInvoiceLinesCreation::main(args);
+        
     }
 
 ]]></Source>
@@ -632,6 +550,9 @@ public class METCBCTInvoiceHeaderTable extends common
 					<DataField>FinancialDimension</DataField>
 				</AxTableFieldGroupField>
 				<AxTableFieldGroupField>
+					<DataField>ErrorTxt</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
 					<DataField>ErrorDescription</DataField>
 				</AxTableFieldGroupField>
 				<AxTableFieldGroupField>
@@ -684,138 +605,6 @@ public class METCBCTInvoiceHeaderTable extends common
 				</AxTableFieldGroupField>
 			</Fields>
 		</AxTableFieldGroup>
-		<AxTableFieldGroup>
-			<Name>Grid</Name>
-			<Label>@SYS26263</Label>
-			<Fields>
-				<AxTableFieldGroupField>
-					<DataField>Number</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>CustomerAccount</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>getCustName</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>VendorAccount</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>getVendName</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>TaxInvoiceNum</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>Reference</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>DocumentDate</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>TransactionDate</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>Status</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>VendInvoiceAmtInclGST</DataField>
-				</AxTableFieldGroupField>
-			</Fields>
-		</AxTableFieldGroup>
-		<AxTableFieldGroup>
-			<Name>Vendor</Name>
-			<Label>@SYS80105</Label>
-			<Fields>
-				<AxTableFieldGroupField>
-					<DataField>VendorAccount</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>getVendName</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>TaxInvoiceNum</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>Reference</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>InvoiceType</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>DocumentDate</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>VendInvoiceAmtInclGST</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>VendInvoiceGSTAmount</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>VendPaymTermId</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>VendCashDisc</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>VendDueDate</DataField>
-				</AxTableFieldGroupField>
-			</Fields>
-		</AxTableFieldGroup>
-		<AxTableFieldGroup>
-			<Name>Customer</Name>
-			<Label>@SYS11779</Label>
-			<Fields>
-				<AxTableFieldGroupField>
-					<DataField>CustomerAccount</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>getCustName</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>CustPaymTermId</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>CustCashDisc</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>CustDueDate</DataField>
-				</AxTableFieldGroupField>
-			</Fields>
-		</AxTableFieldGroup>
-		<AxTableFieldGroup>
-			<Name>PostingDetails</Name>
-			<Label>@MET:PostingDetails</Label>
-			<Fields>
-				<AxTableFieldGroupField>
-					<DataField>RefSalesId</DataField>
-				</AxTableFieldGroupField>
-			</Fields>
-		</AxTableFieldGroup>
-		<AxTableFieldGroup>
-			<Name>VendCustInvoicing</Name>
-			<Label>@MET:ALMSupplierVolumetricRebate</Label>
-			<Fields>
-				<AxTableFieldGroupField>
-					<DataField>Status</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>ManuallyCreated</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>TransactionDate</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>CurrencyCode</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>ErrorDescription</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
-					<DataField>Error</DataField>
-				</AxTableFieldGroupField>
-			</Fields>
-		</AxTableFieldGroup>
 	</FieldGroups>
 	<Fields>
 		<AxTableField xmlns=""
@@ -842,8 +631,8 @@ public class METCBCTInvoiceHeaderTable extends common
 			i:type="AxTableFieldString">
 			<Name>TaxInvoiceNum</Name>
 			<ExtendedDataType>InvoiceId</ExtendedDataType>
+			<GroupPrompt>@SYS13864</GroupPrompt>
 			<Label>@MET:CBCTVendorInvoiceNumber</Label>
-			<Mandatory>Yes</Mandatory>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldString">
@@ -893,7 +682,6 @@ public class METCBCTInvoiceHeaderTable extends common
 			i:type="AxTableFieldDate">
 			<Name>DocumentDate</Name>
 			<ExtendedDataType>DocumentDate</ExtendedDataType>
-			<Mandatory>Yes</Mandatory>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldInt64">
@@ -903,11 +691,14 @@ public class METCBCTInvoiceHeaderTable extends common
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldString">
+			<Name>ErrorTxt</Name>
+			<ExtendedDataType>ErrorTxt</ExtendedDataType>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
 			<Name>ErrorDescription</Name>
-			<AllowEdit>No</AllowEdit>
-			<ExtendedDataType>METError</ExtendedDataType>
+			<ExtendedDataType>ErrorTxt</ExtendedDataType>
 			<HelpText>@MET:CBCTErrorDescriptionHelpText</HelpText>
-			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
 			<Label>@MET:ErrorDescription</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
@@ -930,7 +721,6 @@ public class METCBCTInvoiceHeaderTable extends common
 			<Name>VendInvoiceAmtInclGST</Name>
 			<ExtendedDataType>Amount</ExtendedDataType>
 			<Label>@MET:CBCTVendorInvoiceAmountInclGST</Label>
-			<Mandatory>Yes</Mandatory>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldReal">
@@ -1000,26 +790,6 @@ public class METCBCTInvoiceHeaderTable extends common
 			<Name>ChargeThroughReference</Name>
 			<ExtendedDataType>METCBCTChargeThroughReference</ExtendedDataType>
 		</AxTableField>
-		<AxTableField xmlns=""
-			i:type="AxTableFieldEnum">
-			<Name>ManuallyCreated</Name>
-			<AllowEdit>No</AllowEdit>
-			<ExtendedDataType>METManuallyCreated</ExtendedDataType>
-			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
-			<EnumType>NoYes</EnumType>
-		</AxTableField>
-		<AxTableField xmlns=""
-			i:type="AxTableFieldEnum">
-			<Name>Error</Name>
-			<ExtendedDataType>METErrorNoYes</ExtendedDataType>
-			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
-			<EnumType>NoYes</EnumType>
-		</AxTableField>
-		<AxTableField xmlns=""
-			i:type="AxTableFieldEnum">
-			<Name>InvoiceType</Name>
-			<EnumType>METInvoiceType</EnumType>
-		</AxTableField>
 	</Fields>
 	<FullTextIndexes />
 	<Indexes>
@@ -1032,24 +802,6 @@ public class METCBCTInvoiceHeaderTable extends common
 				</AxTableIndexField>
 			</Fields>
 		</AxTableIndex>
-		<AxTableIndex>
-			<Name>RefSalesIdIdx</Name>
-			<AllowDuplicates>Yes</AllowDuplicates>
-			<Fields>
-				<AxTableIndexField>
-					<DataField>RefSalesId</DataField>
-				</AxTableIndexField>
-			</Fields>
-		</AxTableIndex>
-		<AxTableIndex>
-			<Name>TaxInvoiceNumIdx</Name>
-			<AllowDuplicates>Yes</AllowDuplicates>
-			<Fields>
-				<AxTableIndexField>
-					<DataField>TaxInvoiceNum</DataField>
-				</AxTableIndexField>
-			</Fields>
-		</AxTableIndex>
 	</Indexes>
 	<Mappings />
 	<Relations>
@@ -1057,9 +809,11 @@ public class METCBCTInvoiceHeaderTable extends common
 			i:type="AxTableRelationForeignKey">
 			<Name>VendorAccount</Name>
 			<Cardinality>ZeroMore</Cardinality>
+			<EDTRelation>Yes</EDTRelation>
 			<OnDelete>Restricted</OnDelete>
 			<RelatedTable>VendTable</RelatedTable>
 			<RelatedTableCardinality>ExactlyOne</RelatedTableCardinality>
+			<RelatedTableRole>VendorAccount</RelatedTableRole>
 			<RelationshipType>Association</RelationshipType>
 			<Role>METCBCTInvoiceHeaderTable</Role>
 			<Constraints>
