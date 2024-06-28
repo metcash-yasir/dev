@@ -54,6 +54,11 @@ class METPurchParmPackingSlipTaskService extends METSysOperationTaskService
             if (purchParmTable)
             {
                 this.execute();
+                //CB369 -ImportedItemsReceiving - start
+                purchParmTable.METIntegrationStatus = METIntegrationStatus::Acknowledged;
+                purchParmTable.ParmJobStatus = ParmJobStatus::Executed;
+                purchParmTable.update();
+                //CB369 -ImportedItemsReceiving - end
             }
 
             ttscommit;
@@ -73,8 +78,18 @@ class METPurchParmPackingSlipTaskService extends METSysOperationTaskService
     {
         parmId = purchParmTable.ParmId;
 
-        this.registerPurchLine();
-        this.postPackingSlip();
+        //CB369 -ImportedItemsReceiving - start
+        if (PurchTable::find(purchParmTable.PurchId).PurchStatus == PurchStatus::Invoiced)
+        {
+            this.findMatchingPOLinesAgainstGITOrderAndPost();
+        }
+        //CB369 -ImportedItemsReceiving - end
+        else
+        {
+            this.registerPurchLine();
+            this.postPackingSlip();
+        }
+        
     }
 
 ]]></Source>
@@ -214,6 +229,82 @@ class METPurchParmPackingSlipTaskService extends METSysOperationTaskService
         }
 
         return purchParmUpdate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findMatchingPOLinesAgainstGITOrderAndPost</Name>
+				<Source><![CDATA[
+    /// CB369 -ImportedItemsReceiving 
+    /// <summary>
+    /// Find the matching PO lines in parm lines to get goods transist orders and post if found
+    /// </summary>
+    private void findMatchingPOLinesAgainstGITOrderAndPost()
+    {
+        PurchParmLine           purchParmLine;
+        PurchLine               purchLine;
+        ITMGoodsInTransitOrder  goodsInTransitOrder;
+               
+        while select purchParmLine
+            where purchParmLine.OrigPurchId == purchParmTable.purchId
+         join purchLine
+            where purchLine.ItemId == purchParmLine.ItemId
+            && purchLine.LineNumber == purchParmLine.LineNum
+            && purchLine.PurchId == purchParmTable.purchId
+        join goodsInTransitOrder
+            where goodsInTransitOrder.InventTransIdRef == purchLine.InventTransId
+            && goodsInTransitOrder.Status == ITMGoodsInTransitStatus::InTransit
+        {
+            if (goodsInTransitOrder)
+            {
+                
+                if (purchLine.PurchUnit == "@MET:UOMEachUpperCase" || purchLine.PurchUnit == "@MET:UOMEachLowerCase")
+                {
+                    this.postGoodsInTransitOrder(goodsInTransitOrder);
+                }
+                else
+                {
+                    
+
+                    PurchPrice convertedPurchPrice = UnitOfMeasureConversion::findByConversion(UnitOfMeasure::findBySymbol(purchLine.PurchUnit).RecId,
+                                                      UnitOfMeasure::findBySymbol("@MET:UOMEachUpperCase").RecId,
+                                                      EcoResProduct::findByProductNumber(purchLine.ItemId).RecId).Factor;
+
+                   
+                    ttsbegin;
+                    goodsInTransitOrder.selectForUpdate(true);
+                    goodsInTransitOrder.Qty = convertedPurchPrice * goodsInTransitOrder.Qty;
+                    goodsInTransitOrder.update();
+                    ttscommit;
+
+                    this.postGoodsInTransitOrder(goodsInTransitOrder);
+                }
+            }
+            else
+            {
+                throw error(strFmt("@MET:NoGITOrdersAgainstPO", purchParmTable.PurchId));
+            }
+            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postGoodsInTransitOrder</Name>
+				<Source><![CDATA[
+    /// CB369 -ImportedItemsReceiving - start
+    /// <summary>
+    /// Post GIT orders
+    /// </summary>
+    /// <param name = "_goodsInTransitOrder">GIT order</param>
+    private void postGoodsInTransitOrder(ITMGoodsInTransitOrder _goodsInTransitOrder)
+    {
+        ITMGoodsInTransitUpdateReceived updateReceived = ITMGoodsInTransitUpdateReceived::newGITOrder(_goodsInTransitOrder, _goodsInTransitOrder.Qty,
+                                                                                                                  DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));
+        
+        updateReceived.run();
     }
 
 ]]></Source>
