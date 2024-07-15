@@ -15,7 +15,7 @@ Public class METRPAGeneralJournalWorkflowSubmissionService
 			<Method>
 				<Name>create</Name>
 				<Source><![CDATA[
-    public METRPAGeneralJournalWorkflowSubmissionResponse create(METRPAGeneralJournalWorkflowSubmissionRequest _request)  
+    public Object create(METRPAGeneralJournalWorkflowSubmissionRequest _request)  
     {
         Object                                          jsonString;
         METRPAGeneralJournalWorkflowSubmissionResponse  generalJournalBatchStatusResponse;
@@ -24,8 +24,15 @@ Public class METRPAGeneralJournalWorkflowSubmissionService
         DataAreaId                                      dataAreaId          = _request.ParmDataAreaId();
         boolean                                         JournalHeaderStatus = false, submitToWorkflow    = _request.parmSubmitToWorkflow();
         LedgerJournalCheckPost                          ledgerJournalCheckPost;
-        LedgerJournalTable                              ledgerJournalTable, updateLedgerJournalTable;
+        LedgerJournalTable                              ledgerJournalTable, ledgerJournalTableVoucherCheck;
+        LedgerJournalTrans                              ledgerJournalTransValidation;
         LedgerJournalCheckPost                          jourPost;
+        str                                             workflowTrackingStatus;
+        str                                             headerError, lineError;
+        int                                             voucherErrorCount = 0;
+        WorkflowTrackingStatusTable                     workflowTrackingStatusTable;
+        List                                            orderList = new List(Types::String);
+        
         generalJournalBatchStatusResponse = new METRPAGeneralJournalWorkflowSubmissionResponse();
 
         changecompany(dataAreaId)
@@ -34,8 +41,15 @@ Public class METRPAGeneralJournalWorkflowSubmissionService
             {
                 ledgerJournalTable = this.getCrossCompanyLedgerJournalTable(batchJournalId, dataAreaId);
 
+                select firstonly RecId from workflowtrackingstatustable where
+                    workflowtrackingstatustable.ContextRecId == ledgerJournalTable.RecId &&
+                    (workflowtrackingstatustable.TrackingStatus == WorkflowTrackingStatus::Completed ||
+                    workflowtrackingstatustable.TrackingStatus == WorkflowTrackingStatus::Pending);
+                if(workflowtrackingstatustable.RecId)
+                    ledgerJournalTable.METErrorLog = strFmt("@MET:JournalValidation", ledgerJournalTable.JournalNum);
+                
                 // Journal validation
-                if (ledgerJournalTable.recid)
+                if (ledgerJournalTable.recid && workflowtrackingstatustable.RecId == 0)
                 {
                     ledgerJournalCheckPost = ledgerJournalCheckPost::newLedgerJournalTable(ledgerJournalTable, NoYes::No);
                     ledgerJournalCheckPost.run();
@@ -43,48 +57,76 @@ Public class METRPAGeneralJournalWorkflowSubmissionService
 
                 if(ledgerJournalTable.METErrorLog)
                     JournalHeaderStatus = true;
+                else
+                    if(ledgerJournalTable.UserBlockId)
+                        ledgerJournalTable.METErrorLog = strFmt("@MET:JournalLockedError",ledgerJournalTable.JournalNum,ledgerJournalTable.UserBlockId);
 
-                generalJournalBatchStatusResponse.parmSubmitToWorkflowOutcome(false);
-                if(!JournalHeaderStatus && submitToWorkflow)
+                headerError = ledgerJournalTable.METErrorLog;   // Header level validation error
+
+                // Line level validation
+                while select ledgerJournalTransValidation where
+                    ledgerJournalTransValidation.JournalNum == ledgerJournalTable.JournalNum
+                {
+                    lineError = '';
+                    ledgerJournalCheckPost = LedgerJournalCheckPost::newLedgerJournalTrans(ledgerJournalTransValidation,
+                        LedgerJournalVoucher::Voucher,
+                        NoYes::No,
+                        NoYes::No,
+                        NoYes::No);
+                    ledgerJournalCheckPost.run();
+                    
+                    select firstonly METErrorLog from ledgerJournalTableVoucherCheck
+                        where ledgerJournalTableVoucherCheck.journalNum == ledgerJournalTransValidation.JournalNum;
+                    if(ledgerJournalTableVoucherCheck.METErrorLog)
+                        voucherErrorCount++;
+                    else
+                        ledgerJournalTableVoucherCheck.METErrorLog = "No line error";
+
+                    lineError = strFmt("%1",ledgerJournalTransValidation.LineNum) + '-' + ledgerJournalTransValidation.Voucher + '-' + ledgerJournalTableVoucherCheck.METErrorLog;
+                    orderList.addEnd(lineError);
+                }
+
+                generalJournalBatchStatusResponse.parmVoucherValidation(orderList); //Voucher validation
+                generalJournalBatchStatusResponse.parmSubmitToWorkflowOutcome(false);  // Workflow status TRUE/FALSE
+
+                // Workflow submission
+                if(!JournalHeaderStatus && submitToWorkflow && workflowtrackingstatustable.RecId == 0 && voucherErrorCount == 0)
                 {
                     this.submitToWorkflow(ledgerJournalTable.JournalNum);
-                    generalJournalBatchStatusResponse.parmSubmitToWorkflowOutcome(true);
-
-                    ttsbegin;
-                    select forupdate updateLedgerJournalTable where
-                        updateLedgerJournalTable.RecId == ledgerJournalTable.RecId;
-                    if(updateLedgerJournalTable.RecId)
-                    {
-                        updateLedgerJournalTable.METRPAInterface = true;
-                        updateLedgerJournalTable.update();
-                        
-                    }
-                    ttscommit;
+                    generalJournalBatchStatusResponse.parmSubmitToWorkflowOutcome(true);  // Workflow status TRUE/FALSE
                 }
 
-                // Journal posting
-                if(!JournalHeaderStatus && !submitToWorkflow)
-                {
-                    jourPost = LedgerJournalCheckPost::newLedgerJournalTable(ledgerJournalTable, NoYes::Yes);
-                    jourPost.runOperation();
-                }
-
-                generalJournalBatchStatusResponse.parmHeaderLevelStatus(!JournalHeaderStatus);
-                generalJournalBatchStatusResponse.ParmHeaderLevelError(ledgerJournalTable.METErrorLog);
+                generalJournalBatchStatusResponse.parmHeaderLevelStatus(!JournalHeaderStatus);  // Header status
+                generalJournalBatchStatusResponse.ParmHeaderLevelError(headerError);  // Header validation error
             }
             catch
             {
-                ledgerJournalTable.METErrorLog = ledgerJournalTable.METErrorLog + "@MET:ExceptionJournalError";
-                generalJournalBatchStatusResponse.ParmHeaderLevelError(ledgerJournalTable.METErrorLog);
+                headerError = headerError + "@MET:ExceptionJournalError";
+                generalJournalBatchStatusResponse.ParmHeaderLevelError(headerError);
                 generalJournalBatchStatusResponse.parmHeaderLevelStatus(false);
                
                 JournalHeaderStatus = 0;
             }
             
-            generalJournalBatchStatusResponse.ParmBatchJournalId(strFmt("%1",ledgerJournalTable.JournalNum));
-            generalJournalBatchStatusResponse.parmLineLevelJsonofErrors('');
+            if(submitToWorkflow)
+            {
+                select firstonly RecId, TrackingStatus from workflowtrackingstatustable where
+                    workflowtrackingstatustable.ContextRecId == ledgerJournalTable.RecId;
+                if(workflowtrackingstatustable.RecId)
+                    workflowTrackingStatus = enum2Str(workflowtrackingstatustable.TrackingStatus);
+                else
+                    workflowTrackingStatus = "Workflow hasn't submitted";
+            }
+            else
+                workflowTrackingStatus = "Workflow hasn't submitted";
+
+            generalJournalBatchStatusResponse.parmWorkflowStatus(strFmt("@MET:StringPlaceHolder",workflowTrackingStatus));  // Workflow submission status
+            generalJournalBatchStatusResponse.ParmBatchJournalId(strFmt("@MET:StringPlaceHolder",ledgerJournalTable.JournalNum));
         }
-        return generalJournalBatchStatusResponse;
+        
+        jsonString = generalJournalBatchStatusResponse;
+
+        return jsonString;
     }
 
 ]]></Source>
@@ -92,6 +134,10 @@ Public class METRPAGeneralJournalWorkflowSubmissionService
 			<Method>
 				<Name>submitToWorkflow</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Workflow submission
+    /// </summary>
+    /// <param name = "_journalId">JournalId</param>
     public void submitToWorkflow(JournalId  _journalId)
     {
         WorkflowVersionTable        workflowVersionTable;
@@ -137,6 +183,12 @@ Public class METRPAGeneralJournalWorkflowSubmissionService
 			<Method>
 				<Name>getCrossCompanyLedgerJournalTable</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Get LedgerJournalTable
+    /// </summary>
+    /// <param name = "_ledgerJournalId">LedgerJournalId</param>
+    /// <param name = "_dataAreaId">Legal entity</param>
+    /// <returns></returns>
     private LedgerJournalTable getCrossCompanyLedgerJournalTable(LedgerJournalId _ledgerJournalId, DataAreaId _dataAreaId)
     {
         LedgerJournalTable ledgerJournalTable;
