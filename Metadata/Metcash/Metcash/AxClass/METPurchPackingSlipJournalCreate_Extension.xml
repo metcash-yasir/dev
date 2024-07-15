@@ -23,7 +23,8 @@ final class METPurchPackingSlipJournalCreate_Extension
     {
         #OCCRetryCount
         InventSite inventSite;
-        MetItemSiteSettingsSetup metItemSiteSettingsSetup;
+        //MetItemSiteSettingsSetup metItemSiteSettingsSetup;
+        METInventItemOrderSetup metInventItemOrderSetup;
         PurchParmLine purchParmLine = _purchParmLine as PurchParmLine;
 
         next createJournalLine(_purchParmLine);
@@ -34,16 +35,22 @@ final class METPurchPackingSlipJournalCreate_Extension
         {
             if (inventSite && inventSite.METAutoUpdateItemStatusUponReceipt)
             {
-                metItemSiteSettingsSetup = MetItemSiteSettingsSetup::find(purchParmLine.ItemId, inventSite.SiteId, true);
-            
-                if (metItemSiteSettingsSetup && metItemSiteSettingsSetup.ItemStatus == METConstants::NewStr)
+                
+                metInventItemOrderSetup = METInventItemOrderSetup::findByItemAndSite(purchParmLine.ItemId, inventSite.SiteId, true);
+                
+                if (metInventItemOrderSetup && metInventItemOrderSetup.ItemStatus == METItemStatusTable::findByStatus(METItemsStatus::New).ItemStatus)
                 {
-                    metItemSiteSettingsSetup.ItemStatus = METConstants::Active;
-                    metItemSiteSettingsSetup.update();
-                }
+                    metInventItemOrderSetup.ItemStatus          = METItemStatusTable::findByStatus(METItemsStatus::Active).ItemStatus;
+                    metInventItemOrderSetup.PublishPriceBook    = true;
+                    metInventItemOrderSetup.PublishPortal       = true;
+                    metInventItemOrderSetup.PublishHost         = true;
+                    metInventItemOrderSetup.update();
+                    //info(strFmt("@MET:ItemSiteUpdated",metInventItemOrderSetup.ItemId, metInventItemOrderSetup.SiteId, metInventItemOrderSetup.ItemStatus));
+                }              
 
                 // Update child items as well.
-                MetItemSiteSettingsSetup::updateChildItemSiteStatus(purchParmLine.ItemId, inventSite.SiteId);
+                METInventItemOrderSetup::updateChildItemSiteStatus(purchParmLine.ItemId, inventSite.SiteId);
+                this.itemStatusToTransferDependSites(metInventItemOrderSetup);
             }
 
             // CB232_AutoSettingItemStockStatus.
@@ -78,6 +85,122 @@ final class METPurchPackingSlipJournalCreate_Extension
             {
                 throw Exception::UpdateConflict;
             }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>itemStatusToTransferDependSites</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Change Item status to transfer dependent sites
+    /// </summary>
+    /// <param name = "_metInventItemOrderSetup">METInventItemOrderSetup table</param>
+    public void itemStatusToTransferDependSites(METInventItemOrderSetup _metInventItemOrderSetup)
+    {
+        ReqItemTable    reqItemTable;
+        InventDim       inventDim;
+        InventLocation              inventLocation;
+        METInventItemOrderSetup metInventItemOrderSetupSupplySite;
+                
+        while select ItemId,CovInventDimId,ReqPOType,InventLocationIdReqMain, VendId 
+            from reqItemTable
+            join RecId from inventDim
+            where reqItemTable.ItemId == _metInventItemOrderSetup.ItemId    &&
+            reqItemTable.CovInventDimId == inventDim.inventDimId      &&
+            inventDim.InventSiteId == _metInventItemOrderSetup.SiteId
+        {
+            if(reqItemTable.ReqPOType == ReqPOType::Transfer)
+            {
+                select firstonly InventSiteId from inventLocation
+                            where inventLocation.InventLocationId == reqItemTable.InventLocationIdReqMain;
+
+                if(inventLocation && inventLocation.InventSiteId != _metInventItemOrderSetup.SiteId)
+                {
+                    select firstonly metInventItemOrderSetupSupplySite                         
+                        where metInventItemOrderSetupSupplySite.ItemId      == _metInventItemOrderSetup.ItemId  &&
+                        metInventItemOrderSetupSupplySite.SiteId   == inventLocation.InventSiteId; 
+                        
+                    if(metInventItemOrderSetupSupplySite)
+                    {
+                        this.updateStatusToActive(metInventItemOrderSetupSupplySite);
+                        METInventItemOrderSetup::updateChildItemSiteStatus(_metInventItemOrderSetup.ItemId, inventLocation.InventSiteId);
+                    }
+                }
+            }
+            else if(reqItemTable.ReqPOType == ReqPOType::Purch
+                && VendTable::find(reqItemTable.VendId).VendGroup != VendParameters::find().METInterCompanyVendGroupId)
+            {
+                continue;
+            }
+            else
+            {
+                InventLocation inventLocationNDC;
+
+                InventLocationId warehouse = InventDim::find(reqItemTable.CovInventDimId).InventLocationId;
+                container warehouseCon;
+
+                if(InventLocation::find(warehouse).METNDCWarehouse)
+                {
+                    while select inventLocationNDC
+                        where inventLocationNDC.METNDCWarehouse == NoYes::Yes
+                    {
+                        warehouseCon += inventLocationNDC.InventLocationId;
+                    }
+                }
+                else
+                {
+                    warehouseCon += warehouse;
+                }
+                
+                changecompany(VendParameters::find().METInterCompanyLegalEntity)
+                {
+                    ReqItemTable reqItemTableIntComp;                   
+
+                    while select ItemId,CovInventDimId,ReqPOType,InventLocationIdReqMain, VendId
+                        from reqItemTableIntComp
+                        where reqItemTableIntComp.ItemId == _metInventItemOrderSetup.ItemId    
+                    {
+                        if(reqItemTableIntComp.ReqPOType == ReqPOType::Purch
+                            && VendTable::find(reqItemTableIntComp.VendId).VendGroup == VendParameters::find().METInterCompanyVendGroupId)
+                        {
+                            for(int i =1; i<= conLen(warehouseCon); i++)
+                            {
+                                if(conPeek(warehouseCon, i) == VendTable::find(reqItemTableIntComp.VendId).METIntercompanyWarehouse)
+                                {
+                                    METInventItemOrderSetup metInventItemOrderSetupIntComp = METInventItemOrderSetup::findByItemAndSite(reqItemTableIntComp.ItemId, InventDim::find(reqItemTableIntComp.CovInventDimId).InventSiteId);
+                                    this.updateStatusToActive(metInventItemOrderSetupIntComp);
+                                    METInventItemOrderSetup::updateChildItemSiteStatus(metInventItemOrderSetupIntComp.ItemId, metInventItemOrderSetupIntComp.SiteId);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateStatusToActive</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update Item status to Active
+    /// </summary>
+    /// <param name = "_metInventItemOrderSetup">METInventItemOrderSetup table</param>
+    public void updateStatusToActive(METInventItemOrderSetup _metInventItemOrderSetup)
+    {
+        if(_metInventItemOrderSetup)
+        {
+            _metInventItemOrderSetup.selectForUpdate(true);
+            _metInventItemOrderSetup.ItemStatus = METItemStatusTable::findByStatus(METItemsStatus::Active).ItemStatus;
+            _metInventItemOrderSetup.PublishPriceBook = NoYes::Yes;
+            _metInventItemOrderSetup.PublishPortal = NoYes::Yes;
+            _metInventItemOrderSetup.PublishHost = NoYes::Yes;
+            _metInventItemOrderSetup.update();
+            info(strFmt("@MET:ItemSiteUpdated",_metInventItemOrderSetup.ItemId, _metInventItemOrderSetup.SiteId, _metInventItemOrderSetup.ItemStatus));
         }
     }
 
