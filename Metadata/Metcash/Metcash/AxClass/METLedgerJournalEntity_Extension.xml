@@ -678,15 +678,17 @@ public final class METLedgerJournalEntity_Extension
     public static void postGetStagingData(DMFDefinitionGroupExecution _dmfDefinitionGroupExecution)
     {
         LedgerParameters            ledgerParameters;
+        CustParameters              custParameters = custParameters::find();
 
         next postGetStagingData( _dmfDefinitionGroupExecution );
 
-        select firstonly METGLNZDefinitionGroupName, METARNZDefinitionGroupName, METAPNZDefinitionGroupName
+        select firstonly METGLNZDefinitionGroupName, METARNZDefinitionGroupName, METAPNZDefinitionGroupName 
             from ledgerParameters;
 
         if (_dmfDefinitionGroupExecution.DefinitionGroup    == ledgerParameters.METAPNZDefinitionGroupName
             || _dmfDefinitionGroupExecution.DefinitionGroup == ledgerParameters.METARNZDefinitionGroupName
-            || _dmfDefinitionGroupExecution.DefinitionGroup == ledgerParameters.METGLNZDefinitionGroupName)
+            || _dmfDefinitionGroupExecution.DefinitionGroup == ledgerParameters.METGLNZDefinitionGroupName
+            || (curExt() == '@MET:MET2002' && custParameters.METAR67RestrictDuplicateInvoiceCheck))
         {
             LedgerJournalEntity::checkDuplicateNZJournalReference(_dmfDefinitionGroupExecution, ledgerParameters);
         }
@@ -705,13 +707,15 @@ public final class METLedgerJournalEntity_Extension
     public static void checkDuplicateNZJournalReference(DMFDefinitionGroupExecution _dmfDefinitionGroupExecution, LedgerParameters _ledgerParameters)
     {
         LedgerJournalEntityStaging  staging, errorStaging;
+        CustInvoiceJour             custInvoiceJour;
         LedgerJournalTrans          ledgerJournalTrans;
         Voucher                     voucher;
+        CustParameters              custParameters = CustParameters::find();
         boolean                     ok;
         
         try
         {
-            while select JournalBatchNumber, DataAreaId
+            while select JournalBatchNumber, DataAreaId, JournalName, AccountType
                         from staging
                         group by staging.Voucher
                         where staging.DefinitionGroup   == _dmfDefinitionGroupExecution.DefinitionGroup
@@ -728,11 +732,58 @@ public final class METLedgerJournalEntity_Extension
                     select firstonly JournalNum, Txt, DocumentNum from ledgerJournalTrans
                         where ledgerJournalTrans.Txt        == voucher;
                 }
-                else
+                else if(_dmfDefinitionGroupExecution.DefinitionGroup == _ledgerParameters.METGLNZDefinitionGroupName)
                 {
                     select firstonly JournalNum, Voucher, DocumentNum from ledgerJournalTrans
                         where ledgerJournalTrans.DocumentNum  == voucher;
                 }
+                else if(_dmfDefinitionGroupExecution.DefinitionGroup == _ledgerParameters.METARNZDefinitionGroupName)
+                {
+                     select firstonly custInvoiceJour
+                       where custInvoiceJour.InvoiceId == voucher;
+                    
+                }
+                
+                if(curExt() == '@MET:MET2002')
+                {
+                    if((custParameters.METAR67RestrictDuplicateInvoiceCheck 
+                        && (staging.JournalName == '@MET:CustInv' || staging.JournalName == '@MET:CustInvMC' || staging.JournalName == '@MET:CustInvDC')
+                        && (staging.AccountType == LedgerJournalACType::Cust  || staging.AccountType == LedgerJournalACType::Ledger))
+                            || ((custParameters.METGL70RestrictDuplicateInvoiceCheck && staging.JournalName == '@MET:GLINT')
+                                || (custParameters.METAP68RestrictDuplicateInvoiceCheck && staging.JournalName == "VenInvNZ")))
+                    {
+                        select firstonly JournalNum, Voucher, DocumentNum from ledgerJournalTrans
+                        where ((voucher!= '' && ledgerJournalTrans.Voucher  == voucher) || (staging.Invoice !='' && ledgerJournalTrans.Invoice  == staging.Invoice));
+                    }
+                }
+
+                if(custInvoiceJour)
+                {
+                    ok                      = true;
+                    Counter infoLogEndPos   = infologLine();
+                    str logText             = strFmt("@MET:ErrorMsgDuplicateCheck", voucher); 
+                
+                    while select forupdate errorStaging
+                        where errorStaging.DefinitionGroup  == _dmfDefinitionGroupExecution.DefinitionGroup
+                        && errorStaging.ExecutionId         == _dmfDefinitionGroupExecution.ExecutionId
+                        && errorStaging.voucher             == voucher
+                    {
+                        ttsbegin;
+                        errorStaging.TransferStatus = DMFTransferStatus::Error;
+                        errorStaging.Update();
+                        ttscommit;
+
+                        DMFStagingValidationLog::insertLogs(_dmfDefinitionGroupExecution.DefinitionGroup,
+                                    _dmfDefinitionGroupExecution.ExecutionId,
+                                    DMFEntity::find(_dmfDefinitionGroupExecution.Entity),
+                                    errorStaging.RecId,
+                                    "",
+                                    logText,
+                                    DMFSourceTarget::Target);
+                    }
+                }
+                
+
                 if (ledgerJournalTrans)
                 {
                     ok                      = true;
@@ -805,6 +856,63 @@ public final class METLedgerJournalEntity_Extension
                 throw Exception::DuplicateKeyException;
             }
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateWrite</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// MET_98891_DuplicateInvoiceOnLedgerJournal developed by Yadavpa on 28/11/2023
+    /// </summary>
+    /// <returns></returns>
+    public boolean validateWrite()
+    {
+        CustTrans           custTrans;
+        LedgerJournalTrans  LedgerJournalTrans, LedgerJournalTransCust;
+        CustParameters      custParameters;
+        boolean             isLedgerExist = false;
+
+        boolean isValid = next validateWrite();
+
+        if(curExt() == 'Test@MET:MET2002' && custParameters::find().METAR67RestrictDuplicateInvoiceCheck)
+        {
+            select firstonly RecId from custTrans
+                where custTrans.Invoice == this.Invoice;
+
+            select firstonly RecId, JournalNum, AccountType from LedgerJournalTrans
+                where LedgerJournalTrans.Invoice == this.Invoice 
+                    && (LedgerJournalTrans.AccountType == LedgerJournalACType::Cust
+                    ||  LedgerJournalTrans.AccountType == LedgerJournalACType::Ledger)
+                    &&  LedgerJournalTrans.AccountType == this.AccountType
+                    && this.JournalName == '@MET:CustInv';
+            if(custTrans.RecId || LedgerJournalTrans.RecId)
+            {
+                if(LedgerJournalTrans.AccountType == LedgerJournalACType::Ledger)
+                {
+                   select firstonly RecId, ModifiedDateTime from LedgerJournalTransCust
+                        order by LedgerJournalTransCust.ModifiedDateTime desc
+                        where LedgerJournalTransCust.Invoice == this.Invoice
+                            && LedgerJournalTransCust.AccountType == LedgerJournalACType::Cust;
+
+                    int ledgerCreationTimeGap = 
+                        DateTimeUtil :: getDifference(DateTimeUtil::addMinutes(this.ModifiedDateTime,0),DateTimeUtil::addMinutes(LedgerJournalTransCust.ModifiedDateTime, 0));
+                    if(LedgerJournalTransCust.RecId && abs(ledgerCreationTimeGap) > 300)
+                    {
+                        isLedgerExist = true;
+                    }
+
+                }
+                if(isLedgerExist || LedgerJournalTrans.AccountType == LedgerJournalACType::Cust)
+                {
+                    isValid = false;
+                    error(strFmt("@MET:DuplicateInvoice", this.Invoice, LedgerJournalTrans.JournalNum));
+                }
+            }
+        }
+
+        return isValid;
     }
 
 ]]></Source>
