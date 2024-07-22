@@ -1,0 +1,411 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesOrderGuideCheckTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// CB167_PerformStockReservation
+/// This is a task service class for sales order guide check.
+/// </summary>
+class METSalesOrderGuideCheckTaskService extends METSysOperationTaskService
+{
+    RefRecID   salesLineRecId;
+    ReasonCode reasonId;
+    guid       topPickingProcessId;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Initializes the object.
+    /// </summary>
+    protected void initialise()
+    {
+        METSalesOrderGuideCheckContract contract;
+        
+        super();
+
+        // get the topPickingProcessId from the contract
+        contract            = dataContract as METSalesOrderGuideCheckContract;
+        topPickingProcessId = contract.parmTopPickingProcessId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    /// <param name = "_contract">
+    /// <c>METSalesOrderGuideCheckContract</c>.
+    /// </param>
+    public void process(METSalesOrderGuideCheckContract _contract)
+    {
+        TimeOfDay startTime = DateTimeUtil::getTimeNow(DateTimeUtil::getUserPreferredTimeZone());
+
+        this.processInternal(_contract);
+
+        TimeOfDay endTime = DateTimeUtil::getTimeNow(DateTimeUtil::getUserPreferredTimeZone());
+
+        int ret = endTime - startTime;
+
+        info(strFmt('Total time: %1', ret));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    // <summary>
+    /// Runs tasks of the task service class.
+    /// </summary>
+    /// <param name = "_readPast">Table read past setting</param>
+    protected void processTask(boolean _readPast)
+    {
+        while (this.getDataFromTopPickingQueue(topPickingProcessId, _readPast))
+        {
+            try
+            {
+                this.execute();
+            }
+            catch (Exception::Error)
+            {
+                // Catch any exception so that any one error won't bring down
+                // the entire process of sales order substitution.
+                Global::exceptionTextFallThrough();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDataFromTopPickingQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets data to check sales order guide.
+    ///</summary>
+    /// <param name = "_processId">Guid created and added in the contract <c>METSalesOrderGuideCheckQueue</c>.</param>
+    /// <param name = "_readPast">boolean to read past records or not</param>
+    /// <returns>True, if data is retrieved from the queue; otherwise; false.</returns>
+    private boolean getDataFromTopPickingQueue(guid _processId, boolean _readPast)
+    {
+        #OCCRetryCount
+    
+        METSalesOrderGuideCheckQueue topPickingQueue;
+        int                          backOffWait;
+    
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockException;
+        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
+        Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
+        
+        topPickingQueue.readPast(_readPast);
+
+        try
+        {
+            ttsbegin;
+    
+            select firstonly pessimisticlock topPickingQueue
+                where topPickingQueue.ProcessId == _processId;
+
+            if (topPickingQueue.RecId)
+            {
+                salesLineRecId = topPickingQueue.SalesLine;
+                reasonId = topPickingQueue.ReasonId;
+
+                topPickingQueue.delete();
+            }
+            else
+            {
+                salesLineRecId = 0;
+                reasonId = '';
+            }
+           
+            ttscommit;
+        }
+        catch (deadLockException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw deadLockException;
+                }
+            }
+            else
+            {
+                throw deadLockException;
+            }
+        }
+        catch (updateConflictException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+            }
+            else
+            {
+                throw updateConflictException;
+            }
+        }
+        catch (transientSqlConnectionError)
+        {
+            if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw transientSqlConnectionError;
+            }
+        }
+
+        return (salesLineRecId != 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    private void execute()
+    {
+        SalesLine salesLine;
+        
+        salesLine = SalesLine::findRecId(salesLineRecId);
+
+        if (salesLine && reasonId)
+        {
+            switch (reasonId)
+            {
+                case METConstants::NewReasonCode:
+                    this.performSOGuideCheckForNew(salesLine);
+                    break;
+                case METConstants::NIRReasonCode:
+                    this.performSOGuideCheckForNIR(salesLine);
+                    break;
+                default:
+                    throw error(Error::wrongUseOfFunction(funcName()));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>performSOGuideCheckForNew</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Performs sales order guide check for New lines.
+    /// </summary>
+    /// <param name = "_salesLine">SalesLine.</param>
+    private void performSOGuideCheckForNew(SalesLine _salesLine)
+    {
+        boolean                 onlySellTo,
+                                doNotSellTo;
+
+        if (!this.checkItemStatusActive(_salesLine))
+        {
+            this.cancelSalesLine(_salesLine);
+            return;
+        }
+
+        [onlySellTo, doNotSellTo] = this.checkForOrderGuide(_salesLine);
+
+        if (onlySellTo)
+        {
+            this.updateReasonCode(_salesLine, '');
+        }
+        else if (doNotSellTo)
+        {
+            this.updateReasonCode(_salesLine, METConstants::NIRReasonCode);
+            this.cancelSalesLine(_salesLine);
+        }
+        else
+        {
+            //Record doesn't exist for OnlySellTo and doNotSellTo.
+            this.updateReasonCode(_salesLine, '');
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>performSOGuideCheckForNIR</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Performs sales order guide check for NIR lines.
+    /// </summary>
+    /// <param name = "_salesLine">SalesLine.</param>
+    private void performSOGuideCheckForNIR(SalesLine _salesLine)
+    {
+        boolean                 onlySellTo,
+                                doNotSellTo;
+
+        if (!this.checkItemStatusActive(_salesLine))
+        {
+            this.cancelSalesLine(_salesLine);
+            return;
+        }
+
+        [onlySellTo, doNotSellTo] = this.checkForOrderGuide(_salesLine);
+
+        if (onlySellTo)
+        {
+            this.updateReasonCode(_salesLine, '');
+        }
+        else if (doNotSellTo)
+        {
+            this.cancelSalesLine(_salesLine);
+        }
+        else
+        {
+            //Record doesn't exist for OnlySellTo and doNotSellTo.
+            this.updateReasonCode(_salesLine, '');
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateReasonCode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates reason code.
+    /// </summary>
+    /// <param name = "_salesLine">SalesLine.</param>
+    /// <param name = "_reasonCode">ReasonCode.</param>
+    private void updateReasonCode(SalesLine _salesLine, ReasonCode _reasonCode)
+    {
+        METSalesLine metSalesLine = _salesLine.metSalesLine();
+
+        if (metSalesLine)
+        {
+            ttsbegin;
+            
+            metSalesLine.reread();
+            metSalesLine.selectForUpdate(true);
+
+            metSalesLine.ReasonId = _reasonCode;
+            metSalesLine.update();
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancels <c>SalesLine</c>.
+    /// </summary>
+    /// <param name = "_salesLine">
+    /// <c>SalesLine</c>.
+    /// </param>
+    private void cancelSalesLine(SalesLine _salesLine)
+    {
+        _salesLine.reread();
+        _salesLine.selectForUpdate(true);
+        SalesUpdateRemain::construct().updateDeliverRemainder(_salesLine, 0, 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkForOrderGuide</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if order guide records record exists against <c>SalesLine</c>.
+    /// </summary>
+    /// <param name = "_salesLine">SalesLine.</param>
+    /// <returns>Container containing flags to sell or do not sell.</returns>
+    private container checkForOrderGuide(SalesLine _salesLine)
+    {
+        LogisticsPostalAddress deliveryAddress;
+        CustTable              custTable;
+        InventDim              inventDim;
+        METSalesOrderGuideItem salesOrderGuideType;
+        boolean                onlySellTo, 
+                               doNotSellTo;
+
+        boolean orderGuideRecordNotExist(ItemId _itemId, METSalesOrderGuideReferenceType _referenceType, METSalesOrderGuideReference _reference)
+        {
+            onlySellTo = METSalesOrderGuideItem::exist(_itemId, _referenceType, _reference, METSalesOrderGuideType::OnlySellTo);
+            doNotSellTo =  METSalesOrderGuideItem::exist(_itemId, _referenceType, _reference, METSalesOrderGuideType::DoNotSellTo);
+            
+            return !onlySellTo && !doNotSellTo;
+        }
+
+        if (orderGuideRecordNotExist(_salesLine.ItemId, METSalesOrderGuideReferenceType::Customer, _salesLine.CustAccount))
+        {
+            select firstonly METCustOperGroupId from custTable
+                where custTable.AccountNum == _salesLine.CustAccount;
+
+            if (orderGuideRecordNotExist(_salesLine.ItemId, METSalesOrderGuideReferenceType::CustomerOperationsGroup, custTable.METCustOperGroupId))
+            {
+                select firstonly InventSiteId from inventDim
+                    where inventDim.InventDimId == _salesLine.InventDimId;
+
+                if (orderGuideRecordNotExist(_salesLine.ItemId, METSalesOrderGuideReferenceType::Site, inventDim.InventSiteId))
+                {
+                    select firstonly State from deliveryAddress
+                        where deliveryAddress.RecId == _salesLine.DeliveryPostalAddress;
+
+                    orderGuideRecordNotExist(_salesLine.ItemId, METSalesOrderGuideReferenceType::State, deliveryAddress.State);
+                }
+            }
+        }
+
+        return [onlySellTo, doNotSellTo];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkItemStatusActive</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if item status is Active for given item on salesline.
+    /// </summary>
+    /// <param name = "_salesLine">Salesine.</param>
+    /// <returns>True, if item status is active; otherwise, false.</returns>
+    private boolean checkItemStatusActive(SalesLine _salesLine)
+    {
+        return (
+            select firstonly RecId from METInventItemOrderSetup
+                where METInventItemOrderSetup.ItemId == _salesLine.ItemId
+                &&    METInventItemOrderSetup.SiteId == _salesLine.inventDim().InventSiteId
+                &&    METInventItemOrderSetup.ItemStatus == METConstants::Active).RecID != 0;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
