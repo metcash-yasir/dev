@@ -1,0 +1,223 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METReserveEventOrdersTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// CB167_PerformStockReservation
+/// This is a task service class for reserve event orders batch job.
+/// </summary>
+class METReserveEventOrdersTaskService extends METSysOperationTaskService
+{
+    guid      topPickingProcessId;
+    SalesId   salesId;
+    METPOLink poLink;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Initializes the object.
+    /// </summary>
+    protected void initialise()
+    {
+        METReserveEventOrdersContract contract;
+        
+        super();
+
+        // get the topPickingProcessId from the contract
+        contract            = dataContract as METReserveEventOrdersContract;
+        topPickingProcessId = contract.parmTopPickingProcessId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    /// <param name = "_contract">
+    /// <c>METReserveEventOrdersContract</c>.
+    /// </param>
+    public void process(METReserveEventOrdersContract _contract)
+    {
+        TimeOfDay startTime = DateTimeUtil::getTimeNow(DateTimeUtil::getUserPreferredTimeZone());
+
+        this.processInternal(_contract);
+
+        TimeOfDay endTime = DateTimeUtil::getTimeNow(DateTimeUtil::getUserPreferredTimeZone());
+
+        int ret = endTime - startTime;
+
+        info(strFmt('Total time: %1', ret));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs tasks of the task service class.
+    /// </summary>
+    /// <param name = "_readPast">Table read past setting</param>
+    protected void processTask(boolean _readPast)
+    {
+        while (this.getDataFromTopPickingQueue(topPickingProcessId, _readPast))
+        {
+            try
+            {
+                this.execute();
+            }
+            catch (Exception::Error)
+            {
+                // Catch any exception so that any one error won't bring down
+                // the entire process of sales order substitution.
+                Global::exceptionTextFallThrough();
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDataFromTopPickingQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets data to reserve event orders.
+    ///</summary>
+    /// <param name = "_processId">Guid created and added in the contract <c>METReserveEventOrdersContract</c>.</param>
+    /// <param name = "_readPast">boolean to read past records or not</param>
+    /// <returns>True, if data is retrieved from the queue; otherwise; false.</returns>
+    private boolean getDataFromTopPickingQueue(guid _processId, boolean _readPast)
+    {
+        #OCCRetryCount
+    
+        METReserveEventOrdersQueue topPickingQueue;
+        int                        backOffWait;
+    
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockException;
+        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
+        Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
+        
+        topPickingQueue.readPast(_readPast);
+
+        try
+        {
+            ttsbegin;
+    
+            select firstonly pessimisticlock topPickingQueue
+                where topPickingQueue.ProcessId == _processId;
+
+            if (topPickingQueue.RecId)
+            {
+                salesId = topPickingQueue.SalesId;
+                poLink = topPickingQueue.POLink;
+
+                topPickingQueue.delete();
+            }
+            else
+            {
+                salesId = '';
+                poLink = NoYes::No;
+            }
+           
+            ttscommit;
+        }
+        catch (deadLockException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw deadLockException;
+                }
+            }
+            else
+            {
+                throw deadLockException;
+            }
+        }
+        catch (updateConflictException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+            }
+            else
+            {
+                throw updateConflictException;
+            }
+        }
+        catch (transientSqlConnectionError)
+        {
+            if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw transientSqlConnectionError;
+            }
+        }
+
+        return (salesId != '');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    private void execute()
+    {
+        SalesLine         salesLine;
+        InventTransOrigin inventTransOrigin;
+        InventTrans       inventTrans;
+
+        if (salesId)
+        {
+            while select salesLine
+                where salesLine.SalesId == salesId
+                &&    salesLine.SalesStatus == SalesStatus::Backorder
+                exists join inventTransOrigin
+                    where inventTransOrigin.InventTransId == salesLine.InventTransId
+                exists join inventTrans
+                    where inventTrans.InventTransOrigin == inventTransOrigin.RecId
+                    &&    inventTrans.StatusIssue == StatusIssue::OnOrder
+            {
+                METInventTransReserveService::construct(salesLine.InventTransId, salesLine.QtyOrdered).reserve();
+            }
+        }
+        
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
