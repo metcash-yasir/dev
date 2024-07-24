@@ -149,8 +149,27 @@ public class METSalesOrderShipmentLoadHeader extends common
         metSalesOrderShipmentLoadHeader.SiteId          = InventLocation::find(_inventLocationId).InventSiteId;
         metSalesOrderShipmentLoadHeader.TransactionType = _transactionType;
         metSalesOrderShipmentLoadHeader.ShipmentStatus  = MetShipmentStatus::Open;
-        metSalesOrderShipmentLoadHeader.insert();
+        
+        if (metSalesOrderShipmentLoadHeader.validateWrite())
+        {
+            metSalesOrderShipmentLoadHeader.insert();
+        }
+        else //In case of validation fail, try again to search for open shipment. This may occur when multi thread is running and at same time two picking list executed and system tryed to insert shipment for same parameter.
+        {
+            select firstonly metSalesOrderShipmentLoadHeader
+                where metSalesOrderShipmentLoadHeader.CustAccount == _custAccount       &&
+                    metSalesOrderShipmentLoadHeader.Route == _metRoute                  &&
+                    metSalesOrderShipmentLoadHeader.RouteStopNum == _metRouteStop       &&
+                    metSalesOrderShipmentLoadHeader.ConfirmedShipDate == _confirmedDate &&
+                    metSalesOrderShipmentLoadHeader.Warehouse == _inventLocationId      &&
+                    metSalesOrderShipmentLoadHeader.TransactionType == _transactionType &&
+                    metSalesOrderShipmentLoadHeader.ShipmentStatus == MetShipmentStatus::Open;
 
+                if (metSalesOrderShipmentLoadHeader.RecId != 0)
+                {
+                    return metSalesOrderShipmentLoadHeader;
+                }
+        }
 
         return metSalesOrderShipmentLoadHeader;
     }
@@ -183,7 +202,8 @@ public class METSalesOrderShipmentLoadHeader extends common
 				<Name>generateShipmentLoadFromExtraction</Name>
 				<Source><![CDATA[
     public static void generateShipmentLoadFromExtraction(container         _soListFromExtraction,
-                                                        boolean             _createShipment)
+                                                        boolean             _createShipment,
+                                                        boolean             _skipShipmentLinesCreation)
     {
         SalesTable                                  salesTable;
         METSalesOrderShipmentLoadCreationTmp        tmpTable;
@@ -207,7 +227,7 @@ public class METSalesOrderShipmentLoadHeader extends common
             }
         }
 
-        METSalesOrderShipmentLoadHeader::createShippmentLoadFromTmpTable(tmpTable, _createShipment);
+        METSalesOrderShipmentLoadHeader::createShippmentLoadFromTmpTable(tmpTable, _createShipment, _skipShipmentLinesCreation);
     }
 
 ]]></Source>
@@ -215,8 +235,9 @@ public class METSalesOrderShipmentLoadHeader extends common
 			<Method>
 				<Name>createShippmentLoadFromTmpTable</Name>
 				<Source><![CDATA[
-    public static void createShippmentLoadFromTmpTable(METSalesOrderShipmentLoadCreationTmp     _tmpTable, 
-                                                      boolean                                   _createShipment)
+    public static void createShippmentLoadFromTmpTable(METSalesOrderShipmentLoadCreationTmp     _tmpTable,
+                                                      boolean                                   _createShipment,
+                                                      boolean                                   _skipShipmentLinesCreation)
     {
         METSalesOrderShipmentLoadHeader salesOrderShipmentLoadHeader;
 
@@ -234,7 +255,10 @@ public class METSalesOrderShipmentLoadHeader extends common
                                                                                                     _createShipment);
             if (salesOrderShipmentLoadHeader.RecId)
             {
-                METSalesOrderShipmentLoadLines::createShipmentLines(salesOrderShipmentLoadHeader);
+                if (_skipShipmentLinesCreation == false)
+                {
+                    //METSalesOrderShipmentLoadLines::createShipmentLines(salesOrderShipmentLoadHeader);
+                }
 
                 if (_createShipment)
                 {
@@ -253,8 +277,8 @@ public class METSalesOrderShipmentLoadHeader extends common
             group by ConfirmedShipDate, Warehouse, Route
         {
             loadId = METSalesOrderShipmentLoadHeader::consolidateShipmentAndCreateLoads(_tmpTable.Route,
-                                                                                    _tmpTable.ConfirmedShipDate, 
-                                                                                    _tmpTable.Warehouse, 
+                                                                                    _tmpTable.ConfirmedShipDate,
+                                                                                    _tmpTable.Warehouse,
                                                                                     METOrderTransactionType::SalesOrder,
                                                                                     _createShipment);
 
@@ -270,6 +294,7 @@ public class METSalesOrderShipmentLoadHeader extends common
                 }
             }
         }
+
     }
 
 ]]></Source>
@@ -314,6 +339,97 @@ public class METSalesOrderShipmentLoadHeader extends common
 
 ]]></Source>
 			</Method>
+			<Method>
+				<Name>validateWrite</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    /// <returns></returns>
+    public boolean validateWrite()
+    {
+        METSalesOrderShipmentLoadHeader     shipmentLoadHeader;
+        boolean ret;
+    
+        ret = super();
+    
+        select firstonly RecId from shipmentLoadHeader
+            where shipmentLoadHeader.ConfirmedShipDate == this.ConfirmedShipDate    &&
+                shipmentLoadHeader.CustAccount == this.CustAccount                  &&
+                shipmentLoadHeader.Warehouse == this.Warehouse                      &&
+                shipmentLoadHeader.Route == this.Route                              &&
+                shipmentLoadHeader.RouteStopNum == this.RouteStopNum                &&
+                shipmentLoadHeader.ShipmentId != this.ShipmentId                    &&
+                shipmentLoadHeader.ShipmentStatus == MetShipmentStatus::Open;
+
+        if (shipmentLoadHeader.RecId != 0)
+        {
+            ret = checkFailed(strFmt("Open shipment '%1' exist for the same Customer, Warehouse, Ship date, route, route stop num. Hence, cannot create new.", shipmentLoadHeader.ShipmentId));
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createShippmentLoadFromSalesTable</Name>
+				<Source><![CDATA[
+    public static void createShippmentLoadFromSalesTable(SalesId     _salesId,
+                                                      boolean       _createShipment,
+                                                      boolean       _skipShipmentLinesCreation)
+    {
+        METSalesOrderShipmentLoadHeader salesOrderShipmentLoadHeader;
+        SalesTable      salesTable = SalesTable::find(_salesId);
+
+        salesOrderShipmentLoadHeader = METSalesOrderShipmentLoadHeader::findOrCreateOpenShipment(salesTable.CustAccount,
+                                                                                                salesTable.METRoute,
+                                                                                                salesTable.METRouteStopNum,
+                                                                                                salesTable.ShippingDateConfirmed,
+                                                                                                salesTable.InventLocationId,
+                                                                                                METOrderTransactionType::SalesOrder,
+                                                                                                _createShipment);
+        if (salesOrderShipmentLoadHeader.RecId)
+        {
+            if (_skipShipmentLinesCreation == false)
+            {
+                METSalesOrderShipmentLoadLines::createShipmentLines(salesOrderShipmentLoadHeader, salesTable);
+            }
+
+            if (_createShipment)
+            {
+                info(strFmt("Shipment %1 is created.", salesOrderShipmentLoadHeader.ShipmentId));
+            }
+            else
+            {
+                info(strFmt("Shipment %1 is updated.", salesOrderShipmentLoadHeader.ShipmentId));
+            }
+        }
+
+        MetLoadId       loadId;
+        //Load creation and update
+        loadId = METSalesOrderShipmentLoadHeader::consolidateShipmentAndCreateLoads(salesTable.METRoute,
+                                                                                    salesTable.ShippingDateConfirmed,
+                                                                                    salesTable.InventLocationId,
+                                                                                    METOrderTransactionType::SalesOrder,
+                                                                                    _createShipment);
+
+        if (loadId)
+        {
+            if (_createShipment)
+            {
+                info(strFmt("Load %1 is created.", salesOrderShipmentLoadHeader.LoadId));
+            }
+            else
+            {
+                info(strFmt("Load %1 is updated.", salesOrderShipmentLoadHeader.LoadId));
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
 		</Methods>
 	</SourceCode>
 	<SubscriberAccessLevel>
@@ -321,6 +437,10 @@ public class METSalesOrderShipmentLoadHeader extends common
 	</SubscriberAccessLevel>
 	<AllowRowVersionChangeTracking>Yes</AllowRowVersionChangeTracking>
 	<ClusteredIndex></ClusteredIndex>
+	<CreatedBy>Yes</CreatedBy>
+	<CreatedDateTime>Yes</CreatedDateTime>
+	<ModifiedBy>Yes</ModifiedBy>
+	<ModifiedDateTime>Yes</ModifiedDateTime>
 	<DeleteActions />
 	<FieldGroups>
 		<AxTableFieldGroup>
@@ -419,13 +539,13 @@ public class METSalesOrderShipmentLoadHeader extends common
 					<DataField>RouteStopNum</DataField>
 				</AxTableFieldGroupField>
 				<AxTableFieldGroupField>
-					<DataField>displayShipmentOrderSplitGroup</DataField>
-				</AxTableFieldGroupField>
-				<AxTableFieldGroupField>
 					<DataField>displayPickComplete</DataField>
 				</AxTableFieldGroupField>
 				<AxTableFieldGroupField>
 					<DataField>displayLoadPickComplete</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>displayShipmentOrderSplitGroup</DataField>
 				</AxTableFieldGroupField>
 			</Fields>
 		</AxTableFieldGroup>
