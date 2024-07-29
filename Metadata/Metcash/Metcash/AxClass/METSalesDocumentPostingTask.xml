@@ -1,0 +1,296 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesDocumentPostingTask</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// <c>public class METSalesDocumentPostingTask</c> is a class used to print sales document.
+/// </summary>
+public class METSalesDocumentPostingTask
+{
+    #OCCRetryCount
+    DocumentStatus              docStatus;
+    WHSShipmentId               shipmentId;
+    AccountOrder                accountOrder;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Run method
+    /// </summary>
+    /// <param name = "_dataContract">METSalesDocumentPostingDataContract</param>
+    
+    //[METSysOperationDataContractNameAttribute(classstr(METSalesDocumentPostingDataContract))]
+    public void run(METSalesDocumentPostingDataContract _dataContract)
+    {
+        docStatus       = _dataContract.parmDocStatus();
+        shipmentId      = _dataContract.parmShipmentId();
+        accountOrder    = _dataContract.parmAccountOrder();
+
+        this.postSalesDocument();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postSalesDocument</Name>
+				<Source><![CDATA[
+    private void postSalesDocument()
+    {
+        try
+        {
+            ttsBegin;
+            JournalId       jourId;
+            jourId = this.postPackingslipInvoiceReport(accountOrder);
+            ttsCommit;
+
+            if(jourId)
+            {
+                this.updateDocStatusInHeader(MetShipmentStatus::Shipped, MetLoadStatus::Shipped, docStatus, jourId);
+            }
+            else
+            {
+                this.updateDocStatusInHeader(MetShipmentStatus::Open, MetLoadStatus::Open, DocumentStatus::None, '');
+            }
+
+            //info(strFmt('shipmentId - %1, DocumentStatus - %2', shipmentId, docStatus));
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw;
+            }
+        }
+        catch
+        {   
+            this.updateDocStatusInHeader(MetShipmentStatus::Open, MetLoadStatus::Open, DocumentStatus::None, '');
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postPackingslipInvoiceReport</Name>
+				<Source><![CDATA[
+    private JournalId postPackingslipInvoiceReport(AccountOrder _accountOrder)
+    {
+        boolean                         isSingleDoc = _accountOrder == AccountOrder::Account ? true : false;
+        JournalId                       jourId;
+        SalesFormLetter                 salesFormLetter;
+
+        salesFormLetter = SalesFormLetter::construct(docStatus);
+
+        salesFormLetter.chooseLinesQuery(this.calcQuery(shipmentId));
+        salesFormLetter.transDate(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));
+        salesFormLetter.specQty(SalesUpdate::PickingList);
+        salesFormLetter.proforma(NoYes::No);
+        salesFormLetter.printout(Printout::Current);
+        salesFormLetter.printFormLetter(NoYes::No);
+        salesFormLetter.usePrintManagement(NoYes::No);
+        salesFormLetter.chooseLines(false, true);
+        salesFormLetter.sumBy(_accountOrder);
+        salesFormLetter.reArrangeNow(isSingleDoc);
+
+        salesFormLetter.run();
+
+        if (salesFormLetter.parmJournalRecord().TableId == tableNum(CustPackingSlipJour))
+        {
+            CustPackingSlipJour     jourTable;
+            jourTable = salesFormLetter.parmJournalRecord();
+            jourId  = jourTable.packingSlipId;
+
+            if(jourTable)
+            {
+                if(isSingleDoc)
+                {
+                    ttsbegin;
+                    METSalesOrderShipmentLoadHeader     metSalesOrderShipmentLoadHeader;
+
+                    select firstonly metSalesOrderShipmentLoadHeader
+                        where metSalesOrderShipmentLoadHeader.ShipmentId == shipmentId;
+
+                    jourTable.selectForUpdate(true);
+                    jourTable.METLoadId     = metSalesOrderShipmentLoadHeader.LoadId;
+                    jourTable.METShipmentId = shipmentId;
+
+                    jourTable.doUpdate();
+                    ttscommit;
+                }
+                else
+                {
+                    METSalesOrderShipmentLoadLines          metSalesOrderShipmentLoadLines;
+                    SalesLine                               salesLine;
+                    CustPackingSlipTrans                    packslipTrans;
+                    CustPackingSlipJour                     packslipJour;
+                    container                               conSalesId;
+
+                    while select metSalesOrderShipmentLoadLines
+                            where metSalesOrderShipmentLoadLines.ShipmentId == shipmentId
+                            join salesLine
+                                where salesLine.SalesId == metSalesOrderShipmentLoadLines.OrderNum &&
+                                    salesLine.LineNum == metSalesOrderShipmentLoadLines.LineNum
+                                join packslipTrans
+                                    where packslipTrans.InventTransId == salesLine.InventTransId
+                    {
+                        if(!conFind(conSalesId, salesLine.SalesId))
+                        {
+                            packslipJour = packslipTrans.custPackingslipJour();
+                            if(packslipJour)
+                            {
+                                packslipJour.selectForUpdate(true);
+                                packslipJour.METLoadId     = metSalesOrderShipmentLoadLines.LoadId;
+                                packslipJour.METShipmentId = shipmentId;
+
+                                packslipJour.doUpdate();
+                                ttscommit;
+                            }
+
+                            conSalesId += salesLine.SalesId;
+                        }
+                    }
+                }
+            }
+        }
+        else if(salesFormLetter.parmJournalRecord().TableId == tableNum(CustInvoiceJour))
+        {
+            CustInvoiceJour     jourTable;
+            jourTable = salesFormLetter.parmJournalRecord();
+            jourId  = jourTable.InvoiceId;
+
+            if(jourTable)
+            {
+                if(isSingleDoc)
+                {
+                    // For Single Posting Document
+                    ttsbegin;
+                    METSalesOrderShipmentLoadHeader     metSalesOrderShipmentLoadHeader;
+
+                    select firstonly metSalesOrderShipmentLoadHeader
+                    where metSalesOrderShipmentLoadHeader.ShipmentId == shipmentId;
+
+                    jourTable.selectForUpdate(true);
+                    jourTable.METLoadId     = metSalesOrderShipmentLoadHeader.LoadId;
+                    jourTable.METShipmentId = shipmentId;
+
+                    jourTable.doUpdate();
+                    ttscommit;
+                }
+                else
+                {
+                    METSalesOrderShipmentLoadLines          metSalesOrderShipmentLoadLines;
+                    SalesLine                               salesLine;
+                    CustInvoiceTrans                        invoiceTrans;
+                    CustInvoiceJour                         invoiceJour;
+                    container                               conSalesId;
+
+                    while select metSalesOrderShipmentLoadLines
+                        where metSalesOrderShipmentLoadLines.ShipmentId == shipmentId
+                        join salesLine
+                            where salesLine.SalesId == metSalesOrderShipmentLoadLines.OrderNum &&
+                                salesLine.LineNum == metSalesOrderShipmentLoadLines.LineNum
+                            join invoiceTrans
+                                where invoiceTrans.InventTransId == salesLine.InventTransId
+                    {
+                        if(!conFind(conSalesId, salesLine.SalesId))
+                        {
+                            invoiceJour = invoiceTrans.custInvoiceJour();
+                            if(invoiceJour)
+                            {
+                                invoiceJour.selectForUpdate(true);
+                                invoiceJour.METLoadId     = metSalesOrderShipmentLoadLines.LoadId;
+                                invoiceJour.METShipmentId = shipmentId;
+
+                                invoiceJour.doUpdate();
+                                ttscommit;
+                            }
+
+                            conSalesId += salesLine.SalesId;
+                        }
+                    }
+                }
+
+            }
+        }
+
+        return jourId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcQuery</Name>
+				<Source><![CDATA[
+    private SysQueryRun calcQuery(WMSShipmentId _shipmentId)
+    {
+        METSalesOrderShipmentLoadLines  metLines;
+        RefRecId                salesLineRecId;
+        Query                   qry = new Query(QueryStr(SalesUpdate));
+        QueryBuildDataSource    queryBuildDataSource = qry.dataSourceTable(tableNum(SalesLine));
+        QueryBuildRange         queryBuildRange;
+        SalesLine               salesLine;
+
+        while select metLines
+                where metLines.ShipmentId == _shipmentId 
+                //&& metLines.PickingListStatus == WMSExpeditionStatus::Loaded
+            join RecId from salesLine
+                where salesLine.SalesId == metLines.ordernum &&
+                    salesLine.LineNum == metLines.lineNum
+        {
+            salesLineRecId = salesLine.RecId;
+            queryBuildRange = queryBuildDataSource.addRange(fieldnum(SalesLine, RecId));
+            queryBuildRange.value(SysQuery::value(salesLineRecId));
+        }
+        return new sysQueryRun(qry);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDocStatusInHeader</Name>
+				<Source><![CDATA[
+    private void updateDocStatusInHeader(MetShipmentStatus _shipmentStatus, MetLoadStatus _loadStatus, DocumentStatus _docStatus, JournalId _jourId)
+    {
+        METSalesOrderShipmentLoadHeader     shipmentHeader;
+
+        ttsbegin;
+        select firstonly shipmentHeader
+            where shipmentHeader.ShipmentId == shipmentId;
+
+        if(shipmentHeader)
+        {
+            shipmentHeader.selectForUpdate(true);
+            shipmentHeader.MarkSelection    = NoYes::No;
+            shipmentHeader.ShipmentStatus   = _shipmentStatus;
+            shipmentHeader.LoadStatus       = _loadStatus;
+            shipmentHeader.DocumentStatus   = _docStatus;
+            shipmentHeader.RefTransId       = _jourId;
+            shipmentHeader.update();
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
