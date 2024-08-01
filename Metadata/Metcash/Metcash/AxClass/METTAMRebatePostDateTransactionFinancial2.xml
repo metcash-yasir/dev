@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METTAMRebatePostDateTransactionFinancial2</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+internal final class METTAMRebatePostDateTransactionFinancial2 extends TAMRebatePostDateTransaction
+{
+    protected TAMRebateCreateDocumentFinancial createDocument;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>rebateCompany</Name>
+				<Source><![CDATA[
+    internal SelectableDataArea rebateCompany()
+    {
+        return createDocument.getRebatePosting().RebateCompany;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processRebateDateTransaction</Name>
+				<Source><![CDATA[
+    protected Common processRebateDateTransaction(TAMRebateDateTrans _rebateDateTrans)
+    {
+        using (var activityContext = TAMRebateInstrumentationLogger::createLogger(classStr(TAMRebatePost)).postActivities().processRebateFinancial())
+        {
+            if (_rebateDateTrans.RebateTransactionType == TAMRebateTransactionType::Rebate)
+            {
+                if (this.useCustomerAccount() && createDocument.getRebatePosting().RebatePaymentType == TAMRebatePaymentType::Vendor)
+                {
+                    CustTable custTable = CustTable::find(_rebateDateTrans.RemittanceAccount);
+
+                    if (!custTable.VendAccount)
+                    {
+                        throw error(strfmt("@RebatesAndDeductions:VendorSetupMissingOnCustomer", custTable.AccountNum));
+                    }
+                }
+
+                TAMRebatePostingAccount rebatePostingAccount = createDocument.getRebatePostingAccount();
+                rebatePostingAccount.parmRecipient(_rebateDateTrans.RemittanceAccount);
+            }
+
+            Map postingAmountMap = this.calcPostingAmount(_rebateDateTrans);
+    
+            if (!postingAmountMap.elements())
+            {
+                return null;
+            }
+            
+            if (FeatureStateProvider::isFeatureEnabled(TAMRebateCancelProvisionWithPostingDateFeature::instance()))
+            {
+                createDocument.parmRebateDateTrans(_rebateDateTrans);
+            }
+            createDocument.parmRebateTransId(_rebateDateTrans.RebateTransId);
+            createDocument.parmTransDate(processDate);
+            createDocument.parmTotalAmount(0);
+
+            if (TAMRebatePayToSoldToCustomerFeature::isEnabled()
+                && createDocument.getRebatePosting().DynamicAccount == TAMRebateDynamicAccount::CustomerAccount)
+            {
+                createDocument.createHeader();
+            }
+
+            MapEnumerator postingAmountEnumerator = postingAmountMap.getEnumerator();
+            while (postingAmountEnumerator.moveNext())
+            {
+                Amount postingAmount = postingAmountEnumerator.currentValue();
+                if (postingAmount)
+                {
+                    SelectableDataArea company;
+                    DimensionDefault dimension;
+
+                    [company, dimension] = postingAmountEnumerator.currentKey();
+
+                    createDocument.createLine(postingAmount, company, dimension, rebateParameters.ProcessByDimension);
+                }
+            }
+
+            this.postExtraLedgerJournalTrans(createDocument, _rebateDateTrans);
+    
+            return createDocument.getDocumentHeader();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initializeCreateDocumentInstance</Name>
+				<Source><![CDATA[
+    internal TAMRebateCreateDocument initializeCreateDocumentInstance(boolean _isCreateFreeTextInvoice, ModuleInventCustVend _module)
+    {
+        createDocument = TAMRebateCreateDocumentFinancial::newFromDocumentType(_isCreateFreeTextInvoice);
+
+        return createDocument;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPostingAmountQuery</Name>
+				<Source><![CDATA[
+    private Query getPostingAmountQuery(TAMRebateDateTrans _rebateDateTrans)
+    {
+        Query postingAmountQuery = new Query();
+
+        QueryBuildDataSource rebateTransDataSource = postingAmountQuery.addDataSource(tableNum(TAMRebateTrans));
+        rebateTransDataSource.addSelectionField(fieldNum(TAMRebateTrans, PostingAmount), SelectionField::Sum);
+
+        if (rebateDeal.RebateReconciliation == TAMRebateReconciliation::Deal)
+        {
+            rebateTransDataSource.addGroupByAndSelectionField(fieldNum(TAMRebateTrans, RefCompanyId));
+        }
+
+        if (rebateParameters.ProcessByDimension)
+        {
+            rebateTransDataSource.addGroupByAndSelectionField(fieldNum(TAMRebateTrans, DefaultDimension));
+        }
+
+        rebateTransDataSource.addRange(fieldNum(TAMRebateTrans, RebateTransId)).value(SysQuery::value(_rebateDateTrans.RebateTransId));
+
+        if (rebateParameters.UseClaimProcess && _rebateDateTrans.RebateTransactionType == TAMRebateTransactionType::Rebate)
+        {
+            rebateTransDataSource.addRange(fieldNum(TAMRebateTrans, Claimed)).value(SysQuery::value(NoYes::Yes));
+        }
+        
+        return postingAmountQuery;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcPostingAmount</Name>
+				<Source><![CDATA[
+    private Map calcPostingAmount(TAMRebateDateTrans _rebateDateTrans)
+    {
+        Map postingAmountMap = new Map(Types::Container, Types::Real);
+        Amount totalAmount = 0;
+
+        TAMRebateCalculateGuarantee rebateCalculateGuarantee = TAMRebateCalculateGuarantee::newFromRebateDateTrans(
+            _rebateDateTrans,
+            rebateDeal.RebateGuaranteeCumulative,
+            true,
+            rebateParameters.UseClaimProcess);
+
+        QueryRun queryRun = new QueryRun(this.getPostingAmountQuery(_rebateDateTrans));
+        while (queryRun.next())
+        {
+            TAMRebateTrans rebateTrans = queryRun.get(tableNum(TAMRebateTrans));
+
+            Amount postingAmount = rebateTrans.PostingAmount > 0 ? rebateCalculateGuarantee.calculatePostingAmount(rebateTrans.PostingAmount, rebateTrans.RefCompanyId) : rebateTrans.PostingAmount;
+
+            container key = [rebateTrans.RefCompanyId, rebateTrans.DefaultDimension];
+            if (postingAmountMap.exists(key))
+            {
+                postingAmount += postingAmountMap.lookup(key);
+            }
+
+            postingAmountMap.insert(key, postingAmount);
+
+            totalAmount += postingAmount;
+        }
+
+        this.rebateDateTransactionTotalAmountCalculated(_rebateDateTrans, totalAmount);
+        return postingAmountMap;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>useCustomerAccount</Name>
+				<Source><![CDATA[
+    protected boolean useCustomerAccount()
+    {
+        return createDocument.getRebatePosting().useCustomerAccount();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postExtraLedgerJournalTrans</Name>
+				<Source><![CDATA[
+    public void postExtraLedgerJournalTrans(TAMRebateCreateDocumentFinancial _createDocument, TAMRebateDateTrans _rebateDateTrans)
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>rebateDateTransactionTotalAmountCalculated</Name>
+				<Source><![CDATA[
+    protected void rebateDateTransactionTotalAmountCalculated(TAMRebateDateTrans _rebateDateTrans, Amount _amount)
+    {
+        return;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
