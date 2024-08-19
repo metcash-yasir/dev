@@ -1,0 +1,281 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METTAMProcessExternalSellDataHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Created for the FSD - CB201 Rebates Extension - Undertake Build -  External Data Sources
+/// </summary>
+public class METTAMProcessExternalSellDataHelper
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>createDateTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to create Rebate transactions
+    /// </summary>
+    /// <param name = "_rebateDealRecId">Rebate deal Reference to transaction</param>
+    /// <param name = "_rebateTableRebateId">Rebate table reference to transaction</param>
+    /// <param name = "_scanSupplierTransDate">Transaction date of custom external sell data</param>
+    /// <param name = "_rebateDate">TAMRebateDate table</param>
+    /// <param name = "_transType">Transaction type from user interface</param>
+    /// <param name = "_externalSellData">External sell data record</param>
+    /// <returns>Existing or newly created rebate transaction reference</returns>
+    public static TAMRebateDateTrans createDateTrans(RefRecId                       _rebateDealRecId,
+                                                        TAMRebateId                 _rebateTableRebateId,
+                                                        TransDate                   _scanSupplierTransDate,
+                                                        TAMRebateDate               _rebateDate,
+                                                        TAMRebateTransactionType    _transType,
+                                                        METRebateScanSupplierTable  _externalSellData)
+    {   
+        TAMRebateDateTrans  rebateDateTrans;
+
+        select firstonly1 rebateDateTrans
+            where  rebateDateTrans.RebateDeal == _rebateDealRecId
+               && rebateDateTrans.RebateFromDate <= _scanSupplierTransDate
+               && rebateDateTrans.RebateToDate >= _scanSupplierTransDate
+               && rebateDateTrans.RebateTransactionType == _transType;
+        
+        //If the rebate transaction exists, return the existing transaction else create a new transaction
+        if(rebateDateTrans)
+        {
+            return rebateDateTrans;
+        }
+        else
+        {
+            try
+            {
+                ttsbegin;
+                rebateDateTrans.RebateId                =   _rebateTableRebateId;
+                rebateDateTrans.RebateDeal              =   _rebateDealRecId;
+                rebateDateTrans.RebateTransId           =   NumberSeq::newGetNum(NumberSeqReference::findReference(extendedTypeNum(METOrigRebateTransId))).num();
+                rebateDateTrans.RebateFromDate          =   _scanSupplierTransDate;
+                
+                if (TAMRebateTable::find(_rebateTableRebateId).RebateBasis == TAMRebateBasis::Quantity)
+                {
+                    rebateDateTrans.RebateAmount = METTAMProcessExternalSellDataHelper::calcRebateAmount(_externalSellData.SalesQty, _rebateDate);
+                }
+                else if (TAMRebateTable::find(_rebateTableRebateId).RebateBasis == TAMRebateBasis::Value)
+                {
+                    rebateDateTrans.RebateAmount = METTAMProcessExternalSellDataHelper::calcRebateAmount(_externalSellData.SalesValue, _rebateDate);
+                }
+
+                //Get the data from external sell table
+                rebateDateTrans.RebateToDate            =   _scanSupplierTransDate + METTAMProcessExternalSellDataHelper::getRebateToDate(_rebateDate, _scanSupplierTransDate);
+                rebateDateTrans.RebateTransactionType   =   _transType;
+                
+                //Initialize the value
+                rebateDateTrans.initValue();
+                rebateDateTrans.initFromReference(_externalSellData);
+                rebateDateTrans.getRebateReference(TAMRebateParameters::find().ItemOrderReference);
+
+                //External sell data identification
+                rebateDateTrans.METExternalSellTransactionNumber    = _externalSellData.TransactionNumber;
+
+                rebateDateTrans.insert();
+                ttscommit;
+            }
+            catch(Exception::DuplicateKeyException)
+            {
+                Info("@MET:METRebateDuplicateKey");
+                throw Exception::DuplicateKeyExceptionNotRecovered;
+            }
+            catch(Exception::Error)
+            {
+                Info("@MET:METRebateInsertError");
+            }
+            return rebateDateTrans;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to cretae Rebate source transaction
+    /// </summary>
+    /// <param name = "_rebateDateTrans">TAMRebateDateTrans table</param>
+    /// <param name = "_rebateDate">TAMRebateDate table</param>
+    /// <param name = "_externalSellData">METRebateScanSupplierTable table</param>
+    /// <param name = "_toleranceQty">Tolerance quantity from user interface</param>
+    /// <param name = "_rebateTableUnitId">Rebate table unit of measure</param>
+    /// <param name = "_moduleInventCustVend">Module</param>
+    public static TAMRebateTrans createTrans(TAMRebateDateTrans             _rebateDateTrans,
+                                                TAMRebateDate               _rebateDate,
+                                                METRebateScanSupplierTable  _externalSellData,
+                                                UnitOfMeasureSymbol         _rebateTableUnitId,
+                                                ModuleInventCustVend        _moduleInventCustVend)
+    {
+        CustTable       custTableLoc;
+        VendTable       vendTableLoc;
+        InventDim       inventDimLoc;
+        TAMRebateTrans  rebateTrans;
+
+        try
+        {
+            ttsbegin;
+            rebateTrans.RefCompanyId        =   _externalSellData.Company;
+            rebateTrans.RebateRefDate       =   _externalSellData.TransactionDate;
+            rebateTrans.ItemId              =   _externalSellData.ItemId;
+            rebateTrans.RefUnitId           =   _rebateTableUnitId ? _rebateTableUnitId : _externalSellData.UnitOfMeasure;
+            
+            //NS-CB201 Rebates Extension - External Data Sources
+            if(_moduleInventCustVend == ModuleInventCustVend::Cust)
+            {
+                rebateTrans.RebateRefAccount =   _externalSellData.CustAccount;
+
+                select firstonly InventSiteId, InventLocation
+                    from custTableLoc index hint AccountIdx
+                    where custTableLoc.AccountNum == _externalSellData.CustAccount;
+
+                if (custTableLoc)
+                {
+                    inventDimLoc.InventSiteId       =   custTableLoc.InventSiteId;
+                    inventDimLoc.InventLocationId   =   custTableLoc.InventLocation;
+                }
+            }
+            else if (_moduleInventCustVend == ModuleInventCustVend::Vend)
+            {
+                rebateTrans.RebateRefAccount =   _externalSellData.VendAccount;
+
+                select firstonly InventSiteId, InventLocation
+                    from vendTableLoc index hint AccountIdx
+                    where vendTableLoc.AccountNum == _externalSellData.VendAccount;
+
+                if (vendTableLoc)
+                {
+                    inventDimLoc.InventSiteId       =   vendTableLoc.InventSiteId;
+                    inventDimLoc.InventLocationId   =   vendTableLoc.InventLocation;
+                }
+            }
+            //NE-CB201 Rebates Extension - External Data Sources
+            
+            rebateTrans.InventDimId                 =   InventDim::findOrCreate(inventDimLoc).inventDimId;
+
+            if (!_rebateTableUnitId || _rebateTableUnitId == _externalSellData.UnitOfMeasure)
+            {
+                rebateTrans.RebateQty               =   _externalSellData.SalesQty;
+            }
+            else
+            {
+                rebateTrans.RebateQty               =   EcoResProductUnitConverter::convertForReleasedProduct(rebateTrans.ItemId,
+                                                            rebateTrans.InventDimId,
+                                                            _externalSellData.SalesQty,
+                                                            UnitOfMeasure::findBySymbol(_externalSellData.UnitOfMeasure).RecId,
+                                                            UnitOfMeasure::findBySymbol(_rebateTableUnitId).RecId,
+                                                            NoYes::Yes);
+            }
+
+            rebateTrans.RebateRefQty                =   rebateTrans.RebateQty;
+
+            if (TAMRebateTable::find(_rebateDateTrans.RebateId).RebateBasis == TAMRebateBasis::Quantity)
+            {
+                rebateTrans.RebateAmount = METTAMProcessExternalSellDataHelper::calcRebateAmount(_externalSellData.SalesQty, _rebateDate);
+            }
+            else if (TAMRebateTable::find(_rebateDateTrans.RebateId).RebateBasis == TAMRebateBasis::Value)
+            {
+                rebateTrans.RebateAmount = METTAMProcessExternalSellDataHelper::calcRebateAmount(_externalSellData.SalesValue, _rebateDate);
+            }
+            
+            rebateTrans.PostingAmount               =   rebateTrans.RebateAmount;
+            rebateTrans.RebateTransId               =   _rebateDateTrans.RebateTransId;
+            rebateTrans.RebateId                    =   _rebateDate.RebateId;
+            rebateTrans.RebateRefId                 =   _externalSellData.TransactionNumber;
+            rebateTrans.CurrencyCode                =   _externalSellData.CurrencyCode;
+            rebateTrans.Claimed                     =   NoYes::Yes;
+            rebateTrans.RebateFromDate              =   _rebateDateTrans.RebateFromDate;
+            rebateTrans.RebateToDate                =   _rebateDateTrans.RebateToDate;
+            rebateTrans.METRebateScanSupplierTable  =   _externalSellData.RecId;
+
+            rebateTrans.setPostingAmount(TAMRebateParameters::find().UseClaimProcess);
+
+            if(rebateTrans.validateWrite())
+            {
+                rebateTrans.insert();
+            }
+            ttscommit;
+        }
+        catch(Exception::Error)
+        {
+            Info("@MET:METRebateInsertError");
+        }
+
+        return rebateTrans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRebateToDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to get number of days to be added to the new transaction line Date
+    /// </summary>
+    /// <param name = "_rebateDate">TAMRebateDate table</param>
+    /// <param name = "_externalSellData">Transaction date of custom external sell data</param>
+    /// <returns>number of days based on "Cumulate by" and "Rebate per" fields of Rebate date setup</returns>
+    public static Days getRebateToDate(TAMRebateDate  _rebateDate, TransDate  _externalSellData)
+    {
+        switch(_rebateDate.RebatePeriodCode)
+        {
+            case TAMRebatePeriodCode::Month:
+                return dayOfMth(dateEndMth(_externalSellData)) * _rebateDate.RebatePer;
+            case TAMRebatePeriodCode::Week:
+                return  METConstants::weekDays * _rebateDate.RebatePer;
+            case TAMRebatePeriodCode::Year:
+                xSession xSession = new xSession();
+                return dayOfYr(DateTimeUtil::getEndOfYearDate(xSession.preferredLocale(), _externalSellData)) * _rebateDate.RebatePer;
+            case TAMRebatePeriodCode::Day:
+            default:
+                return METConstants::oneDay * _rebateDate.RebatePer;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcRebateAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to calculate Rebate amount for Rebate source transaction
+    /// </summary>
+    /// <param name = "_rebateQty">Rebate quantity of source transaction line</param>
+    /// <param name = "_rebateDate">TAMRebateData table</param>
+    /// <returns>Calculate rebate amount</returns>
+    public static Amount calcRebateAmount(Qty _rebateQty, TAMRebateDate _rebateDate)
+    {
+        Amount          rebateAmt = 0;
+        TAMRebateLine   rebateLine;
+
+        while select rebateLine order by RebateFrom asc
+            where rebateLine.RefLineNum == _rebateDate.LineNum
+            && rebateLine.RebateId == _rebateDate.RebateId
+            && rebateLine.RebateFrom <= _rebateQty
+            && rebateLine.RebateLimit >= _rebateQty
+        {
+            switch(rebateLine.RebateMethod)
+            {
+                case TAMRebateMethod::Fixed :
+                    rebateAmt += rebateLine.RebateAmount;
+                    break;
+                case TAMRebateMethod::Percent:
+                    rebateAmt += _rebateQty * rebateLine.RebateAmount / 100;
+                    break;
+                case TAMRebateMethod::Rate :
+                    rebateAmt += rebateLine.RebateAmount * _rebateQty;
+                    break;
+            }
+        }
+        return rebateAmt;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
