@@ -28,9 +28,11 @@ class METVendorChangeRequestService
             METVendorChangeRequest metVendorChangeRequest;
             InventSiteId inventSiteId;
             inventSiteId = _data.parmInventSiteId();
+            MetChangeReqEffectiveDate currentDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), DateTimeUtil::getUserPreferredTimeZone()));
 
             while select metVendorChangeRequest
                 where metVendorChangeRequest.Status != METVendChangeReqStatus::Completed
+                && metVendorChangeRequest.ChangeReqEffectiveDate <= currentDate
             {
                 if((_data.parmCalledFromDefaultForm() && inventSiteId && _data.parmItemId()) && (metVendorChangeRequest.SiteId == inventSiteId) && (metVendorChangeRequest.ItemId == _data.parmItemId()))
                 {
@@ -96,124 +98,167 @@ class METVendorChangeRequestService
 
         _metVendorChangeRequest.ChangeRequestLog = '';
 
-        MetChangeReqEffectiveDate currentDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), DateTimeUtil::getUserPreferredTimeZone()));
+        ReqItemTable reqItemTable;
+        InventDim inventDim;
 
-        if (_metVendorChangeRequest.ChangeReqEffectiveDate <= currentDate)
+        select firstonly ReqPOType, VendId, RecId from reqItemTable
+            exists join inventDim
+            where inventDim.inventDimId == reqItemTable.CovInventDimId
+                && reqItemTable.ItemId == _metVendorChangeRequest.ItemId
+                && inventDim.InventLocationId == _metVendorChangeRequest.InventLocationId
+            && inventDim.InventSiteId == _metVendorChangeRequest.SiteId;
+
+        if (reqItemTable.RecId && reqItemTable.ReqPOType == ReqPOType::Purch &&
+            VendGroup::find(VendTable::find(reqItemTable.VendId).VendGroup).VendGroup != intercomp)
         {
-            ReqItemTable reqItemTable;
-            InventDim inventDim;
-
-            select firstonly ReqPOType, VendId, RecId from reqItemTable
-                exists join inventDim
-                where inventDim.inventDimId == reqItemTable.CovInventDimId
-                    && reqItemTable.ItemId == _metVendorChangeRequest.ItemId
-                    && inventDim.InventLocationId == _metVendorChangeRequest.InventLocationId
-                && inventDim.InventSiteId == _metVendorChangeRequest.SiteId;
-
-            if (reqItemTable.RecId && reqItemTable.ReqPOType == ReqPOType::Purch &&
-                VendGroup::find(VendTable::find(reqItemTable.VendId).VendGroup).VendGroup != intercomp)
-            {
-                ret = this.validateVendorChangeRequest(_metVendorChangeRequest, reqItemTable);
+            ret = this.validateVendorChangeRequest(_metVendorChangeRequest, reqItemTable);
                
-                METInventItemOrderSetup metInventItemOrderSetup = METInventItemOrderSetup::findByItemAndSite(_metVendorChangeRequest.ItemId, _metVendorChangeRequest.SiteId);
+            METInventItemOrderSetup metInventItemOrderSetup = METInventItemOrderSetup::findByItemAndSite(_metVendorChangeRequest.ItemId, _metVendorChangeRequest.SiteId);
                  
-                if (metInventItemOrderSetup.SubrangeId && ret)
-                {
-                    METInventItemOrderSetup metInventItemOrderSetupSubRange;
+            if (metInventItemOrderSetup.SubrangeId && ret)
+            {
+                METInventItemOrderSetup metInventItemOrderSetupSubRange;
 
-                    while select ItemId from metInventItemOrderSetupSubRange
-                        where metInventItemOrderSetupSubRange.SubrangeId == metInventItemOrderSetup.SubrangeId
-                    {
-                        ret = this.validateVendorChangeRequest(_metVendorChangeRequest, reqItemTable, metInventItemOrderSetupSubRange.ItemId, true);
-                    }
+                while select ItemId from metInventItemOrderSetupSubRange
+                    where metInventItemOrderSetupSubRange.SubrangeId == metInventItemOrderSetup.SubrangeId
+                {
+                    ret = this.validateVendorChangeRequest(_metVendorChangeRequest, reqItemTable, metInventItemOrderSetupSubRange.ItemId, true);
                 }
+            }
 
-                METSalesItemSubstitutionParentChild child;
-                METSalesItemSubstitutionParentChild parent;
+            METSalesItemSubstitutionParentChild child;
+            METSalesItemSubstitutionParentChild parent;
 
-                select firstonly ParentItemID from child
-                    where child.InventSiteId == _metVendorChangeRequest.SiteId
-                    && child.ChildItemID == _metVendorChangeRequest.ItemId;
+            select firstonly ParentItemID from child
+                where child.InventSiteId == _metVendorChangeRequest.SiteId
+                && child.ChildItemID == _metVendorChangeRequest.ItemId;
 
-                if (child.ParentItemID)
+            if (child.ParentItemID)
+            {
+                while select  ChildItemID from parent
+                    where parent.ParentItemID == child.ParentItemID
                 {
-                    while select  ChildItemID from parent
-                        where parent.ParentItemID == child.ParentItemID
-                    {
-                        this.processNoErrorRecords(_metVendorChangeRequest, reqItemTable, parent.ChildItemID);
-                        this.updateVendorChangeRequestStatus(_metVendorChangeRequest);
-                    }
-                }
-
-                if (ret)
-                {
-                    this.processNoErrorRecords(_metVendorChangeRequest, reqItemTable);
+                    this.processNoErrorRecords(_metVendorChangeRequest, reqItemTable, parent.ChildItemID);
                     this.updateVendorChangeRequestStatus(_metVendorChangeRequest);
                 }
             }
-            else if (reqItemTable.RecId && reqItemTable.ReqPOType == ReqPOType::Purch &&
-                VendGroup::find(VendTable::find(reqItemTable.VendId).VendGroup).VendGroup == intercomp)
+
+            if (ret)
             {
-                ReqItemTable reqItemTableTransfer;
-
-                select firstonly RecId from reqItemTableTransfer
-                    exists join inventDim
-                    where inventDim.inventDimId == reqItemTableTransfer.CovInventDimId
-                        && reqItemTableTransfer.ItemId == _metVendorChangeRequest.ItemId
-                        && inventDim.InventSiteId == _metVendorChangeRequest.SiteId
-                        && reqItemTableTransfer.InventLocationIdReqMain == _metVendorChangeRequest.InventLocationId
-                    && reqItemTableTransfer.ReqPOType == ReqPOType::Transfer;
-
-                if (reqItemTableTransfer.RecId)
-                {
-                    this.clearPendingVendorAccountFields(reqItemTable.RecId);
-                }
+                this.processNoErrorRecords(_metVendorChangeRequest, reqItemTable);
+                this.updateVendorChangeRequestStatus(_metVendorChangeRequest);
             }
-            else if (reqItemTable.ReqPOType == ReqPOType::Transfer)
-            {
-                ReqItemTable reqItemTablePurch;
 
-                while select ReqPOType, VendId, RecId from reqItemTablePurch
-                    exists join inventDim
-                    where inventDim.inventDimId == reqItemTablePurch.CovInventDimId
-                        && reqItemTablePurch.ItemId == _metVendorChangeRequest.ItemId
-                        && inventDim.InventSiteId == _metVendorChangeRequest.SiteId
-                        && reqItemTablePurch.InventLocationIdReqMain == _metVendorChangeRequest.InventLocationId
-                        && reqItemTablePurch.ReqPOType == ReqPOType::Purch
-                {
-                    if (reqItemTablePurch.RecId)
-                    {
-                        this.processNoErrorRecords(_metVendorChangeRequest, reqItemTablePurch);
-                        this.clearPendingVendorAccountFields(reqItemTable.RecId);
-                        this.updateVendorChangeRequestStatus(_metVendorChangeRequest);
-                    }
-                    else
-                    {
-                        _metVendorChangeRequest.selectForUpdate(true);
-                        _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
-                        _metVendorChangeRequest.ChangeRequestLog += "@MET:TransferOrderError";
-                        _metVendorChangeRequest.update();
-                        ret = false;
-                    }
-                }
-            }
-            else if (!reqItemTable.RecId)
+            this.updateTransferOrderRelatedToPO(_metVendorChangeRequest);
+        }
+        else if (reqItemTable.RecId && reqItemTable.ReqPOType == ReqPOType::Purch &&
+            VendGroup::find(VendTable::find(reqItemTable.VendId).VendGroup).VendGroup == intercomp)
+        {
+            ReqItemTable reqItemTableTransfer;
+
+            select firstonly RecId from reqItemTableTransfer
+                exists join inventDim
+                where inventDim.inventDimId == reqItemTableTransfer.CovInventDimId
+                    && reqItemTableTransfer.ItemId == _metVendorChangeRequest.ItemId
+                    && inventDim.InventSiteId == _metVendorChangeRequest.SiteId
+                    && reqItemTableTransfer.InventLocationIdReqMain == _metVendorChangeRequest.InventLocationId
+                && reqItemTableTransfer.ReqPOType == ReqPOType::Transfer;
+
+            if (reqItemTableTransfer.RecId)
             {
-                _metVendorChangeRequest.selectForUpdate(true);
-                _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
-                _metVendorChangeRequest.ChangeRequestLog += "@MET:NoItemCoverageError";
-                _metVendorChangeRequest.update();
-                ret = false;
+                this.clearPendingVendorAccountFields(reqItemTable.RecId);
             }
         }
-        else
+        else if (reqItemTable.ReqPOType == ReqPOType::Transfer)
+        {
+            ReqItemTable reqItemTablePurch;
+            ReqItemTable reqItemTableTransfer;
+            InventDim inventDimPurch;
+            METReqItemTable metReqItemTable;
+
+            select firstonly PendingVendAccountNumber from metReqItemTable
+                join ReqPOType, VendId, RecId from reqItemTableTransfer
+                join InventLocationId from inventDim
+                    where inventDim.inventDimId == reqItemTableTransfer.CovInventDimId
+                    && reqItemTableTransfer.ItemId == _metVendorChangeRequest.ItemId
+                    && inventDim.InventSiteId == _metVendorChangeRequest.SiteId
+                    && inventDim.InventLocationId == _metVendorChangeRequest.InventLocationId
+                    && reqItemTableTransfer.ReqPOType == ReqPOType::Transfer
+             join ReqPOType, VendId, RecId from reqItemTablePurch
+             join InventLocationId, InventSiteId from inventDimPurch
+                where inventDimPurch.inventDimId == reqItemTablePurch.CovInventDimId
+                    && reqItemTablePurch.ItemId == _metVendorChangeRequest.ItemId
+                    && reqItemTableTransfer.InventLocationIdReqMain == inventDimPurch.InventLocationId
+                    && reqItemTablePurch.RecId == metReqItemTable.RefRecId
+                    && reqItemTablePurch.ReqPOType == ReqPOType::Purch;
+
+                if (metReqItemTable.PendingVendAccountNumber == '')
+                {
+                    _metVendorChangeRequest.selectForUpdate(true);
+                    _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
+                    _metVendorChangeRequest.ChangeRequestLog += "@MET:TransferOrderError";
+                    _metVendorChangeRequest.update();
+                    ret = false;
+                }
+                else
+                {
+                    MetVendorChangeRequest metVendorChangeRequestPO;
+
+                    select firstonly metVendorChangeRequestPO
+                        where metVendorChangeRequestPO.Status != METVendChangeReqStatus::Completed
+                            && metVendorChangeRequestPO.ChangeReqEffectiveDate == _metVendorChangeRequest.ChangeReqEffectiveDate
+                            && metVendorChangeRequestPO.InventLocationId == inventDimPurch.InventLocationId
+                            && metVendorChangeRequestPO.SiteId == inventDimPurch.InventSiteId
+                            && metVendorChangeRequestPO.ItemId == _metVendorChangeRequest.ItemId;
+                    
+                        if (metVendorChangeRequestPO.RecId)
+                        {
+                            this.validateVendorChangeRequests(metVendorChangeRequestPO);
+                        }
+                        else
+                        {
+                            if (this.validateVendorChangeRequest(_metVendorChangeRequest, reqItemTableTransfer))
+                            {
+                                this.processNoErrorRecords(_metVendorChangeRequest, reqItemTableTransfer);
+                                this.updateVendorChangeRequestStatus(_metVendorChangeRequest);
+                            }
+                        }
+                    
+                }
+        }
+        else if (!reqItemTable.RecId)
         {
             _metVendorChangeRequest.selectForUpdate(true);
-            _metVendorChangeRequest.Status = METVendChangeReqStatus::Waiting;
+            _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
+            _metVendorChangeRequest.ChangeRequestLog += "@MET:NoItemCoverageError";
             _metVendorChangeRequest.update();
+            ret = false;
         }
+     
+        this.updateWaitingStatusForRecords(_metVendorChangeRequest);
 
         return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateWaitingStatusForRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the vendor change request status to waiting for the greater than today records.
+    /// </summary>
+    /// <param name = "_metVendorChangeRequest">_metVendorChangeRequest</param>
+    private void updateWaitingStatusForRecords(MetVendorChangeRequest _metVendorChangeRequest)
+    {
+        MetChangeReqEffectiveDate currentDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), DateTimeUtil::getUserPreferredTimeZone()));
+
+        MetVendorChangeRequest metVendorChangeRequest;
+
+        update_recordset metVendorChangeRequest
+            setting Status = METVendChangeReqStatus::Waiting
+            where metVendorChangeRequest.ChangeReqEffectiveDate > currentDate
+            && metVendorChangeRequest.SiteId == _metVendorChangeRequest.SiteId;
     }
 
 ]]></Source>
@@ -244,7 +289,7 @@ class METVendorChangeRequestService
         _reqItemTable.VendId = pendingVendAccount;
         _reqItemTable.update();
 
-        // Clear the pending vendor number and date.
+        // Clear the pending vendor number and date when there is no error.
         this.clearPendingVendorAccountFields(_reqItemTable.RecId);
 
         // Pricelist of vendor to close
@@ -374,15 +419,26 @@ class METVendorChangeRequestService
 				<Name>updateVendorChangeRequestStatus</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Update the vendor change requesty status to completed.
+    /// Update the vendor change request status and change request log based on the PO, if not TO record which processed recently.
     /// </summary>
     /// <param name = "_metVendorChangeRequest">_metVendorChangeRequest</param>
-    private void updateVendorChangeRequestStatus(MetVendorChangeRequest _metVendorChangeRequest)
+    /// <param name = "_metVendorChangeRequestPO">_metVendorChangeRequestPO</param>
+    private void updateVendorChangeRequestStatus(MetVendorChangeRequest _metVendorChangeRequest, MetVendorChangeRequest _metVendorChangeRequestPO = null)
     {
-        // Update the record status
+        _metVendorChangeRequest.reread();
         _metVendorChangeRequest.selectForUpdate(true);
-        _metVendorChangeRequest.Status = METVendChangeReqStatus::Completed;
-        _metVendorChangeRequest.ChangeRequestLog = strFmt("@MET:VendorUpdateSuccess", DateTimeUtil::utcNow());
+
+        if (_metVendorChangeRequestPO.RecId)
+        {
+            _metVendorChangeRequest.Status = _metVendorChangeRequestPO.Status;
+            _metVendorChangeRequest.ChangeRequestLog = _metVendorChangeRequestPO.ChangeRequestLog;
+        }
+        else
+        {
+            _metVendorChangeRequest.Status = METVendChangeReqStatus::Completed;
+            _metVendorChangeRequest.ChangeRequestLog = strFmt("@MET:VendorUpdateSuccess", DateTimeUtil::utcNow());
+        }
+        
         _metVendorChangeRequest.update();
     }
 
@@ -402,6 +458,41 @@ class METVendorChangeRequestService
         metReqItemTable.PendingVendAccountNumber = '';
         metReqItemTable.PendingVendChangeDate = utcdatetimenull();
         metReqItemTable.update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTransferOrderRelatedToPO</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the transfer order records related to purchase order.
+    /// </summary>
+    /// <param name = "_metVendorChangeRequest">_metVendorChangeRequest</param>
+    private void updateTransferOrderRelatedToPO(METVendorChangeRequest _metVendorChangeRequest)
+    {
+        ReqItemTable reqItemTableTransfer;
+        InventDim inventDim;
+        MetVendorChangeRequest metVendorChangeRequestTransfer;
+
+        while select ReqPOType, VendId, RecId, CovInventDimId from reqItemTableTransfer
+            join RecId from inventDim
+                where inventDim.inventDimId == reqItemTableTransfer.CovInventDimId
+                && reqItemTableTransfer.ItemId == _metVendorChangeRequest.ItemId
+                && reqItemTableTransfer.InventLocationIdReqMain == _metVendorChangeRequest.InventLocationId
+                && reqItemTableTransfer.ReqPOType == ReqPOType::Transfer
+            join SiteId, ItemId, InventLocationId, RecId from metVendorChangeRequestTransfer
+                where metVendorChangeRequestTransfer.SiteId == inventDim.InventSiteId
+                && metVendorChangeRequestTransfer.ItemId == _metVendorChangeRequest.ItemId
+                && metVendorChangeRequestTransfer.InventLocationId == inventDim.InventLocationId
+            {
+                if (_metVendorChangeRequest.Status != METVendChangeReqStatus::Error)
+                {
+                    this.processNoErrorRecords(metVendorChangeRequestTransfer, reqItemTableTransfer);
+                }
+
+                this.updateVendorChangeRequestStatus(metVendorChangeRequestTransfer, _metVendorChangeRequest);
+            }
     }
 
 ]]></Source>
