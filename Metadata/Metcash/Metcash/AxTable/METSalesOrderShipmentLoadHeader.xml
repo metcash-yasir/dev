@@ -225,7 +225,8 @@ public class METSalesOrderShipmentLoadHeader extends common
             where metSalesOrderShipmentLoadHeader.Route == _metRoute                    &&
                 metSalesOrderShipmentLoadHeader.ConfirmedShipDate == _confirmedDate     &&
                 metSalesOrderShipmentLoadHeader.Warehouse == _inventLocationId          &&
-                metSalesOrderShipmentLoadHeader.LoadStatus == METLoadStatus::Open;
+                metSalesOrderShipmentLoadHeader.LoadStatus == METLoadStatus::Open       &&
+                metSalesOrderShipmentLoadHeader.TransactionType == _transactionType;
 
         return metSalesOrderShipmentLoadHeader;
 
@@ -271,7 +272,6 @@ public class METSalesOrderShipmentLoadHeader extends common
             setting LoadId = loadId,
                     LoadStatus = MetLoadStatus::Open
                 where metSalesOrderShipmentLoadHeader.ShipmentStatus == MetShipmentStatus::Open     &&
-                    metSalesOrderShipmentLoadHeader.LoadStatus == MetLoadStatus::Open               &&
                     metSalesOrderShipmentLoadHeader.Route == _metRoute                              &&
                     metSalesOrderShipmentLoadHeader.ConfirmedShipDate == _confirmedDate             &&
                     metSalesOrderShipmentLoadHeader.Warehouse == _inventLocationId                  &&
@@ -430,7 +430,6 @@ public class METSalesOrderShipmentLoadHeader extends common
                 break;
 
         }
-        
 
         metSalesOrderShipmentLoadHeader.skipDataMethods(true);
 
@@ -438,7 +437,7 @@ public class METSalesOrderShipmentLoadHeader extends common
             setting LoadStatus = metLoadStatusUpdate
                 where metSalesOrderShipmentLoadHeader.LoadId == _loadId;
 
-        info(strFmt("Load '%1' is updated with '%2' status.", _loadId, metLoadStatusUpdate));
+        info(strFmt("@MET:LoadUpdate", _loadId, metLoadStatusUpdate));
     }
 
 ]]></Source>
@@ -466,8 +465,9 @@ public class METSalesOrderShipmentLoadHeader extends common
             shipmentHeader.ShipmentStatus   = _shipmentStatus;
             shipmentHeader.DocumentStatus   = _docStatus;
             shipmentHeader.update();
-
             shipmentHeader.reread();
+
+            Info(strFmt("@MET:ShipmentUpdateMsg", shipmentHeader.ShipmentId, shipmentHeader.ShipmentStatus));
             METSalesOrderShipmentLoadHeader::updateLoadStatus(shipmentHeader.LoadId);
 
         }
@@ -476,8 +476,136 @@ public class METSalesOrderShipmentLoadHeader extends common
 
 ]]></Source>
 			</Method>
+			<Method>
+				<Name>updateRouteInformation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the route information on shipment header and lines
+    /// </summary>
+    /// <param name = "_confirmedShipDate">Confirmed ship date value</param>
+    /// <param name = "_route">Route value</param>
+    /// <param name = "_routeStopNum">Route stop num</param>
+    public void updateRouteInformation(SalesShippingDateConfirmed   _confirmedShipDate,
+                                    METRoute                        _route,
+                                    METRouteStopNum                 _routeStopNum)
+    {
+        METSalesOrderShipmentLoadLines      metSalesOrderShipmentLoadLines;
+        
+        if (_route)
+        {
+            this.Route = _route;
+        }
+        if (_routeStopNum)
+        {
+            this.RouteStopNum = _routeStopNum;
+        }
+        if (_confirmedShipDate)
+        {
+            this.ConfirmedShipDate = _confirmedShipDate;
+        }
+
+        //Either one value will always be available, hence not checking for update. Skipping update above if all three are blank.
+        this.update();
+
+        this.reread();
+
+        //Update recordset cannot be used as need to check what values are getting filled from dialogue
+        while select metSalesOrderShipmentLoadLines
+            group by OrderNum
+            where metSalesOrderShipmentLoadLines.ShipmentId == this.ShipmentId
+        {
+            METSalesOrderShipmentLoadHeader::updateSalesTableAndShipment(metSalesOrderShipmentLoadLines.OrderNum, _confirmedShipDate, _route, _routeStopNum);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSalesTableAndShipment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update sales order with new routes
+    /// </summary>
+    /// <param name = "_orderNum">Sales order</param>
+    /// <param name = "_confirmedShipDate">Confirm ship date</param>
+    /// <param name = "_route">Route value</param>
+    /// <param name = "_routeStopNum">Route stop num</param>
+    public static void updateSalesTableAndShipment(SalesId                         _orderNum,
+                                                SalesShippingDateConfirmed      _confirmedShipDate,
+                                                METRoute                        _route,
+                                                METRouteStopNum                 _routeStopNum)
+    {
+        SalesTable      salesTable;
+
+        salesTable = SalesTable::find(_orderNum, true);
+
+        salesTable.skipDataMethods(true);
+
+        if (_route)
+        {
+            salesTable.METRoute = _route;
+        }
+        if (_routeStopNum)
+        {
+            salesTable.METRouteStopNum = _routeStopNum;
+        }
+        if (_confirmedShipDate)
+        {
+            salesTable.ShippingDateConfirmed = _confirmedShipDate;
+        }
+
+        //Either one value will always be available, hence not checking for update. Skipping update above if all three are blank.
+        salesTable.update();
+
+        METSalesOrderShipmentLoadHeader::createShippmentLoadFromSalesTable(salesTable.SalesId, true, false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isValidShipmentToShipped</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validation for shipment before going to shipped. 
+    /// </summary>
+    /// <returns>Boolean value</returns>
+    public boolean isValidShipmentToShipped()
+    {
+        METContainerTypeTable               mETContainerTypeTable;
+        boolean                             ret = true;
+
+        select firstonly RecId from mETContainerTypeTable
+                where mETContainerTypeTable.InventLocationId == this.Warehouse;
+
+        if (mETContainerTypeTable.RecId == 0)
+        {
+            Error(strFmt("@MET:ContainerNotAssociated", this.Warehouse));
+            ret = false;
+        }
+
+        if (this.displayPickComplete() == NoYes::No)
+        {
+            error(strfmt("@MET:ShipmentNotPicked", this.ShipmentId));
+            ret = false;
+        }
+
+        METCustTable   custTableLoc = METCustTable::find(this.CustAccount);
+
+        if (custTableLoc.FinalizationDocument  == METFinalizationDocument::None)
+        {
+            warning(strFmt("@MET:DocumentNotSet", this.CustAccount, this.ShipmentId));
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
 		</Methods>
 	</SourceCode>
+	<DeveloperDocumentation>@MET:ShipHeaderDevDocumentations</DeveloperDocumentation>
+	<FormRef>METSalesOrderShipments</FormRef>
+	<Label>@MET:ShipmentHeaderTable</Label>
 	<SubscriberAccessLevel>
 		<Read>Allow</Read>
 	</SubscriberAccessLevel>
@@ -486,11 +614,12 @@ public class METSalesOrderShipmentLoadHeader extends common
 	<TitleField2>ShipmentStatus</TitleField2>
 	<AllowRowVersionChangeTracking>Yes</AllowRowVersionChangeTracking>
 	<CacheLookup>NotInTTS</CacheLookup>
-	<ClusteredIndex></ClusteredIndex>
+	<ClusteredIndex>ShipmentLoadIdx</ClusteredIndex>
 	<CreatedBy>Yes</CreatedBy>
 	<CreatedDateTime>Yes</CreatedDateTime>
 	<ModifiedBy>Yes</ModifiedBy>
 	<ModifiedDateTime>Yes</ModifiedDateTime>
+	<PrimaryIndex>ShipmentIdx</PrimaryIndex>
 	<DeleteActions />
 	<FieldGroups>
 		<AxTableFieldGroup>
@@ -701,7 +830,7 @@ public class METSalesOrderShipmentLoadHeader extends common
 			<Name>PostMultiDocument</Name>
 			<ExtendedDataType>NoYesId</ExtendedDataType>
 			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
-			<Label>Post multiple document</Label>
+			<Label>@MET:PostMultipleDoc</Label>
 			<EnumType>NoYes</EnumType>
 		</AxTableField>
 	</Fields>
@@ -709,7 +838,6 @@ public class METSalesOrderShipmentLoadHeader extends common
 	<Indexes>
 		<AxTableIndex>
 			<Name>ShipmentIdx</Name>
-			<AllowDuplicates>Yes</AllowDuplicates>
 			<Fields>
 				<AxTableIndexField>
 					<DataField>LoadId</DataField>
@@ -731,6 +859,33 @@ public class METSalesOrderShipmentLoadHeader extends common
 				</AxTableIndexField>
 				<AxTableIndexField>
 					<DataField>Route</DataField>
+				</AxTableIndexField>
+			</Fields>
+		</AxTableIndex>
+		<AxTableIndex>
+			<Name>ShipmentLoadIdx</Name>
+			<AllowDuplicates>Yes</AllowDuplicates>
+			<Fields>
+				<AxTableIndexField>
+					<DataField>CustAccount</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>Route</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>RouteStopNum</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>ConfirmedShipDate</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>Warehouse</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>TransactionType</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>ShipmentStatus</DataField>
 				</AxTableIndexField>
 			</Fields>
 		</AxTableIndex>
@@ -772,6 +927,7 @@ public class METSalesOrderShipmentLoadHeader extends common
 		<AxTableRelation>
 			<Name>CustTable</Name>
 			<Cardinality>ZeroMore</Cardinality>
+			<OnDelete>Restricted</OnDelete>
 			<RelatedTable>CustTable</RelatedTable>
 			<RelatedTableCardinality>ExactlyOne</RelatedTableCardinality>
 			<RelationshipType>Association</RelationshipType>
