@@ -1,0 +1,262 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPickDirectorDataController</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// This class is called METPickDirectorDataEntitity has done the import.
+/// </summary>
+class METPickDirectorDataController
+{
+    SalesLine salesLine;
+    InventQty qtyPicked;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processSOForPickDirectorData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the sales orders which are macthing with the METPickDirectorData.
+    /// </summary>
+    public void processSOForPickDirectorData()
+    {
+        #OCCRetryCount
+        System.Exception netExcepn;
+        METPickDirectorData pickDirectorData;
+
+        try
+        {
+            ttsbegin;
+            while select QtyPicked from pickDirectorData
+                join salesLine
+                where salesLine.SalesId == pickDirectorData.SalesId
+                && salesLine.LineNum == pickDirectorData.LineNum
+                && salesLine.ItemId == pickDirectorData.ItemId
+                && salesLine.SalesStatus == SalesStatus::Backorder
+            {
+                qtyPicked = pickDirectorData.QtyPicked;
+
+                if (qtyPicked > 0)
+                {
+                    // Reservation
+                    this.reserveSOLineQty();
+
+                    // Generate and post picking list
+                    WMSPickingRouteID pickingRouteID = this.createSalesPickingListSingleLine();
+
+                    // Register picking list
+                    if (pickingRouteID)
+                    {
+                        this.registerPickingList(pickingRouteID);
+                    }
+
+                    // Cancel delivery remainder
+                    if (salesLine.RemainSalesPhysical || salesLine.RemainInventPhysical)
+                    {
+                        this.cancelDeliveryRemainder();
+                    }
+                }
+            }
+            ttscommit;
+        }
+        catch (Exception::CLRError)
+        {
+            netExcepn = CLRInterop::getLastException();
+            throw error(netExcepn.ToString());
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch
+        {
+            throw error("@MET:UnhandledError");
+        }
+        finally
+        {
+            delete_from pickDirectorData;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reserveSOLineQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reserves the sales order line with the quantity picked.
+    /// </summary>
+    public void reserveSOLineQty()
+    {
+        InventMovement movement = InventMovement::construct(salesLine);
+        InventUpd_Reservation reservation = InventUpd_Reservation::newMovement(movement, -qtyPicked, true);
+        reservation.updateNow();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSalesPickingListSingleLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generated and posts the picking list for the sales order line with the quantity picked.
+    /// </summary>
+    /// <returns>WMSPickingRouteID</returns>
+    public WMSPickingRouteID createSalesPickingListSingleLine()
+    {
+        SalesTable salesTable = salesTable::find(salesLine.SalesId);
+        SalesFormLetter salesFormLetter = SalesFormLetter::construct(DocumentStatus::PickingList);
+        salesFormLetter.salesTable(salesTable);
+        salesFormLetter.initParmSalesTable(salesFormLetter.salesTable());
+        salesFormLetter.transDate(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+        salesFormLetter.specQty(SalesUpdate::All);
+        salesFormLetter.printFormLetter(salesFormLetter.printFormLetter());
+
+        salesFormLetter.createParmUpdateFromParmUpdateRecord(
+        SalesFormletterParmData::initSalesParmUpdateFormletter(
+            salesFormLetter.documentStatus(),
+            salesFormLetter.pack()));
+
+        salesFormLetter.initParameters(
+        salesFormLetter.salesParmUpdate(),
+        Printout::Current);
+
+        salesFormLetter.initLinesQuery();
+
+        SalesParmLine salesParmLine;
+
+        // Delete unwanted records in SalesParmLine
+        while select forupdate salesParmLine
+            where salesParmLine.ParmId == salesFormLetter.parmId()
+        {
+            container inventTransIdCon = [salesLine.InventTransId];
+
+            if (conFind(inventTransIdCon, salesParmLine.InventTransId) == 0)
+            {
+                salesParmLine.delete();
+            }
+            else
+            {
+                if (salesLine.metSalesLine().OrderExtractStatus == METOrderExtractStatus::Open ||
+                    salesLine.metSalesLine().OrderExtractStatus == METOrderExtractStatus::ReadyForExtract)
+                {
+                    salesParmLine.DeliverNow = qtyPicked;
+                    salesParmLine.setQty(DocumentStatus::PickingList, false);
+                    salesParmLine.update();
+                }
+            }
+        }
+
+        salesFormLetter.run();
+
+        WMSPickingRoute wmsPickingRoute;
+
+        select firstonly pickingRouteID from wmsPickingRoute
+                where wmsPickingRoute.parmid == salesFormLetter.parmId();
+
+        return wmsPickingRoute.pickingRouteID;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>registerPickingList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Registers the picking list for the selected sales line.
+    /// </summary>
+    /// <param name = "_pickingRouteID">_pickingRouteID</param>
+    public void registerPickingList(WMSPickingRouteID _pickingRouteID)
+    {
+        Map inventTransMap = new Map(Types::String, Types::Real);
+        InventTransId inventTransId;
+        Qty pickQty;
+        List list = new List(Types::String);
+        WmsOrderTrans wmsOrderTrans;
+        WmsOrderTrans wmsOrderTransNew;
+
+        list.addEnd(_pickingRouteID);
+
+        // Build map containing the lot-ids and quantity to pick
+        inventTransMap.insert(salesLine.InventTransId, qtyPicked);
+    
+        MapEnumerator me = inventTransMap.getEnumerator();
+
+        while (me.moveNext())
+        {
+            inventTransId = me.currentKey();
+            pickQty = me.currentValue();
+        
+            ttsBegin;
+            select firstonly forupdate wmsOrderTrans
+                where wmsOrderTrans.RouteId == _pickingRouteID &&
+                wmsOrderTrans.inventTransId == inventTransId &&
+                wmsOrderTrans.FullPallet == NoYes::No &&
+                (wmsOrderTrans.ExpeditionStatus == WMSExpeditionStatus::Registered ||
+                wmsOrderTrans.ExpeditionStatus == WMSExpeditionStatus::Activated  ||
+                wmsOrderTrans.ExpeditionStatus == WMSExpeditionStatus::Started);
+           
+            if (wmsOrderTrans.Qty > pickQty)
+            {
+                // Split line
+                wmsOrderTransNew = wmsOrderTrans.split(pickQty);
+            }
+            ttsCommit;
+        
+            if (wmsOrderTrans.Qty > pickQty)
+            {
+                ttsBegin;
+                // Cancel remaining line
+                wmsOrderTrans.cancel();
+                ttsCommit;
+            }
+        }
+    
+        WMSPickingRoute::finishMulti(list.pack());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelDeliveryRemainder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancel the delivery reminder for the given sales line.
+    /// </summary>
+    public void cancelDeliveryRemainder()
+    {
+        salesLine.selectForUpdate(true);
+        salesLine.RemainInventPhysical = 0;
+        salesLine.RemainSalesPhysical = 0;             
+        salesLine.SalesStatus = SalesStatus::Canceled;
+        salesLine.update();
+ 
+        // This method will update the inventory transactions
+        InventMovement::bufferSetRemainQty(salesLine);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
