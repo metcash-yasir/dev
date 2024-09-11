@@ -186,6 +186,10 @@ public class METInventItemOrderSetup extends common
                 throw Exception::UpdateConflict;
             }
         }
+        catch
+        {
+            throw error("@MET:UnhandledError");
+        }
     }
 
 ]]></Source>
@@ -196,8 +200,9 @@ public class METInventItemOrderSetup extends common
     /// <summary>
     /// Updates the child item's status
     /// </summary>
-    /// <param name = "_parentItemId">The Parent Item Id</param>
-    /// <param name = "_inventSiteId">The site Id to be updated</param>
+    /// <param name = "_parentItemId">ItemId</param>
+    /// <param name = "_inventSiteId">InventSiteId</param>
+    /// <param name = "_metInventItemOrderSetupSource">METInventItemOrderSetup</param>
     public static void updateChildItemSiteStatusToDiscontinue(ItemId _parentItemId, InventSiteId _inventSiteId, METInventItemOrderSetup _metInventItemOrderSetupSource)
     {
         #OCCRetryCount
@@ -264,6 +269,81 @@ public class METInventItemOrderSetup extends common
                 throw Exception::UpdateConflict;
             }
         }
+        catch
+        {
+            throw error("@MET:UnhandledError");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateChildItemSiteStatusToNew</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the child item's status
+    /// </summary>
+    /// <param name = "_parentItemId">The Parent Item Id</param>
+    /// <param name = "_inventSiteId">The site Id to be updated</param>
+    public static void updateChildItemSiteStatusToNew(ItemId _parentItemId, InventSiteId _inventSiteId)
+    {
+        #OCCRetryCount
+        METSalesItemSubstitutionParentChild metSalesItemSubstitutionParentChild;
+        METInventItemOrderSetup metInventItemOrderSetup;
+        InventDim inventDim;
+
+        try
+        {
+            ttsbegin;
+        
+            update_recordset metInventItemOrderSetup
+                setting ItemStatus = METConstants::NewStr,
+                PublishPriceBook = NoYes::No,
+                PublishPortal = NoYes::No,
+                PublishHost = NoYes::No
+            exists join inventDim
+                where inventDim.inventDimId == metInventItemOrderSetup.InventDimId
+                && inventDim.InventSiteId == _inventSiteId
+            exists join metSalesItemSubstitutionParentChild
+                where metSalesItemSubstitutionParentChild.ParentItemId == _parentItemId
+                && metInventItemOrderSetup.ItemId == metSalesItemSubstitutionParentChild.ChildItemId
+                && metSalesItemSubstitutionParentChild.InventSiteId == _inventSiteId;
+        
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch
+        {
+            throw error("@MET:UnhandledError");
+        }
     }
 
 ]]></Source>
@@ -280,15 +360,14 @@ public class METInventItemOrderSetup extends common
         super(_fieldId);
 
         switch (_fieldId)
-        {
-            case fieldNum(METInventItemOrderSetup, ItemStatus) :
-                this.executeActiveItemStatusBatch();
-                break;
+        {            
             case fieldNum(METInventItemOrderSetup, CartonPerLayer) :
                 this.CartonPerPallet = this.CartonPerLayer * this.Layers;
+                this.calculatePalletQty();
                 break;
             case fieldNum(METInventItemOrderSetup, Layers) :
                 this.CartonPerPallet = this.CartonPerLayer * this.Layers;
+                this.calculatePalletQty();
                 break;
         }
     }
@@ -296,36 +375,33 @@ public class METInventItemOrderSetup extends common
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>executeActiveItemStatusBatch</Name>
+				<Name>calculatePalletQty</Name>
 				<Source><![CDATA[
-    public void executeActiveItemStatusBatch()
+    /// <summary>
+    /// Calculate Pallet Qty
+    /// </summary>
+    public void calculatePalletQty()
     {
-        METInventItemOrderSetup metInventItemOrderSetupOrig = this.orig();
+        UnitOfMeasureSymbol fromUnit, toUnit;
+        UnitOfMeasureConversionFactor factor;
 
-        if(metInventItemOrderSetupOrig.ItemStatus == METConstants::NewStr && this.ItemStatus == METConstants::Active)
+        fromUnit = InventItemPurchSetup::find(this.ItemId, this.InventDimId).METPurchUnit;
+
+        toUnit = InventTable::find(this.ItemId).inventTableModuleInvent().UnitId;
+
+        if(fromUnit == toUnit)
         {
-            METChangeItemStatusController     controller  = METChangeItemStatusController::construct();
-            METChangeItemStatusContract       contract    = controller ? controller.getDataContractObject() : null;
-
-            if (!contract)
-            {
-                throw error(Error::wrongUseOfFunction(funcName()));
-            }
-
-            // Set contract fields
-            contract.parmItemId(this.ItemId);
-            contract.parmInventSiteId(this.SiteId );
-            contract.parmMETItemStatus(METConstants::Active);
-            contract.parmCalledFromDefaultForm(true);
-
-            controller.parmExecutionMode(SysOperationExecutionMode::ScheduledBatch); // Set execution mode
-            controller.parmShowDialog(false); // Prevent dialog
-            controller.parmLoadFromSysLastValue(false); // Prevent loading from last value
-            controller.parmInBatch(true);
-            controller.parmDialogCaption(strFmt("@MET:ChangeItemStatus @DOMLabels:DOMItemId - %1 @SYS177684 - %2",this.ItemId, this.SiteId));
-            // Start operation
-            controller.startOperation();
+            factor = 1;
         }
+        else
+        {
+            factor = UnitOfMeasureConversion::findByConversion(UnitOfMeasure::findBySymbol(fromUnit).RecId,
+            UnitOfMeasure::findBySymbol(toUnit).RecId,
+            EcoResProduct::findByProductNumber(this.ItemId).RecId).Factor;
+        }
+
+        this.PalletLayerQty = this.CartonPerLayer * factor;
+        this.PalletQty = this.CartonPerPallet * factor;
     }
 
 ]]></Source>
@@ -363,6 +439,7 @@ public class METInventItemOrderSetup extends common
 	<TitleField1>ItemId</TitleField1>
 	<TitleField2>InventDimId</TitleField2>
 	<AllowRowVersionChangeTracking>Yes</AllowRowVersionChangeTracking>
+	<CacheLookup>FoundAndEmpty</CacheLookup>
 	<ReplacementKey>ItemDimIdx</ReplacementKey>
 	<DeleteActions />
 	<FieldGroups>
@@ -602,6 +679,21 @@ public class METInventItemOrderSetup extends common
 				</AxTableFieldGroupField>
 				<AxTableFieldGroupField>
 					<DataField>M10ZMFactor</DataField>
+				</AxTableFieldGroupField>
+			</Fields>
+		</AxTableFieldGroup>
+		<AxTableFieldGroup>
+			<Name>General</Name>
+			<Label>@ApplicationSuite_Localization:General</Label>
+			<Fields>
+				<AxTableFieldGroupField>
+					<DataField>LikeItem</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>LikeItemRatio</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>NoAlternative</DataField>
 				</AxTableFieldGroupField>
 			</Fields>
 		</AxTableFieldGroup>
@@ -1000,6 +1092,7 @@ public class METInventItemOrderSetup extends common
 		<AxTableRelation>
 			<Name>InventItemPurchSetup</Name>
 			<Cardinality>ExactlyOne</Cardinality>
+			<OnDelete>Cascade</OnDelete>
 			<RelatedTable>InventItemPurchSetup</RelatedTable>
 			<RelatedTableCardinality>ExactlyOne</RelatedTableCardinality>
 			<RelationshipType>Association</RelationshipType>
@@ -1022,6 +1115,7 @@ public class METInventItemOrderSetup extends common
 		<AxTableRelation>
 			<Name>InventItemSalesSetup</Name>
 			<Cardinality>ExactlyOne</Cardinality>
+			<OnDelete>Cascade</OnDelete>
 			<RelatedTable>InventItemSalesSetup</RelatedTable>
 			<RelatedTableCardinality>ExactlyOne</RelatedTableCardinality>
 			<RelationshipType>Association</RelationshipType>
@@ -1044,6 +1138,7 @@ public class METInventItemOrderSetup extends common
 		<AxTableRelation>
 			<Name>InventItemInventSetup</Name>
 			<Cardinality>ExactlyOne</Cardinality>
+			<OnDelete>Cascade</OnDelete>
 			<RelatedTable>InventItemInventSetup</RelatedTable>
 			<RelatedTableCardinality>ExactlyOne</RelatedTableCardinality>
 			<RelationshipType>Association</RelationshipType>
@@ -1080,6 +1175,7 @@ public class METInventItemOrderSetup extends common
 		</AxTableRelation>
 		<AxTableRelation>
 			<Name>METItemStatusTable</Name>
+			<Cardinality>ZeroOne</Cardinality>
 			<RelatedTable>METItemStatusTable</RelatedTable>
 			<RelatedTableCardinality>ZeroOne</RelatedTableCardinality>
 			<RelationshipType>Association</RelationshipType>
@@ -1133,6 +1229,7 @@ public class METInventItemOrderSetup extends common
 		</AxTableRelation>
 		<AxTableRelation>
 			<Name>METItemSegregationCodes</Name>
+			<Cardinality>ZeroOne</Cardinality>
 			<RelatedTable>METItemSegregationCodes</RelatedTable>
 			<RelatedTableCardinality>ZeroOne</RelatedTableCardinality>
 			<RelationshipType>Association</RelationshipType>

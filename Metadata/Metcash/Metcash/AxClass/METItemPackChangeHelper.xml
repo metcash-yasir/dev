@@ -15,8 +15,10 @@ class METItemPackChangeHelper
     WHSPhysDimUOM whsPhysDimUOMOrigItem;
     WHSPhysDimUOM whsPhysDimUOMTempItem;
     METInventItemOrderSetup metInventItemOrderSetupOrigItem;
-    METInventItemOrderSetup metInventItemOrderSetupTempItem;   
-    List siteList = new List(Types::String);
+    METInventItemOrderSetup metInventItemOrderSetupTempItem;
+   
+    VendParameters vendParameters = VendParameters::find();
+    
    
 
 }
@@ -28,7 +30,7 @@ class METItemPackChangeHelper
     /// <summary>
     /// Parm method for METInventItemOrderSetup
     /// </summary>
-    /// <param name = "_metItemSiteSettingsSetupOriginal">METInventItemOrderSetup table</param>
+    /// <param name = "_metInventItemOrderSetupOrigItem">METInventItemOrderSetup table</param>
     /// <returns>METInventItemOrderSetup</returns>
     public METInventItemOrderSetup parmMETInventItemOrderSetup(METInventItemOrderSetup _metInventItemOrderSetupOrigItem = metInventItemOrderSetupOrigItem)
     {
@@ -45,7 +47,7 @@ class METItemPackChangeHelper
     /// <summary>
     /// Parm method for METInventItemOrderSetup
     /// </summary>
-    /// <param name = "_metItemSiteSettingsSetupOriginal">METInventItemOrderSetup table</param>
+    /// <param name = "_metInventItemOrderSetupTempItem">METInventItemOrderSetup</param>
     /// <returns>METInventItemOrderSetup</returns>
     public METInventItemOrderSetup parmMETInventItemOrderSetupTempItem(METInventItemOrderSetup _metInventItemOrderSetupTempItem = metInventItemOrderSetupTempItem)
     {
@@ -165,39 +167,70 @@ class METItemPackChangeHelper
     /// Runs the pack change operations
     /// </summary>
     public void startOperation()
-    {        
-        ttsbegin;
+    {
+        #OCCRetryCount
 
-        this.createVendListPrice();
-        this.runPricingRoutine();
-        this.createBarcode(metInventItemOrderSetupOrigItem, metInventItemOrderSetupTempItem);
+        try
+        {
+            ttsbegin;
 
-        this.replaceOriginalItemSiteInfo(
-                inventItemPurchSetupOrigItem, inventItemPurchSetupTempItem, 
-                inventItemSalesSetupOrigItem, inventItemSalesSetupTempItem, 
-                metInventItemOrderSetupOrigItem, metInventItemOrderSetupTempItem);
-        this.createPhysicalDim(metInventItemOrderSetupOrigItem, whsPhysDimUOMTempItem);
+            this.createVendListPrice();
+            this.runPricingRoutine();
+            this.createBarcode(metInventItemOrderSetupOrigItem, metInventItemOrderSetupTempItem);
+
+            this.replaceOriginalItemSiteInfo(
+                    inventItemPurchSetupOrigItem, inventItemPurchSetupTempItem, 
+                    inventItemSalesSetupOrigItem, inventItemSalesSetupTempItem, 
+                    metInventItemOrderSetupOrigItem, metInventItemOrderSetupTempItem);
+            this.createPhysicalDim(metInventItemOrderSetupOrigItem, whsPhysDimUOMTempItem);
 
  
-        this.unlinkTempItem();
-        this.updateItemStatus(metInventItemOrderSetupOrigItem, METConstants::Active);
-        this.updateItemStatus(metInventItemOrderSetupTempItem, METConstants::Discontinued, true);
-        this.rePriceOpenSalesOrders();
+            this.unlinkTempItem();
+            this.updateItemStatus(metInventItemOrderSetupOrigItem, METConstants::Active);
+            this.updateItemStatus(metInventItemOrderSetupTempItem, METConstants::Discontinued, true);
+            this.rePriceOpenSalesOrders();
+
         
-        //Task110346_CB409-D365ToPIM Main site id - start
-        siteList.addEnd(metInventItemOrderSetupOrigItem.SiteId);
-        //Task110346_CB409-D365ToPIM Main site id - end
+            this.processNDCDependentSites();
+            this.processCDSDependentSites();
 
-        this.processNDCDependentSites();
-        this.processCDSDependentSites();
+            this.runVendorChangeRequest();        
 
-        this.runVendorChangeRequest();
-        
-
-        ttscommit;  
-        //Task110346_CB409-D365ToPIM- start
-        this.triggerItemPackchangeCompleteBusinessEvent(metInventItemOrderSetupOrigItem.ItemId, metInventItemOrderSetupTempItem.ItemId, siteList);
-        //Task110346_CB409-D365ToPIM - end
+            ttscommit;  
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch
+        {
+            throw error("@MET:UnhandledError");
+        }
     }
 
 ]]></Source>
@@ -244,7 +277,7 @@ class METItemPackChangeHelper
         {
             ret = checkFailed("@MET:METTempItemForPackChangeError");
         }
-        if(!metInventItemOrderSetupTempItem.RecId)
+        if (!metInventItemOrderSetupTempItem.RecId)
         {
             ret = checkFailed("@MET:TempItemNotLinked") && ret;
         }        
@@ -259,7 +292,7 @@ class METItemPackChangeHelper
 
         ret = this.checkStock() && ret;
 
-        if(ret)
+        if (ret)
         {
             ret = this.checkItemSubRange() && ret;
         }
@@ -278,21 +311,18 @@ class METItemPackChangeHelper
     /// <returns>True or false</returns>
     private boolean checkNDCSite()
     {
-        ReqItemTable reqItemTable;
-        InventDim inventDim;
+        METReqItemTableInventDimView metReqItemTableInventDimView;
 
         boolean ret = true;
 
         if (InventSite::find(metInventItemOrderSetupOrigItem.SiteId).METNDCSite)
         {
-            select firstonly RecId, InventLocationIdReqMain from reqItemTable
-                exists join inventDim
-                where inventDim.inventDimId == reqItemTable.CovInventDimId
-                && ReqItemTable.ItemId == metInventItemOrderSetupOrigItem.ItemId
-                && inventDim.InventSiteId == metInventItemOrderSetupOrigItem.SiteId
-                && reqItemTable.ReqPOType == ReqPOType::Transfer;
+            select firstonly METNDCWarehouse_MainWarehouse from metReqItemTableInventDimView
+                where metReqItemTableInventDimView.ItemId == metInventItemOrderSetupOrigItem.ItemId
+                && metReqItemTableInventDimView.InventSiteId == metInventItemOrderSetupOrigItem.SiteId
+                && metReqItemTableInventDimView.ReqPOType == ReqPOType::Transfer;
             
-            if (InventLocation::find(reqItemTable.InventLocationIdReqMain).METNDCWarehouse)
+            if (metReqItemTableInventDimView.METNDCWarehouse_MainWarehouse)
             {
                 ret = checkFailed("@MET:ValidationNDCSite");
             }      
@@ -312,19 +342,19 @@ class METItemPackChangeHelper
     /// <returns>True or False</returns>
     private boolean checkCDSSite()
     {
-        ReqItemTable reqItemTable;
-        InventDim inventDim;
+        METReqItemTableInventDimView metReqItemTableInventDimView;
+        InventLocation inventLocation;
 
         boolean ret = true;
        
-        select firstonly RecId, InventLocationIdReqMain from reqItemTable
-            join InventLocationId, RecId, inventDimId from inventDim
-            where inventDim.inventDimId == reqItemTable.CovInventDimId
-            && ReqItemTable.ItemId == metInventItemOrderSetupOrigItem.ItemId
-            && inventDim.InventSiteId == metInventItemOrderSetupOrigItem.SiteId
-            && reqItemTable.ReqPOType == ReqPOType::Transfer;
+        select firstonly METCSDWarehouse from inventLocation
+            exists join metReqItemTableInventDimView
+            where inventLocation.InventLocationId == metReqItemTableInventDimView.InventLocationId
+            && metReqItemTableInventDimView.ItemId == metInventItemOrderSetupOrigItem.ItemId
+            && metReqItemTableInventDimView.InventSiteId == metInventItemOrderSetupOrigItem.SiteId
+            && metReqItemTableInventDimView.ReqPOType == ReqPOType::Transfer;
             
-        if (InventLocation::find(inventDim.InventLocationId).METCSDWarehouse)
+        if (inventLocation.METCSDWarehouse)
         {
             ret = checkFailed("@MET:ValidationCDSSite");
         }
@@ -343,39 +373,24 @@ class METItemPackChangeHelper
     /// <returns>True or false</returns>
     private boolean checkSourceSiteIsPendingPackChange()
     {
-        ReqItemTable reqItemTable;
-        InventDim inventDim;
+        METReqItemTableInventDimView metReqItemTableInventDimView;
         METInventItemOrderSetup metInventItemOrderSetupTempItemLocal;
-        InventLocation inventLocation;
 
         boolean ret = true;
-       
-        select firstonly ItemId,CovInventDimId,ReqPOType,InventLocationIdReqMain, VendId from reqItemTable
-            join RecId from inventDim
-                where reqItemTable.ItemId == metInventItemOrderSetupOrigItem.ItemId
-                && reqItemTable.CovInventDimId == inventDim.inventDimId
-                && inventDim.InventSiteId == metInventItemOrderSetupOrigItem.SiteId
-                && reqItemTable.ReqPOType == ReqPOType::Transfer;
-        if (reqItemTable)
+
+        select firstonly TempItemPackChg from metInventItemOrderSetupTempItemLocal
+            exists join metReqItemTableInventDimView
+            where metReqItemTableInventDimView.ItemId == metInventItemOrderSetupOrigItem.ItemId
+            && metReqItemTableInventDimView.InventSiteId == metInventItemOrderSetupOrigItem.SiteId
+            && metReqItemTableInventDimView.ReqPOType == ReqPOType::Transfer
+            && metReqItemTableInventDimView.MainWarehouseInventSiteId != metInventItemOrderSetupOrigItem.SiteId
+            && metInventItemOrderSetupTempItemLocal.SiteId == metReqItemTableInventDimView.MainWarehouseInventSiteId
+            && metInventItemOrderSetupTempItemLocal.ItemId == metInventItemOrderSetupOrigItem.ItemId;
+
+        if (metInventItemOrderSetupTempItemLocal.TempItemPackChg)//Check for if temp Item is populated
         {
-            select firstonly InventSiteId from inventLocation
-                    where inventLocation.InventLocationId == reqItemTable.InventLocationIdReqMain;
-
-            if (inventLocation.InventSiteId && (inventLocation.InventSiteId != metInventItemOrderSetupOrigItem.SiteId))
-            {
-                select firstonly RecId, TempItemPackChg
-                    from metInventItemOrderSetupTempItemLocal
-                    where metInventItemOrderSetupTempItemLocal.ItemId == metInventItemOrderSetupOrigItem.ItemId
-                    && metInventItemOrderSetupTempItemLocal.SiteId == inventLocation.InventSiteId;
-                
-
-                if(metInventItemOrderSetupTempItemLocal.TempItemPackChg)//Check for if temp Item is populated
-                {
-                    ret = checkFailed("@MET:ValidationSSS");
-                }                           
-                
-            }
-        }
+            ret = checkFailed("@MET:ValidationSSS");
+        }                       
        
         return ret;
     }
@@ -391,43 +406,31 @@ class METItemPackChangeHelper
     /// <returns>True or false</returns>
     private boolean checkSourceSiteIsPendingPackChange_IntComp()
     {
-        ReqItemTable reqItemTable;
-        InventDim inventDim;
+        METReqItemTableInventDimView metReqItemTableInventDimView;
         METInventItemOrderSetup metInventItemOrderSetupTempItemLocal;
         InventLocation inventLocation;
-        VendTable vendTableLocal;
-        VendGroup vendGroup;
 
         boolean ret = true;
        
-        select firstonly ItemId,CovInventDimId,ReqPOType,InventLocationIdReqMain, VendId from reqItemTable
-            join RecId from inventDim
-                where reqItemTable.ItemId == metInventItemOrderSetupOrigItem.ItemId
-                && reqItemTable.CovInventDimId == inventDim.inventDimId 
-                && inventDim.InventSiteId == metInventItemOrderSetupOrigItem.SiteId            
-                && reqItemTable.ReqPOType == ReqPOType::Purch
-            join RecId, vendGroup from vendTableLocal
-                where vendTableLocal.AccountNum == reqItemTable.VendId
-            exists join vendGroup
-                where vendGroup.VendGroup == vendTableLocal.VendGroup
-                && vendGroup.VendGroup == VendParameters::find().METInterCompanyVendGroupId;
+        select firstonly ItemId,CovInventDimId,ReqPOType,InventLocationIdReqMain, VendId, VendIntercompanyWarehouse from metReqItemTableInventDimView
+            where metReqItemTableInventDimView.ItemId == metInventItemOrderSetupOrigItem.ItemId
+            && metReqItemTableInventDimView.InventSiteId == metInventItemOrderSetupOrigItem.SiteId
+            && metReqItemTableInventDimView.ReqPOType == ReqPOType::Purch
+            && metReqItemTableInventDimView.VendGroup == vendParameters.METInterCompanyVendGroupId;
 
-        if (reqItemTable)
+        if (metReqItemTableInventDimView && metReqItemTableInventDimView.VendIntercompanyWarehouse)
         {
-            VendTable vendTable = VendTable::find(reqItemTable.VendId);
-            VendParameters vendParameters = VendParameters::find();
-
             changecompany(vendParameters.METInterCompanyLegalEntity)
             {
                 select firstonly InventSiteId from inventLocation
-                    where inventLocation.InventLocationId == vendTable.METIntercompanyWarehouse;
+                    where inventLocation.InventLocationId == metReqItemTableInventDimView.VendIntercompanyWarehouse;
 
                 if (inventLocation.InventSiteId)
                 {
                     select firstonly RecId, TempItemPackChg
-                    from metInventItemOrderSetupTempItemLocal
-                    where metInventItemOrderSetupTempItemLocal.ItemId == metInventItemOrderSetupOrigItem.ItemId
-                    && metInventItemOrderSetupTempItemLocal.SiteId == inventLocation.InventSiteId;
+                        from metInventItemOrderSetupTempItemLocal
+                        where metInventItemOrderSetupTempItemLocal.ItemId == metInventItemOrderSetupOrigItem.ItemId
+                        && metInventItemOrderSetupTempItemLocal.SiteId == inventLocation.InventSiteId;
 
                     if (metInventItemOrderSetupTempItemLocal.TempItemPackChg)
                     {
@@ -454,33 +457,29 @@ class METItemPackChangeHelper
     {
         boolean ret = true;
         
-        ReqItemTable reqItemTable;
-        InventDim inventDim;        
-        InventLocation inventLocation, inventLocationNDC;
-       
-        select firstonly ItemId,CovInventDimId,ReqPOType,InventLocationIdReqMain, VendId from reqItemTable
-            join RecId, InventLocationId from inventDim
-                where reqItemTable.ItemId == metInventItemOrderSetupOrigItem.ItemId &&
-                reqItemTable.CovInventDimId == inventDim.inventDimId &&
-                inventDim.InventSiteId == metInventItemOrderSetupOrigItem.SiteId;
-        if(reqItemTable)
+        METReqItemTableInventDimView metReqItemTableInventDimView;       
+        InventLocation inventLocation, inventLocationNDC;       
+
+        select firstonly METNDCWarehouse, InventSiteId, InventLocationId from inventLocation
+            exists join metReqItemTableInventDimView
+            where inventLocation.InventLocationId == metReqItemTableInventDimView.InventLocationId
+            && metReqItemTableInventDimView.ItemId == metInventItemOrderSetupOrigItem.ItemId
+            && metReqItemTableInventDimView.InventSiteId == metInventItemOrderSetupOrigItem.SiteId;
+
+        if (inventLocation.METNDCWarehouse)
         {
-            select firstonly inventLocation
-                    where inventLocation.InventLocationId == inventDim.InventLocationId;
-            if(inventLocation.METNDCWarehouse)
+            while select RecId, InventSiteId, InventLocationId
+                    from inventLocationNDC
+                    where inventLocationNDC.METNDCWarehouse == NoYes::Yes
             {
-                while select RecId, InventSiteId, InventLocationId
-                        from inventLocationNDC
-                        where inventLocationNDC.METNDCWarehouse == NoYes::Yes
-                {
-                    ret = this.checkStockStatus(inventLocationNDC) && ret;
-                }
+                ret = this.checkStockStatus(inventLocationNDC) && ret;
             }
-            else
-            {
-                ret = this.checkStockStatus(inventLocation) && ret;
-            }
-        }        
+        }
+        else
+        {
+            ret = this.checkStockStatus(inventLocation) && ret;
+        }
+     
 
         return ret;
     }
@@ -512,7 +511,7 @@ class METItemPackChangeHelper
         {
             ret = checkFailed(strfmt("@MET:OnHandValidation", metInventItemOrderSetupOrigItem.ItemId,_inventLocation.InventSiteId, _inventLocation.InventLocationId));
         }
-        if(inventOnHandEntity.OrderedQuantity || inventOnHandEntity.OrderedCatchWeightQuantity || inventOnHandEntity.ReservedOnHandQuantity ||
+        if (inventOnHandEntity.OrderedQuantity || inventOnHandEntity.OrderedCatchWeightQuantity || inventOnHandEntity.ReservedOnHandQuantity ||
             inventOnHandEntity.ReservedOnHandCatchWeightQuantity)
         {
             ret = checkFailed(strfmt("@MET:OpenPOTOValidation", metInventItemOrderSetupOrigItem.ItemId,_inventLocation.InventSiteId, _inventLocation.InventLocationId)) && ret;
@@ -568,7 +567,7 @@ class METItemPackChangeHelper
 
         str message = strFmt("@MET:ItemIsAttachedToSubrange", metInventItemOrderSetupOrigItem.SubrangeId, metInventItemOrderSetupOrigItem.SubrangeDesc);
         
-        if(metInventItemOrderSetupOrigItem.SubrangeId)
+        if (metInventItemOrderSetupOrigItem.SubrangeId)
         {
             res = Box::yesNo(message, DialogButton::No, "@MET:PackChange");
 
@@ -644,15 +643,14 @@ class METItemPackChangeHelper
         METSalesUnit            metSalesUnit    = inventItemSalesSetupTempItem.METSalesUnit;
        
 
-        if(metPurchUnit != InventTable::find(_metInventItemOrderSetupOrigItem.ItemId).inventTableModuleInvent().UnitId)
+        if (metPurchUnit != InventTable::find(_metInventItemOrderSetupOrigItem.ItemId).inventTableModuleInvent().UnitId)
         {
-            select metWHSPhysDimUOMSiteTempPurch
+            select firstonly metWHSPhysDimUOMSiteTempPurch
                 where metWHSPhysDimUOMSiteTempPurch.ItemId == metInventItemOrderSetupTempItem.ItemId
                 && metWHSPhysDimUOMSiteTempPurch.UOM == metPurchUnit
                 && metWHSPhysDimUOMSiteTempPurch.SiteId == metInventItemOrderSetupTempItem.SiteId;
-            if(metWHSPhysDimUOMSiteTempPurch)
+            if (metWHSPhysDimUOMSiteTempPurch)
             {
-
                 select firstonly forupdate metWHSPhysDimUOMSite
                 where metWHSPhysDimUOMSite.ItemId == _metInventItemOrderSetupOrigItem.ItemId
                 && metWHSPhysDimUOMSite.UOM == metWHSPhysDimUOMSiteTempPurch.UOM
@@ -674,9 +672,9 @@ class METItemPackChangeHelper
             }
 
         }
-        else if(metSalesUnit != InventTable::find(_metInventItemOrderSetupOrigItem.ItemId).inventTableModuleInvent().UnitId)
+        else if (metSalesUnit != InventTable::find(_metInventItemOrderSetupOrigItem.ItemId).inventTableModuleInvent().UnitId)
         {
-            select metWHSPhysDimUOMSiteTempSales
+            select firstonly metWHSPhysDimUOMSiteTempSales
                 where metWHSPhysDimUOMSiteTempSales.ItemId == metInventItemOrderSetupTempItem.ItemId
                 && metWHSPhysDimUOMSiteTempSales.UOM == metSalesUnit
                 && metWHSPhysDimUOMSiteTempSales.SiteId == metWHSPhysDimUOMSiteTempPurch.SiteId;
@@ -723,6 +721,7 @@ class METItemPackChangeHelper
             inventItemBarcodeMainItem.itemId == _metItemSiteSettingsSetupOriginal.ItemId
             && inventItemBarcodeMainItem.UnitID == purchUnitTmpItem;
             //&& InventTable::find(_metItemSiteSettingsSetupOriginal.ItemId).inventTableModuleInvent().UnitId != inventItemBarcodeMainItem.UnitID;
+
         if (inventItemBarcodeMainItem && inventItemBarcodeMainItem.METDefault == NoYes::No)
         {
             inventItemBarcodeMainItem.selectForUpdate(true);  
@@ -734,11 +733,11 @@ class METItemPackChangeHelper
             ItemId          tmpItemId       = metInventItemOrderSetupTempItem.ItemId;
             METPurchUnit    metPurchUnit    = inventItemPurchSetupTempItem.METPurchUnit;
 
-            select firstonly inventItemBarcodeTempItem where
-            inventItemBarcodeTempItem.itemId == tmpItemId
-            && inventItemBarcodeTempItem.UnitID == metPurchUnit;
+            select firstonly inventItemBarcodeTempItem 
+                where inventItemBarcodeTempItem.itemId == tmpItemId
+                && inventItemBarcodeTempItem.UnitID == metPurchUnit;
             
-            if(inventItemBarcodeTempItem)
+            if (inventItemBarcodeTempItem)
             {
                 inventItemBarcode.clear();
                 buf2Buf(inventItemBarcodeTempItem, inventItemBarcode);
@@ -794,27 +793,26 @@ class METItemPackChangeHelper
     /// </summary>
     private void createVendListPrice()
     {
-        ReqItemTable            reqItemTable;
-        InventDim               inventDim;
+        METReqItemTableInventDimView metReqItemTableInventDimView;
+
         GUPVendPriceAdmTrans    gupVendPriceAdmTransMainItem, gupVendPriceAdmTransTempItem, gupVendPriceAdmTrans;
         GUPVendPriceAdmTable    gupVendPriceAdmTable;
 
-        select firstonly ItemId,CovInventDimId,ReqPOType,InventLocationIdReqMain, VendId from reqItemTable
-        join RecId, InventLocationId from inventDim
-          where reqItemTable.ItemId == metInventItemOrderSetupOrigItem.ItemId    &&
-          reqItemTable.CovInventDimId == inventDim.inventDimId      &&
-          inventDim.InventSiteId == metInventItemOrderSetupOrigItem.SiteId
-         && VendTable::find(reqItemTable.VendId).VendGroup != VendParameters::find().METInterCompanyVendGroupId
-        && reqItemTable.ReqPOType == ReqPOType::Purch;
+        select firstonly ItemId,CovInventDimId,ReqPOType,InventLocationIdReqMain, VendId 
+            from metReqItemTableInventDimView
+            where metReqItemTableInventDimView.ItemId == metInventItemOrderSetupOrigItem.ItemId
+            && metReqItemTableInventDimView.InventSiteId == metInventItemOrderSetupOrigItem.SiteId
+            && metReqItemTableInventDimView.VendGroup != vendParameters.METInterCompanyVendGroupId
+            && metReqItemTableInventDimView.ReqPOType == ReqPOType::Purch;
 
-        if(reqItemTable)
+        if (metReqItemTableInventDimView)
         {
-            GUPVendPriceJournalNum journalNum = reqItemTable.VendId + METConstants::hyphen + inventDim.InventLocationId;
+            GUPVendPriceJournalNum journalNum = metReqItemTableInventDimView.VendId + METConstants::hyphen + metReqItemTableInventDimView.InventLocationId;
 
             select firstonly forupdate gupVendPriceAdmTable
                 where gupVendPriceAdmTable.JournalNum == journalNum
                 && gupVendPriceAdmTable.Status == GUPDisabledEnabled::Enabled;
-            if(gupVendPriceAdmTable) // Disable journal if its enabled
+            if (gupVendPriceAdmTable) // Disable journal if its enabled
             {
                 gupVendPriceAdmTable.Status = GUPDisabledEnabled::Disabled;
                 gupVendPriceAdmTable.update();
@@ -822,38 +820,56 @@ class METItemPackChangeHelper
 
             METPurchUnit metpurchUnit       = inventItemPurchSetupOrigItem.METPurchUnit;
 
-            update_recordset gupVendPriceAdmTransMainItem
-                setting ToDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone())
+            select firstonly forupdate gupVendPriceAdmTransMainItem
+                order by gupVendPriceAdmTransMainItem.LineNum desc
                 where gupVendPriceAdmTransMainItem.JournalNum == journalNum
                 && gupVendPriceAdmTransMainItem.UnitId == metpurchUnit
-                && gupVendPriceAdmTransMainItem.ItemNum == metInventItemOrderSetupOrigItem.ItemId
-                && gupVendPriceAdmTransMainItem.FromDate >= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+                && gupVendPriceAdmTransMainItem.ItemNum == metInventItemOrderSetupOrigItem.ItemId;
+            if (gupVendPriceAdmTransMainItem)
+            {
+                gupVendPriceAdmTransMainItem.ToDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+                gupVendPriceAdmTransMainItem.update();
+            }                              
+
+            select firstonly forupdate gupVendPriceAdmTransMainItem
+                order by gupVendPriceAdmTransMainItem.LineNum desc
+                where gupVendPriceAdmTransMainItem.JournalNum == journalNum
+                && gupVendPriceAdmTransMainItem.UnitId == metpurchUnit
+                && gupVendPriceAdmTransMainItem.ItemNum == metInventItemOrderSetupOrigItem.ItemId;
+            if (gupVendPriceAdmTransMainItem)
+            {
+                gupVendPriceAdmTransMainItem.ToDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+                gupVendPriceAdmTransMainItem.update();
+            }
+                              
 
             metpurchUnit = inventItemPurchSetupTempItem.METPurchUnit;
+
+
+            RecordInsertList gupVendPriceAdmTransRecordInsertList = new RecordInsertList(tableNum(GUPVendPriceAdmTrans));
 
             while select gupVendPriceAdmTransTempItem
                 where gupVendPriceAdmTransTempItem.JournalNum == journalNum
                 && gupVendPriceAdmTransTempItem.UnitId == metpurchUnit
                 && gupVendPriceAdmTransTempItem.ItemNum == metInventItemOrderSetupTempItem.ItemId
-                && gupVendPriceAdmTransTempItem.FromDate >= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone())
+                && (gupVendPriceAdmTransTempItem.FromDate >= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone())
+                || gupVendPriceAdmTransTempItem.ToDate >= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
             {
-                if(gupVendPriceAdmTransTempItem)
-                {
-                    gupVendPriceAdmTrans.initFromGUPVendPriceAdmTrans(gupVendPriceAdmTransTempItem);
-                    gupVendPriceAdmTrans.ItemNum = metInventItemOrderSetupOrigItem.ItemId;
-                    gupVendPriceAdmTrans.FromDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
-                    gupVendPriceAdmTrans.JournalNum = journalNum;
-                    gupVendPriceAdmTrans.insert();                    
-                
-                }
+                gupVendPriceAdmTrans.initFromGUPVendPriceAdmTrans(gupVendPriceAdmTransTempItem);
+                gupVendPriceAdmTrans.ItemNum = metInventItemOrderSetupOrigItem.ItemId;
+                gupVendPriceAdmTrans.FromDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+                gupVendPriceAdmTrans.JournalNum = journalNum;
+
+                gupVendPriceAdmTransRecordInsertList.add(gupVendPriceAdmTrans);                
             }
+            gupVendPriceAdmTransRecordInsertList.insertDatabase();
 
             if(gupVendPriceAdmTable) // Enable journal if its disabled
             {
                 gupVendPriceAdmTable.Status = GUPDisabledEnabled::Enabled;
                 gupVendPriceAdmTable.update();
             }            
-            this.createVendPriceTermAgreements(reqItemTable.VendId,  inventDim.InventLocationId);
+            this.createVendPriceTermAgreements(metReqItemTableInventDimView.VendId,  metReqItemTableInventDimView.InventLocationId);
         }
 
     }
@@ -943,28 +959,38 @@ class METItemPackChangeHelper
 
             METPurchUnit metpurchUnit       = inventItemPurchSetupOrigItem.METPurchUnit;
             
-            update_recordset gupPriceTermJournalTransEntityMainItem
-                setting ValidTo = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone())
+            select forupdate firstonly gupPriceTermJournalTransEntityMainItem
+                order by gupPriceTermJournalTransEntityMainItem.RecId desc
                 where gupPriceTermJournalTransEntityMainItem.AgreementId == agreementId
                 && gupPriceTermJournalTransEntityMainItem.UnitId == metpurchUnit
                 && gupPriceTermJournalTransEntityMainItem.line1 == metInventItemOrderSetupOrigItem.ItemId
-                && gupPriceTermJournalTransEntityMainItem.ValidFrom >= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+                && gupPriceTermJournalTransEntityMainItem.ValidFrom >= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());             
+            if (gupPriceTermJournalTransEntityMainItem)
+            {
+                gupPriceTermJournalTransEntityMainItem.ValidTo = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+                gupPriceTermJournalTransEntityMainItem.update();
+            }
 
             metpurchUnit       = inventItemPurchSetupTempItem.METPurchUnit;
+
+            RecordInsertList gupPriceTermJournalTransEntityRecordInsertList = new RecordInsertList(tableNum(GUPPriceTermJournalTransEntity));
 
             while select gupPriceTermJournalTransEntityTempItem
                 where gupPriceTermJournalTransEntityTempItem.AgreementId == agreementId
                 && gupPriceTermJournalTransEntityTempItem.UnitId == metpurchUnit
                 && gupPriceTermJournalTransEntityTempItem.line1 == metInventItemOrderSetupTempItem.ItemId
-                && gupPriceTermJournalTransEntityTempItem.ValidFrom >= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone())
+                && (gupPriceTermJournalTransEntityTempItem.ValidFrom >= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone())
+                || gupPriceTermJournalTransEntityTempItem.ValidFrom >= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
             {
-                    buf2Buf(gupPriceTermJournalTransEntityTempItem, gupPriceTermJournalTransEntity);
-                    gupPriceTermJournalTransEntity.Line1 = metInventItemOrderSetupOrigItem.ItemId;
-                    gupPriceTermJournalTransEntity.ValidFrom = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
-                    gupPriceTermJournalTransEntity.LineNum = GUPPriceTermJournalTrans::lastLineNum(agreementId) + 1;
-                    gupPriceTermJournalTransEntity.insert();
+                buf2Buf(gupPriceTermJournalTransEntityTempItem, gupPriceTermJournalTransEntity);
+                gupPriceTermJournalTransEntity.Line1 = metInventItemOrderSetupOrigItem.ItemId;
+                gupPriceTermJournalTransEntity.ValidFrom = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+                gupPriceTermJournalTransEntity.LineNum = GUPPriceTermJournalTrans::lastLineNum(agreementId) + 1;
+
+                gupPriceTermJournalTransEntityRecordInsertList.add(gupPriceTermJournalTransEntity);
             }
-         
+            gupPriceTermJournalTransEntityRecordInsertList.insertDatabase();
+
             gupPriceTermJournalTable.Status = GUPDisabledEnabled::Enabled;
             gupPriceTermJournalTable.update();
 
@@ -1123,7 +1149,6 @@ class METItemPackChangeHelper
         InventDim inventDim;
         InventLocation inventLocation;
         InventSite inventSite;
-        InventSiteId siteId = metInventItemOrderSetupOrigItem.SiteId;
 
         while select firstonly RecId from reqItemTable
                 where reqItemTable.ItemId == metInventItemOrderSetupOrigItem.ItemId
@@ -1140,7 +1165,7 @@ class METItemPackChangeHelper
             ItemId mainItem = metInventItemOrderSetupOrigItem.ItemId;
             ItemId tmpItem = METInventItemOrderSetup::findByItemAndSite(metInventItemOrderSetupOrigItem.ItemId, inventDim.InventSiteId).TempItemPackChg;
 
-            if(tmpItem)
+            if (tmpItem)
             {       
 
                 METItemPackChangeHelper metItemPackChangeHelperDependentSites = new METItemPackChangeHelper();
@@ -1158,10 +1183,6 @@ class METItemPackChangeHelper
                 metItemPackChangeHelperDependentSites.parmWHSPhysDimUOMTempItem(METItemPackChangeHelper::getWhsPhysDimOUM(tmpItem));
 
                 metItemPackChangeHelperDependentSites.startOperation_DependentSites();
-
-                //Task110346_CB409-D365ToPIM-child site been added to list- start
-                siteList.addEnd(inventDim.InventSiteId);
-                //Task110346_CB409-D365ToPIM-child site been added to list- end
                 
             }
         }
@@ -1184,9 +1205,9 @@ class METItemPackChangeHelper
         InventSiteId siteId = metInventItemOrderSetupOrigItem.SiteId;
 
         while select firstonly RecId from reqItemTable
-                where reqItemTable.ItemId == metInventItemOrderSetupOrigItem.ItemId
+            where reqItemTable.ItemId == metInventItemOrderSetupOrigItem.ItemId
             && reqItemTable.ReqPOType == ReqPOType::Transfer
-            join inventLocation
+            join RecId from inventLocation
             where inventLocation.InventLocationIdReqMain == reqItemTable.InventLocationIdReqMain
             && inventLocation.METCSDWarehouse == NoYes::Yes
             && inventLocation.InventSiteId == siteId
@@ -1196,25 +1217,26 @@ class METItemPackChangeHelper
             where inventDim.InventSiteId == inventSite.SiteId
             && inventSite.METNDCSite == NoYes::Yes
         {
-            if(METInventItemOrderSetup::findByItemAndSite(metInventItemOrderSetupOrigItem.ItemId, inventDim.InventSiteId).TempItemPackChg)
+            ItemId mainItem = metInventItemOrderSetupOrigItem.ItemId;
+            ItemId tmpItem = METInventItemOrderSetup::findByItemAndSite(metInventItemOrderSetupOrigItem.ItemId, inventDim.InventSiteId).TempItemPackChg;
+
+            if (tmpItem)
             {
-                metInventItemOrderSetupOrigItem      = METInventItemOrderSetup::findByItemAndSite(metInventItemOrderSetupOrigItem.ItemId, inventDim.InventSiteId);
-                metInventItemOrderSetupTempItem      = METInventItemOrderSetup::findByItemAndSite(metInventItemOrderSetupOrigItem.TempItemPackChg, inventDim.InventSiteId);
-                InventTable inventTable = InventTable::find(metInventItemOrderSetupOrigItem.ItemId);
-                inventItemPurchSetupOrigItem = InventItemPurchSetup::find(metInventItemOrderSetupOrigItem.ItemId, inventDim.inventDimId);
-                inventItemPurchSetupTempItem = InventItemPurchSetup::find(metInventItemOrderSetupOrigItem.TempItemPackChg, inventDim.inventDimId);
-                inventItemSalesSetupOrigItem = InventItemSalesSetup::find(metInventItemOrderSetupOrigItem.ItemId, inventDim.inventDimId);
-                inventItemSalesSetupTempItem = InventItemSalesSetup::find(metInventItemOrderSetupOrigItem.TempItemPackChg, inventDim.inventDimId);
-            
-                whsPhysDimUOMOrigItem = METItemPackChangeHelper::getWhsPhysDimOUM(inventTable.ItemId);
-               
-                whsPhysDimUOMTempItem = METItemPackChangeHelper::getWhsPhysDimOUM(metInventItemOrderSetupOrigItem.TempItemPackChg);
+                METItemPackChangeHelper metItemPackChangeHelperDependentSites = new METItemPackChangeHelper();
 
-                this.startOperation_DependentSites();
+                metItemPackChangeHelperDependentSites.parmMETInventItemOrderSetup(METInventItemOrderSetup::findByItemAndSite(mainItem, inventDim.InventSiteId));
+                metItemPackChangeHelperDependentSites.parmMETInventItemOrderSetupTempItem(METInventItemOrderSetup::findByItemAndSite(tmpItem, inventDim.InventSiteId));
 
-                //Task110346_CB409-D365ToPIM-child site been added to list- start
-                siteList.addEnd(metInventItemOrderSetupOrigItem.SiteId);
-                //Task110346_CB409-D365ToPIM-child site been added to list- end
+                metItemPackChangeHelperDependentSites.parmInventItemPurchSetupOrigItem(InventItemPurchSetup::find(mainItem, inventDim.inventDimId));
+                metItemPackChangeHelperDependentSites.parmInventItemPurchSetupTempItem(InventItemPurchSetup::find(tmpItem, inventDim.inventDimId));
+
+                metItemPackChangeHelperDependentSites.parmInventItemSalesSetupOrigItem(InventItemSalesSetup::find(mainItem, inventDim.inventDimId));
+                metItemPackChangeHelperDependentSites.parmInventItemSalesSetupTempItem(InventItemSalesSetup::find(tmpItem, inventDim.inventDimId));
+
+                metItemPackChangeHelperDependentSites.parmWHSPhysDimUOMOrigItem(METItemPackChangeHelper::getWhsPhysDimOUM(mainItem));
+                metItemPackChangeHelperDependentSites.parmWHSPhysDimUOMTempItem(METItemPackChangeHelper::getWhsPhysDimOUM(tmpItem));
+
+                metItemPackChangeHelperDependentSites.startOperation_DependentSites();
             }
         }
     }
@@ -1247,34 +1269,31 @@ class METItemPackChangeHelper
     /// <summary>
     /// Gets the Item code table buffer
     /// </summary>
-    /// <param name = "_itemId">Item Id</param>
-    /// <param name = "_inventDim">Invent Dim</param>
-    /// <param name = "_inventUnit">Unit Id</param>
-    /// <returns></returns>
+    /// <param name = "_itemId">ItemId</param>
+    /// <param name = "_inventDim">InventDim</param>
+    /// <param name = "_inventUnit">InventUnitId</param>
+    /// <returns>ItemBarCode</returns>
     public static ItemBarCode getInventItembarcode(ItemId _itemId, InventDim _inventDim, InventUnitId _inventUnit)
     {
-        ReqItemTable reqItemTable;
-        InventDim inventDim;
+        METReqItemTableInventDimView metReqItemTableInventDimView;
         InventItemBarcode inventItembarcode;
 
-        select firstonly Recid, VendId from reqItemTable
-             exists join inventDim
-            where reqItemTable.ItemId == _itemId
-            && reqItemTable.CovInventDimId == inventDim.inventDimId
-            && inventDim.InventSiteId == _inventDim.InventSiteId
-            && reqItemTable.VendId != '';
+        select firstonly ReqItemTableRecId, VendId, RecId from metReqItemTableInventDimView
+            where metReqItemTableInventDimView.ItemId == _itemId
+            && metReqItemTableInventDimView.InventSiteId == _inventDim.InventSiteId
+            && metReqItemTableInventDimView.VendId != '';
 
-        if(!reqItemTable)
+        if (!metReqItemTableInventDimView)
         {
             return '';
         }        
-        else if (reqItemTable && reqItemTable.VendId)
+        else if (metReqItemTableInventDimView && metReqItemTableInventDimView.VendId)
         {
-            select firstonly inventItembarcode
-            where inventItembarcode.itemId == _itemId
-            && inventItembarcode.METDefault == NoYes::Yes
-            && inventItembarcode.METVendAccount == reqItemTable.VendId
-            && inventItembarcode.UnitID == _inventUnit;
+            select firstonly itemBarCode from inventItembarcode
+                where inventItembarcode.itemId == _itemId
+                && inventItembarcode.METDefault == NoYes::Yes
+                && inventItembarcode.METVendAccount == metReqItemTableInventDimView.VendId
+                && inventItembarcode.UnitID == _inventUnit;
         }
 
         return inventItembarcode.itemBarCode;
@@ -1288,26 +1307,27 @@ class METItemPackChangeHelper
     /// <summary>
     /// Get vendor List price
     /// </summary>
-    /// <param name = "_itemId"></param>
-    /// <param name = "_inventDim"></param>
-    /// <returns></returns>
+    /// <param name = "_itemId">ItemId</param>
+    /// <param name = "_inventDim">InventDim</param>
+    /// <returns>GUPVendPriceAmount</returns>
     public static GUPVendPriceAmount getVendorListPrice(ItemId _itemId, InventDim _inventDim)
     {
-        ReqItemTable    reqItemTable;
-        InventDim       inventDim, inventDimPrice;
+        METReqItemTableInventDimView metReqItemTableInventDimView;
+        InventDim       inventDimPrice;
         InventLocation  inventLocation;
         GUPVendPriceAdmTrans gupVendPriceAdmTrans;
         GUPVendPriceAmount amount;
         GUPVendPriceJournalNum journalNum;
 
-        select firstonly RecId, VendId from reqItemTable
-                join InventLocationId from inventDim
-                    where inventDim.inventDimId == reqItemTable.CovInventDimId 
-                    && inventDim.InventSiteId == _inventDim.InventSiteId
-                    && reqItemTable.ItemId == _itemId;
-        if(reqItemTable && !InventLocation::find(inventDim.InventLocationId).METNDCWarehouse)
+        select firstonly RecId, VendId from metReqItemTableInventDimView
+            join InventLocationId,METNDCWarehouse from inventLocation
+            where inventLocation.InventLocationId == metReqItemTableInventDimView.InventLocationId
+            && metReqItemTableInventDimView.InventSiteId == _inventDim.InventSiteId
+            && metReqItemTableInventDimView.ItemId == _itemId;
+
+        if (metReqItemTableInventDimView && !inventLocation.METNDCWarehouse)
         {
-            journalNum = reqItemTable.VendId + '-' + inventDim.InventLocationId; 
+            journalNum = metReqItemTableInventDimView.VendId + METConstants::hyphen + metReqItemTableInventDimView.InventLocationId;
 
             select firstonly Amount from gupVendPriceAdmTrans
                 order by gupVendPriceAdmTrans.LineNum desc
@@ -1315,27 +1335,25 @@ class METItemPackChangeHelper
                 && gupVendPriceAdmTrans.ItemNum == _itemId
                 exists join inventDimPrice
                 where inventDimPrice.inventDimId == gupVendPriceAdmTrans.InventDimId
-                && inventDimPrice.InventLocationId == inventDim.InventLocationId
+                && inventDimPrice.InventLocationId == metReqItemTableInventDimView.InventLocationId
                 && inventDimPrice.InventSiteId == _inventDim.InventSiteId;
 
             amount = gupVendPriceAdmTrans.Amount;
             
         } 
-        else if(reqItemTable && InventLocation::find(inventDim.InventLocationId).METNDCWarehouse)
+        else if(metReqItemTableInventDimView && inventLocation.METNDCWarehouse)
         {
-            inventDim.clear();
+            inventLocation.clear();
 
-            select firstonly RecId, VendId from reqItemTable
-                exists join inventDim
-                    where inventDim.inventDimId == reqItemTable.CovInventDimId
-                    && inventDim.InventSiteId == _inventDim.InventSiteId
-                    && reqItemTable.ItemId == _itemId
-                    join RecId, InventLocationId from inventLocation
-                    where inventLocation.InventLocationId == inventDim.InventLocationId
-                    && inventLocation.METNDCWarehouse == NoYes::Yes
-                    && reqItemTable.ReqPOType == ReqPOType::Purch;
+            select firstonly RecId, VendId from metReqItemTableInventDimView
+                where metReqItemTableInventDimView.InventSiteId == _inventDim.InventSiteId
+                && metReqItemTableInventDimView.ItemId == _itemId
+                join RecId, InventLocationId from inventLocation
+                where inventLocation.InventLocationId == metReqItemTableInventDimView.InventLocationId
+                && inventLocation.METNDCWarehouse == NoYes::Yes
+                && metReqItemTableInventDimView.ReqPOType == ReqPOType::Purch;
 
-            journalNum = reqItemTable.VendId + '-' + inventLocation.InventLocationId;  
+            journalNum = metReqItemTableInventDimView.VendId +  METConstants::hyphen + inventLocation.InventLocationId;
         
             select firstonly Amount from gupVendPriceAdmTrans
                 order by gupVendPriceAdmTrans.LineNum desc
@@ -1504,19 +1522,17 @@ class METItemPackChangeHelper
     /// </summary>
     private void runVendorChangeRequest()
     {
-        ReqItemTable    reqItemTable;
-        InventDim       inventDim;
         METReqItemTable metReqItemTable;
+        METReqItemTableInventDimView metReqItemTableInventDimView;
 
-        while select ItemId,CovInventDimId,ReqPOType,InventLocationIdReqMain, VendId from reqItemTable
-            exists join inventDim
-            where reqItemTable.ItemId == metInventItemOrderSetupOrigItem.ItemId    &&
-                  reqItemTable.CovInventDimId == inventDim.inventDimId      &&
-                  inventDim.InventSiteId == metInventItemOrderSetupOrigItem.SiteId
+        while select ItemId, CovInventDimId, ReqPOType, InventLocationIdReqMain, VendId, InventSiteId
+            from metReqItemTableInventDimView
             exists join metReqItemTable
-            where metReqItemTable.RefRecId == reqItemTable.RecId
+            where metReqItemTable.RefRecId == metReqItemTableInventDimView.ReqItemTableRecId
             && metReqItemTable.PendingVendChangeDate <= DateTimeUtil::getSystemDateTime()
             && metReqItemTable.PendingVendAccountNumber != ''
+            && metReqItemTableInventDimView.ItemId == metInventItemOrderSetupOrigItem.ItemId
+            && metReqItemTableInventDimView.InventSiteId == metInventItemOrderSetupOrigItem.SiteId
         {
             METVendorChangeRequestController    controller  = METVendorChangeRequestController::construct();
             METVendorChangeRequestContract      contract    = controller ? controller.getDataContractObject() : null;
@@ -1527,8 +1543,8 @@ class METItemPackChangeHelper
             }
 
             // Set contract fields
-            contract.parmItemId(reqItemTable.ItemId);
-            contract.parmInventSiteId(reqItemTable.inventDim().InventSiteId);
+            contract.parmItemId(metReqItemTableInventDimView.ItemId);
+            contract.parmInventSiteId(metReqItemTableInventDimView.InventSiteId);
             contract.parmCalledFromDefaultForm(true);
 
             controller.parmExecutionMode(SysOperationExecutionMode::ScheduledBatch); // Set execution mode
@@ -1538,26 +1554,6 @@ class METItemPackChangeHelper
             controller.parmDialogCaption(strFmt("@MET:VendChangeReqBatch @DOMLabels:DOMItemId - %1 @SYS177684 - %2",metInventItemOrderSetupOrigItem.ItemId, metInventItemOrderSetupOrigItem.SiteId));
             // Start operation
             controller.startOperation();
-        }
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>triggerItemPackchangeCompleteBusinessEvent</Name>
-				<Source><![CDATA[
-    ///Task110346_CB409-D365ToPIM
-    /// <summary>
-    /// trigger the item pack change business event on completion
-    /// </summary>
-    /// <param name = "_itemId">Itemid</param>
-    /// <param name = "_tempItemPackChg">Temp item</param>
-    /// <param name = "_inventSiteId">InventSite list</param>
-    private void triggerItemPackchangeCompleteBusinessEvent(ItemId _itemId, METTempItemPackChg _tempItemPackChg, list _inventSiteId)
-    {
-        if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METItemPackChangeCompletedBusinessEvent)))
-        {
-            METItemPackChangeCompletedBusinessEvent::newFromItemPackChangeCompleted(_itemId, _tempItemPackChg, _inventSiteId).send();
         }
     }
 
