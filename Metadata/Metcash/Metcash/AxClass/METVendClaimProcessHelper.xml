@@ -29,6 +29,40 @@ internal final class METVendClaimProcessHelper
 ]]></Declaration>
 		<Methods>
 			<Method>
+				<Name>parmSiteId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// SiteId
+    /// </summary>
+    /// <param name = "_siteId">SiteId</param>
+    /// <returns>SiteId</returns>
+    public InventSiteId parmSiteId(InventSiteId _siteId = siteId)
+    {
+        siteId = _siteId;
+
+        return siteId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmActivationDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Activation date
+    /// </summary>
+    /// <param name = "_date">date</param>
+    /// <returns>activationDate</returns>
+    public TransDate parmActivationDate(TransDate _date = activationDate)
+    {
+        activationDate = _date;
+
+        return activationDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>parmDutyRollVariance</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -61,6 +95,23 @@ internal final class METVendClaimProcessHelper
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>initCostingVersion</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Init Costing Version parameters
+    /// </summary>
+    private void initCostingVersion()
+    {
+        costingVersion = CostingVersion::find(gupParameters.METCostingVersionId);
+        if(!costingVersion)
+        {
+            throw Error(strFmt("@MET:CostingVersionNotSetMsg", "@GlobalUnifiedPricing:GUPParameters", fieldPName(GUPParameters, METCostingVersionId)));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>initLedgerJournalParm</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -79,6 +130,119 @@ internal final class METVendClaimProcessHelper
         }
         ledgerJournalName               = LedgerJournalName::find(exciseDutyParameteres.ExciseClaimJournalName);
         ledgerJournalTransRecordList    = new RecordInsertList(tableNum(LedgerJournalTrans));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processForItemBasePrice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// main process for Vendor claims from Item Base Price
+    /// </summary>
+    public void processForItemBasePrice()
+    {
+        InventDim   inventDim;
+
+        this.initParameters();
+        this.initCostingVersion();
+
+        while select forupdate itemBasePrice
+            where itemBasePrice.PriceType == GUPBasePriceType::BasePriceInventoryCost
+                &&  itemBasePrice.Calculated == NoYes::Yes
+                &&  itemBasePrice.ActivationDate == activationDate
+                &&  itemBasePrice.FromDate >= activationDate
+                &&  itemBasePrice.METVendClaimEnabled == NoYes::Yes
+                &&  itemBasePrice.METVendClaimCreated == NoYes::No
+            join inventDim
+                where inventDim.inventDimId == itemBasePrice.InventDimId
+                &&  inventDim.InventSiteId == siteId
+        {
+            try
+            {
+                ttsbegin;
+                recordInsertList.add(this.initVendorClaimFromItemBasePrice());
+
+                itemBasePrice.METVendClaimCreated = NoYes::Yes;
+                itemBasePrice.update();
+                ttscommit;
+            }
+            catch (Exception::Error)
+            {
+                error (strFmt("@MET:StdCostVersionLineProcessErrorMsg", "@SYS24667", itemBasePrice.ItemId));
+                
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error (strFmt("@MET:StdCostVersionLineProcessErrorMsg", "@SYS59280", itemBasePrice.ItemId));
+                    
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        error (strFmt("@MET:StdCostVersionLineProcessErrorMsg", "@SYS107548", itemBasePrice.ItemId));
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    error (strFmt("@MET:StdCostVersionLineProcessErrorMsg", "@SYS107548", itemBasePrice.ItemId));
+                }
+            }
+        }
+        recordInsertList.insertDatabase();
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initVendorClaimFromItemBasePrice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// init from ItemBasePrice
+    /// </summary>
+    /// <returns>METVendorClaimTable</returns>
+    private METVendorClaimTable initVendorClaimFromItemBasePrice()
+    {
+        METVendorClaimTable     vendorClaimTable;
+        InventDim               inventDim = InventDim::find(itemBasePrice.InventDimId);
+        VendAccount             defaultVendor = ReqItemTable::find(itemBasePrice.ItemId, itemBasePrice.InventDimId).VendId;
+        METAmountCurNew         newPrice = itemBasePrice.Price / itemBasePrice.PriceQty;
+        METAmountCurOld         oldPrice = this.getItemBasePriceOldPrice(itemBasePrice.ItemId, inventDim);
+
+        if (oldPrice > newPrice && defaultVendor)
+        {
+            vendorClaimTable.clear();
+
+            vendorClaimTable.ClaimLineId = numberSeq.num();
+            vendorClaimTable.ClaimType = MetVendClaimType::StandardCost;
+            vendorClaimTable.SiteId = inventDim.InventSiteId;
+            vendorClaimTable.ItemId = itemBasePrice.ItemId;
+            vendorClaimTable.modifiedField(fieldNum(METVendorClaimTable, ItemId));
+
+            vendorClaimTable.UnitId = InventTableModule::find(itemBasePrice.ItemId, ModuleInventPurchSales::Invent).UnitId;
+            vendorClaimTable.Qty = this.inventoryOnHand(itemBasePrice.ItemId, inventDim);
+            vendorClaimTable.OldPrice = oldPrice;
+            vendorClaimTable.NewPrice = newPrice;
+            vendorClaimTable.VendAccount = defaultVendor;
+        
+            vendorClaimTable.setClaimAmount();
+        }
+        return vendorClaimTable;
     }
 
 ]]></Source>
@@ -114,6 +278,51 @@ internal final class METVendClaimProcessHelper
         vendorClaimTable.ClaimInvoiceId = ledgerJournalTrans.Invoice;
             
         return vendorClaimTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>inventoryOnHand</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get Quantity
+    /// </summary>
+    /// <param name = "_itemId">ItemId</param>
+    /// <param name = "_inventDim">InventDim</param>
+    /// <returns>Qty</returns>
+    private Qty inventoryOnHand(ItemId _itemId, InventDim _inventDim)
+    {
+        InventOnhand    inventOnhand;
+        InventDimParm   inventDimParm;
+
+        inventDimParm.initFromInventDim(_inventDim);
+        inventOnhand = InventOnhand::newParameters(_itemId, _inventDim, inventDimParm);
+        return inventOnhand.availPhysical();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getItemBasePriceOldPrice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get old price
+    /// </summary>
+    /// <param name = "_itemId">ItemId</param>
+    /// <param name = "_inventDim">InventDim</param>
+    /// <returns>METAmountCurOld</returns>
+    private METAmountCurOld getItemBasePriceOldPrice(ItemId _itemId, InventDim _inventDim)
+    {
+        InventItemPrice inventItemPriceCurrent = InventItemPrice::findCurrent(_itemId, CostingVersionPriceType::Cost, _inventDim.InventDimId, activationDate, _inventDim.InventSiteId, InventItemCostingType::Standard);
+        METAmountCurOld amountCurOld;
+
+        if(inventItemPriceCurrent)
+        {
+            amountCurOld = inventItemPriceCurrent.Price/inventItemPriceCurrent.PriceUnit; //get the unit price
+        }
+
+        return amountCurOld;
     }
 
 ]]></Source>
