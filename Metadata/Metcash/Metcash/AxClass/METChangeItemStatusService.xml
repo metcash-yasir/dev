@@ -9,6 +9,7 @@
 /// </summary>
 class METChangeItemStatusService
 {
+    VendParameters vendParameters = VendParameters::find();
 }
 ]]></Declaration>
 		<Methods>
@@ -22,39 +23,86 @@ class METChangeItemStatusService
     /// <param name = "_metChangeItemStatusContract">data contract </param>
     public void changeStatus(METChangeItemStatusContract _metChangeItemStatusContract)
     {
-        Query                   query = new Query();
-        QueryBuildDataSource    qbds;
-        QueryBuildRange         qbrItem, qbrSiteId;
-
-        ItemId                  itemId  = _metChangeItemStatusContract.parmItemId();
-        InventSiteId            siteId  = _metChangeItemStatusContract.parmInventSiteId();
-        qbds        = query.addDataSource(tableNum(MetItemSiteSettingsSetup));
-
-        if (itemId != '')
+        #OCCRetryCount
+        Query                   query;
+        QueryBuildDataSource    qbds, qbdsInventDim;
+        QueryBuildRange         qbrItem, qbrSiteId, qbrItemStatus, qbrDiscontinueDate;
+        
+        try
         {
-            qbrItem     = qbds.addRange(fieldNum(MetItemSiteSettingsSetup,ItemId));
-            qbrItem.value(queryValue(_metChangeItemStatusContract.parmItemId()));
+            ttsbegin;
+            query   = new Query();
+            ItemId  itemId  = _metChangeItemStatusContract.parmItemId();
+            InventSiteId siteId  = _metChangeItemStatusContract.parmInventSiteId();
+            qbds = query.addDataSource(tableNum(METInventItemOrderSetup));
+
+            if (itemId != '')
+            {
+                qbrItem = qbds.addRange(fieldNum(METInventItemOrderSetup, ItemId));
+                qbrItem.value(queryValue(itemId));
+            }
+
+            if (siteId != '')
+            {
+                qbdsInventDim = qbds.addDataSource(tablenum(InventDim));
+                qbdsInventDim.relations(true);
+                qbrSiteId = qbdsInventDim.addRange(fieldNum(InventDim, InventSiteId));
+                qbrSiteId.value(queryValue(siteId));
+            }
+            if (_metChangeItemStatusContract.parmMETItemStatus() == METItemStatusTable::findByStatus(METItemsStatus::Active).ItemStatus)
+            {            
+                qbrItemStatus = qbds.addRange(fieldNum(METInventItemOrderSetup, ItemStatus));
+                qbrItemStatus.value(METItemStatusTable::findByStatus(METItemsStatus::New).ItemStatus);
+            }           
+
+            QueryRun                queryRun = new QueryRun(query);
+
+            if (_metChangeItemStatusContract.parmMETItemStatus() == METConstants::Active)
+            {
+                this.changeStatusToActive(queryRun);            
+            }
+            else if (_metChangeItemStatusContract.parmMETItemStatus() == METConstants::Discontinued)
+            {
+                this.changeStatusToDiscontinued(queryRun, _metChangeItemStatusContract);
+            }
+            else if (_metChangeItemStatusContract.parmMETItemStatus() == METConstants::Deleted)
+            {
+                this.changeStatusToDeleted(queryRun);
+            }
+            ttscommit;
         }
-
-        if (siteId != '')
+        catch (Exception::Deadlock)
         {
-            qbrSiteId   = qbds.addRange(fieldNum(MetItemSiteSettingsSetup,InventSiteId));
-            qbrSiteId.value(queryValue(_metChangeItemStatusContract.parmInventSiteId()));
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
         }
-
-        QueryRun                queryRun = new QueryRun(query);
-
-        if(_metChangeItemStatusContract.parmMETItemStatus() == METConstants::Active)
+        catch (Exception::UpdateConflict)
         {
-            this.changeStatusToActive(queryRun);            
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
         }
-        if(_metChangeItemStatusContract.parmMETItemStatus() == METConstants::Discontinued)
+        catch
         {
-            this.changeStatusToDiscontinued(queryRun);
-        }
-        if(_metChangeItemStatusContract.parmMETItemStatus() == METConstants::Deleted)
-        {
-            this.changeStatusToDeleted(QueryRun);
+            throw error("@MET:UnhandledError");
         }
         
     }
@@ -65,78 +113,536 @@ class METChangeItemStatusService
 				<Name>changeStatusToDeleted</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// to change the item site level field called Item status to 'Deleted'.
-    /// MPJ_22974_BMSProductMDRItemStatusAndPackChange    
-    /// </summary>    
-    /// <param name = "_queryRun"> query to select rcords </param>
+    /// Delete change status
+    /// </summary>
+    /// <param name = "_queryRun">QueryRun</param>
     private void changeStatusToDeleted(QueryRun _queryRun)
     {
         while(_queryRun.next())
         {
-            MetItemSiteSettingsSetup            metItemSiteSettingsSetup;            
-            METSalesItemSubstitutionParentChild metSalesItemSubstitutionParentChild;
+            InventLocation inventLocation, inventLocationNDC;
+            METInventItemOrderSetup metInventItemOrderSetup;
+            METReqItemTableInventDimView metReqItemTableInventDimView;
 
-            metItemSiteSettingsSetup = _queryRun.get(tableNum(MetItemSiteSettingsSetup));
+            metInventItemOrderSetup = _queryRun.get(tableNum(METInventItemOrderSetup));
 
-            select firstonly RecId from metSalesItemSubstitutionParentChild
-                where metSalesItemSubstitutionParentChild.ChildItemID   == metItemSiteSettingsSetup.ItemId &&
-                      metSalesItemSubstitutionParentChild.InventSiteId  == metItemSiteSettingsSetup.InventSiteId;
+            InventSite inventSite = InventSite::find(InventDim::find(metInventItemOrderSetup.InventDimId).InventSiteId);
 
-            boolean emptyInventValue        = this.isPhysicalInventoryValueZero(metItemSiteSettingsSetup.ItemId, metItemSiteSettingsSetup.InventSiteId);
-
-            boolean isPOQtyOrTransQtyExist  = this.isPOQtyOrTransQtyExist(metItemSiteSettingsSetup.ItemId);
-
-            if(!metSalesItemSubstitutionParentChild.RecId && 
-                metItemSiteSettingsSetup.ItemStatus == METConstants::Discontinued && 
-                emptyInventValue && 
-                !isPOQtyOrTransQtyExist)
+            while select ItemId, CovInventDimId, ReqPOType, InventLocationIdReqMain, VendId, ReqItemTableRecId, InventLocationId
+                from metReqItemTableInventDimView
+                where metReqItemTableInventDimView.ItemId == metInventItemOrderSetup.ItemId
+                && metReqItemTableInventDimView.InventSiteId == inventSite.SiteId
+                && metReqItemTableInventDimView.ReqPOType == ReqPOType::Purch
+                && metReqItemTableInventDimView.VendGroup != vendParameters.METInterCompanyVendGroupId
             {
-                ReqItemTable    reqItemTable;
-                InventDim       inventDimReq;
-                InventDim       inventDim;
-
-                inventDim.inventSiteId = metItemSiteSettingsSetup.InventSiteId;
-                inventDim = InventDim::findDim(inventDim);
-                
-                select firstonly ItemId, CovInventDimId, ReqPOType, InventLocationIdReqMain, RecId 
-                    from reqItemTable
-                    where reqItemTable.ReqPOType        == ReqPOType::Transfer
-                    join RecId from inventDimReq
-                        where reqItemTable.ItemId           == metItemSiteSettingsSetup.ItemId    &&
-                                reqItemTable.CovInventDimId   == inventDimReq.inventDimId      &&                               
-                                inventDimReq.InventSiteId     == metItemSiteSettingsSetup.InventSiteId;
-                
-                if(reqItemTable.RecId)
+                //When planned order type is Purch
+                if ( metInventItemOrderSetup.ItemStatus == METConstants::Discontinued
+                    && metInventItemOrderSetup.DiscontinueDate <= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
                 {
-                    InventLocation inventLocation;
-                    
-                    select firstonly inventLocation
-                            where inventLocation.InventLocationId == reqItemTable.InventLocationIdReqMain;
-                    
-                    if(inventLocation)
+                    if ((this.checkIfItemIsTemp(metReqItemTableInventDimView.ItemId) 
+                        && this.checkIfItemIsTempItemForPackChange(metReqItemTableInventDimView.ItemId)) 
+                        || (this.checkIfItemIsChild(metReqItemTableInventDimView.ItemId, inventSite.SiteId)))
                     {
-                        MetItemSiteSettingsSetup    metItemSiteSettingsSetupSupplySite;
-                        
-                        select firstonly RecId 
-                            from  metItemSiteSettingsSetupSupplySite
-                            where metItemSiteSettingsSetupSupplySite.ItemId         == metItemSiteSettingsSetup.ItemId  &&
-                                    metItemSiteSettingsSetupSupplySite.InventSiteId == inventLocation.InventSiteId      &&
-                                    metItemSiteSettingsSetupSupplySite.ItemStatus   == METConstants::Deleted;
-                        
-                        if(metItemSiteSettingsSetupSupplySite.RecId)
+                        continue;
+                    }
+
+                    select firstonly METNDCWarehouse, InventSiteId, InventLocationId from inventLocation
+                        where inventLocation.InventLocationId == metReqItemTableInventDimView.InventLocationId;
+
+                    if (inventLocation.METNDCWarehouse) // If NDC warehouse, check for all NDC
+                    {
+                        while select RecId, InventSiteId, InventLocationId
+                        from inventLocationNDC
+                        where inventLocationNDC.METNDCWarehouse == NoYes::Yes
                         {
-                            this.updateStatusToDeletedMain(metItemSiteSettingsSetup, inventDim.inventDimId);                             
+                            this.changeStatusToDeleted_ValidateAndDelete(inventLocationNDC, metInventItemOrderSetup, metReqItemTableInventDimView.ReqItemTableRecId, false);
+                            if (this.changeStatusToDeleted_Validate(inventLocationNDC, metReqItemTableInventDimView.ReqItemTableRecId, metInventItemOrderSetup.ItemId))
+                            {
+                                this.checkAndDeleteIfItemIsTOInOtherSites(inventLocationNDC, metInventItemOrderSetup);
+                                this.checkAndDeleteIfItemIsTOInOtherSites_IntComp(inventLocationNDC, metInventItemOrderSetup);
+                            }
                         }
                     }
-                }
+                    else // Non NDC site
+                    {
+                        this.changeStatusToDeleted_ValidateAndDelete(inventLocation, metInventItemOrderSetup, metReqItemTableInventDimView.ReqItemTableRecId, false);
+                        if (this.changeStatusToDeleted_Validate(inventLocation, metReqItemTableInventDimView.ReqItemTableRecId, metInventItemOrderSetup.ItemId))
+                        {
+                            this.checkAndDeleteIfItemIsTOInOtherSites(inventLocation, metInventItemOrderSetup);
+                            this.checkAndDeleteIfItemIsTOInOtherSites_IntComp(inventLocation, metInventItemOrderSetup);
+                        }
+                    }               
 
-                else
-                {
-                    this.updateStatusToDeletedMain(metItemSiteSettingsSetup, inventDim.inventDimId);
                 }
-                
+            }
+            while select ItemId, CovInventDimId, ReqPOType, InventLocationIdReqMain, VendId, ReqItemTableRecId, InventLocationId
+                from metReqItemTableInventDimView
+                where metReqItemTableInventDimView.ItemId == metInventItemOrderSetup.ItemId
+                && metReqItemTableInventDimView.InventSiteId == inventSite.SiteId
+                && metReqItemTableInventDimView.ReqPOType == ReqPOType::Transfer
+            {
+                //when planned order is Transfer
+                if (metInventItemOrderSetup.ItemStatus == METConstants::Discontinued
+                    && metInventItemOrderSetup.DiscontinueDate <= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()))
+                 {
+
+                    if (this.checkIfItemIsTemp(metInventItemOrderSetup.ItemId) && this.checkIfItemIsTempItemForPackChange(metInventItemOrderSetup.ItemId)
+                        || (this.checkIfItemIsChild(metInventItemOrderSetup.ItemId, inventSite.SiteId))
+                        || (!this.checkIfSourceSiteWithItemStatusNotDiscontinued(metInventItemOrderSetup)))
+                    {
+                        continue;
+                    }
+
+                    select firstonly METNDCWarehouse, InventSiteId, InventLocationId from inventLocation
+                        where inventLocation.InventLocationId == metReqItemTableInventDimView.InventLocationId;
+
+                    if (inventLocation.METNDCWarehouse) // If NDC warehouse, check for all NDC
+                    {
+                        while select RecId, InventSiteId, InventLocationId
+                        from inventLocationNDC
+                        where inventLocationNDC.METNDCWarehouse == NoYes::Yes
+                        {
+                            this.changeStatusToDeleted_ValidateAndDelete(inventLocationNDC, metInventItemOrderSetup, metReqItemTableInventDimView.ReqItemTableRecId, false);
+                        }
+                    }
+                    else // Non NDC site
+                    {
+                        this.changeStatusToDeleted_ValidateAndDelete(inventLocation, metInventItemOrderSetup, metReqItemTableInventDimView.ReqItemTableRecId, false);
+                    }
+                }               
+            }
+            while select ItemId, CovInventDimId, ReqPOType, InventLocationIdReqMain, VendId, ReqItemTableRecId, InventLocationId
+                from metReqItemTableInventDimView
+                where metReqItemTableInventDimView.ItemId == metInventItemOrderSetup.ItemId
+                && metReqItemTableInventDimView.InventSiteId == inventSite.SiteId
+                && metReqItemTableInventDimView.ReqPOType == ReqPOType::Purch
+                && metReqItemTableInventDimView.VendGroup == vendParameters.METInterCompanyVendGroupId
+            {
+                //when planned order is PO (Intercompany)
+                if (metInventItemOrderSetup.ItemStatus == METConstants::Discontinued
+                && metInventItemOrderSetup.DiscontinueDate <= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone())
+                )
+                {
+                    if ((this.checkIfItemIsTemp(metInventItemOrderSetup.ItemId) && this.checkIfItemIsTempItemForPackChange(metInventItemOrderSetup.ItemId))
+                        || (this.checkIfItemIsChild(metInventItemOrderSetup.ItemId, inventSite.SiteId))
+                        || (!this.checkIfSourceSiteWithItemStatusNotDiscontinued_IntCom(metInventItemOrderSetup, metReqItemTableInventDimView.VendId))
+                        )
+                    {
+                        continue;
+                    }
+
+                    select firstonly METNDCWarehouse, InventSiteId, InventLocationId from inventLocation
+                        where inventLocation.InventLocationId == metReqItemTableInventDimView.InventLocationId;
+
+                    if (inventLocation.METNDCWarehouse) // If NDC warehouse, check for all NDC
+                    {
+                        while select RecId, InventSiteId, InventLocationId
+                        from inventLocationNDC
+                        where inventLocationNDC.METNDCWarehouse == NoYes::Yes
+                        {
+                            this.changeStatusToDeleted_ValidateAndDelete(inventLocationNDC, metInventItemOrderSetup, metReqItemTableInventDimView.ReqItemTableRecId, false);
+                        }
+                    }
+                    else // Non NDC site
+                    {
+                        this.changeStatusToDeleted_ValidateAndDelete(inventLocation, metInventItemOrderSetup, metReqItemTableInventDimView.ReqItemTableRecId, false);
+                    }
+                }
+            }
+
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>changeStatusToDeleted_ValidateAndDelete</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate the record and status to Delete
+    /// </summary>
+    /// <param name = "_inventLocation">InventLocation</param>
+    /// <param name = "_metInventItemOrderSetup">METInventItemOrderSetup</param>
+    /// <param name = "_reqItemTableRecId">RecId</param>
+    /// <param name = "_calledFromTransferSite">boolean</param>
+    private void changeStatusToDeleted_ValidateAndDelete(InventLocation _inventLocation, METInventItemOrderSetup _metInventItemOrderSetup, RecId _reqItemTableRecId, boolean _calledFromTransferSite)
+    {
+        if (this.changeStatusToDeleted_Validate(_inventLocation, _reqItemTableRecId, _metInventItemOrderSetup.ItemId)) // Validate main Item
+        {
+            if (_metInventItemOrderSetup.TempItemPackChg
+                && this.changeStatusToDeleted_Validate(_inventLocation, _reqItemTableRecId, _metInventItemOrderSetup.TempItemPackChg) ) // If main Item contains Temp Item and validate temp Item
+            {               
+                if (_calledFromTransferSite)
+                {
+                    METInventItemOrderSetup metInventItemOrderSetupTransferSite, metInventItemOrderSetupTransferSiteTempItem;
+                    METReqItemTableInventDimView metReqItemTableInventDimView;
+
+                    select firstonly InventSiteId from metReqItemTableInventDimView
+                        where metReqItemTableInventDimView.ReqItemTableRecId == _reqItemTableRecId;
+
+                    select firstonly metInventItemOrderSetupTransferSite
+                        where metInventItemOrderSetupTransferSite.SiteId == metReqItemTableInventDimView.InventSiteId
+                        && metInventItemOrderSetupTransferSite.ItemId == _metInventItemOrderSetup.ItemId
+                        && metInventItemOrderSetupTransferSite.ItemStatus != METConstants::Deleted
+                        && metInventItemOrderSetupTransferSite.ItemStatus != METConstants::Discontinued;
+
+                    this.copyDelReasonAndVendReplacementFromSourceToTransferSite(_metInventItemOrderSetup, metInventItemOrderSetupTransferSite);
+
+                    select firstonly metInventItemOrderSetupTransferSiteTempItem
+                        where metInventItemOrderSetupTransferSiteTempItem.SiteId == metInventItemOrderSetupTransferSite.SiteId
+                        && metInventItemOrderSetupTransferSiteTempItem.ItemId == metInventItemOrderSetupTransferSite.TempItemPackChg
+                        && metInventItemOrderSetupTransferSiteTempItem.ItemStatus != METConstants::Deleted
+                        && metInventItemOrderSetupTransferSiteTempItem.ItemStatus != METConstants::Discontinued;
+                        
+                    this.copyDelReasonAndVendReplacementFromSourceToTransferSite(metInventItemOrderSetupTransferSite, metInventItemOrderSetupTransferSiteTempItem);
+                }
+                this.updateStatusToDeletedMain(_metInventItemOrderSetup.ItemId, InventDim::find(_metInventItemOrderSetup.InventDimId), _metInventItemOrderSetup); // Delete status to Main item
+                this.updateStatusToDeletedMain(_metInventItemOrderSetup.TempItemPackChg, InventDim::find(_metInventItemOrderSetup.InventDimId), _metInventItemOrderSetup); // Delete status to Temp item
+            }
+            else if (!_metInventItemOrderSetup.TempItemPackChg) // If no temp item found
+            {
+                this.updateStatusToDeletedMain(_metInventItemOrderSetup.ItemId, InventDim::find(_metInventItemOrderSetup.InventDimId), _metInventItemOrderSetup); // Delete status to Main item
             }
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAndDeleteIfItemIsTOInOtherSites</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if Transfer order is present or not
+    /// </summary>
+    /// <param name = "_inventLocation">InventLocation</param>
+    /// <param name = "_metInventItemOrderSetup">METInventItemOrderSetup</param>
+    private void checkAndDeleteIfItemIsTOInOtherSites(InventLocation _inventLocation, METInventItemOrderSetup _metInventItemOrderSetup )
+    {
+        ReqItemTable reqItemTableTOInOtherSite;
+        METInventItemOrderSetup metInventItemOrderSetupTransferSite, metInventItemOrderSetupTransferSiteTempItem;
+
+        // Check if Item is a transferorder in other sites
+        while select ItemId, CovInventDimId, ReqPOType, InventLocationIdReqMain, VendId, RecId 
+            from reqItemTableTOInOtherSite
+            where reqItemTableTOInOtherSite.ItemId == _metInventItemOrderSetup.ItemId &&
+            reqItemTableTOInOtherSite.InventLocationIdReqMain == _inventLocation.InventLocationId &&
+            reqItemTableTOInOtherSite.ReqPOType == ReqPOType::Transfer
+        {
+            InventSite inventSite = InventSite::find(InventDim::find(reqItemTableTOInOtherSite.CovInventDimId).InventSiteId);
+
+            select firstonly metInventItemOrderSetupTransferSite
+                where metInventItemOrderSetupTransferSite.SiteId == inventSite.SiteId
+                && metInventItemOrderSetupTransferSite.ItemId == _metInventItemOrderSetup.ItemId
+                && metInventItemOrderSetupTransferSite.ItemStatus != METConstants::Deleted;
+
+            if (inventSite.METNDCSite && metInventItemOrderSetupTransferSite && metInventItemOrderSetupTransferSite.ItemStatus != METConstants::Discontinued)
+            {                
+                this.copyDelReasonAndVendReplacementFromSourceToTransferSite(_metInventItemOrderSetup, metInventItemOrderSetupTransferSite);
+                METInventItemOrderSetup::updateChildItemSiteStatusToDiscontinue(metInventItemOrderSetupTransferSite.ItemId, metInventItemOrderSetupTransferSite.SiteId, metInventItemOrderSetupTransferSite);
+                if (metInventItemOrderSetupTransferSite.TempItemPackChg)
+                {
+                    select firstonly metInventItemOrderSetupTransferSiteTempItem
+                        where metInventItemOrderSetupTransferSiteTempItem.SiteId == metInventItemOrderSetupTransferSite.SiteId
+                        && metInventItemOrderSetupTransferSiteTempItem.ItemId == metInventItemOrderSetupTransferSite.TempItemPackChg
+                        && metInventItemOrderSetupTransferSiteTempItem.ItemStatus != METConstants::Deleted
+                        && metInventItemOrderSetupTransferSiteTempItem.ItemStatus != METConstants::Discontinued;
+
+                    if (metInventItemOrderSetupTransferSiteTempItem)
+                    {
+                        this.copyDelReasonAndVendReplacementFromSourceToTransferSite(metInventItemOrderSetupTransferSite, metInventItemOrderSetupTransferSiteTempItem);
+                        METInventItemOrderSetup::updateChildItemSiteStatusToDiscontinue(metInventItemOrderSetupTransferSiteTempItem.ItemId, metInventItemOrderSetupTransferSiteTempItem.SiteId, metInventItemOrderSetupTransferSiteTempItem);
+                    }
+
+                }
+            }
+            else if (!inventSite.METNDCSite)
+            {
+                this.changeStatusToDeleted_ValidateAndDelete(_inventLocation, metInventItemOrderSetupTransferSite, reqItemTableTOInOtherSite.RecId, true);
+            }
+        }
+       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAndDeleteIfItemIsTOInOtherSites_IntComp</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if Transfer order is present or not for Intercompany
+    /// </summary>
+    /// <param name = "_inventLocation">Warehouse table</param>
+    /// <param name = "_metInventItemOrderSetup">METInventItemOrderSetup table</param>
+    private void checkAndDeleteIfItemIsTOInOtherSites_IntComp(InventLocation _inventLocation, METInventItemOrderSetup _metInventItemOrderSetup )
+    { 
+        changecompany(vendParameters.METInterCompanyLegalEntity)
+        {
+            METInventItemOrderSetup metInventItemOrderSetupTransferSite, metInventItemOrderSetupTransferSiteTempItem;
+            METReqItemTableInventDimView metReqItemTableInventDimView;
+
+            // Check if Item is a transferorder in other sites            
+            while select ItemId, CovInventDimId, ReqPOType, InventLocationIdReqMain, VendId, RecId, VendIntercompanyWarehouse
+                from metReqItemTableInventDimView
+                where metReqItemTableInventDimView.ItemId == _metInventItemOrderSetup.ItemId
+                && metReqItemTableInventDimView.ReqPOType == ReqPOType::Purch
+                && metReqItemTableInventDimView.VendGroup == vendParameters.METInterCompanyVendGroupId
+            {                
+                if (this.getSiteFromCurrentLegalEntity(metReqItemTableInventDimView.VendIntercompanyWarehouse, VendParameters::find().METInterCompanyLegalEntity)  == _inventLocation.InventSiteId)
+                {
+                    InventSite inventSite = InventSite::find(InventDim::find(metReqItemTableInventDimView.CovInventDimId).InventSiteId);
+
+                    select firstonly metInventItemOrderSetupTransferSite
+                        where metInventItemOrderSetupTransferSite.SiteId == inventSite.SiteId
+                        && metInventItemOrderSetupTransferSite.ItemId == _metInventItemOrderSetup.ItemId;
+
+                    if (inventSite.METNDCSite && (metInventItemOrderSetupTransferSite.ItemStatus != METConstants::Deleted || metInventItemOrderSetupTransferSite.ItemStatus != METConstants::Discontinued))
+                    {
+                        this.copyDelReasonAndVendReplacementFromSourceToTransferSiteMain(_metInventItemOrderSetup, metInventItemOrderSetupTransferSite);
+                        if (metInventItemOrderSetupTransferSite.TempItemPackChg)
+                        {
+                            select firstonly metInventItemOrderSetupTransferSiteTempItem
+                                where metInventItemOrderSetupTransferSiteTempItem.SiteId == metInventItemOrderSetupTransferSite.SiteId
+                                && metInventItemOrderSetupTransferSiteTempItem.ItemId == metInventItemOrderSetupTransferSite.TempItemPackChg;
+
+                            if(metInventItemOrderSetupTransferSiteTempItem.ItemStatus != METConstants::Deleted ||  metInventItemOrderSetupTransferSiteTempItem.ItemStatus != METConstants::Discontinued)
+                            {
+                                this.copyDelReasonAndVendReplacementFromSourceToTransferSiteMain(metInventItemOrderSetupTransferSite, metInventItemOrderSetupTransferSiteTempItem);
+                            }
+
+                        }
+                    }
+                    else if (!inventSite.METNDCSite)
+                    {
+                        this.changeStatusToDeleted_ValidateAndDelete(_inventLocation, metInventItemOrderSetupTransferSite, metReqItemTableInventDimView.ReqItemTableRecId, true);
+                    }
+
+                }
+            }
+        }        
+       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSiteFromCurrentLegalEntity</Name>
+				<Source><![CDATA[
+    private InventSiteId getSiteFromCurrentLegalEntity(InventLocationId _inventLocationId, DataAreaId _searchLegalEntity)
+    {
+        InventLocationId    inventLocationId;
+
+        changecompany(_searchLegalEntity)
+        {
+            InventLocation inventLocation;
+
+            select firstonly InventSiteId from inventLocation
+                where inventLocation.InventLocationId == _inventLocationId;
+
+            inventLocationId = inventLocation.InventSiteId;
+        }
+
+        return inventLocationId;
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copyDelReasonAndVendReplacementFromSourceToTransferSiteMain</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copy reason code, vend replacement and update to discontinue
+    /// </summary>
+    /// <param name = "_metInventItemOrderSetupSource">METInventItemOrderSetup</param>
+    /// <param name = "_metInventItemOrderSetupDestination">METInventItemOrderSetup</param>
+    private void copyDelReasonAndVendReplacementFromSourceToTransferSiteMain(METInventItemOrderSetup _metInventItemOrderSetupSource, METInventItemOrderSetup _metInventItemOrderSetupDestination)
+    {
+        if(_metInventItemOrderSetupDestination)
+        {
+            this.copyDelReasonAndVendReplacementFromSourceToTransferSite(_metInventItemOrderSetupSource,_metInventItemOrderSetupDestination);
+
+            METSalesItemSubstitutionParentChild childItems;
+            METInventItemOrderSetup metInventItemOrderSetupForChildItems;
+                                                        
+            while select ChildItemID, InventSiteId from childItems
+                join forupdate metInventItemOrderSetupForChildItems
+                where childItems.ParentItemID == _metInventItemOrderSetupDestination.ItemId
+                && childItems.InventSiteId == _metInventItemOrderSetupDestination.SiteId
+                && metInventItemOrderSetupForChildItems.ItemId == childItems.ChildItemID
+                && metInventItemOrderSetupForChildItems.SiteId == childItems.InventSiteId
+            {
+                this.copyDelReasonAndVendReplacementFromSourceToTransferSite(_metInventItemOrderSetupDestination,metInventItemOrderSetupForChildItems);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copyDelReasonAndVendReplacementFromSourceToTransferSite</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copy deletion reason and Vend replacement
+    /// </summary>
+    /// <param name = "_metInventItemOrderSetupSource">METInventItemOrderSetup</param>
+    /// <param name = "_metInventItemOrderSetupDestination">METInventItemOrderSetup</param>
+    private void copyDelReasonAndVendReplacementFromSourceToTransferSite(METInventItemOrderSetup _metInventItemOrderSetupSource, METInventItemOrderSetup _metInventItemOrderSetupDestination)
+    {
+        InventItemPurchSetup inventItemPurchSetup = InventItemPurchSetup::find(_metInventItemOrderSetupDestination.ItemId,_metInventItemOrderSetupDestination.InventDimId);
+
+        if (_metInventItemOrderSetupDestination)
+        {
+            ttsbegin;
+            _metInventItemOrderSetupDestination.selectForUpdate(true);
+            _metInventItemOrderSetupDestination.ItemStatus = METConstants::Discontinued;
+            _metInventItemOrderSetupDestination.DiscontinueDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+            _metInventItemOrderSetupDestination.VendReplacement = _metInventItemOrderSetupSource.VendReplacement;
+            _metInventItemOrderSetupDestination.DeletionReason = _metInventItemOrderSetupSource.DeletionReason;
+            _metInventItemOrderSetupDestination.update();
+            ttscommit;
+        }
+
+        if (inventItemPurchSetup)
+        {
+            ttsbegin;
+            inventItemPurchSetup.selectForUpdate(true);
+            inventItemPurchSetup.Stopped = true;
+            inventItemPurchSetup.update();
+            ttscommit;
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkIfSourceSiteWithItemStatusNotDiscontinued</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if source site with item status is not discontinued 
+    /// </summary>
+    /// <param name = "_metInventItemOrderSetup">METInventItemOrderSetup</param>
+    /// <returns>boolean</returns>
+    private boolean checkIfSourceSiteWithItemStatusNotDiscontinued(METInventItemOrderSetup _metInventItemOrderSetup)
+    {
+        ReqItemTable reqItemTableSourceSite;
+        InventDim   inventDimSourceSite;
+        InventLocation inventLocation;
+        METInventItemOrderSetup metInventItemOrderSetupDiscontinued;
+        boolean ret;
+
+        select firstonly ItemId,CovInventDimId,ReqPOType,InventLocationIdReqMain, VendId from reqItemTableSourceSite
+                    exists join inventDimSourceSite
+                    where reqItemTableSourceSite.ItemId == _metInventItemOrderSetup.ItemId   &&
+                    reqItemTableSourceSite.CovInventDimId == inventDimSourceSite.inventDimId &&
+                    inventDimSourceSite.InventSiteId == _metInventItemOrderSetup.SiteId;
+
+        select firstonly InventSiteId, RecId from inventLocation
+                            where inventLocation.InventLocationId == reqItemTableSourceSite.InventLocationIdReqMain;
+
+        if (inventLocation)
+        {
+            select firstonly RecId
+                from metInventItemOrderSetupDiscontinued
+                where metInventItemOrderSetupDiscontinued.ItemId  == _metInventItemOrderSetup.ItemId  &&
+                metInventItemOrderSetupDiscontinued.SiteId        == inventLocation.InventSiteId      &&
+                metInventItemOrderSetupDiscontinued.ItemStatus    !=  METConstants::Discontinued;
+
+            if (metInventItemOrderSetupDiscontinued)
+            {
+                return true;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkIfSourceSiteWithItemStatusNotDiscontinued_IntCom</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if source site with item status is not discontinued
+    /// </summary>
+    /// <param name = "_metInventItemOrderSetup">METInventItemOrderSetup table</param>
+    /// <param name = "_vendAccount">Vendor account</param>
+    /// <returns>boolean</returns>
+    private boolean checkIfSourceSiteWithItemStatusNotDiscontinued_IntCom(METInventItemOrderSetup _metInventItemOrderSetup, VendAccount _vendAccount)
+    {  
+        VendTable vendTable = VendTable::find(_vendAccount);
+        boolean ret;
+
+        changecompany(vendParameters.METInterCompanyLegalEntity)
+        {
+            InventLocation inventLocation;
+            METInventItemOrderSetup metInventItemOrderSetupDiscontinued;
+
+            select firstonly InventSiteId, RecId from inventLocation
+                where inventLocation.InventLocationId == vendTable.METIntercompanyWarehouse;
+
+            if (inventLocation)
+            {
+                select firstonly RecId
+                from metInventItemOrderSetupDiscontinued
+                    where metInventItemOrderSetupDiscontinued.ItemId  == _metInventItemOrderSetup.ItemId
+                    && metInventItemOrderSetupDiscontinued.SiteId == inventLocation.InventSiteId
+                    && metInventItemOrderSetupDiscontinued.ItemStatus !=  METConstants::Discontinued;
+
+                if (metInventItemOrderSetupDiscontinued)
+                {
+                    ret = true;
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>changeStatusToDeleted_Validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate Delete batch data
+    /// </summary>
+    /// <param name = "_inventLocation">InventLocation</param>
+    /// <param name = "_reqItemTableRecId">RecId</param>
+    /// <param name = "_itemId">ItemId</param>
+    /// <returns>boolean</returns>
+    private boolean changeStatusToDeleted_Validate(InventLocation _inventLocation, RecId _reqItemTableRecId, ItemId _itemId)
+    {
+        boolean ret = true;
+
+        InventWarehouseOnHandIncludingCatchWeightItemEntity inventOnHandEntity;
+        METReqItemTable metReqItemTable = METReqItemTable::find(_reqItemTableRecId);
+
+        select firstonly OnHandQuantity, OnHandCatchWeightQuantity, OrderedQuantity, OrderedCatchWeightQuantity, ReservedOnHandQuantity, ReservedOnHandCatchWeightQuantity
+            from inventOnHandEntity
+            where inventOnHandEntity.ItemNumber == _itemId
+            && inventOnHandEntity.InventorySiteId == _inventLocation.InventSiteId
+            && inventOnHandEntity.InventoryWarehouseId == _inventLocation.InventLocationId;
+
+        if (inventOnHandEntity.OnHandQuantity || inventOnHandEntity.OnHandCatchWeightQuantity)
+        {
+            ret = checkFailed(strfmt("@MET:OnHandValidation", _itemId,_inventLocation.InventSiteId, _inventLocation.InventLocationId));
+        }
+        if (inventOnHandEntity.OrderedQuantity || inventOnHandEntity.OrderedCatchWeightQuantity || inventOnHandEntity.ReservedOnHandQuantity || 
+            inventOnHandEntity.ReservedOnHandCatchWeightQuantity)
+        {
+            ret = checkFailed(strfmt("@MET:OpenPOTOValidation", _itemId,_inventLocation.InventSiteId, _inventLocation.InventLocationId)) && ret;
+        }
+        if (metReqItemTable.SlotLoc1Area)
+        {
+            ret = checkFailed(strfmt("@MET:SlotLocation1Validation", _itemId,_inventLocation.InventSiteId, _inventLocation.InventLocationId)) && ret;
+        }
+        if (metReqItemTable.SlotLoc2Area)
+        {
+            ret = checkFailed(strfmt("@MET:SlotLocation2Validation",_itemId,_inventLocation.InventSiteId, _inventLocation.InventLocationId))&& ret;
+        }
+
+        return ret;
     }
 
 ]]></Source>
@@ -145,33 +651,32 @@ class METChangeItemStatusService
 				<Name>updateStatusToDeletedMain</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// to change the item site level field called Item status to 'Deleted'.
-    /// MPJ_22974_BMSProductMDRItemStatusAndPackChange
+    /// To change the item site level field called Item status to 'Deleted'.
     /// </summary>
-    /// <param name = "_metItemSiteSettingsSetup"> MetItemSiteSettingsSetup record </param>
-    /// <param name = "_inventDimId"> Inventory Dimension Id </param>    
-    private void updateStatusToDeletedMain( MetItemSiteSettingsSetup    _metItemSiteSettingsSetup,
-                                            InventDimId                 _inventDimId)
+    /// <param name = "_itemId">Item Id</param>
+    /// <param name = "_inventDim">Invent Dim</param>
+    /// <param name = "_metInventItemOrderSetup">METInventItemOrderSetup table</param>
+    private void updateStatusToDeletedMain(ItemId    _itemId, InventDim _inventDim, METInventItemOrderSetup _metInventItemOrderSetup)
     {
-        if(_metItemSiteSettingsSetup.RecId)
+        if (_itemId)
         {
-            this.updateStatusToDeleted(_metItemSiteSettingsSetup, _inventDimId);
+            this.updateStatusToDeleted(_metInventItemOrderSetup, _inventDim.inventDimId);
                                 
             METSalesItemSubstitutionParentChild childItems;
                                                             
             while select ChildItemID, InventSiteId from childItems
-                    where childItems.ParentItemID == _metItemSiteSettingsSetup.ItemId &&
-                            childItems.InventSiteId == _metItemSiteSettingsSetup.InventSiteId
+                    where childItems.ParentItemID == _itemId
+                    && childItems.InventSiteId == _inventDim.InventSiteId
             {
-                METItemSiteSettingsSetup itemSiteSettingsSetupForChildItems;
+                METInventItemOrderSetup metInventItemOrderSetupForChildItems;
                                     
-                select firstonly itemSiteSettingsSetupForChildItems
-                        where itemSiteSettingsSetupForChildItems.ItemId           == childItems.ChildItemID  &&
-                            itemSiteSettingsSetupForChildItems.InventSiteId     == childItems.InventSiteId;
+                select firstonly metInventItemOrderSetupForChildItems
+                        where metInventItemOrderSetupForChildItems.ItemId   == childItems.ChildItemID && 
+                           metInventItemOrderSetupForChildItems.SiteId     == childItems.InventSiteId;
 
-                if (itemSiteSettingsSetupForChildItems)
+                if (metInventItemOrderSetupForChildItems)
                 {
-                    this.updateStatusToDeleted(itemSiteSettingsSetupForChildItems, _inventDimId, true);
+                    this.updateStatusToDeleted(metInventItemOrderSetupForChildItems, _inventDim.inventDimId);
                 }
             }
         }
@@ -183,55 +688,40 @@ class METChangeItemStatusService
 				<Name>updateStatusToDeleted</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// to change the item site level field called Item status to 'Deleted'.
-    /// MPJ_22974_BMSProductMDRItemStatusAndPackChange
+    /// To change the item site level field called Item status to 'Deleted'.
     /// </summary>
-    /// <param name = "_metItemSiteSettingsSetup"> MetItemSiteSettingsSetup record </param>
-    /// <param name = "_inventDimId"> Inventory Dimension Id </param>
-    /// <param name = "_isChild"> Is child </param>
-    private void updateStatusToDeleted( MetItemSiteSettingsSetup    _metItemSiteSettingsSetup, 
-                                        InventDimId                 _inventDimId,
-                                        boolean                     _isChild = false)
+    /// <param name = "_metInventItemOrderSetup">METInventItemOrderSetup table</param>
+    /// <param name = "_inventDimId">Invent Dim Id</param>
+    private void updateStatusToDeleted( METInventItemOrderSetup     _metInventItemOrderSetup,
+                                        InventDimId                 _inventDimId)
     {
-        if (_metItemSiteSettingsSetup)
-        {
+        if (_metInventItemOrderSetup)
+        {          
             ttsbegin;
-
-            _metItemSiteSettingsSetup.selectForUpdate(true);
-            _metItemSiteSettingsSetup.ItemStatus         = METConstants::Deleted;
-            _metItemSiteSettingsSetup.DeleteStatusDate   = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
-            _metItemSiteSettingsSetup.doUpdate();
-
-            InventItemInventSetup inventItemInventSetup     = InventItemInventSetup::find(_metItemSiteSettingsSetup.ItemId, _inventDimId);
-            InventItemSalesSetup inventItemSalesSetup       = InventItemSalesSetup::find(_metItemSiteSettingsSetup.ItemId, _inventDimId);
-                            
-            if(inventItemInventSetup)
-            {
-                inventItemInventSetup.selectForUpdate(true);
-                inventItemInventSetup.Stopped = true;
-                inventItemInventSetup.doUpdate();
-            }
-
-            if(inventItemSalesSetup)
-            {
-                inventItemSalesSetup.selectForUpdate(true);
-                inventItemSalesSetup.Stopped = true;
-                inventItemSalesSetup.doUpdate();
-            }
-
-            if (_isChild)
-            {
-                InventItemPurchSetup inventItemPurchSetup       = InventItemPurchSetup::find(_metItemSiteSettingsSetup.ItemId, _inventDimId);
-                            
-                if(inventItemPurchSetup)
-                {
-                    inventItemPurchSetup.selectForUpdate(true);
-                    inventItemPurchSetup.Stopped = true;
-                    inventItemPurchSetup.doUpdate();
-                }
-            }
-
+            _metInventItemOrderSetup.selectForUpdate(true);
+            _metInventItemOrderSetup.ItemStatus         = METConstants::Deleted;
+            _metInventItemOrderSetup.DeleteStatusDate   = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+            _metInventItemOrderSetup.update();
             ttscommit;
+
+            InventItemInventSetup inventItemInventSetup     = InventItemInventSetup::find(_metInventItemOrderSetup.ItemId, _inventDimId,true);
+            InventItemPurchSetup inventItemPurchSetup       = InventItemPurchSetup::find(_metInventItemOrderSetup.ItemId, _inventDimId, true);
+                            
+            if (inventItemInventSetup)
+            {
+                ttsbegin;                
+                inventItemInventSetup.Stopped = true;
+                inventItemInventSetup.update();
+                ttscommit;
+            }
+            if (inventItemPurchSetup)
+            {
+                ttsbegin;                
+                inventItemPurchSetup.Stopped = true;
+                inventItemPurchSetup.update();
+                ttscommit;
+            }            
+            
         }
     }
 
@@ -263,7 +753,7 @@ class METChangeItemStatusService
                 where inventTransferTable.TransferId == inventTransferLine.TransferId && 
                 inventTransferTable.TransferStatus != InventTransferStatus::Shipped;
         
-        if(purchLine || inventTransferLine)
+        if (purchLine || inventTransferLine)
         {
             ret = true;
         }
@@ -295,7 +785,7 @@ class METChangeItemStatusService
         inventDimParm.initFromInventDim(inventDim);
         inventOnhand = InventOnhand::newParameters(_itemId, inventDim, inventDimParm);
         
-        if(!inventOnhand.availPhysical())
+        if (!inventOnhand.availPhysical())
         {
             ret = true;
         }
@@ -309,37 +799,140 @@ class METChangeItemStatusService
 				<Name>changeStatusToDiscontinued</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// to change the item site level field called Item status to 'Discontinued'.
-    /// MPJ_22974_BMSProductMDRItemStatusAndPackChange     
+    /// To change the item site level field called Item status to 'Discontinued'.
     /// </summary>
-    /// <param name = "_queryRun"> query to select rcords </param>
-    private void changeStatusToDiscontinued(QueryRun _queryRun)
+    /// <param name = "_queryRun">QueryRun</param>
+    /// <param name = "_metChangeItemStatusContract">METChangeItemStatusContract</param>
+    private void changeStatusToDiscontinued(QueryRun _queryRun, METChangeItemStatusContract _metChangeItemStatusContract)
     {
+        
         while(_queryRun.next())
         {
-            MetItemSiteSettingsSetup    metItemSiteSettingsSetup;
-            metItemSiteSettingsSetup = _queryRun.get(tableNum(MetItemSiteSettingsSetup));
             
-            if(metItemSiteSettingsSetup.DiscontinueDate != dateNull() && 
-                metItemSiteSettingsSetup.DiscontinueDate <= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()) && 
-                metItemSiteSettingsSetup.ItemStatus !=METConstants::Discontinued)
-            {
-                InventItemPurchSetup inventItemPurchSetup = InventItemPurchSetup::find(metItemSiteSettingsSetup.ItemId,metItemSiteSettingsSetup.InventDimId);
-                
-                if( inventItemPurchSetup )
-                {
-                    ttsbegin;
-                    inventItemPurchSetup.selectForUpdate(true);;
-                    inventItemPurchSetup.Stopped = true;
-                    inventItemPurchSetup.doUpdate();
+            METInventItemOrderSetup    metInventItemOrderSetup, metInventItemOrderSetupToActive, metInventItemOrderSetupToDiscontinue;
+            metInventItemOrderSetup = _queryRun.get(tableNum(METInventItemOrderSetup)); 
+            InventItemPurchSetup inventItemPurchSetup;
 
-                    metItemSiteSettingsSetup.selectForUpdate(true);
-                    metItemSiteSettingsSetup.ItemStatus = METConstants::Discontinued;
-                    metItemSiteSettingsSetup.doUpdate();
-                    ttscommit;
-                }
-            }
+            update_recordset metInventItemOrderSetupToDiscontinue
+                setting ItemStatus = METConstants::Discontinued
+                where metInventItemOrderSetupToDiscontinue.ItemId == metInventItemOrderSetup.ItemId
+                && metInventItemOrderSetupToDiscontinue.SiteId == metInventItemOrderSetup.SiteId
+                && (metInventItemOrderSetupToDiscontinue.ItemStatus != METConstants::Discontinued || metInventItemOrderSetupToDiscontinue.ItemStatus != METConstants::Deleted)
+                && (metInventItemOrderSetupToDiscontinue.DiscontinueDate != Global::DateNull()
+                || metInventItemOrderSetupToDiscontinue.DiscontinueDate <= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+
+            update_recordset inventItemPurchSetup
+                setting Stopped = NoYes::Yes
+                exists join metInventItemOrderSetupToDiscontinue
+                where metInventItemOrderSetupToDiscontinue.ItemId == inventItemPurchSetup.ItemId
+                && metInventItemOrderSetupToDiscontinue.InventDimId == inventItemPurchSetup.InventDimId
+                && metInventItemOrderSetupToDiscontinue.ItemId == metInventItemOrderSetup.ItemId
+                && metInventItemOrderSetupToDiscontinue.SiteId == metInventItemOrderSetup.SiteId
+                && metInventItemOrderSetupToDiscontinue.ItemStatus == METConstants::Discontinued
+                && (metInventItemOrderSetupToDiscontinue.DiscontinueDate == Global::DateNull()
+                || metInventItemOrderSetupToDiscontinue.DiscontinueDate == DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+
+
+            // New condition to make Item as Actice from discontinue batch job            
+
+            update_recordset metInventItemOrderSetupToActive
+                setting ItemStatus = METConstants::Active
+                where metInventItemOrderSetupToActive.ItemId == metInventItemOrderSetup.ItemId
+                && metInventItemOrderSetupToActive.SiteId == metInventItemOrderSetup.SiteId
+                && metInventItemOrderSetupToActive.ItemStatus == METConstants::Discontinued
+                && (metInventItemOrderSetupToActive.DiscontinueDate == Global::DateNull() 
+                || metInventItemOrderSetupToActive.DiscontinueDate >= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+
+            update_recordset inventItemPurchSetup
+                setting Stopped = NoYes::No
+                exists join metInventItemOrderSetupToActive
+                where metInventItemOrderSetupToActive.ItemId == inventItemPurchSetup.ItemId
+                && metInventItemOrderSetupToActive.InventDimId == inventItemPurchSetup.InventDimId
+                && inventItemPurchSetup.ItemId == metInventItemOrderSetup.ItemId
+                && metInventItemOrderSetupToActive.SiteId == metInventItemOrderSetup.SiteId
+                && metInventItemOrderSetupToActive.ItemStatus == METConstants::Discontinued
+                && (metInventItemOrderSetupToActive.DiscontinueDate == Global::DateNull()
+                || metInventItemOrderSetupToActive.DiscontinueDate >= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkIfItemIsChild</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method checks if Item is Child or not
+    /// </summary>
+    /// <param name = "_itemId">Item Id</param>
+    /// <param name = "_inventSiteId">Site Id</param>
+    /// <returns>boolean</returns>
+    private boolean checkIfItemIsChild(ItemId _itemId, InventSiteId _inventSiteId)
+    {
+        METSalesItemSubstitutionParentChild metSalesItemSubstitutionParentChild;
+
+        select firstonly RecId
+            from metSalesItemSubstitutionParentChild
+            where metSalesItemSubstitutionParentChild.ChildItemID == _itemId
+            && metSalesItemSubstitutionParentChild.InventSiteId == _inventSiteId;
+        
+        if (metSalesItemSubstitutionParentChild.RecId)
+        {
+            return true;
+        }       
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkIfItemIsTemp</Name>
+				<Source><![CDATA[
+    private boolean checkIfItemIsTemp(ItemId _itemId)
+    { 
+        InventTable                 inventTable;
+        EcoResProductAttributeValue ecoResProductAttributeValue;
+        EcoResAttribute             ecoResAttribute;
+        EcoResValue                 ecoResValue;        
+
+        select firstonly ecoResValue
+            exists join ecoResProductAttributeValue
+            where ecoResValue.RecId == ecoResProductAttributeValue.Value
+            exists join ecoResAttribute
+            where ecoResProductAttributeValue.Attribute == ecoResAttribute.RecId
+            && ecoResAttribute.Name == METConstants::TempItemForPackChange
+            exists join inventTable
+            where inventTable.itemid == _itemId
+            && ecoResProductAttributeValue.Product == inventTable.Product;
+       
+        if (ecoResValue.value()== METConstants::Yes)
+        {
+            return true;
+        }      
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkIfItemIsTempItemForPackChange</Name>
+				<Source><![CDATA[
+    private boolean checkIfItemIsTempItemForPackChange(ItemId _itemId)
+    {
+        METInventItemOrderSetup inventItemOrderSetup;
+
+        select firstonly RecId
+            from inventItemOrderSetup
+            where inventItemOrderSetup.TempItemPackChg == _itemId;
+
+        if (inventItemOrderSetup)
+        {
+            return true;
+        }
+
+        return false;
     }
 
 ]]></Source>
@@ -356,51 +949,121 @@ class METChangeItemStatusService
     {
         
         while(_queryRun.next())
-        {
-            MetItemSiteSettingsSetup    metItemSiteSettingsSetup;
-            metItemSiteSettingsSetup = _queryRun.get(tableNum(MetItemSiteSettingsSetup));
-            InventSite  inventSite = InventSite::find(metItemSiteSettingsSetup.InventSiteId);
+        {            
+            METInventItemOrderSetup    metInventItemOrderSetup, metInventItemOrderSetupSupplySite;
+            metInventItemOrderSetup = _queryRun.get(tableNum(METInventItemOrderSetup));            
             
-            if(metItemSiteSettingsSetup.ItemStatus == METConstants::NewStr && inventSite.METItemStatusUpdateTfrDependentSite)
+            if (!this.checkIfItemIsChild(metInventItemOrderSetup.ItemId, metInventItemOrderSetup.SiteId))
             {
-                ReqItemTable    reqItemTable;
-                InventDim       inventDim;
+                METReqItemTableInventDimView metReqItemTableInventDimView;                
                 
-                select firstonly ItemId,CovInventDimId,ReqPOType,InventLocationIdReqMain from reqItemTable
-                        join RecId from inventDim
-                        where reqItemTable.ItemId == metItemSiteSettingsSetup.ItemId    &&
-                              reqItemTable.CovInventDimId == inventDim.inventDimId      &&
-                              inventDim.InventSiteId == inventSite.SiteId;
-                
-                if(reqItemTable.ReqPOType == ReqPOType::Transfer)
-                {
-                    InventLocation inventLocation;
-                    select firstonly inventLocation
-                            where inventLocation.InventLocationIdReqMain == reqItemTable.InventLocationIdReqMain;
-                    
-                    if(inventLocation)
+                while select ItemId, CovInventDimId, ReqPOType, InventLocationIdReqMain, VendId, MainWarehouseInventSiteId
+                    from metReqItemTableInventDimView
+                    where metReqItemTableInventDimView.ItemId == metInventItemOrderSetup.ItemId
+                    && metReqItemTableInventDimView.InventSiteId == metInventItemOrderSetup.SiteId
+                    && metReqItemTableInventDimView.ReqPOType == ReqPOType::Transfer
+                    && metReqItemTableInventDimView.MainWarehouseInventSiteId != ''
+                    && metReqItemTableInventDimView.MainWarehouseInventSiteId != metInventItemOrderSetup.SiteId
+                {                       
+                    select firstonly RecId
+                        from metInventItemOrderSetupSupplySite
+                        where metInventItemOrderSetupSupplySite.ItemId  == metInventItemOrderSetup.ItemId
+                        && metInventItemOrderSetupSupplySite.SiteId   == metReqItemTableInventDimView.MainWarehouseInventSiteId
+                        && metInventItemOrderSetupSupplySite.ItemStatus ==  METConstants::Active;                                    
+                        
+                    if (metInventItemOrderSetupSupplySite)
                     {
-                        MetItemSiteSettingsSetup    metItemSiteSettingsSetupSupplySite;
-                        
-                        select firstonly RecId 
-                            from metItemSiteSettingsSetupSupplySite
-                            where metItemSiteSettingsSetupSupplySite.ItemId         == metItemSiteSettingsSetup.ItemId  &&
-                                    metItemSiteSettingsSetupSupplySite.InventSiteId   == inventLocation.InventSiteId      &&
-                                    metItemSiteSettingsSetupSupplySite.ItemStatus     == METConstants::Active;
-                        
-                        if(metItemSiteSettingsSetupSupplySite)
-                        {
-                            ttsbegin;
-                            metItemSiteSettingsSetup.selectForUpdate(true);
-                            metItemSiteSettingsSetup.ItemStatus = METConstants::Active;
-                            metItemSiteSettingsSetup.doUpdate();
-                            ttscommit;
-                        }
-                    }
+                        this.updateStatusToActive(metInventItemOrderSetup);
+                        METInventItemOrderSetup::updateChildItemSiteStatus(metInventItemOrderSetup.ItemId, metInventItemOrderSetup.SiteId);
+                    }                  
+                    
                 }
-                                   
+                while select ItemId, CovInventDimId, ReqPOType, InventLocationIdReqMain, VendId, VendIntercompanyWarehouse
+                    from metReqItemTableInventDimView
+                    where metReqItemTableInventDimView.ItemId == metInventItemOrderSetup.ItemId
+                    && metReqItemTableInventDimView.InventSiteId == metInventItemOrderSetup.SiteId
+                    && metReqItemTableInventDimView.ReqPOType == ReqPOType::Purch
+                    && metReqItemTableInventDimView.VendGroup == vendParameters.METInterCompanyVendGroupId
+                {
+                    boolean updateToActive;
+                    
+                    InventLocationId interCompInventLocationId = metReqItemTableInventDimView.VendIntercompanyWarehouse;
+
+                    if (interCompInventLocationId)
+                    {
+                        changecompany(vendParameters.METInterCompanyLegalEntity)
+                        {
+                            InventLocation inventLocationIntCom;
+
+                            select firstonly InventSiteId from inventLocationIntCom
+                            where inventLocationIntCom.InventLocationId == interCompInventLocationId;
+
+                            if (inventLocationIntCom)
+                            {
+                                METInventItemOrderSetup     metInventItemOrderSetupIntCom;
+
+                                select firstonly RecId
+                                from metInventItemOrderSetupIntCom
+                                where metInventItemOrderSetupIntCom.ItemId == metInventItemOrderSetup.ItemId
+                                    && metInventItemOrderSetupIntCom.SiteId == inventLocationIntCom.InventSiteId
+                                    && metInventItemOrderSetupIntCom.ItemStatus ==  METConstants::Active;
+
+                                if(metInventItemOrderSetupIntCom)
+                                {
+                                    updateToActive = true;
+                                }
+                            }
+                        }
+                        //Update Active status in current batch job
+                        if (updateToActive)
+                        {
+                            this.updateStatusToActive(metInventItemOrderSetup);
+                            METInventItemOrderSetup::updateChildItemSiteStatus(metInventItemOrderSetup.ItemId, metInventItemOrderSetup.SiteId);
+                        }
+                    }                    
+                }                                   
             }
         }   
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update Status method
+    /// </summary>
+    /// <param name = "_metInventItemOrderSetup">METInventItemOrderSetup</param>
+    /// <param name = "_status">METItemStatus</param>
+    public void updateStatus(METInventItemOrderSetup _metInventItemOrderSetup, METItemStatus _status)
+    {
+        ttsbegin;
+        _metInventItemOrderSetup.selectForUpdate(true);
+        _metInventItemOrderSetup.ItemStatus = _status;
+        _metInventItemOrderSetup.update();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateStatusToActive</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update status to Active
+    /// </summary>
+    /// <param name = "_metInventItemOrderSetup">METInventItemOrderSetup</param>
+    public void updateStatusToActive(METInventItemOrderSetup _metInventItemOrderSetup)
+    {
+        ttsbegin;
+        _metInventItemOrderSetup.selectForUpdate(true);
+        _metInventItemOrderSetup.ItemStatus = METItemStatusTable::findByStatus(METItemsStatus::Active).ItemStatus;
+        _metInventItemOrderSetup.PublishPriceBook = NoYes::Yes;
+        _metInventItemOrderSetup.PublishPortal = NoYes::Yes;
+        _metInventItemOrderSetup.PublishHost = NoYes::Yes;
+        _metInventItemOrderSetup.update();
+        ttscommit;
     }
 
 ]]></Source>

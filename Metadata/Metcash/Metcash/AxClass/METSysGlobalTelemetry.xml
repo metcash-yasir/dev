@@ -18,18 +18,18 @@ public class METSysGlobalTelemetry
         str eventName;
         str exceptionMessage = Args.getArg('txt');
 
-        eventName   = "BATCH ERROR";
+        eventName   = "@MET:EvntBtchErr";
         if (BatchHeader::isExecutingInBatch())
         {
             Batch   batch = BatchHeader::getCurrentBatchTask();
             Map customProperties = new Map(Types::String, Types::String);
-            customProperties.insert("BatchJobId", strFmt('%1',batch.BatchJobId));
-            customProperties.insert("BatchJobTaskId", strFmt('%1',batch.RecId));
-            customProperties.insert("BatchJobName", batch.Caption);
-            customProperties.insert("StartDateTime", strFmt('%1',batch.StartDateTime));
-            customProperties.insert("LegalEntity", batch.Company);
-            customProperties.insert("ExceptionMessage", exceptionMessage);
-            customProperties.insert('CallStack', METSysGlobalTelemetry::formatXppCallStack(xSession::xppCallStack()));
+            customProperties.insert("@MET:BtchJId", strFmt('%1',batch.BatchJobId));
+            customProperties.insert("@MET:BtchTsk", strFmt('%1',batch.RecId));
+            customProperties.insert("@MET:BtchNme", batch.Caption);
+            customProperties.insert("@MET:SrtrDTme", strFmt('%1',batch.StartDateTime));
+            customProperties.insert("@MET:LglEntty", batch.Company);
+            customProperties.insert("@MET:ExptnMssg", exceptionMessage);
+            customProperties.insert("@MET:ClStck", METSysGlobalTelemetry::formatXppCallStack(xSession::xppCallStack()));
             // Log custom event
             SysGlobalTelemetry::logEventWithCustomProperties(eventName, customProperties);
 
@@ -50,41 +50,50 @@ public class METSysGlobalTelemetry
     public static void DMFDefinitionGroupExecution_onUpdated(Common sender, DataEventArgs e)
     {
         DMFDefinitionGroupExecution dMFDefinitionGroupExecution = sender;
-        str eventName, DMFerror;
+        notes eventName, DMFerror;
         boolean isError = false;
         
-        eventName           = "DMF ERROR";
+        eventName = "@MET:EvntNme";
         if (dMFDefinitionGroupExecution.StagingStatus == DMFBatchJobStatus::Error)
         {
-            DMFerror = "ImportFailedInStaging";
+            DMFerror = "@MET:DErr";
             isError = true;
         }
         else if (dMFDefinitionGroupExecution.TargetStatus == DMFBatchJobStatus::Error)
         {
             str errorMessage = "@DMF:StagingToTargetImportFailed";
-            DMFerror = "MET" + ' ' + strFmt("@DMF:EntityImportError", dMFDefinitionGroupExecution.Entity, errorMessage);
+            DMFerror = "@MET:METError" + ' ' + strFmt("@DMF:EntityImportError", dMFDefinitionGroupExecution.Entity, errorMessage);
             isError = true;
         }
 
-        if (isError)
+        if (isError || dMFDefinitionGroupExecution.TargetErrorCount > 0)
         {
             Map customProperties = new Map(Types::String, Types::String);
-            customProperties.insert("DMFProjectDefinition", dMFDefinitionGroupExecution.DefinitionGroup);
-            customProperties.insert("DMFEntityName", dMFDefinitionGroupExecution.Entity);
-            customProperties.insert("ExceptionMessage", DMFerror);
-            customProperties.insert("LegalEntity", dMFDefinitionGroupExecution.Company);
-            customProperties.insert("DMFExecutionId", dMFDefinitionGroupExecution.ExecutionId);
-            customProperties.insert("DMFStagingErrorCount", int2Str(dMFDefinitionGroupExecution.StagingErrorCount));
-            customProperties.insert("DMFStagingStatus", enum2Str(dMFDefinitionGroupExecution.StagingStatus));
-            customProperties.insert("DMFTargetErrorCount", int2Str(dMFDefinitionGroupExecution.TargetErrorCount));
-            customProperties.insert("DMFTargetStatus", enum2Str(dMFDefinitionGroupExecution.TargetStatus));
-            customProperties.insert('CallStack', METSysGlobalTelemetry::formatXppCallStack(xSession::xppCallStack()));
+            customProperties.insert("@MET:DMExctnGrp", dMFDefinitionGroupExecution.DefinitionGroup);
+            customProperties.insert("@MET:DeftnEntNme", dMFDefinitionGroupExecution.Entity);
+            customProperties.insert("@MET:ExctnLglEntty", dMFDefinitionGroupExecution.Company);
+            customProperties.insert("@MET:ExuctnId", dMFDefinitionGroupExecution.ExecutionId);
+            customProperties.insert("@MET:StagngErrCnt", int2Str(dMFDefinitionGroupExecution.StagingErrorCount));
+            customProperties.insert("@MET:Stngnstus", enum2Str(dMFDefinitionGroupExecution.StagingStatus));
+            customProperties.insert("@MET:DTrgtErrCnt", int2Str(dMFDefinitionGroupExecution.TargetErrorCount));
+            customProperties.insert("@MET:TrgtStus", enum2Str(dMFDefinitionGroupExecution.TargetStatus));
+            customProperties.insert("@MET:ClStck", METSysGlobalTelemetry::formatXppCallStack(xSession::xppCallStack()));
             // CS CB718 VM 28032024-DMFLoggingAppinsights
-            DMFerror += METSysGlobalTelemetry::getPrimaryKeyDetails(dMFDefinitionGroupExecution);
-            customProperties.insert("ExceptionMessage", DMFerror);
-            // CE
+
+            //Based on the flags the primary key detail will be added in the error
+            if(DMFEntity::find(dMFDefinitionGroupExecution.Entity).METIncludeErrorLogging && SysIntParameters::find().METEntityLogging)
+            {
+                DMFerror += METSysGlobalTelemetry::getPrimaryKeyDetails(dMFDefinitionGroupExecution);
+            }
+            customProperties.insert("@MET:ExcptnMssg", DMFerror);
             // Log custom event
             SysGlobalTelemetry::logEventWithCustomProperties(eventName, customProperties);
+
+            /* Commented and can be used in case we go with DXC 
+            DXCInsightsLogEvents::logEvent(
+                  DXCInsightsLogEventContract::newFromTypeAndName(
+                      DXCInsightsLoggingType::LogCustom, "Custom DXC Journal Err", customProperties));
+            */ 
         }
     }
 
@@ -144,36 +153,74 @@ public class METSysGlobalTelemetry
         SysDictTable sysDictTable;
         Common buffer;
         SysDictTable dictTable;
-        DMFErrorMessage dmfError;
+        Notes dmfError;
 
         while select * from DMFStagingValidationLog
                 where DMFStagingValidationLog.ExecutionId == _dmfDefinitionGroupExecution.ExecutionId
         {
             TableName tablename = DMFStagingValidationLog.StagingTableName;
-
+            dmfError = '';
             sysDictTable = new SysDictTable(tablename2id(tablename));
             if (sysDictTable)
             {
                 TableId tableId = sysDictTable.id();
-                str fieldid;
+                dictTable = new SysDictTable(tableId);
+                str fieldidPrim;
+                int counter,fieldId;
+                
                 keyIndex = new SysDictIndex(tableId, sysDictTable.primaryIndex());
+                
                 if (keyIndex)
                 {
                     for (fieldIndex = 1; fieldIndex <= keyIndex.numberOfFields(); fieldIndex++)
                     {
                         dictField = new DictField(tableId, keyindex.field(fieldindex));
-                        dictTable = new SysDictTable(tableId);
                         buffer = dictTable.makeRecord();
-                        fieldid = fieldId2Name(tableId, dictfield.id());
+                        fieldidPrim = fieldId2Name(tableId, dictfield.id());
 
-                        select firstonly buffer 
+                        select firstonly buffer
                             where buffer.RecId == DMFStagingValidationLog.StagingRecId;
 
-                        if (fieldid != 'DefinitionGroup' && fieldid != 'ExecutionId')
+                        if (fieldidPrim != METConstants::DefinitionGroup && fieldidPrim != METConstants::ExecutionId)
                         {
-                            dmfError += strFmt("%1: %2 :%3 ",fieldId2Name(tableId, dictfield.id()),buffer.(dictfield.id()),DMFStagingValidationLog.ErrorMessage);
+                            dmfError += strFmt("%1 : %2: ",dictfield.label(),buffer.(dictfield.id()));
                         }
                     }
+                    dmfError += DMFStagingValidationLog.ErrorMessage;
+                }
+
+                DictFieldGroup dictFieldGrp = new DictFieldGroup(tableId,METConstants::METReference);
+               // If table is having table group METReference then check all the fields and assign those fields as custom dimensions
+                if (dictFieldGrp)
+                {
+                    Map customProperties = new Map(Types::String, Types::String);
+
+                    for (counter = 1; counter <= dictFieldGrp.numberOfFields(); counter++)
+                    {
+                        fieldId = dictFieldGrp.field(counter); 
+
+                        dictField = new DictField(tableId, fieldId);
+                        if (buffer.(fieldId))
+                        {
+                            dmfError += strFmt('%1 - %2 ',dictField.label(),any2str(buffer.(fieldId)));
+                            //Reference Added as custom dimension
+                            customProperties.insert(dictField.label(),any2str(buffer.(fieldId)));
+                        }
+                    }//for
+
+                    customProperties.insert("@MET:DeftnEntNme", DMFStagingValidationLog.EntityName);
+                    customProperties.insert("@MET:ExcptnMssg", DMFerror);
+                    customProperties.insert("@MET:ExctnLglEntty", DMFStagingValidationLog.company());
+                    customProperties.insert("@MET:ExuctnId", DMFStagingValidationLog.ExecutionId);
+                    customProperties.insert("@MET:ClStck", METSysGlobalTelemetry::formatXppCallStack(xSession::xppCallStack()));
+                    customProperties.insert("@MET:EvntNme", DMFerror);
+                   
+                    SysGlobalTelemetry::logEventWithCustomProperties(METConstants::METDMFError, customProperties);
+                     
+                    /*
+                    DXCInsightsLogEvents::logEvent(
+                    DXCInsightsLogEventContract::newFromTypeAndName(
+                        DXCInsightsLoggingType::LogCustom, "Metcash DXC DMF Error", customProperties)); */
                 }
             }
         }

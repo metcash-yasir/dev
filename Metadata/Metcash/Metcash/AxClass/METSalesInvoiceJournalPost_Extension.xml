@@ -74,17 +74,19 @@ internal final  class METSalesInvoiceJournalPost_Extension
 			<Method>
 				<Name>postLines</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Posts line
+    /// </summary>
     protected void postLines()
     {
         next postLines();
 
-        /*if (FeatureStateProvider::isFeatureEnabled(GUPGlobalEnableFeature::instance()))
-        {*/
+        //CS-CB789_InvoicePosting
+        this.metPostAdditionalCOGS();
+        //CE-CB789_InvoicePosting
+
         discountClaimHelper.setPostLinesParameters(ledgerVoucher);
-
         discountClaimHelper.postDiscountClaimAccrualJournal();
-        /*}*/
-
     }
 
 ]]></Source>
@@ -92,6 +94,9 @@ internal final  class METSalesInvoiceJournalPost_Extension
 			<Method>
 				<Name>postLineDiscount</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Posts line discount
+    /// </summary>
     protected void postLineDiscount()
     {
         next postLineDiscount();
@@ -126,7 +131,7 @@ internal final  class METSalesInvoiceJournalPost_Extension
                                         custInvoiceJour.InvoiceId,
                                         salesLine);
 
-       /* while select PeriodicDiscountOfferId, Amount, RefTableId, RefRecId from retailSalesDiscountLine
+        /* while select PeriodicDiscountOfferId, Amount, RefTableId, RefRecId from retailSalesDiscountLine
                 where retailSalesDiscountLine.InventTransId == salesLine.InventTransId
                     && retailSalesDiscountLine.DiscountOriginType == RetailDiscountOriginType::Periodic
                 join PeriodicDiscountType, DiscountClaimPostingOffset from retailPeriodicDiscount
@@ -143,8 +148,8 @@ internal final  class METSalesInvoiceJournalPost_Extension
             AmountCur discountAmountPosted = this.METGetDiscountAmountPosted(priceComponentDetail);
             if (discountAmountPosted != 0)
             {*/
-                discountClaimHelper.distributeDiscountClaim(/*retailSalesDiscountLine, retailPeriodicDiscount, retailDiscountLineOffer, discountAmountPosted*/);
-            /*}
+        discountClaimHelper.distributeDiscountClaim(/*retailSalesDiscountLine, retailPeriodicDiscount, retailDiscountLineOffer, discountAmountPosted*/);
+        /*}
         }*/
     }
 
@@ -182,6 +187,9 @@ internal final  class METSalesInvoiceJournalPost_Extension
 			<Method>
 				<Name>afterLinePost</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// posts after line
+    /// </summary>
     protected void afterLinePost()
     {
         next afterLinePost();
@@ -197,6 +205,80 @@ internal final  class METSalesInvoiceJournalPost_Extension
             {
                 this.METPostSalesTradeAgreement();
                 this.METPostMarginComponentAdjustments();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metPostAdditionalCOGS</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method is for additional postings upon enabling of control
+    /// </summary>
+    private void metPostAdditionalCOGS()
+    {
+        METSalesLinePriceComponent  metSalesLinePriceComponent;
+        METComponentCode            metComponentCode;
+        LedgerVoucher               ledgerVoucherLocal  = this.getLedgerVoucher();
+        LedgerVoucherObject         ledgerVoucherObject = ledgerVoucherLocal.findLedgerVoucherObject();
+        CurrencyExchangeHelper      exchangeRateHelper  = CurrencyExchangeHelper::newExchangeDate(
+                                                                                Ledger::primaryLedger(
+                                                                                CompanyInfo::findDataArea(curext()).RecId),
+                                                                                ledgerVoucherObject.parmAccountingDate());
+        exchangeRateHelper.parmExchangeRate1(this.fixedExchRate());
+        exchangeRateHelper.parmExchangeRate2(this.fixedExchRateSecondary());
+
+        SalesLine salesLineDefaultDim;
+
+        while select InventTransId, CurrencyCode, DefaultDimension from salesLineDefaultDim
+                where salesLineDefaultDim.SalesId == salesTable.salesId
+            join Value, Component, InventTransId from metSalesLinePriceComponent
+                where metSalesLinePriceComponent.InventTransId == salesLineDefaultDim.InventTransId
+            join MainAccountId from metComponentCode
+                where metComponentCode.Component == metSalesLinePriceComponent.Component
+                && metComponentCode.AdditionalPostingsToCOGS == NoYes::Yes
+                && metComponentCode.MainAccountId != ''
+        {
+            RecId ledgerDimensionId = LedgerDefaultAccountHelper::getDefaultAccountFromMainAccountId(metComponentCode.MainAccountId);
+
+            if (ledgerDimensionId)
+            {
+                LedgerDimensionAccount ledgerDimensionMerged = this.getLedgerDimensionLineAmount();
+                ledgerDimensionMerged = LedgerDimensionFacade::serviceCreateLedgerDimension(ledgerDimensionMerged, salesLineDefaultDim.DefaultDimension);
+                Amount value = metSalesLinePriceComponent.Value;
+                        
+                // For promotion and deals, we will have component detail lines, the amount used for claiming will be the sum of vendor value
+                if (METSalesLinePriceComponentDetail::existComponent(salesLineDefaultDim.InventTransId, metSalesLinePriceComponent.Component))
+                {
+                    value = metSalesLinePriceComponent.getTotalVendorValue();
+                }
+
+                Amount postingAmount = CurrencyExchange::round(updateNow * value, salesLineDefaultDim.CurrencyCode);
+
+                LedgerVoucherTransObject ledgerVoucherTransObject = LedgerVoucherTransObject::newTransactionAmountDefault(
+                    ledgerVoucherObject,
+                    LedgerPostingType::SalesConsump,
+                    ledgerDimensionMerged,
+                    salesLineDefaultDim.CurrencyCode,
+                    postingAmount,
+                    exchangeRateHelper);
+
+                ledgerVoucherLocal.addTrans(ledgerVoucherTransObject);
+
+                ledgerDimensionMerged = LedgerDimensionFacade::serviceCreateLedgerDimension(ledgerDimensionId, salesLine.DefaultDimension);
+                ledgerDimensionMerged = LedgerDimensionFacade::serviceCreateLedgerDimension(ledgerDimensionMerged, salesLineDefaultDim.DefaultDimension);
+
+                ledgerVoucherTransObject = LedgerVoucherTransObject::newTransactionAmountDefault(
+                    ledgerVoucherObject,
+                    LedgerPostingType::SalesRevenue,
+                    ledgerDimensionMerged,
+                    salesLineDefaultDim.CurrencyCode,
+                    -1 * postingAmount,
+                    exchangeRateHelper);
+
+                ledgerVoucherLocal.addTrans(ledgerVoucherTransObject);
             }
         }
     }
@@ -335,9 +417,9 @@ internal final  class METSalesInvoiceJournalPost_Extension
                     join MainAccountId from METComponentCode
                    where METSalesLinePriceComponent.InventTransId == SalesLine.InventTransId
                       && METComponentCode.Component == METSalesLinePriceComponent.Component;
-                      //&& (METComponentCode.Type == GUPPriceComponent::BasePriceInventoryPrice ||
-                      //    METComponentCode.Type == GUPPriceComponent::BasePriceSalesPrice ||
-                      //    METComponentCode.Type == GUPPriceComponent::BasePricePurchasePrice);
+        //&& (METComponentCode.Type == GUPPriceComponent::BasePriceInventoryPrice ||
+        //    METComponentCode.Type == GUPPriceComponent::BasePriceSalesPrice ||
+        //    METComponentCode.Type == GUPPriceComponent::BasePricePurchasePrice);
 
         Amount value = METSalesLinePriceComponent.Value;
 
@@ -379,7 +461,7 @@ internal final  class METSalesInvoiceJournalPost_Extension
                         return;
                     }*/
 
-                LedgerVoucher ledgerVoucherLocal = this.getLedgerVoucher();
+                    LedgerVoucher ledgerVoucherLocal = this.getLedgerVoucher();
 
                 LedgerVoucherObject ledgerVoucherObject = ledgerVoucherLocal.findLedgerVoucherObject();
 
@@ -428,7 +510,7 @@ internal final  class METSalesInvoiceJournalPost_Extension
     {
         next postRetailPeriodicDiscounts();
 
-        // 
+        //
         LedgerVoucherTransObject ledgerPostingTransaction;
         //RetailSalesDiscountLine retailSalesDiscountLine;
         METSalesLinePriceComponentDetail salesLinePriceComponentDetail;
@@ -479,7 +561,7 @@ internal final  class METSalesInvoiceJournalPost_Extension
                   && salesLinePriceComponent.Component == salesLinePriceComponentDetail.Component
             exists join componentCode
                   where componentCode.Component == salesLinePriceComponentDetail.Component
-                     //&& componentCode.Type == GUPPriceComponent::RetailDiscounts        
+                     //&& componentCode.Type == GUPPriceComponent::RetailDiscounts
         {
             metDiscAmount = salesLinePriceComponentDetail.VendorValue;
             

@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METGL70EmailFailureService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MET_136556_GL70EmailNotification developed by yadavpa on 11/04/2024
+/// GL - 70 email notification
+/// </summary>
+public class METGL70EmailFailureService extends SysOperationServiceBase
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    public void processOperation()
+    {
+        DMFDefinitionGroupExecution dmfDefinitionGroupExecution;
+        DMFStagingValidationLog     dmfStagingValidationLog;
+        LedgerJournalEntityStaging  ledgerJournalEntityStaging;
+        LedgerParameters            ledgerParameters = LedgerParameters::find();
+        StartDateTime               startDateTime;
+
+        if(ledgerParameters.METGL70RestrictDuplicateInvoiceCheck)   
+        {
+            SysMailerMessageBuilder mailer = new SysMailerMessageBuilder();;
+            SysMailerSMTP           smtp = new SysMailerSMTP();
+            CustGroup               custGrp;
+            RowNumber               row = 1 ;
+            System.IO.MemoryStream memoryStream = new System.IO.MemoryStream();
+            
+            using (var package = new OfficeOpenXml.ExcelPackage(memoryStream))
+            {
+                var worksheets = package.get_Workbook().get_Worksheets();
+                var worksheet = worksheets.Add("@MET:GLFailureDetail");
+                var cells = worksheet.get_Cells();
+                var cell = cells.get_Item(1,1);
+                cell.set_Value("@MET:JournalBatchNumber");
+                cell = cells.get_Item(1,2);
+                cell.set_Value("@MET:Voucher");
+                cell = cells.get_Item(1,3);
+                cell.set_Value("@MET:JournalName");
+                cell = cells.get_Item(1,4);
+                cell.set_Value("@MET:Description");
+                cell = cells.get_Item(1,5);
+                cell.set_Value("@MET:LineNumber");
+                cell = cells.get_Item(1,6);
+                cell.set_Value("@MET:Invoice");
+                cell = cells.get_Item(1,7);
+                cell.set_Value("@MET:Document");
+                cell = cells.get_Item(1,8);
+                cell.set_Value("@MET:CreditAmount");
+                cell = cells.get_Item(1,9);
+                cell.set_Value("@MET:DebitAmount");
+                cell = cells.get_Item(1,10);
+                cell.set_Value("@MET:Error1");
+                cell = cells.get_Item(1,11);
+                cell.set_Value("@MET:ImportFailure");
+
+                select firstonly ExecutionId, StartDateTime, EndDateTime, Entity, DefinitionGroup, StagingStatus, TargetStatus from dmfDefinitionGroupExecution
+                    order by dmfDefinitionGroupExecution.EndDateTime desc where
+                    dmfDefinitionGroupExecution.Entity == '@MET:GeneralJournal'
+                    && dmfDefinitionGroupExecution.DefinitionGroup == ledgerParameters.METGL70DMFDefinitionGroup
+                    && dmfDefinitionGroupExecution.Company == curExt();
+                if(dmfDefinitionGroupExecution.ExecutionId && (DMFDefinitionGroupExecution.StagingStatus == DMFBatchjobStatus::Error
+                    || DMFDefinitionGroupExecution.TargetStatus == DMFBatchjobStatus::Error))
+                {
+                    startDateTime = dmfDefinitionGroupExecution.StartDateTime;
+
+                    while select JournalBatchNumber, Voucher, JournalName, Description, LineNumber,Invoice, Document, CreditAmount, DebitAmount
+                        from ledgerJournalEntityStaging join ErrorMessage from dmfStagingValidationLog
+                        where dmfStagingValidationLog.ExecutionId  == ledgerJournalEntityStaging.ExecutionId &&
+                           dmfStagingValidationLog.ExecutionId     == dmfDefinitionGroupExecution.ExecutionId &&
+                           dmfStagingValidationLog.StagingRecId    == ledgerJournalEntityStaging.RecId &&
+                           ledgerJournalEntityStaging.JournalName  == '@MET:GLINT' && dmfStagingValidationLog.ErrorMessage != ''  // For Journal GLINT
+                    {
+                        row++;
+                        cell = cells.get_item(row, 1);
+                        cell.set_Value(ledgerJournalEntityStaging.JournalBatchNumber);
+                        cell = cells.get_item(row, 2);
+                        cell.set_Value(ledgerJournalEntityStaging.Voucher);
+                        cell = cells.get_item(row, 3);
+                        cell.set_Value(ledgerJournalEntityStaging.JournalName);
+                        cell = cells.get_item(row, 4);
+                        cell.set_Value(ledgerJournalEntityStaging.Description);
+                        cell = cells.get_item(row, 5);
+                        cell.set_Value(ledgerJournalEntityStaging.LineNumber);
+                        cell = cells.get_item(row, 6);
+                        cell.set_Value(ledgerJournalEntityStaging.Invoice);
+                        cell = cells.get_item(row, 7);
+                        cell.set_Value(ledgerJournalEntityStaging.Document);
+                        cell = cells.get_item(row, 8);
+                        cell.set_Value(ledgerJournalEntityStaging.CreditAmount);
+                        cell = cells.get_item(row, 9);
+                        cell.set_Value(ledgerJournalEntityStaging.DebitAmount);
+                        cell = cells.get_item(row, 10);
+                        cell.set_Value(dmfStagingValidationLog.ErrorMessage);
+                        cell = cells.get_item(row, 11);
+                        cell.set_Value(strFmt("%1",dmfDefinitionGroupExecution.StartDateTime));
+                    }
+                }
+                package.Save();
+            }
+            memoryStream.Seek(0, System.IO.SeekOrigin::Begin);
+
+            //The below line used to attach excel file to email.
+            Info(strFmt("@MET:FailedImportCount", row));
+            if(row >= 2 && ledgerParameters.METToEmail !='')
+            {
+                mailer.setSubject(strFmt(ledgerParameters.METEmailSubject,startDateTime));   
+                mailer.setFrom(ledgerParameters.METFromEmail);
+                mailer.setBody(ledgerParameters.METEmailBody);
+                mailer.addTo(ledgerParameters.METToEmail);
+                mailer.addAttachment(memoryStream, strFmt("@MET:GLFailedFile", startDateTime), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+                try
+                {
+                    smtp.sendNonInteractive(mailer.getMessage());
+                }
+                catch(Exception::CLRError)
+                {
+                    error(CLRInterop::getLastException().toString());
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
