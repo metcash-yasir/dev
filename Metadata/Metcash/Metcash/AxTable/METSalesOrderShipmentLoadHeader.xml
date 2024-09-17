@@ -650,7 +650,19 @@ public class METSalesOrderShipmentLoadHeader extends common
             while select mETSalesOrderShipmentLoadLines
                 where mETSalesOrderShipmentLoadLines.ShipmentId == this.ShipmentId
             {
-                this.checkAndUpdateCCRTable(mETSalesOrderShipmentLoadLines.OrderNum);
+                NoYes   isSecurityTote  = this.checkSecurityTote(mETSalesOrderShipmentLoadLines);
+                boolean isCCRReceived   = this.checkAndUpdateCCRTable(mETSalesOrderShipmentLoadLines.OrderNum, isSecurityTote);
+
+                if(isCCRReceived)
+                {
+                    ttsbegin;
+                    mETSalesOrderShipmentLoadLines.selectForUpdate();
+
+                    mETSalesOrderShipmentLoadLines.CCRReceived = isCCRReceived;
+
+                    mETSalesOrderShipmentLoadLines.update();
+                    ttscommit;
+                }
             }
         }
     }
@@ -665,7 +677,7 @@ public class METSalesOrderShipmentLoadHeader extends common
     /// </summary>
     /// <param name = "_salesId">SalesId</param>
     /// CB231 - Container content report
-    protected void checkAndUpdateCCRTable(SalesId _salesId)
+    protected boolean checkAndUpdateCCRTable(SalesId _salesId, NoYes _isSecurityToteEnabled)
     {
         METCCRTable     ccrTable;
         boolean         isCCRTableHasRecord = false;
@@ -673,25 +685,27 @@ public class METSalesOrderShipmentLoadHeader extends common
         while select SalesOrder, ToteId from ccrTable group by SalesOrder, ToteId
             where ccrTable.SalesOrder == _salesId
         {
-
             isCCRTableHasRecord = true;
             
-            this.checkAndUpdateTote(ccrTable.SalesOrder, ccrTable.ToteId);
+            this.checkAndUpdateTote(ccrTable.SalesOrder, ccrTable.ToteId, _isSecurityToteEnabled);
         }
 
         if(!isCCRTableHasRecord)
         {
             METCCRTable     ccrTableUpdate;
             WMSOrderTrans   wmsOrderTrans;
-            SalesTable      salesTableLoc   = SalesTable::find(_salesId);
+            METSalesLine    metSalesLine;
+            SalesLine       salesLineLoc;
 
-            select  salesTableLoc
-                where salesTableLoc.SalesId == _salesId
-                join wmsOrderTrans
-                    where wmsOrderTrans.inventTransType == InventTransType::TransferOrderShip &&
-                        wmsOrderTrans.inventTransRefId == salesTableLoc.METRefNum
-                    join ccrTableUpdate
-                        where ccrTableUpdate.PickingRoute == wmsOrderTrans.wmsPickingRoute().pickingRouteID;
+            select  salesLineLoc
+                where salesLineLoc.SalesId == _salesId
+                join metSalesLine
+                    where metSalesLine.SalesLine == salesLineLoc.RecId
+                    join wmsOrderTrans
+                        where wmsOrderTrans.inventTransType == InventTransType::TransferOrderShip &&
+                            wmsOrderTrans.inventTransRefId == metSalesLine.TransferOrderNumber
+                        join ccrTableUpdate
+                            where ccrTableUpdate.PickingRoute == wmsOrderTrans.wmsPickingRoute().pickingRouteID;
             if(ccrTableUpdate.RecId != 0)
             {
                 ttsbegin;
@@ -701,11 +715,12 @@ public class METSalesOrderShipmentLoadHeader extends common
                 ccrTableUpdate.update();
                 ttscommit;
 
-                this.checkAndUpdateTote(ccrTableUpdate.SalesOrder, ccrTableUpdate.ToteId);
+                isCCRTableHasRecord = true;
+
+                this.checkAndUpdateTote(ccrTableUpdate.SalesOrder, ccrTableUpdate.ToteId, _isSecurityToteEnabled);
             }
-
-
         }
+        return isCCRTableHasRecord;
     }
 
 ]]></Source>
@@ -719,7 +734,7 @@ public class METSalesOrderShipmentLoadHeader extends common
     /// <param name = "_salesId">SalesId</param>
     /// <param name = "_toteId">String20</param>
     /// CB231 - Container content report
-    public void checkAndUpdateTote(SalesId _salesId, String20 _toteId)
+    public void checkAndUpdateTote(SalesId _salesId, String20 _toteId, NoYesId _securityTote = NoYes::No)
     {
         METTotes        totes;
 
@@ -728,11 +743,76 @@ public class METSalesOrderShipmentLoadHeader extends common
                 totes.Tote == _toteId;
         if(totes.RecId == 0)
         {
-            totes.SalesId   = _salesId;
-            totes.Tote      = _toteId;
+            totes.SalesId       = _salesId;
+            totes.Tote          = _toteId;
+            totes.SecurityTote  = _securityTote;
 
             totes.insert();
         }
+        else if(_securityTote == NoYes::Yes)
+        {
+            ttsbegin;
+            totes.selectforupdate();
+
+            totes.SecurityTote  = _securityTote;
+
+            totes.update();
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkSecurityTote</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// method to check order split group for each line
+    /// </summary>
+    /// <param name = "_metSOShipmentLoadLines">METSalesOrderShipmentLoadLines</param>
+    /// <returns>NoYes</returns>
+    /// CB231 - Container content report
+    protected NoYes checkSecurityTote(METSalesOrderShipmentLoadLines _metSOShipmentLoadLines)
+    {
+        METSplitGroupTable              splitGroupTable;
+
+        select  splitGroupTable
+            where splitGroupTable.IsSecurityToteEnabled == NoYes::Yes &&
+                splitGroupTable.SplitGroup == _metSOShipmentLoadLines.OrderSplitGroup;
+        if(splitGroupTable)
+        {
+            return NoYes::Yes;
+        }
+    
+        return NoYes::No;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkShipmentSecurityTote</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// method to check order split group for each shipment
+    /// </summary>
+    /// <returns>NoYes</returns>
+    /// CB231 - Container content report
+    public NoYes checkShipmentSecurityTote()
+    {
+        METSplitGroupTable              splitGroupTable;
+        METSalesOrderShipmentLoadLines  metSOShipmentLoadLines;
+
+        select splitGroupTable
+            where splitGroupTable.IsSecurityToteEnabled == NoYes::Yes 
+            join metSOShipmentLoadLines
+                where metSOShipmentLoadLines.OrderSplitGroup == splitGroupTable.SplitGroup &&
+                    metSOShipmentLoadLines.shipmentid == this.ShipmentId;
+        if(splitGroupTable)
+        {
+            return NoYes::Yes;
+        }
+    
+        return NoYes::No;
     }
 
 ]]></Source>
