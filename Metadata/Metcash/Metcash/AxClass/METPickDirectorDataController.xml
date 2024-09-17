@@ -8,8 +8,9 @@
 /// </summary>
 class METPickDirectorDataController
 {
-    SalesLine salesLine;
-    InventQty qtyPicked;
+    SalesTable salesTablePick;
+    METPickDirectorData pickDirectorData;
+    Map soLineWithQtyPick;
 
 }
 ]]></Declaration>
@@ -24,42 +25,29 @@ class METPickDirectorDataController
     {
         #OCCRetryCount
         System.Exception netExcepn;
-        METPickDirectorData pickDirectorData;
 
         try
         {
-            ttsbegin;
-            while select QtyPicked from pickDirectorData
-                join salesLine
-                where salesLine.SalesId == pickDirectorData.SalesId
-                && salesLine.LineNum == pickDirectorData.LineNum
-                && salesLine.ItemId == pickDirectorData.ItemId
-                && salesLine.SalesStatus == SalesStatus::Backorder
+            while select SalesId from salesTablePick group by SalesId
+                exists join pickDirectorData
+                where salesTablePick.SalesId == pickDirectorData.SalesId
+                && salesTablePick.SalesStatus == SalesStatus::Backorder
             {
-                qtyPicked = pickDirectorData.QtyPicked;
+                soLineWithQtyPick = this.deriveSoLinesAndQtyPicked();
+                ttsbegin;
+                // Reservation
+                this.reserveSOLineQty();
 
-                if (qtyPicked > 0)
+                // Generate and post picking list
+                WMSPickingRouteID pickingRouteID = this.createSalesPickingListSingleLine();
+
+                // Register picking list
+                if (pickingRouteID)
                 {
-                    // Reservation
-                    this.reserveSOLineQty();
-
-                    // Generate and post picking list
-                    WMSPickingRouteID pickingRouteID = this.createSalesPickingListSingleLine();
-
-                    // Register picking list
-                    if (pickingRouteID)
-                    {
-                        this.registerPickingList(pickingRouteID);
-                    }
-
-                    // Cancel delivery remainder
-                    if (salesLine.RemainSalesPhysical || salesLine.RemainInventPhysical)
-                    {
-                        this.cancelDeliveryRemainder();
-                    }
+                    this.registerPickingList(pickingRouteID);
                 }
+                ttscommit;
             }
-            ttscommit;
         }
         catch (Exception::CLRError)
         {
@@ -90,7 +78,7 @@ class METPickDirectorDataController
         }
         catch
         {
-            throw error("@MET:UnhandledError");
+            exceptionTextFallThrough();
         }
         finally
         {
@@ -108,9 +96,18 @@ class METPickDirectorDataController
     /// </summary>
     public void reserveSOLineQty()
     {
-        InventMovement movement = InventMovement::construct(salesLine);
-        InventUpd_Reservation reservation = InventUpd_Reservation::newMovement(movement, -qtyPicked, true);
-        reservation.updateNow();
+        MapEnumerator mapEnumerator = soLineWithQtyPick.getEnumerator();
+
+        while (mapEnumerator.moveNext())
+        {
+            if (mapEnumerator.currentValue() > 0)
+            {
+                SalesLine salesLine = mapEnumerator.currentKey();
+                InventMovement movement = InventMovement::construct(salesLine);
+                InventUpd_Reservation reservation = InventUpd_Reservation::newMovement(movement, -mapEnumerator.currentValue(), true);
+                reservation.updateNow();
+            }
+        }
     }
 
 ]]></Source>
@@ -124,7 +121,7 @@ class METPickDirectorDataController
     /// <returns>WMSPickingRouteID</returns>
     public WMSPickingRouteID createSalesPickingListSingleLine()
     {
-        SalesTable salesTable = salesTable::find(salesLine.SalesId);
+        salesTable salesTable = salesTable::find(salesTablePick.SalesId);
         SalesFormLetter salesFormLetter = SalesFormLetter::construct(DocumentStatus::PickingList);
         salesFormLetter.salesTable(salesTable);
         salesFormLetter.initParmSalesTable(salesFormLetter.salesTable());
@@ -144,29 +141,34 @@ class METPickDirectorDataController
         salesFormLetter.initLinesQuery();
 
         SalesParmLine salesParmLine;
+        Map inventTransMap = new Map(Types::String, Types::Real);
+        MapEnumerator mapEnumerator = soLineWithQtyPick.getEnumerator();
 
+        while (mapEnumerator.moveNext())
+        {
+            if (mapEnumerator.currentValue() > 0)
+            {
+                SalesLine salesLine = mapEnumerator.currentKey();
+                inventTransMap.insert(salesLine.InventTransId, mapEnumerator.currentValue());
+            }
+        }
+        
         // Delete unwanted records in SalesParmLine
         while select forupdate salesParmLine
             where salesParmLine.ParmId == salesFormLetter.parmId()
         {
-            container inventTransIdCon = [salesLine.InventTransId];
-
-            if (conFind(inventTransIdCon, salesParmLine.InventTransId) == 0)
+            if (!inventTransMap.exists(salesParmLine.InventTransId))
             {
                 salesParmLine.delete();
             }
             else
             {
-                if (salesLine.metSalesLine().OrderExtractStatus == METOrderExtractStatus::Open ||
-                    salesLine.metSalesLine().OrderExtractStatus == METOrderExtractStatus::ReadyForExtract)
-                {
-                    salesParmLine.DeliverNow = qtyPicked;
-                    salesParmLine.setQty(DocumentStatus::PickingList, false);
-                    salesParmLine.update();
-                }
+                salesParmLine.DeliverNow = inventTransMap.lookup(salesParmLine.InventTransId);
+                salesParmLine.setQty(DocumentStatus::PickingList, false);
+                salesParmLine.update();
             }
         }
-
+        
         salesFormLetter.run();
 
         WMSPickingRoute wmsPickingRoute;
@@ -197,8 +199,20 @@ class METPickDirectorDataController
 
         list.addEnd(_pickingRouteID);
 
-        // Build map containing the lot-ids and quantity to pick
-        inventTransMap.insert(salesLine.InventTransId, qtyPicked);
+        int incr;
+        MapEnumerator mapEnumerator = soLineWithQtyPick.getEnumerator();
+
+        while (mapEnumerator.moveNext())
+        {
+            if (mapEnumerator.currentValue() > 0)
+            {
+                incr++;
+                SalesLine salesLine = mapEnumerator.currentKey();
+                // Build map containing the lot-ids and quantity to pick
+                inventTransMap.insert(salesLine.InventTransId, mapEnumerator.currentValue());
+            }
+        }
+       
     
         MapEnumerator me = inventTransMap.getEnumerator();
 
@@ -238,21 +252,31 @@ class METPickDirectorDataController
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>cancelDeliveryRemainder</Name>
+				<Name>deriveSoLinesAndQtyPicked</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Cancel the delivery reminder for the given sales line.
+    /// Derives the sales lines and qty picked into a map.
     /// </summary>
-    public void cancelDeliveryRemainder()
+    public Map deriveSoLinesAndQtyPicked()
     {
-        salesLine.selectForUpdate(true);
-        salesLine.RemainInventPhysical = 0;
-        salesLine.RemainSalesPhysical = 0;             
-        salesLine.SalesStatus = SalesStatus::Canceled;
-        salesLine.update();
- 
-        // This method will update the inventory transactions
-        InventMovement::bufferSetRemainQty(salesLine);
+        METPickDirectorData metPickDirectorData;
+        SalesLine salesLine;
+
+        soLineWithQtyPick = new Map(Types::Record, Types::Real);
+
+        while select forupdate salesLine
+            where salesLine.SalesStatus == SalesStatus::Backorder
+            && salesLine.SalesId == salesTablePick.SalesId
+        join QtyPicked from metPickDirectorData
+            where salesLine.SalesId == metPickDirectorData.SalesId
+            && salesLine.LineNum == metPickDirectorData.LineNum
+            && salesLine.ItemId == metPickDirectorData.ItemId
+           
+        {
+            soLineWithQtyPick.insert(salesLine, metPickDirectorData.QtyPicked);
+        }
+
+        return soLineWithQtyPick;
     }
 
 ]]></Source>
