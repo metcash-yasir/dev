@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesLineQuotaProcess</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// CB202_SalesQuotaMinMax
+/// Process sales order line quota
+/// </summary>
+internal final class METSalesLineQuotaProcess
+{
+    SalesTable    salesTable;
+    METSalesTable metSalesTable;
+    SalesLine     salesLine;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Public construct method to execute sales order line quota
+    /// </summary>
+    /// <param name = "_salesTable">Sales order header</param>
+    /// <param name = "_metSalesTable">Sales order header additional fields</param>
+    /// <param name = "_salesLine">Sales order line to process</param>
+    /// <returns>Instance of <c>METSalesLineQuotaProcess</c></returns>
+    public static METSalesLineQuotaProcess construct(SalesTable _salesTable, METSalesTable _metSalesTable, SalesLine _salesLine)
+    {
+        return new METSalesLineQuotaProcess(_salesTable, _metSalesTable, _salesLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// New method
+    /// </summary>
+    /// <param name = "_salesTable">Sales order header</param>
+    /// <param name = "_metSalesTable">Sales order header additional fields</param>
+    /// <param name = "_salesLine">Sales order line to process</param>
+    protected void new(SalesTable _salesTable, METSalesTable _metSalesTable, SalesLine _salesLine)
+    {
+        salesTable      = _salesTable;
+        metSalesTable   = _metSalesTable;
+        salesLine       = _salesLine;        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Execute quotas line logic and create SA link 
+    /// </summary>
+    /// <returns>True if quota logic executed; otherwise, false.</returns>
+    public boolean run()
+    {
+        SalesAgreementHeader    salesAgreementHeader;
+        SalesReceiptDate        receiptDate;
+        ReasonCode              reasonCode;
+        AgreementLine           agreementLine;
+        METSalesLine            metSalesLine = METSalesLine::find(salesLine.RecId, true);
+        InventDim               salesLineInventDim = salesLine.inventDim();
+        AgreementClassification agreementClassification;
+        boolean                 cancelLine = false, qtyUpdated = false;
+
+        // if the line is already linked to SA, do not apply quota logic again
+        if (salesLine.MatchingAgreementLine)
+        {
+            return false;
+        }
+
+        receiptDate = salesTable.receiptDate();
+
+        METAgreementLineSearch agreementLineSearch = METAgreementLineSearch::construct(salesLine.ItemId, receiptDate, salesTable.CustAccount, salesLine.SalesUnit, salesLineInventDim);
+
+        if (agreementLineSearch.run())
+        {
+            salesAgreementHeader = agreementLineSearch.getSalesAgreementHeader();
+            agreementLine = agreementLineSearch.getAgreementLine();
+            agreementClassification = agreementLineSearch.getAgreementClassification();
+
+            metSalesLine.OrderedQuantity = salesLine.SalesQty;
+
+            reasonCode = agreementClassification.METCustReason;
+
+            salesLine.selectForUpdate(true);
+
+            // Product value commitment
+            if (salesAgreementHeader.DefaultAgreementLineType == CommitmentType::ProductVolume)
+            {
+                Amount      remainingAmountInAgreementLine = agreementLine.METgetAgreementLineRemaining();
+            
+                // sales agreement completely fulfilled
+                if (!remainingAmountInAgreementLine)
+                {
+                    cancelLine = true;
+                    //metSalesLine.ReducedQuantity    = salesLine.SalesQty;
+                    metSalesLine.ReasonId           = reasonCode;
+                }
+                // SA fulfilment remaining amount < salesLine.LineAmount
+                else if (remainingAmountInAgreementLine < salesLine.LineAmount && salesLine.SalesPrice != 0)
+                {
+                    SalesQty reducedQty = remainingAmountInAgreementLine / salesLine.SalesPrice;
+
+                    salesLine.SalesQty              = reducedQty;
+                    salesLine.SalesPrice            = salesLine.SalesPrice;
+                    salesLine.LineAmount            = salesLine.SalesPrice * reducedQty;
+                    metSalesLine.ReasonId           = reasonCode;
+                    //metSalesLine.ReducedQuantity    = metSalesLine.OrderedQuantity - salesLine.SalesQty;
+
+                    qtyUpdated = true;
+                }
+            }
+            // Product qty commitment
+            else if(salesAgreementHeader.DefaultAgreementLineType == CommitmentType::ProductQuantity)
+            {                
+                Qty qtyRemainInAgreementLine = agreementLine.METgetAgreementLineRemaining();
+
+                // sales agreement completely fulfilled
+                if (!qtyRemainInAgreementLine)
+                {
+                    cancelLine = true;
+                    //metSalesLine.ReducedQuantity    = salesLine.SalesQty;
+                    metSalesLine.ReasonId           = reasonCode;
+                }
+                // SA fulfilment remaining qty < salesLine.SalesQty
+                else if (qtyRemainInAgreementLine != 0 && qtyRemainInAgreementLine < salesLine.SalesQty)
+                {
+                    salesLine.SalesQty              = qtyRemainInAgreementLine;
+                    metSalesLine.ReasonId           = reasonCode;
+                    //metSalesLine.ReducedQuantity    = metSalesLine.OrderedQuantity - salesLine.SalesQty;
+                    qtyUpdated = true;
+                }
+            }
+
+            if (qtyUpdated)
+            {
+                salesLine.salesQtyModified();
+            }
+            //salesLine.update(); // salesLine.update() update is called in metCancelSalesOrderLine and SalesTableForm::createAgreementLinkServer
+            metSalesLine.update();
+
+            if (cancelLine)
+            {
+                salesLine.metCancelSalesOrderLine();
+            }
+            else if (metSalesTable.LinkedSalesAgreement == true && salesLine.MatchingAgreementLine == 0 && agreementLine.RecId) /// CB_202 SalesQuota changes by Akshay
+            {
+                // Insert the sales agreement number onto the sales order line via the update line > create link menu option
+                // this will then trigger the enforce quota code that is described below and if required the line quantity will be reduced or the line cancelled.
+                ttsbegin;
+                SalesTableForm::createAgreementLinkServer(salesLine, agreementLine);
+                ttscommit;
+            }
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
