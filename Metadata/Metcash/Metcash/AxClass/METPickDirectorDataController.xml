@@ -4,14 +4,10 @@
 	<SourceCode>
 		<Declaration><![CDATA[
 /// <summary>
-/// This class is called METPickDirectorDataEntitity has done the import.
+/// This class is called when METPickDirectorDataEntitity has done the import.
 /// </summary>
 class METPickDirectorDataController
 {
-    SalesTable salesTablePick;
-    METPickDirectorData pickDirectorData;
-    Map soLineWithQtyPick;
-
 }
 ]]></Declaration>
 		<Methods>
@@ -26,28 +22,45 @@ class METPickDirectorDataController
         #OCCRetryCount
         System.Exception netExcepn;
 
+        SalesLine salesLine;
+        METPickDirectorData pickDirectorData;
+        Query qry = new Query(QueryStr(SalesUpdate));
+        QueryBuildDataSource queryBuildDataSource = qry.dataSourceTable(tableNum(SalesLine));
+        QueryBuildRange queryBuildRange;
+
         try
         {
-            while select SalesId from salesTablePick group by SalesId
-                exists join pickDirectorData
-                where salesTablePick.SalesId == pickDirectorData.SalesId
-                && salesTablePick.SalesStatus == SalesStatus::Backorder
+            ttsbegin;
+            while select QtyPicked from pickDirectorData
+                join salesLine
+                where salesLine.SalesId == pickDirectorData.SalesId
+                && salesLine.LineNum == pickDirectorData.LineNum
+                && salesLine.ItemId == pickDirectorData.ItemId
+                && salesLine.SalesStatus == SalesStatus::Backorder
             {
-                soLineWithQtyPick = this.deriveSoLinesAndQtyPicked();
-                ttsbegin;
+                InventQty qtyPicked = pickDirectorData.QtyPicked;
+                queryBuildRange = queryBuildDataSource.addRange(fieldnum(SalesLine, RecId));
+                queryBuildRange.value(SysQuery::value(salesLine.RecId));
+          
                 // Reservation
-                this.reserveSOLineQty();
-
-                // Generate and post picking list
-                WMSPickingRouteID pickingRouteID = this.createSalesPickingListSingleLine();
-
-                // Register picking list
-                if (pickingRouteID)
+                if (qtyPicked > 0)
                 {
-                    this.registerPickingList(pickingRouteID);
+                    this.reserveSOLineQty(salesLine, qtyPicked);
                 }
-                ttscommit;
+
             }
+            ttscommit;
+
+            ttsbegin;
+            // Generate and post picking list
+            List pickingRouteIDList = this.createSalesPickingListSingleLine(qry);
+
+            // Register picking list
+            if (!pickingRouteIDList.empty())
+            {
+                this.registerPickingList(pickingRouteIDList);
+            }
+            ttscommit;
         }
         catch (Exception::CLRError)
         {
@@ -94,20 +107,11 @@ class METPickDirectorDataController
     /// <summary>
     /// Reserves the sales order line with the quantity picked.
     /// </summary>
-    public void reserveSOLineQty()
+    public void reserveSOLineQty(SalesLine _salesLine, InventQty _qtyPicked)
     {
-        MapEnumerator mapEnumerator = soLineWithQtyPick.getEnumerator();
-
-        while (mapEnumerator.moveNext())
-        {
-            if (mapEnumerator.currentValue() > 0)
-            {
-                SalesLine salesLine = mapEnumerator.currentKey();
-                InventMovement movement = InventMovement::construct(salesLine);
-                InventUpd_Reservation reservation = InventUpd_Reservation::newMovement(movement, -mapEnumerator.currentValue(), true);
-                reservation.updateNow();
-            }
-        }
+        InventMovement movement = InventMovement::construct(_salesLine);
+        InventUpd_Reservation reservation = InventUpd_Reservation::newMovement(movement, -_qtyPicked, true);
+        reservation.updateNow();
     }
 
 ]]></Source>
@@ -118,65 +122,45 @@ class METPickDirectorDataController
     /// <summary>
     /// Generated and posts the picking list for the sales order line with the quantity picked.
     /// </summary>
+    /// <param name = "_qry">_qry</param>
     /// <returns>WMSPickingRouteID</returns>
-    public WMSPickingRouteID createSalesPickingListSingleLine()
+    public List createSalesPickingListSingleLine(Query _qry)
     {
-        salesTable salesTable = salesTable::find(salesTablePick.SalesId);
         SalesFormLetter salesFormLetter = SalesFormLetter::construct(DocumentStatus::PickingList);
-        salesFormLetter.salesTable(salesTable);
-        salesFormLetter.initParmSalesTable(salesFormLetter.salesTable());
-        salesFormLetter.transDate(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+        salesFormLetter.chooseLinesQuery(this.calcQuery(_qry));
+        salesFormLetter.transDate(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));
         salesFormLetter.specQty(SalesUpdate::All);
-        salesFormLetter.printFormLetter(salesFormLetter.printFormLetter());
-
-        salesFormLetter.createParmUpdateFromParmUpdateRecord(
-        SalesFormletterParmData::initSalesParmUpdateFormletter(
-            salesFormLetter.documentStatus(),
-            salesFormLetter.pack()));
-
-        salesFormLetter.initParameters(
-        salesFormLetter.salesParmUpdate(),
-        Printout::Current);
-
-        salesFormLetter.initLinesQuery();
+        salesFormLetter.proforma(NoYes::No);
+        salesFormLetter.printout(Printout::Current);
+        salesFormLetter.printFormLetter(NoYes::No);
+        salesFormLetter.usePrintManagement(NoYes::No);
+        salesFormLetter.chooseLines(false, true);
+        salesFormLetter.sumBy(AccountOrder::Order);
+        salesFormLetter.reArrangeNow(false);
 
         SalesParmLine salesParmLine;
-        Map inventTransMap = new Map(Types::String, Types::Real);
-        MapEnumerator mapEnumerator = soLineWithQtyPick.getEnumerator();
 
-        while (mapEnumerator.moveNext())
-        {
-            if (mapEnumerator.currentValue() > 0)
-            {
-                SalesLine salesLine = mapEnumerator.currentKey();
-                inventTransMap.insert(salesLine.InventTransId, mapEnumerator.currentValue());
-            }
-        }
-        
-        // Delete unwanted records in SalesParmLine
         while select forupdate salesParmLine
             where salesParmLine.ParmId == salesFormLetter.parmId()
         {
-            if (!inventTransMap.exists(salesParmLine.InventTransId))
-            {
-                salesParmLine.delete();
-            }
-            else
-            {
-                salesParmLine.DeliverNow = inventTransMap.lookup(salesParmLine.InventTransId);
-                salesParmLine.setQty(DocumentStatus::PickingList, false);
-                salesParmLine.update();
-            }
+            SalesLine salesline = salesParmLine.salesLine();
+            salesParmLine.DeliverNow = METPickDirectorData::find(salesline.SalesId, salesline.LineNum).QtyPicked;
+            salesParmLine.setQty(DocumentStatus::PickingList, false);
+            salesParmLine.update();
         }
         
         salesFormLetter.run();
 
+        List list = new List(Types::String);
         WMSPickingRoute wmsPickingRoute;
 
-        select firstonly pickingRouteID from wmsPickingRoute
-                where wmsPickingRoute.parmid == salesFormLetter.parmId();
+        while select pickingRouteID from wmsPickingRoute
+            where wmsPickingRoute.parmid == salesFormLetter.parmId()
+        {
+            list.addEnd(wmsPickingRoute.pickingRouteID);
+        }
 
-        return wmsPickingRoute.pickingRouteID;
+        return list;
     }
 
 ]]></Source>
@@ -188,95 +172,24 @@ class METPickDirectorDataController
     /// Registers the picking list for the selected sales line.
     /// </summary>
     /// <param name = "_pickingRouteID">_pickingRouteID</param>
-    public void registerPickingList(WMSPickingRouteID _pickingRouteID)
+    public void registerPickingList(List _list)
     {
-        Map inventTransMap = new Map(Types::String, Types::Real);
-        InventTransId inventTransId;
-        Qty pickQty;
-        List list = new List(Types::String);
-        WmsOrderTrans wmsOrderTrans;
-        WmsOrderTrans wmsOrderTransNew;
-
-        list.addEnd(_pickingRouteID);
-
-        int incr;
-        MapEnumerator mapEnumerator = soLineWithQtyPick.getEnumerator();
-
-        while (mapEnumerator.moveNext())
-        {
-            if (mapEnumerator.currentValue() > 0)
-            {
-                incr++;
-                SalesLine salesLine = mapEnumerator.currentKey();
-                // Build map containing the lot-ids and quantity to pick
-                inventTransMap.insert(salesLine.InventTransId, mapEnumerator.currentValue());
-            }
-        }
-       
-    
-        MapEnumerator me = inventTransMap.getEnumerator();
-
-        while (me.moveNext())
-        {
-            inventTransId = me.currentKey();
-            pickQty = me.currentValue();
-        
-            ttsBegin;
-            select firstonly forupdate wmsOrderTrans
-                where wmsOrderTrans.RouteId == _pickingRouteID &&
-                wmsOrderTrans.inventTransId == inventTransId &&
-                wmsOrderTrans.FullPallet == NoYes::No &&
-                (wmsOrderTrans.ExpeditionStatus == WMSExpeditionStatus::Registered ||
-                wmsOrderTrans.ExpeditionStatus == WMSExpeditionStatus::Activated  ||
-                wmsOrderTrans.ExpeditionStatus == WMSExpeditionStatus::Started);
-           
-            if (wmsOrderTrans.Qty > pickQty)
-            {
-                // Split line
-                wmsOrderTransNew = wmsOrderTrans.split(pickQty);
-            }
-            ttsCommit;
-        
-            if (wmsOrderTrans.Qty > pickQty)
-            {
-                ttsBegin;
-                // Cancel remaining line
-                wmsOrderTrans.cancel();
-                ttsCommit;
-            }
-        }
-    
-        WMSPickingRoute::finishMulti(list.pack());
+        WMSPickingRoute::finishMulti(_list.pack());
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>deriveSoLinesAndQtyPicked</Name>
+				<Name>calcQuery</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Derives the sales lines and qty picked into a map.
+    /// Calculate query for list of sales lines.
     /// </summary>
-    public Map deriveSoLinesAndQtyPicked()
+    /// <param name = "_qry">_qry</param>
+    /// <returns>SysQueryRun</returns>
+    private SysQueryRun calcQuery(Query _qry)
     {
-        METPickDirectorData metPickDirectorData;
-        SalesLine salesLine;
-
-        soLineWithQtyPick = new Map(Types::Record, Types::Real);
-
-        while select forupdate salesLine
-            where salesLine.SalesStatus == SalesStatus::Backorder
-            && salesLine.SalesId == salesTablePick.SalesId
-        join QtyPicked from metPickDirectorData
-            where salesLine.SalesId == metPickDirectorData.SalesId
-            && salesLine.LineNum == metPickDirectorData.LineNum
-            && salesLine.ItemId == metPickDirectorData.ItemId
-           
-        {
-            soLineWithQtyPick.insert(salesLine, metPickDirectorData.QtyPicked);
-        }
-
-        return soLineWithQtyPick;
+        return new sysQueryRun(_qry);
     }
 
 ]]></Source>
