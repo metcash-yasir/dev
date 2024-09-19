@@ -1,0 +1,330 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METInventJournalPostingTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// CB223_PalletRounding
+/// Batch service class for Post pricing order optimisation
+/// </summary>
+class METInventJournalPostingTaskService extends METSysOperationTaskService
+{
+    guid    topPickingProcessId;
+    InventJournalId inventJournalId;
+    InventJournalTrans inventJournalTrans;
+    InventJournalTable inventJournalTable;
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    /// <param name = "_contract">
+    /// <c>METPostPricingOrderOptimisationContract</c>.
+    /// </param>
+    public void process(METInventJournalPostingContract _contract)
+    {
+        this.processInternal(_contract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canJournalBeProcessed</Name>
+				<Source><![CDATA[
+    public boolean canJournalBeProcessed(InventJournalTable _inventJournalTable)
+    {
+        boolean ret;
+        select count(RecId) from inventJournalTrans
+            where inventJournalTrans.JournalId == _inventJournalTable.JournalId;
+        if (_inventJournalTable.METNoOfLines )
+        {
+            if ((_inventJournalTable.METNoOfLines == inventJournalTrans.RecId) 
+                && _inventJournalTable.METIntegrationStatus == METIntegrationStatus::None)
+            {
+                ret = true;
+            }
+        }
+      
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getJournalLineCount</Name>
+				<Source><![CDATA[
+    public int getJournalLineCount(InventJournalId _inventJournalId)
+    {
+        select count(RecId) from inventJournalTrans
+            where inventJournalTrans.JournalId == _inventJournalId;
+        return inventJournalTrans.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateLastJournalCheckTime</Name>
+				<Source><![CDATA[
+    public void updateLastJournalCheckTime()
+    {
+        ttsbegin;
+        if (inventJournalTable)
+        {
+            inventJournalTable.selectForUpdate(true);
+            inventJournalTable.METLastJournalCheckTime = DateTimeUtil::utcNow();
+            inventJournalTable.update();
+        }
+        ttscommit;
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the batch tasks.
+    /// </summary>
+    /// <param name = "_readPast">Read past table setting.</param>
+    public void processTask(boolean _readPast)
+    {
+        boolean success;
+       
+        
+        while (this.getInventJournalIdFromTopPickingQueue(topPickingProcessId, _readPast))
+        {
+            try
+            {
+                ttsbegin;
+                if (this.inventJournalId && inventJournalTable.METNoOfLines && inventJournalTable.METIntegrationStatus == METIntegrationStatus::None)
+                {
+                    inventJournalTable = InventJournalTable::find(this.inventJournalId);
+                   // METSalesTable metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId, true);
+                   if (inventJournalTable.METNoOfLines != this.getJournalLineCount(inventJournalTable.JournalId) &&  (DateTimeUtil::getDifference(inventJournalTable.METLastJournalCheckTime, DateTimeUtil::utcNow()) > InventParameters::find().METMaxTimeforJnlCreation  ))
+                    {
+                        throw error("Maximum time duration passed");
+                    }
+                    if (inventJournalTable.METNoOfLines != this.getJournalLineCount(inventJournalTable.JournalId))
+                    {
+                        this.updateLastJournalCheckTime();
+                    }
+
+                    if (inventJournalTable && this.canJournalBeProcessed(inventJournalTable) )
+                    {
+                        // execute optimisation processes after PE pricing update in FO
+                        success = this.execute(inventJournalTable);
+
+                        // update status to optimisation completed once pallet rounding and quota completed
+                        if (success)
+                        {
+                            this.updateInventoryJournalStatus(METIntegrationStatus::Acknowledged, inventJournalTable);
+                           // this.updateSalesOrderProcessingStatus(metSalesTable);
+                        }
+                        else
+                        {
+                            throw error(strFmt("@MET:PostPricingOrderOptimisationError", this.inventJournalId));
+                        }
+                    }
+                }
+                ttscommit;
+            }
+            catch (Exception::Error)
+            {
+                // Catch any exception so that any one error won't bring down
+                // the entire process of sales order pallet rounding but will still capture and show the error.
+                Global::exceptionTextFallThrough();
+                // Send header error to telemetry from here
+                // Update header error 
+                this.updateInventoryJournalStatus(METIntegrationStatus::Error, inventJournalTable);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the object.
+    /// </summary>
+    protected void initialise()
+    {
+        super();
+
+        // get the topPickingProcessId from the contract
+        METInventJournalPostingContract contract = dataContract as METInventJournalPostingContract;
+        topPickingProcessId = contract.parmTopPickingProcessId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main processes pallet rounding, quota min/max and leter credit check.
+    /// </summary>
+    /// <param name = "_salesTable">Sales order to process.</param>
+    /// <param name = "_metSalesTable">Sales order header additional fields</param>
+    /// <returns>True if all lines processed for pallet rounding and quotas; otherwise, false.</returns>
+    private boolean execute(InventJournalTable _inventjournalTable)
+    {
+        boolean success = true;
+        JournalCheckPost               journalCheckPost;
+        //Posting the journal
+
+        journalCheckPost = InventJournalCheckPost::newPostJournal(_inventjournalTable);
+        journalCheckPost.run();
+
+        /*
+        // process pallet rounding
+        if (SalesParameters::find().METActivatePalletRounding)
+        {
+            METSalesTablePalletRoundingProcess palletRoundingProcess = METSalesTablePalletRoundingProcess::construct(_salesTable.salesId);
+            success = palletRoundingProcess.run();
+        }
+
+        // TODO CB202 - Quota Min/Max PLACEHOLDER
+        /*if (_metSalesTable.LinkedSalesAgreement)
+        {
+        
+        }*/
+        */
+
+        return success;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInventJournalIdFromTopPickingQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get sales order id to substitute from the top picking queue <c>METPostPricingOrderOptimisationQueue</c>
+    /// </summary>
+    /// <param name = "_processId">Guid created and added in the contract <c>METPostPricingOrderOptimisationContract</c></param>
+    /// <param name = "_readPast">boolean to read past records or not</param>
+    /// <returns>Get sales order id to substitute</returns>
+    private InventJournalId getInventJournalIdFromTopPickingQueue(guid _processId, boolean _readPast)
+    {
+        METInventJournalPostingQueue postQueue;
+        
+        #OCCRetryCount
+        int backOffWait;
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockException;
+        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
+        Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
+        
+        postQueue.readPast(_readPast);
+
+        try
+        {
+            ttsbegin;
+    
+            select firstonly pessimisticlock JournalNum
+            from postQueue
+            where postQueue.ProcessId == _processId;
+
+            if (postQueue.RecId)
+            {
+                this.inventJournalId = postQueue.JournalNum;
+
+                postQueue.delete();
+            }
+            else
+            {
+                // no sales order id found from top picking queue
+                this.inventJournalId = '';
+            }
+
+            ttscommit;
+        }
+        catch (deadLockException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw deadLockException;
+                }
+            }
+            else
+            {
+                throw deadLockException;
+            }
+        }
+        catch (updateConflictException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+            }
+            else
+            {
+                throw updateConflictException;
+            }
+        }
+        catch (transientSqlConnectionError)
+        {
+            if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw transientSqlConnectionError;
+            }
+        }
+
+        return this.inventJournalId;  
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateInventoryJournalStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update sales order header processing status
+    /// </summary>
+    /// <param name = "_metSalesTable">Sales order header additional fields</param>
+    protected void updateInventoryJournalStatus(METIntegrationStatus metIntegrationStatus, InventJournalTable _inventJournalTable)
+    {
+        ttsbegin;
+        if (_inventJournalTable)
+        {
+            _inventJournalTable.selectForUpdate(true);
+            _inventJournalTable.METIntegrationStatus = metIntegrationStatus;
+            _inventJournalTable.update();
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
