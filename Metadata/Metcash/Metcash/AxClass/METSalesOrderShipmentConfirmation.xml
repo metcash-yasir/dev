@@ -3,15 +3,24 @@
 	<Name>METSalesOrderShipmentConfirmation</Name>
 	<SourceCode>
 		<Declaration><![CDATA[
+/// <summary>
+/// Class to post the shipment confirmation
+/// </summary>
 internal final class METSalesOrderShipmentConfirmation
 {
     MetShipmentId       metShipmentId;
+
 }
 ]]></Declaration>
 		<Methods>
 			<Method>
 				<Name>construct</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Construct method for class
+    /// </summary>
+    /// <param name = "_shipmentid">ShipmentId reference</param>
+    /// <returns>METSalesOrderShipmentConfirmation</returns>
     static METSalesOrderShipmentConfirmation construct(MetShipmentId _shipmentid)
     {
         if (!_shipmentid)
@@ -27,6 +36,10 @@ internal final class METSalesOrderShipmentConfirmation
 			<Method>
 				<Name>new</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// New method for class
+    /// </summary>
+    /// <param name = "_shipmentId">ShipmentId reference</param>
     protected void new(METShipmentId _shipmentId)
     {
         metShipmentId = _shipmentId;
@@ -37,6 +50,9 @@ internal final class METSalesOrderShipmentConfirmation
 			<Method>
 				<Name>run</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Run method for the class
+    /// </summary>
     public void run()
     {
         #OCCRetryCount
@@ -52,20 +68,30 @@ internal final class METSalesOrderShipmentConfirmation
             select firstonly shipmentLoadHeader
                 where shipmentLoadHeader.ShipmentId == metShipmentId;
 
-            metCustTable = metCustTable::find(shipmentLoadHeader.CustAccount);
-
-            if (metCustTable.FinalizationDocument != METFinalizationDocument::None)
+            if (shipmentLoadHeader.TransactionType == METOrderTransactionType::SalesOrder)
             {
-                documentStatus = metCustTable.FinalizationDocument == METFinalizationDocument::Invoice ? DocumentStatus::Invoice : DocumentStatus::PackingSlip;
-                accountOrder   = shipmentLoadHeader.PostMultiDocument == NoYes::No ? AccountOrder::Account : AccountOrder::None;
+                metCustTable = metCustTable::find(shipmentLoadHeader.CustAccount);
 
-                isPosted = this.postPackingslipInvoiceReport(shipmentLoadHeader, documentStatus, accountOrder);
+                if (metCustTable.FinalizationDocument != METFinalizationDocument::None)
+                {
+                    documentStatus = metCustTable.FinalizationDocument == METFinalizationDocument::Invoice ? DocumentStatus::Invoice : DocumentStatus::PackingSlip;
+                    accountOrder   = shipmentLoadHeader.PostMultiDocument == NoYes::No ? AccountOrder::Account : AccountOrder::None;
+
+                    isPosted = this.postPackingslipInvoiceReport(shipmentLoadHeader, documentStatus, accountOrder);
+                }
+                else
+                {
+                    warning (strFmt("@MET:SOFinalisationDocCheck", shipmentLoadHeader.ShipmentId));
+                }
+            }
+            else if (shipmentLoadHeader.TransactionType == METOrderTransactionType::TransferOrder)
+            {
+                isPosted = this.postShipTransferOrder(shipmentLoadHeader);
             }
             else
             {
-                warning (strFmt("@MET:SOFinalisationDocCheck", shipmentLoadHeader.ShipmentId));
+                throw error(strFmt("@SYS19306", funcName()));
             }
-            
             
             ttsCommit;
 
@@ -104,7 +130,6 @@ internal final class METSalesOrderShipmentConfirmation
         catch
         {
             exceptionTextFallThrough();
-            //METSalesOrderShipmentLoadHeader::updateDocStatusInHeader(MetShipmentStatus::Open, DocumentStatus::None, MetShipmentId);
         }
     }
 
@@ -116,6 +141,8 @@ internal final class METSalesOrderShipmentConfirmation
     /// <summary>
     /// Method to post the invoice report
     /// </summary>
+    /// <param name = "_shipmentLoadHeader">Shipment load leader</param>
+    /// <param name = "_docStatus">Document status</param>
     /// <param name = "_accountOrder">Account order</param>
     /// <returns>Boolean result</returns>
     private boolean postPackingslipInvoiceReport(METSalesOrderShipmentLoadHeader    _shipmentLoadHeader, DocumentStatus _docStatus, AccountOrder _accountOrder)
@@ -212,6 +239,98 @@ internal final class METSalesOrderShipmentConfirmation
             queryBuildRange.value(SysQuery::value(salesLineRecId));
         }
         return new sysQueryRun(qry);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postShipTransferOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Posting of transfer order
+    /// </summary>
+    /// <param name = "_shipmentLoadHeader">Shipment header reference</param>
+    /// <returns>Boolean value</returns>
+    public boolean postShipTransferOrder(METSalesOrderShipmentLoadHeader      _shipmentLoadHeader)
+    {
+        METSalesOrderShipmentLoadLines  shipmentLoadLines;
+        InventTransferParmTable         inventTransferParmTable;
+        InventTransferUpd               invTranUpd;
+        InventTransferJour              inventTransferJour;
+        InventTransferTable             inventTransferTable;
+        boolean                         ret;
+
+        while select shipmentLoadLines
+            group by OrderNum
+            where shipmentLoadLines.ShipmentId == _shipmentLoadHeader.ShipmentId
+            exists join inventTransferTable
+                where shipmentLoadLines.OrderNum == inventTransferTable.TransferId  &&
+                    inventTransferTable.TransferStatus == InventTransferStatus::Created
+        {
+            if (InventTransferTable::find(shipmentLoadLines.OrderNum).TransferStatus == InventTransferStatus::Created)
+            {
+                inventTransferParmTable.clear();
+                inventTransferParmTable.initParmDefault();
+                inventTransferParmTable.ParmId = RunBaseMultiParm::getSysParmId();
+                inventTransferParmTable.TransferId = shipmentLoadLines.OrderNum;
+                inventTransferParmTable.UpdateType = InventTransferUpdateType::Shipment;
+                inventTransferParmTable.PrintTransferReceipt = NoYes::No;
+                inventTransferParmTable.ShipUpdateQty = InventTransferShipUpdateQty::All;
+                inventTransferParmTable.EditLines = NoYes::Yes;
+                inventTransferParmTable.ExplodeLines = NoYes::No;
+                inventTransferParmTable.TransDate = _shipmentLoadHeader.ConfirmedShipDate;
+                inventTransferParmTable.InventDimFixedReceiveList = 0;
+                inventTransferParmTable.insert();
+                
+                invTranUpd = METSalesOrderShipmentConfirmation::PostTransferOrder(inventTransferParmTable);
+
+                inventTransferJour = invTranUpd.parmInventTransferJour();
+
+                if (inventTransferJour.RecId)
+                {
+                    inventTransferJour.METShipmentId = _shipmentLoadHeader.ShipmentId;
+                    inventTransferJour.METLoadId     = _shipmentLoadHeader.LoadId;
+                    InventTransferjour.update();
+
+                    ret = true;
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>PostTransferOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// method to post transfer order
+    /// </summary>
+    /// <param name = "_invTransParmTbl">InventTransferParmTable reference</param>
+    /// <returns>InventTransferUpd</returns>
+    public static InventTransferUpd PostTransferOrder(InventTransferParmTable _invTransParmTbl)
+    {
+        InventTransferUpd    invTranUpd;
+     
+        switch(_invTransParmTbl.UpdateType)
+        {
+            case InventTransferUpdateType::PickingList:
+                invTranUpd = InventTransferUpdPick::newParmBuffer(_invTransParmTbl);
+                break;
+            case InventTransferUpdateType::Shipment:
+                invTranUpd = InventTransferUpdShip::newParmBuffer(_invTransParmTbl);
+                break;
+            case InventTransferUpdateType::Receive:
+                invTranUpd = InventTransferUpdReceive::newParmBuffer(_invTransParmTbl);
+                break;
+            default:
+                return null;
+        }
+        invTranUpd.run();
+
+        return invTranUpd;
     }
 
 ]]></Source>
