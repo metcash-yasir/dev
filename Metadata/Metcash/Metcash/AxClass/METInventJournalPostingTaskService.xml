@@ -4,8 +4,8 @@
 	<SourceCode>
 		<Declaration><![CDATA[
 /// <summary>
-/// CB223_PalletRounding
-/// Batch service class for Post pricing order optimisation
+/// CB262_ Dallas-23 Inventory Status ,CB770 - Changes auto-post integrated Inventory Journals
+/// Batch service class for Post inventory journal
 /// </summary>
 class METInventJournalPostingTaskService extends METSysOperationTaskService
 {
@@ -13,6 +13,7 @@ class METInventJournalPostingTaskService extends METSysOperationTaskService
     InventJournalId inventJournalId;
     InventJournalTrans inventJournalTrans;
     InventJournalTable inventJournalTable;
+    
 
 
 }
@@ -25,7 +26,7 @@ class METInventJournalPostingTaskService extends METSysOperationTaskService
     /// Executes the main process.
     /// </summary>
     /// <param name = "_contract">
-    /// <c>METPostPricingOrderOptimisationContract</c>.
+    /// <c>METInventJournalPostingContract</c>.
     /// </param>
     public void process(METInventJournalPostingContract _contract)
     {
@@ -37,15 +38,21 @@ class METInventJournalPostingTaskService extends METSysOperationTaskService
 			<Method>
 				<Name>canJournalBeProcessed</Name>
 				<Source><![CDATA[
-    public boolean canJournalBeProcessed(InventJournalTable _inventJournalTable)
+    /// <summary>
+    /// verify if invent journal table can be processed
+    /// </summary>
+    /// <returns>true or false</returns>
+    public boolean canJournalBeProcessed()
     {
         boolean ret;
+
         select count(RecId) from inventJournalTrans
-            where inventJournalTrans.JournalId == _inventJournalTable.JournalId;
-        if (_inventJournalTable.METNoOfLines )
+            where inventJournalTrans.JournalId == inventJournalTable.JournalId;
+
+        if (inventJournalTable.METJournalLinesCount)
         {
-            if ((_inventJournalTable.METNoOfLines == inventJournalTrans.RecId) 
-                && _inventJournalTable.METIntegrationStatus == METIntegrationStatus::None)
+            if ((inventJournalTable.METJournalLinesCount == inventJournalTrans.RecId)
+                && inventJournalTable.METIntegrationStatus == METIntegrationStatus::None)
             {
                 ret = true;
             }
@@ -59,29 +66,35 @@ class METInventJournalPostingTaskService extends METSysOperationTaskService
 			<Method>
 				<Name>getJournalLineCount</Name>
 				<Source><![CDATA[
-    public int getJournalLineCount(InventJournalId _inventJournalId)
+    /// <summary>
+    /// Get the count of invent journal lines
+    /// </summary>
+    /// <param name = "_inventJournalId">Invent journal id</param>
+    /// <returns>Count of records</returns>
+    public RefRecId getJournalLineCount(InventJournalId _inventJournalId)
     {
         select count(RecId) from inventJournalTrans
             where inventJournalTrans.JournalId == _inventJournalId;
+
         return inventJournalTrans.RecId;
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>updateLastJournalCheckTime</Name>
+				<Name>updateFirstJournalCheckTime</Name>
 				<Source><![CDATA[
-    public void updateLastJournalCheckTime()
+    /// <summary>
+    /// Updtae the last check time on invent journal table
+    /// </summary>
+    public void updateFirstJournalCheckTime()
     {
-        ttsbegin;
-        if (inventJournalTable)
+        if (inventJournalTable && !inventJournalTable.METLastJournalCheckTime)
         {
-            inventJournalTable.selectForUpdate(true);
+            this.skipInventJournalTableEvents();
             inventJournalTable.METLastJournalCheckTime = DateTimeUtil::utcNow();
             inventJournalTable.update();
         }
-        ttscommit;
-        
     }
 
 ]]></Source>
@@ -95,56 +108,107 @@ class METInventJournalPostingTaskService extends METSysOperationTaskService
     /// <param name = "_readPast">Read past table setting.</param>
     public void processTask(boolean _readPast)
     {
-        boolean success;
-       
-        
         while (this.getInventJournalIdFromTopPickingQueue(topPickingProcessId, _readPast))
         {
             try
             {
-                ttsbegin;
-                if (this.inventJournalId && inventJournalTable.METNoOfLines && inventJournalTable.METIntegrationStatus == METIntegrationStatus::None)
+                if (this.inventJournalId && inventJournalTable.METJournalLinesCount &&          inventJournalTable.METIntegrationStatus == METIntegrationStatus::None)
                 {
-                    inventJournalTable = InventJournalTable::find(this.inventJournalId);
-                   // METSalesTable metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId, true);
-                   if (inventJournalTable.METNoOfLines != this.getJournalLineCount(inventJournalTable.JournalId) &&  (DateTimeUtil::getDifference(inventJournalTable.METLastJournalCheckTime, DateTimeUtil::utcNow()) > InventParameters::find().METMaxTimeforJnlCreation  ))
+                    ttsbegin;
+                    if (inventJournalTable.METJournalLinesCount != this.getJournalLineCount(inventJournalTable.JournalId))
                     {
-                        throw error("Maximum time duration passed");
-                    }
-                    if (inventJournalTable.METNoOfLines != this.getJournalLineCount(inventJournalTable.JournalId))
-                    {
-                        this.updateLastJournalCheckTime();
+                        if ((DateTimeUtil::getDifference(DateTimeUtil::utcNow(), inventJournalTable.METLastJournalCheckTime) > InventParameters::find().METMaxTimeforJnlCreation)
+                        && inventJournalTable.METLastJournalCheckTime)
+                        {
+                            this.sendInventJournalHeaderInformationToAppinsights("@MET:MaxTimeDurationPassed");
+                            throw error("@MET:MaxTimeDurationPassed");
+                        }
+
+                        this.updateFirstJournalCheckTime();
                     }
 
-                    if (inventJournalTable && this.canJournalBeProcessed(inventJournalTable) )
+                    if (inventJournalTable && this.canJournalBeProcessed())
                     {
-                        // execute optimisation processes after PE pricing update in FO
-                        success = this.execute(inventJournalTable);
-
-                        // update status to optimisation completed once pallet rounding and quota completed
-                        if (success)
-                        {
-                            this.updateInventoryJournalStatus(METIntegrationStatus::Acknowledged, inventJournalTable);
-                           // this.updateSalesOrderProcessingStatus(metSalesTable);
-                        }
-                        else
-                        {
-                            throw error(strFmt("@MET:PostPricingOrderOptimisationError", this.inventJournalId));
-                        }
+                        this.postInventJournal();
+                        inventJournalTable.reread();
+                        this.updateInventoryJournalStatus(METIntegrationStatus::Acknowledged);
                     }
+                    ttscommit;
                 }
-                ttscommit;
             }
             catch (Exception::Error)
             {
+                str errormessage;
+                errormessage = infolog.text(infologLine());
+                errormessage = infolog.text(infologLine()-1);
+                errormessage = errormessage + METconstants::space + infolog.text(infologLine());
+
+               
                 // Catch any exception so that any one error won't bring down
                 // the entire process of sales order pallet rounding but will still capture and show the error.
                 Global::exceptionTextFallThrough();
                 // Send header error to telemetry from here
-                // Update header error 
-                this.updateInventoryJournalStatus(METIntegrationStatus::Error, inventJournalTable);
+                // Update header error
+                inventJournalTable.reread();
+                this.updateInventoryJournalStatus(METIntegrationStatus::Error);
             }
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>skipInventJournalTableEvents</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Skip Invent journal table events
+    /// </summary>
+    private void skipInventJournalTableEvents()
+    {
+        inventJournalTable.skipDatabaseLog(true);
+        inventJournalTable.skipDataMethods(true);
+        inventJournalTable.skipDeleteActions(true);
+        inventJournalTable.skipEvents(true);
+        inventJournalTable.skipBusinessEvents(true);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendInventJournalHeaderInformationToAppinsights</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Send invent journal Header information to app insights
+    /// </summary>
+    /// <param name = "errorMessage">error message</param>
+    protected void sendInventJournalHeaderInformationToAppinsights(Notes errorMessage)
+    {
+        Notes errMsg = errorMessage;
+        TableId tableId = TableNum(InventJournalTable);
+        DictFieldGroup dictFieldGrp = new DictFieldGroup(tableId, METConstants::METReference);
+        int counter, fieldId;
+
+        METTelemetryInventJournalCheckPostLogging metInventJournalCheckPostLogging = METTelemetryInventJournalCheckPostLogging::construct(errMsg);
+        // If table is having table group METReference then check all the fields and assign those fields as custom dimensions
+        if (dictFieldGrp)
+        {
+            for (counter = 1; counter <= dictFieldGrp.numberOfFields(); counter++)
+            {
+                fieldId = dictFieldGrp.field(counter);
+
+                DictField dictField = new DictField(tableId, fieldId);
+                if (inventJournalTable.(fieldId))
+                {
+                    errMsg += strFmt("@MET:Multiplestrmt",dictField.label(), any2str(inventJournalTable.(fieldId)));
+                    //Reference Added as custom dimension
+                    metInventJournalCheckPostLogging.addRuntimeProperty(dictField.label(), any2str(inventJournalTable.(fieldId)));
+                }
+            }
+        }
+
+        metInventJournalCheckPostLogging.errmsg = errMsg;
+        metInventJournalCheckPostLogging.processEvent(METApplicationInsightsEventNames::InventJournalCheckPostLog);
+    
     }
 
 ]]></Source>
@@ -167,39 +231,18 @@ class METInventJournalPostingTaskService extends METSysOperationTaskService
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>execute</Name>
+				<Name>postInventJournal</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Executes the main processes pallet rounding, quota min/max and leter credit check.
+    /// Post invent journal
     /// </summary>
-    /// <param name = "_salesTable">Sales order to process.</param>
-    /// <param name = "_metSalesTable">Sales order header additional fields</param>
-    /// <returns>True if all lines processed for pallet rounding and quotas; otherwise, false.</returns>
-    private boolean execute(InventJournalTable _inventjournalTable)
+    private void postInventJournal()
     {
-        boolean success = true;
-        JournalCheckPost               journalCheckPost;
-        //Posting the journal
+        JournalCheckPost journalCheckPost = InventJournalCheckPost::newPostJournal(inventjournalTable);
 
-        journalCheckPost = InventJournalCheckPost::newPostJournal(_inventjournalTable);
-        journalCheckPost.run();
-
-        /*
-        // process pallet rounding
-        if (SalesParameters::find().METActivatePalletRounding)
-        {
-            METSalesTablePalletRoundingProcess palletRoundingProcess = METSalesTablePalletRoundingProcess::construct(_salesTable.salesId);
-            success = palletRoundingProcess.run();
-        }
-
-        // TODO CB202 - Quota Min/Max PLACEHOLDER
-        /*if (_metSalesTable.LinkedSalesAgreement)
-        {
-        
-        }*/
-        */
-
-        return success;
+        journalCheckPost.parmShowInfoResult(false);
+        journalCheckPost.parmTransferErrors(false);
+        journalCheckPost.runOperation();
     }
 
 ]]></Source>
@@ -215,14 +258,14 @@ class METInventJournalPostingTaskService extends METSysOperationTaskService
     /// <returns>Get sales order id to substitute</returns>
     private InventJournalId getInventJournalIdFromTopPickingQueue(guid _processId, boolean _readPast)
     {
-        METInventJournalPostingQueue postQueue;
-        
         #OCCRetryCount
-        int backOffWait;
         Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockException;
         Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
         Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
-        
+
+        METInventJournalPostingQueue postQueue;
+        int backOffWait;
+
         postQueue.readPast(_readPast);
 
         try
@@ -236,13 +279,13 @@ class METInventJournalPostingTaskService extends METSysOperationTaskService
             if (postQueue.RecId)
             {
                 this.inventJournalId = postQueue.JournalNum;
-
+                inventJournalTable = InventJournalTable::find(this.inventJournalId, true);
                 postQueue.delete();
             }
             else
             {
-                // no sales order id found from top picking queue
-                this.inventJournalId = '';
+                // no invent journal id found from top picking queue
+                this.inventJournalId = METConstants::emptyString;
             }
 
             ttscommit;
@@ -299,7 +342,7 @@ class METInventJournalPostingTaskService extends METSysOperationTaskService
             }
         }
 
-        return this.inventJournalId;  
+        return this.inventJournalId;
     }
 
 ]]></Source>
@@ -310,17 +353,47 @@ class METInventJournalPostingTaskService extends METSysOperationTaskService
     /// <summary>
     /// Update sales order header processing status
     /// </summary>
-    /// <param name = "_metSalesTable">Sales order header additional fields</param>
-    protected void updateInventoryJournalStatus(METIntegrationStatus metIntegrationStatus, InventJournalTable _inventJournalTable)
+    /// <param name = "_metIntegrationStatus">Sales order header additional fields</param>
+    protected void updateInventoryJournalStatus(METIntegrationStatus _metIntegrationStatus)
     {
-        ttsbegin;
-        if (_inventJournalTable)
+        if (inventJournalTable)
         {
-            _inventJournalTable.selectForUpdate(true);
-            _inventJournalTable.METIntegrationStatus = metIntegrationStatus;
-            _inventJournalTable.update();
+            ttsbegin;
+            this.skipInventJournalTableEvents();
+            inventJournalTable.METIntegrationStatus = _metIntegrationStatus;
+            inventJournalTable.update();
+            ttscommit;
         }
-        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendErrorOrWarningInfoToTelemetry</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Send Error or warning infor to Telemetry
+    /// </summary>
+    /// <param name = "_message">text message to append</param>
+    public void sendErrorOrWarningInfoToTelemetry(str _message = '')
+    {
+        str errorMessage;
+        errorMessage = infolog.text(infologLine());
+        errorMessage = infolog.text(infologLine()-1);
+        errorMessage = errorMessage + METconstants::space + infolog.text(infologLine());
+
+        if (_message)
+        {
+            errormessage = errorMessage + _message;
+        }
+
+        this.sendInventJournalHeaderInformationToAppinsights(errormessage);
+        // Catch any exception so that any one error won't bring down
+        // the entire process of sales order pallet rounding but will still capture and show the error.
+        Global::exceptionTextFallThrough();
+        // Send header error to telemetry from here
+        // Update header error
+        this.updateInventoryJournalStatus(METIntegrationStatus::Error);
     }
 
 ]]></Source>
