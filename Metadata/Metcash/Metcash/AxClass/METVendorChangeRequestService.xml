@@ -43,7 +43,7 @@ class METVendorChangeRequestService
             //Task110346_CB409-D365ToPIM-Supplier change request- end
 
             ttsbegin;
-            while select forupdate metVendorChangeRequest
+            while select metVendorChangeRequest
                 where metVendorChangeRequest.Status != METVendChangeReqStatus::Completed
                 && metVendorChangeRequest.ChangeReqEffectiveDate <= currentDate
             {
@@ -109,7 +109,7 @@ class METVendorChangeRequestService
     /// <returns>The error log is updated and the status is changed to error if any validation fails.</returns>
     private boolean validateVendorChangeRequests(METVendorChangeRequest _metVendorChangeRequest)
     {
-        const str intercomp = "Intercomp";
+        VendGroupId intercomp = VendParameters::find().METInterCompanyVendGroupId;
         boolean ret = true;
 
         _metVendorChangeRequest.ChangeRequestLog = '';
@@ -117,7 +117,14 @@ class METVendorChangeRequestService
         ReqItemTable reqItemTable;
         InventDim inventDim;
 
-        select firstonly forupdate reqItemTable
+        METVendorChangeRequest parentChangeRequest = this.getParentvendorChangeRequest(_metVendorChangeRequest);
+
+        if (parentChangeRequest.RecId)
+        {
+            return false;
+        }
+
+        select firstonly reqItemTable
         exists join inventDim
             where inventDim.inventDimId == reqItemTable.CovInventDimId
             && reqItemTable.ItemId == _metVendorChangeRequest.ItemId
@@ -142,7 +149,7 @@ class METVendorChangeRequestService
             METReqItemTable metReqItemTable;
 
             select firstonly PendingVendAccountNumber from metReqItemTable
-                join forupdate reqItemTableTransfer
+                join reqItemTableTransfer
                 join InventLocationId from inventDim
                     where inventDim.inventDimId == reqItemTableTransfer.CovInventDimId
                     && reqItemTableTransfer.ItemId == _metVendorChangeRequest.ItemId
@@ -157,8 +164,9 @@ class METVendorChangeRequestService
                     && reqItemTablePurch.RecId == metReqItemTable.RefRecId
                     && reqItemTablePurch.ReqPOType == ReqPOType::Purch;
 
-            if (!reqItemTablePurch.RecId)
+            if (!reqItemTablePurch.RecId && !vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
             {
+                _metVendorChangeRequest.selectForUpdate(true);
                 _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
                 _metVendorChangeRequest.ChangeRequestLog += "@MET:NoItemCoverageError";
                 _metVendorChangeRequest.update();
@@ -169,15 +177,16 @@ class METVendorChangeRequestService
             {
                 MetVendorChangeRequest metVendorChangeRequestPO;
 
-                select firstonly forupdate metVendorChangeRequestPO
+                select firstonly metVendorChangeRequestPO
                         where metVendorChangeRequestPO.Status != METVendChangeReqStatus::Completed
                             && metVendorChangeRequestPO.ChangeReqEffectiveDate == _metVendorChangeRequest.ChangeReqEffectiveDate
                             && metVendorChangeRequestPO.InventLocationId == inventDimPurch.InventLocationId
                             && metVendorChangeRequestPO.SiteId == inventDimPurch.InventSiteId
                             && metVendorChangeRequestPO.ItemId == _metVendorChangeRequest.ItemId;
 
-                if (!metVendorChangeRequestPO.RecId && METReqItemTable::find(reqItemTableTransfer.RecId).PendingVendAccountNumber == '')
+                if (!metVendorChangeRequestPO.RecId && METReqItemTable::find(reqItemTableTransfer.RecId).PendingVendAccountNumber == '' && !vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
                 {
+                    _metVendorChangeRequest.selectForUpdate(true);
                     _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
                     _metVendorChangeRequest.ChangeRequestLog += "@MET:TransferOrderError";
                     _metVendorChangeRequest.update();
@@ -197,6 +206,7 @@ class METVendorChangeRequestService
         }
         else if (!reqItemTable.RecId && !vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
         {
+            _metVendorChangeRequest.selectForUpdate(true);
             _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
             _metVendorChangeRequest.ChangeRequestLog += "@MET:NoItemCoverageError";
             _metVendorChangeRequest.update();
@@ -254,8 +264,12 @@ class METVendorChangeRequestService
         VendAccount vendAccount = _reqItemTable.VendId;
         VendAccount pendingVendAccount = METReqItemTable::find(_reqItemTable.RecId).PendingVendAccountNumber;
 
-        _reqItemTable.VendId = pendingVendAccount;
-        _reqItemTable.update();
+        if (_reqItemTable.RecId)
+        {
+            _reqItemTable.selectForUpdate(true);
+            _reqItemTable.VendId = pendingVendAccount;
+            _reqItemTable.update();
+        }
 
         //Task110346_CB409-D365ToPIM-Supplier change request- add Pending vendor account - start
         if (vendAccountNumber != pendingVendAccount)
@@ -319,6 +333,7 @@ class METVendorChangeRequestService
     /// <param name = "_metVendorChangeRequest">Vendor change request record</param>
     /// <param name = "_reqItemTable">Item coverage record</param>
     /// <param name = "_itemId">Item number of vendor change request</param>
+    /// <param name = "_isSubRangeItem">Input a boolean value true if item is a subrange</param>
     /// <returns>A boolean value based on success true, Otherwise false</returns>
     private boolean validateVendorChangeRequest(METVendorChangeRequest _metVendorChangeRequest, ReqItemTable _reqItemTable, ItemId _itemId = '', boolean _isSubRangeItem = false)
     {
@@ -361,7 +376,7 @@ class METVendorChangeRequestService
 
         METReqItemTable metReqItemTable = METReqItemTable::find(_reqItemTable.RecId);
 
-        if (!metReqItemTable.PendingVendAccountNumber && !metReqItemTable.PendingVendChangeDate)
+        if (!metReqItemTable.PendingVendAccountNumber || !metReqItemTable.PendingVendChangeDate)
         {
             errorLog += "@MET:ErrorPendingVendorMiss";
 
@@ -377,18 +392,23 @@ class METVendorChangeRequestService
             ret = false;
         }
              
-        if (ret)
+        if (ret && !vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
         {
+            _metVendorChangeRequest.selectForUpdate(true);
             _metVendorChangeRequest.Status = METVendChangeReqStatus::Waiting;
             _metVendorChangeRequest.ChangeRequestLog = '';
             _metVendorChangeRequest.update();
         }
         else
         {
-            _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
-            _metVendorChangeRequest.ChangeRequestLog = errorLog;
-            _metVendorChangeRequest.update();
-            vendorChangerequestsProcessed.add(_metVendorChangeRequest.RecId);
+            if (!vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
+            {
+                _metVendorChangeRequest.selectForUpdate(true);
+                _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
+                _metVendorChangeRequest.ChangeRequestLog = errorLog;
+                _metVendorChangeRequest.update();
+                vendorChangerequestsProcessed.add(_metVendorChangeRequest.RecId);
+            }
         }
 
         return ret;
@@ -408,6 +428,8 @@ class METVendorChangeRequestService
     {
         if (!vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
         {
+            _metVendorChangeRequest.selectForUpdate(true);
+
             if (_metVendorChangeRequestPO.RecId)
             {
                 _metVendorChangeRequest.Status = _metVendorChangeRequestPO.Status;
@@ -419,6 +441,7 @@ class METVendorChangeRequestService
                 _metVendorChangeRequest.ChangeRequestLog = strFmt("@MET:VendorUpdateSuccess", DateTimeUtil::utcNow());
             }
         
+            _metVendorChangeRequest.selectForUpdate(true);
             _metVendorChangeRequest.update();
             vendorChangerequestsProcessed.add(_metVendorChangeRequest.RecId);
         }
@@ -437,9 +460,13 @@ class METVendorChangeRequestService
     {
         // Clear the pending vendor number and date.
         METReqItemTable metReqItemTable = METReqItemTable::find(_refRecid, true);
-        metReqItemTable.PendingVendAccountNumber = '';
-        metReqItemTable.PendingVendChangeDate = utcdatetimenull();
-        metReqItemTable.update();
+
+        if (metReqItemTable.RecId)
+        {
+            metReqItemTable.PendingVendAccountNumber = '';
+            metReqItemTable.PendingVendChangeDate = utcdatetimenull();
+            metReqItemTable.update();
+        }
     }
 
 ]]></Source>
@@ -457,17 +484,17 @@ class METVendorChangeRequestService
         InventDim inventDim;
         MetVendorChangeRequest metVendorChangeRequestTransfer;
 
-        while select forupdate reqItemTableTransfer
+        while select reqItemTableTransfer
             join RecId from inventDim
                 where inventDim.inventDimId == reqItemTableTransfer.CovInventDimId
                 && reqItemTableTransfer.ItemId == _metVendorChangeRequest.ItemId
                 && reqItemTableTransfer.InventLocationIdReqMain == _metVendorChangeRequest.InventLocationId
                 && reqItemTableTransfer.ReqPOType == ReqPOType::Transfer
-            join forupdate metVendorChangeRequestTransfer
+            join metVendorChangeRequestTransfer
                 where metVendorChangeRequestTransfer.SiteId == inventDim.InventSiteId
                 && metVendorChangeRequestTransfer.ItemId == _metVendorChangeRequest.ItemId
                 && metVendorChangeRequestTransfer.InventLocationId == inventDim.InventLocationId
-                && metVendorChangeRequestTransfer.Status != METVendChangeReqStatus::Completed  
+                && metVendorChangeRequestTransfer.Status != METVendChangeReqStatus::Completed
         {
             if (_metVendorChangeRequest.Status != METVendChangeReqStatus::Error)
             {
@@ -495,8 +522,8 @@ class METVendorChangeRequestService
         METVendorChangeRequest childVendChangeReq;
 
         while select ChildItemID from parent
-                    where parent.ParentItemID == _metVendorChangeRequest.ItemId // 10
-        join childReqItem
+                    where parent.ParentItemID == _metVendorChangeRequest.ItemId
+                join childReqItem
                     where childReqItem.ItemId == parent.ChildItemID
                 join childInventDim
                     where childInventDim.inventDimId == childReqItem.CovInventDimId
@@ -525,7 +552,7 @@ class METVendorChangeRequestService
     /// <summary>
     /// Updates the vendor change requests for all the child items(temporary pack change) based on parent item.
     /// </summary>
-    /// <param name = "_metVendorChangeRequest"></param>
+    /// <param name = "_metVendorChangeRequest">Input the vendor change request record.</param>
     private void updateTemporaryItemPackChangeRecords(MetVendorChangeRequest _metVendorChangeRequest)
     {
         METInventItemOrderSetup metInventItemOrderSetup = METInventItemOrderSetup::findByItemAndSite(_metVendorChangeRequest.ItemId, _metVendorChangeRequest.SiteId);
@@ -629,6 +656,46 @@ class METVendorChangeRequestService
         {
             METSupplierChangeCompletedBusinessEvent::newFromSupplierChangeCompleted(_itemId, _vendAccount, _coverageWareHouseIdList).send();
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getParentvendorChangeRequest</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the Parent vendor change request data.
+    /// </summary>
+    /// <param name = "_childRequest">Send the child vendor change request as a input.</param>
+    /// <returns>Returns the parent vendor change request</returns>
+    private METVendorChangeRequest getParentvendorChangeRequest(METVendorChangeRequest _childRequest)
+    {
+        METVendorChangeRequest parentVendorChangeRequest;
+        METInventItemOrderSetup metInventItemOrderSetup;
+
+        select firstonly parentVendorChangeRequest
+            exists join metInventItemOrderSetup
+            where parentVendorChangeRequest.SiteId == metInventItemOrderSetup.SiteId
+            && parentVendorChangeRequest.ItemId == metInventItemOrderSetup.ItemId
+            && metInventItemOrderSetup.TempItemPackChg == _childRequest.ItemId
+            && metInventItemOrderSetup.SiteId == _childRequest.SiteId
+            && parentVendorChangeRequest.Status != METVendChangeReqStatus::Completed;
+
+        if (!parentVendorChangeRequest.RecId)
+        {
+            METSalesItemSubstitutionParentChild child;
+
+            select firstonly parentVendorChangeRequest
+                where parentVendorChangeRequest.SiteId == _childRequest.SiteId
+                && parentVendorChangeRequest.InventLocationId == _childRequest.InventLocationId
+                && parentVendorChangeRequest.Status != METVendChangeReqStatus::Completed
+            join child
+                where child.ParentItemID == parentVendorChangeRequest.ItemId
+                && child.InventSiteId == parentVendorChangeRequest.SiteId
+                && child.ChildItemID == _childRequest.ItemId;
+        }
+
+        return parentVendorChangeRequest;
     }
 
 ]]></Source>
