@@ -1,0 +1,252 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPickDirectorDataProcess</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// This class is called when METPickDirectorDataEntitity has done the import.
+/// </summary>
+class METPickDirectorDataProcess
+{
+    SalesId salesId;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processSOForPickDirectorData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the sales orders which are macthing with the METPickDirectorDataEntityStaging for the current execution.
+    /// </summary>
+    public void processSOForPickDirectorData()
+    {
+        #OCCRetryCount
+        System.Exception netExcepn;
+
+        SalesLine salesLine;
+        METPickDirectorData pickDirectorData;
+        Query qry = new Query(QueryStr(SalesUpdate));
+        QueryBuildDataSource queryBuildDataSource = qry.dataSourceTable(tableNum(SalesLine));
+        QueryBuildRange queryBuildRange;
+
+        try
+        {
+            ttsbegin;
+            while select forupdate pickDirectorData
+                where pickDirectorData.SalesId == salesId
+                join salesLine
+                    where salesLine.SalesId == pickDirectorData.SalesId
+                    && salesLine.LineNum == pickDirectorData.LineNum
+                    && salesLine.ItemId == pickDirectorData.ItemId
+                    && salesLine.SalesStatus == SalesStatus::Backorder
+            {
+                this.updateMetPickDirectorStatus(METPickDirectorStatuses::InProgress);
+
+                InventQty qtyPicked = pickDirectorData.QtyPicked;
+                queryBuildRange = queryBuildDataSource.addRange(fieldnum(SalesLine, RecId));
+                queryBuildRange.value(SysQuery::value(salesLine.RecId));
+          
+                // Reservation
+                if (qtyPicked > 0)
+                {
+                    this.reserveSOLineQty(salesLine, qtyPicked);
+                }
+            }
+            
+            // Generate and post picking list
+            List pickingRouteIDList = this.createSalesPickingListSingleLine(qry);
+
+            // Register picking list
+            if (!pickingRouteIDList.empty())
+            {
+                this.registerPickingList(pickingRouteIDList);
+            }
+            ttscommit;
+
+            this.updateMetPickDirectorStatus(METPickDirectorStatuses::Processed);
+        }
+        catch (Exception::CLRError)
+        {
+            netExcepn = CLRInterop::getLastException();
+            throw error(netExcepn.ToString());
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch
+        {
+            this.updateMetPickDirectorStatus(METPickDirectorStatuses::Error);
+            exceptionTextFallThrough();
+        }
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reserveSOLineQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reserves the sales order line with the quantity picked.
+    /// </summary>
+    public void reserveSOLineQty(SalesLine _salesLine, InventQty _qtyPicked)
+    {
+        InventMovement movement = InventMovement::construct(_salesLine);
+        InventUpd_Reservation reservation = InventUpd_Reservation::newMovement(movement, -_qtyPicked, true);
+        reservation.updateNow();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSalesPickingListSingleLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generated and posts the picking list for the sales order line with the quantity picked.
+    /// </summary>
+    /// <param name = "_qry">_qry</param>
+    /// <returns>WMSPickingRouteID</returns>
+    public List createSalesPickingListSingleLine(Query _qry)
+    {
+        SalesFormLetter salesFormLetter = SalesFormLetter::construct(DocumentStatus::PickingList);
+        salesFormLetter.chooseLinesQuery(this.calcQuery(_qry));
+        salesFormLetter.transDate(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));
+        salesFormLetter.specQty(SalesUpdate::All);
+        salesFormLetter.proforma(NoYes::No);
+        salesFormLetter.printout(Printout::Current);
+        salesFormLetter.printFormLetter(NoYes::No);
+        salesFormLetter.usePrintManagement(NoYes::No);
+        salesFormLetter.chooseLines(false, true);
+        salesFormLetter.sumBy(AccountOrder::Order);
+        salesFormLetter.reArrangeNow(false);
+
+        SalesParmLine salesParmLine;
+        SalesLine salesLine;
+        METPickDirectorData pickDirectorData;
+
+        while select forupdate salesParmLine
+            where salesParmLine.ParmId == salesFormLetter.parmId()
+            && salesParmLine.OrigSalesId == salesId
+        join InventTransId from salesLine
+            where salesLine.InventTransId == salesParmLine.InventTransId
+        join  QtyPicked from pickDirectorData
+            where pickDirectorData.SalesId == salesLine.SalesId
+            && pickDirectorData.LineNum == salesLine.LineNum
+        {
+            salesParmLine.DeliverNow = pickDirectorData.QtyPicked;
+            salesParmLine.setQty(DocumentStatus::PickingList, false);
+            salesParmLine.update();
+        }
+        
+        salesFormLetter.run();
+
+        List list = new List(Types::String);
+        WMSPickingRoute wmsPickingRoute;
+
+        while select pickingRouteID from wmsPickingRoute
+            where wmsPickingRoute.parmid == salesFormLetter.parmId()
+            && wmsPickingRoute.transType == InventTransType::Sales
+            && wmsPickingRoute.transRefId == salesId
+        {
+            list.addEnd(wmsPickingRoute.pickingRouteID);
+        }
+
+        return list;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>registerPickingList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Registers the picking list for the selected sales line.
+    /// </summary>
+    /// <param name = "_pickingRouteID">_pickingRouteID</param>
+    public void registerPickingList(List _list)
+    {
+        WMSPickingRoute::finishMulti(_list.pack());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate query for list of sales lines.
+    /// </summary>
+    /// <param name = "_qry">_qry</param>
+    /// <returns>SysQueryRun</returns>
+    private SysQueryRun calcQuery(Query _qry)
+    {
+        return new sysQueryRun(_qry);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMetPickDirectorStatus</Name>
+				<Source><![CDATA[
+    // <summary>
+    /// Updates the Met pick director status.
+    /// </summary>
+    private void updateMetPickDirectorStatus(METPickDirectorStatuses _status)
+    {
+        METPickDirectorData pickDirectorData;
+
+        update_recordset pickDirectorData
+            setting PickDirectorStatus = _status
+            where pickDirectorData.SalesId == salesId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    static METPickDirectorDataProcess construct(SalesId _salesId)
+    {
+        if (!_salesId)
+        {
+            throw error(strFmt("@SYS19306", funcName()));
+        }
+        
+        return new METPickDirectorDataProcess(_salesId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    protected void new(SalesId _salesId)
+    {
+        salesId = _salesId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
