@@ -496,7 +496,242 @@ public class METSalesOrderShipmentLoadHeader extends common
             }
         }
 
+        METSalesOrderShipmentLoadLines  mETSalesOrderShipmentLoadLines;
+
+        select firstonly mETSalesOrderShipmentLoadLines
+            where mETSalesOrderShipmentLoadLines.ShipmentId == this.ShipmentId &&
+                mETSalesOrderShipmentLoadLines.CCRReceived == NoYes::No;
+        if(mETSalesOrderShipmentLoadLines && this.isCCRPickDirectorFlagEnabled())
+        {
+            error(strfmt("@MET:CCRValidationErrorMsg", mETSalesOrderShipmentLoadLines.OrderNum));
+            ret = false;
+        }
+
         return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isCCRPickDirectorFlagEnabled</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// method to check the flag is enable in warehouse
+    /// </summary>
+    /// <returns>boolean</returns>
+    /// CB231 - Container content report
+    public boolean isCCRPickDirectorFlagEnabled()
+    {
+        InventLocation      inventLocation = InventLocation::find(this.Warehouse);
+
+        if(inventLocation.METPickDirector == NoYes::Yes || inventLocation.METCCR == NoYes::Yes)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAndUpdateCCR</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// method to check to check CCR data and update
+    /// </summary>
+    /// CB231 - Container content report
+    public void checkAndUpdateCCR()
+    {
+        if(this.isCCRPickDirectorFlagEnabled())
+        {
+            METSalesOrderShipmentLoadLines      mETSalesOrderShipmentLoadLines;
+
+            ttsbegin;
+            while select forupdate mETSalesOrderShipmentLoadLines
+                where mETSalesOrderShipmentLoadLines.ShipmentId == this.ShipmentId
+            {
+                NoYes   isSecurityTote  = this.checkSecurityTote(mETSalesOrderShipmentLoadLines);
+                boolean isCCRReceived   = this.checkAndUpdateCCRTable(mETSalesOrderShipmentLoadLines.OrderNum, isSecurityTote);
+
+                if(isCCRReceived)
+                {
+                    mETSalesOrderShipmentLoadLines.CCRReceived = isCCRReceived;
+
+                    mETSalesOrderShipmentLoadLines.update();
+                }
+            }
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAndUpdateCCRTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// method to check CCR table and Update if no SO found
+    /// </summary>
+    /// <param name = "_salesId">SalesId</param>
+    /// CB231 - Container content report
+    protected boolean checkAndUpdateCCRTable(SalesId _salesId, NoYes _isSecurityToteEnabled)
+    {
+        METCCRTable     ccrTable;
+        boolean         isCCRTableHasRecord = false;
+
+        while select SalesOrder, ToteId from ccrTable group by SalesOrder, ToteId
+            where ccrTable.SalesOrder == _salesId
+        {
+            isCCRTableHasRecord = true;
+            
+            this.checkAndUpdateTote(ccrTable.SalesOrder, ccrTable.ToteId, _isSecurityToteEnabled);
+        }
+
+        if(!isCCRTableHasRecord)
+        {
+            METCCRTable     ccrTableUpdate;
+            WMSOrderTrans   wmsOrderTrans;
+            METSalesLine    metSalesLine;
+            SalesLine       salesLineLoc;
+
+            select RecId from salesLineLoc
+                where salesLineLoc.SalesId == _salesId
+                join TransferOrderNumber from metSalesLine
+                    where metSalesLine.SalesLine == salesLineLoc.RecId
+                    join routeId from wmsOrderTrans
+                        where wmsOrderTrans.inventTransType == InventTransType::TransferOrderShip &&
+                            wmsOrderTrans.inventTransRefId == metSalesLine.TransferOrderNumber
+                        join ccrTableUpdate
+                            where ccrTableUpdate.PickingRoute == wmsOrderTrans.routeId;
+            if(ccrTableUpdate.RecId != 0)
+            {
+                ttsbegin;
+                ccrTableUpdate.selectForUpdate(true);
+                
+                ccrTableUpdate.SalesOrder = _salesId;
+                ccrTableUpdate.update();
+                ttscommit;
+
+                isCCRTableHasRecord = true;
+
+                this.checkAndUpdateTote(ccrTableUpdate.SalesOrder, ccrTableUpdate.ToteId, _isSecurityToteEnabled);
+            }
+        }
+        return isCCRTableHasRecord;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAndUpdateTote</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// method to check and Update SalesId and ToteId in Tote table
+    /// </summary>
+    /// <param name = "_salesId">SalesId</param>
+    /// <param name = "_toteId">String20</param>
+    /// CB231 - Container content report
+    public void checkAndUpdateTote(SalesId _salesId, String20 _toteId, NoYesId _securityTote = NoYes::No)
+    {
+        METTotes        totes;
+
+        ttsbegin;
+        select forupdate totes
+            where totes.SalesId == _salesId &&
+                totes.Tote == _toteId;
+        if(totes.RecId == 0)
+        {
+            totes.SalesId       = _salesId;
+            totes.Tote          = _toteId;
+            totes.SecurityTote  = _securityTote;
+
+            totes.insert();
+        }
+        else if(_securityTote == NoYes::Yes)
+        {
+            totes.SecurityTote  = _securityTote;
+
+            totes.update();
+        }
+        ttscommit;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkSecurityTote</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// method to check order split group for each line
+    /// </summary>
+    /// <param name = "_metSOShipmentLoadLines">METSalesOrderShipmentLoadLines</param>
+    /// <returns>NoYes</returns>
+    /// CB231 - Container content report
+    protected NoYes checkSecurityTote(METSalesOrderShipmentLoadLines _metSOShipmentLoadLines)
+    {
+        METSplitGroupTable              splitGroupTable;
+        METItemType                     itemType;
+        NoYes                           isSecurityToteEnabled;
+
+        select firstonly splitGroupTable
+            where splitGroupTable.IsSecurityToteEnabled == NoYes::Yes &&
+                splitGroupTable.SplitGroup == _metSOShipmentLoadLines.OrderSplitGroup;
+        if(splitGroupTable)
+        {
+            isSecurityToteEnabled = NoYes::Yes;
+        }
+
+        select firstonly itemType
+            where itemType.IsSecurityToteEnabled == NoYes::Yes &&
+                itemType.ItemType == _metSOShipmentLoadLines.OrderSplitGroup;
+        if(itemType)
+        {
+            isSecurityToteEnabled = NoYes::Yes;
+        }
+    
+        return isSecurityToteEnabled;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkShipmentSecurityTote</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// method to check order split group for each shipment
+    /// </summary>
+    /// <returns>NoYes</returns>
+    /// CB231 - Container content report
+    public NoYes checkShipmentSecurityTote()
+    {
+        METSplitGroupTable              splitGroupTable;
+        METItemType                     itemType;
+        METSalesOrderShipmentLoadLines  metSOShipmentLoadLines;
+        NoYes                           isSecurityToteEnabled;
+
+        select firstonly splitGroupTable
+            where splitGroupTable.IsSecurityToteEnabled == NoYes::Yes 
+            join metSOShipmentLoadLines
+                where metSOShipmentLoadLines.OrderSplitGroup == splitGroupTable.SplitGroup &&
+                    metSOShipmentLoadLines.shipmentid == this.ShipmentId;
+        if(splitGroupTable)
+        {
+            isSecurityToteEnabled = NoYes::Yes;
+        }
+
+        select firstonly itemType
+            where itemType.IsSecurityToteEnabled == NoYes::Yes
+            join metSOShipmentLoadLines
+                where metSOShipmentLoadLines.OrderSplitGroup == itemType.ItemType &&
+                    metSOShipmentLoadLines.shipmentid == this.ShipmentId;
+        if(itemType)
+        {
+            isSecurityToteEnabled = NoYes::Yes;
+        }
+
+        return isSecurityToteEnabled;
     }
 
 ]]></Source>
