@@ -9,6 +9,7 @@
 internal final class METTMSEngineSalesOrderProccess_PackingSlip extends METTMSEngineSalesOrderProccess
 {
     METSalesOrderShipmentLoadHeader salesOrderShipmentLoadHeader;
+    METSalesOrderShipmentLoadLines  salesOrderShipmentLoadLines;
     PackingSlipId                   packingSlipId;
     
 }
@@ -24,6 +25,28 @@ internal final class METTMSEngineSalesOrderProccess_PackingSlip extends METTMSEn
     {
         salesOrderShipmentLoadHeader = _salesOrderShipmentLoadHeader;
         packingSlipId = _packingSlipId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initSalesLineQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialise the sales order line query
+    /// </summary>
+    /// <returns><c>Query</c> object</returns>
+    Query initSalesLineQuery()
+    {
+        Query query = super();
+        
+        // extend the query to add a link to salesOrderShipmentLoadLines so that we can get the new PickedQty instead of salesLine.SalesQty
+        QueryBuildDataSource qbds = query.dataSourceTable(tableNum(SalesLine));
+        QueryBuildDataSource qbdsShipmentLines = qbds.addDataSource(tableNum(METSalesOrderShipmentLoadLines));
+        qbdsShipmentLines.joinMode(JoinMode::InnerJoin);
+        qbdsShipmentLines.addLink(fieldNum(SalesLine, InventTransId), fieldNum(METSalesOrderShipmentLoadLines, InventTransId));
+
+        return query;
     }
 
 ]]></Source>
@@ -62,12 +85,15 @@ internal final class METTMSEngineSalesOrderProccess_PackingSlip extends METTMSEn
     /// Run the TMS engine
     /// </summary>
     public void run()
-    {
-        METSalesOrderShipmentLoadLines  salesOrderShipmentLoadLines;
+    {        
         SalesTable                      salesTableLoop;
         METTMSShipmentTable             tmsShipmentTable;
         METTMSShipmentTable             tmsShipmentTableCancel;
         METTMSShipmentOrderTable        tmsShipmentOrderTable;
+
+        // Get validated SO from the shipments
+
+        // initTmpTable for multiple SOs
 
         // For each combination of sales order - picking list number in the F&O finalisation shipment lines
         while select salesOrderShipmentLoadLines
@@ -78,79 +104,7 @@ internal final class METTMSEngineSalesOrderProccess_PackingSlip extends METTMSEn
         {
             this.init(salesTableLoop);
 
-            // Step 1: check if order should be excluded from TMS Engine processing
-            // Apply the exact same checks on the sales order being processed as done in “Step 1” of the CB624 FSD’s processing
-            if (this.validate())
-            {
-                proccessLinesTmp = this.initTmpTable();
-                try
-                {
-                    ttsbegin;
-
-                    //Step 2: Check if the order is already on a shipment. Check to see if there is a TSO with PickListID or blank
-                    tmsShipmentOrderTable = this.getTMSShipmentOrderTable(salesOrderShipmentLoadLines.OrderNum, salesOrderShipmentLoadLines.PickingListNum);
-
-                    if (!tmsShipmentOrderTable.RecId)
-                    {
-                        //Step 3: If order is not on any existing shipment
-                        tmsShipmentTable = this.initTMSShipment();
-               
-                        //Step 3a: check if there is an existing shipment this order can be made part of.
-                        if (!tmsShipmentTable.RecId)
-                        {
-                            this.createShipment();
-                        }
-                        else
-                        {
-                            //Step 3c: If a shipment exists, update it
-                            this.createShipment(false);
-                        }
-                    }
-                    else
-                    {
-                        tmsShipmentTable = this.initTMSShipment();
-                        //Step 4: If order is on an existing shipment and there is a change to either Route or Ship date
-                        if (tmsShipmentOrderTable.ShipmentId != shipmentId)
-                        {
-                            //Step 4a: Get the “TMS Shipment” record related to the “TMS Shipment Order”
-                            tmsShipmentTableCancel = METTMSShipmentTable::find(tmsShipmentOrderTable.ShipmentId);
-
-                            //Step 4c: Update the current “TMS Shipment” - cancel it
-                            this.cancelShipment(salesTable.SalesId);
-
-                            //Step 4d: Link the sales order to a new shipment
-                            this.createShipment();
-                    
-                        }
-                        else
-                        {
-                            //Step 5: If order is on an existing shipment and there is no change to both Route and Ship date
-                            //delete Shipment itemgroup - recreate
-                            delete_from tmsShipmentOrderTable
-                            where tmsShipmentOrderTable.ShipmentId == shipmentId;
-                            //Step 3d: Create TMS Shipment Order record
-                            //Step 4d: Link the sales order to a new shipment
-                            this.createShipment(false);
-                        }
-                    }
-
-                    //Step 6: Update order and shipment totals
-                    //Step 6a: Update the order’s “Order weight”
-                    //Step 6b: Update the order’s “Order volume”
-                    //Step 6c: Update order’s “Pallet Total footprint”
-                    this.updateTMSShipmentOrder();
-
-                    //Step 6d: Update the shipment’s “Pallet lifts”
-                    this.updateTMSShipment();
-                    
-                    ttscommit;
-                }
-                catch (Exception::Error)
-                {
-                    //An error occurs during the creation or updates of the staging records
-                    error(strFmt("@MET:TMSEngineSalesOrderProcessCreation", salesTable.SalesId));
-                }
-            }
+            //super();
         }
     }
 
@@ -171,6 +125,51 @@ internal final class METTMSEngineSalesOrderProccess_PackingSlip extends METTMSEn
         // If a TS record is not found for the selection in step 3a, create a new one with values as defined in Step 3b of the CB624 FSD, 
         // with the extra value for Delivery note number from The Delivery Note journals Delivery note
         _tmsShipmentTable.DeliveryNoteNumber = packingSlipId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTMSShipment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Step 3c: If a shipment exists, update it and also the delivery note number
+    /// </summary>
+    void updateTMSShipment()
+    {
+        METTMSShipmentTable         tmsShipmentTable;
+        METTMSShipmentOrderTable    tmsShipmentOrderTable;
+
+        update_recordset tmsShipmentTable
+            setting TMSSendStatus = METTMSSendStatus::ToBeSent,
+                    ShipmentStatus = METCashShipmentStatus::Active,
+                    PalletLifts = tmsShipmentOrderTable.PalletTotalFootprint,
+                    // CB626_TMSEngineSOPackingSlip not sure if we can make update_recordset dynamic to set that extra field
+                    DeliveryNoteNumber = packingSlipId
+            join sum(PalletTotalFootprint) from tmsShipmentOrderTable
+                where tmsShipmentOrderTable.ShipmentId == tmsShipmentTable.ShipmentID
+                    && tmsShipmentOrderTable.OrderNumber == salesTable.SalesId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setTMSShipmentOrderFields</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to set the fields for <c>METTMSShipmentOrderTable</c> record
+    /// </summary>
+    /// <param name = "_tmsShipmentOrderTable"><c>METTMSShipmentOrderTable</c> record</param>
+    protected void setTMSShipmentOrderFields(METTMSShipmentOrderTable _tmsShipmentOrderTable)
+    {
+        super(_tmsShipmentOrderTable);
+
+        // Step 3d: Create TSO record
+        // As this is an order not processed by “TMS Engine” in past, create a TSO record to capture details of this order similar to 
+        // what was defined in “Step 3d” of the CB624 FSD, with the following differences an extra Pick List ID field as defined in the table below.
+        _tmsShipmentOrderTable.PickListId = salesOrderShipmentLoadLines.PickingListNum;
+
+        // TODO Where CCR data is available, calculations of some of the quantity / counts are different, as shown in the table below.
     }
 
 ]]></Source>
