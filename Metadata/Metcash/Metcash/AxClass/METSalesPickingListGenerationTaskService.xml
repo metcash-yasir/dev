@@ -123,17 +123,23 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
     /// Post picking list
     /// </summary>
     /// <param name = "_salesTable">SalesTable buffer.</param>
-    private void postPickingList(SalesTable     _salesTable)
+    private void postPickingList(SalesTable _salesTable)
     {
-        SalesFormLetter             salesFormLetter;
-        SalesParmLine               salesParmLine;
-        boolean                     isError;
+        boolean             isError;
+        QueryRun            queryRun;
+        SalesParmLine       salesParmLine;
+        SalesFormLetter     salesFormLetter;
 
         try
         {
             ttsbegin;
 
+            //NS-Created for CB274 - Intercompany Transfers.
+            queryRun = this.calcQuery(_salesTable);
+            //NE-Created for CB274 - Intercompany Transfers.
+
             salesFormLetter = SalesFormLetter::construct(DocumentStatus::PickingList);
+            salesFormLetter.chooseLinesQuery(queryRun);
             salesFormLetter.salesTable(_salestable);
             salesFormLetter.initParmSalesTable(salesFormLetter.salesTable());
             salesFormLetter.transDate(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
@@ -189,6 +195,9 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
                                                                                                                 salesTable.SalesId);
             shipmentLoadCreation.createShippmentLoad(true,false);
 
+            
+            METSalesOrderShipmentLoadHeader::createShippmentLoadFromSalesTable(_salesTable.SalesId, true, false);
+            //METSalesOrderShipmentLoadHeader::generateShipmentLoadFromExtraction([_salestable.SalesId], true, false);
             ttscommit;
 
             select firstonly wmsPickingRoute 
@@ -218,6 +227,94 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
             salesTable.selectForUpdate(true);
             salesTable.metUpdateExtractStatus();
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Created for the CB274 - Intercompany Transfers.
+    /// Exclude the SO  line for extraction if it's a food item.
+    /// Create a Purchase order for the food item line.
+    /// </summary>
+    /// <param name = "_shipmentId">Shipment Id reference</param>
+    /// <returns>SysQueryRun</returns>
+    private SysQueryRun calcQuery(SalesTable _salesTable)
+    {
+        str                     oscCode;
+        Query                   qry = new Query(QueryStr(SalesUpdate));
+        RefRecId                salesLineRecId;
+        SalesLine               salesLine;
+        QueryBuildRange         qbrSalesLine;
+        QueryBuildDataSource    qbdsSalesLine;
+
+        qbdsSalesLine = qry.dataSourceTable(tableNum(SalesLine));
+
+        while select salesLine
+            where salesLine.SalesId == _salesTable.SalesId
+        {
+            oscCode = InventTable::metGetOSCCode(salesLine.ItemId, salesLine.inventDim());
+            
+            if (oscCode == 'G' && SalesTable::find(salesLine.SalesId).METIntercompanyTransferFulfillment == NoYes::Yes)
+            {
+                this.createPOForIntercompanyFulfillment(salesLine);
+            }
+            else
+            {
+                salesLineRecId  = salesLine.RecId;
+                qbrSalesLine    = qbdsSalesLine.addRange(fieldnum(SalesLine, RecId));
+                
+                qbrSalesLine.value(SysQuery::value(salesLineRecId));
+            }
+        }
+        return new sysQueryRun(qry);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPOForIntercompanyFulfillment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create the Purchase order.
+    /// </summary>
+    /// <param name = "_salesTable"></param>
+    /// <param name = "_salesLine"></param>
+    public void createPOForIntercompanyFulfillment(SalesLine _salesLine)
+    {
+        boolean             isIncluded = NoYes::Yes;
+        InventTable         inventTable;
+        TmpPurchLinePrice   tmpPurchLinePrice;
+       
+        //Insert <c>SalesLine</c> record into <c>TmpPurchLinePrice</c>.
+        tmpPurchLinePrice.clear();
+
+        tmpPurchLinePrice.SalesId           = _salesLine.SalesId;
+        tmpPurchLinePrice.LineNum           = _salesLine.LineNum;
+        tmpPurchLinePrice.PurchQty          = _salesLine.SalesQty;
+        tmpPurchLinePrice.Included          = isIncluded;
+
+        select firstonly PrimaryVendorId from inventTable
+            where inventTable.ItemId == _salesLine.ItemId
+            && inventTable.PrimaryVendorId != '';
+
+        if (inventTable.RecId)
+        {
+            tmpPurchLinePrice.AccountNum        = inventTable.PrimaryVendorId;
+            tmpPurchLinePrice.SalesLineRefRecId = _salesLine.RecId;
+
+            tmpPurchLinePrice.insert();
+
+            //Create the purchase order from the extracted sales order.
+            PurchCreateFromSalesOrder purchCreateFromSalesOrder = PurchCreateFromSalesOrder::newPurchCreateFromSalesOrder(TradeLineDlvType::None);
+            purchCreateFromSalesOrder.parmSalesTable(salesTable);
+            purchCreateFromSalesOrder.parmCallerRecord(salesTable);
+            purchCreateFromSalesOrder.parmTmpPurchLinePrice(tmpPurchLinePrice);
+            purchCreateFromSalesOrder.runOperation();
+        }
+        
     }
 
 ]]></Source>
