@@ -87,10 +87,25 @@ internal class METTMSEngineSalesOrderProccess
 
             // CB626_TMSEngineSOPackingSlip
             case (METTMSEngineSalesOrderProcess::PackingSlip) :
-                if (_sourceRecord is SalesTable
-                &&  _postingIdentifier)
+                if (_sourceRecord is METSalesOrderShipmentLoadHeader)
                 {
-                    process = new METTMSEngineSalesOrderProccess_PackingSlip(_sourceRecord, _postingIdentifier);
+                    METSalesOrderShipmentLoadHeader shipmentHeader = _sourceRecord as METSalesOrderShipmentLoadHeader;
+                    
+                    // Manual retrigger from shipment form
+                    if (!_postingIdentifier)
+                    {
+                        // retrieve the delivery note from the journal
+                        _postingIdentifier = (CustPackingSlipJour::METFindLoadShipment(shipmentHeader.LoadId, shipmentHeader.ShipmentId)).PackingSlipId;
+                    }
+                    
+                    if (_postingIdentifier)
+                    {
+                        process = new METTMSEngineSalesOrderProccess_PackingSlip(_sourceRecord, _postingIdentifier);
+                    }
+                    else
+                    {
+                        error = true;
+                    }
                 }
                 else
                 {
@@ -120,15 +135,22 @@ internal class METTMSEngineSalesOrderProccess
     {
         METTMSEngineSalesOrderProcess   tmsEngineSalesOrderProcess;
         SalesTable                      salesTableLoc;
+        Common common;
 
-        if (_args.record() &&
-            _args.record().TableId == tableNum(SalesTable))
+        if (_args.record() /*&&
+            _args.record().TableId == tableNum(SalesTable)*/)
         {
             tmsEngineSalesOrderProcess = _args.parmEnum();
-            salesTableLoc = _args.record();
-            METTMSEngineSalesOrderProccess process = METTMSEngineSalesOrderProccess::construct(tmsEngineSalesOrderProcess, salesTableLoc);
+            common = _args.record();
+            METTMSEngineSalesOrderProccess process = METTMSEngineSalesOrderProccess::construct(tmsEngineSalesOrderProcess, common);
 
             process.run();
+
+            if (common is SalesTable)
+            {
+                salesTableLoc = common as SalesTable;
+            }
+
             if (process.isShipmentCreated())
             {
                 info(strFmt("@MET:TMSEngineSuccessMessage", salesTableLoc.SalesId));
@@ -162,7 +184,11 @@ internal class METTMSEngineSalesOrderProccess
         metSalesTable           = METSalesTable::findByRefRecId(salesTable.RecId);
         metInventLocation       = METInventLocation::findByInventLocationId(salesTable.InventLocationId);
         
-        isToteCustomer          = this.isToteCustomer();        
+        isToteCustomer          = this.isToteCustomer();  
+      
+        // Added as never initialized
+        whsPalletVolume = METInventLocation.WHSPalletVolume;
+        whsPalletWeight = METInventLocation.WHSPalletWeight;
     }
 
 ]]></Source>
@@ -270,10 +296,13 @@ internal class METTMSEngineSalesOrderProccess
         METTMSShipmentTable         tmsShipmentTableCancel;
         METTMSShipmentOrderTable    tmsShipmentOrderTable;
 
+        // TODO TEST making temp table permanent to check data and why results are different from test scenario
+        //delete_from proccessLinesTmp;
+
         //Step 1: check if order should be excluded from TMS Engine processing
         if (this.validate())
         {
-            proccessLinesTmp = this.initTmpTable();
+            /*proccessLinesTmp = */this.initTmpTable();
             try
             {
                 ttsbegin;
@@ -346,13 +375,13 @@ internal class METTMSEngineSalesOrderProccess
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>initTmpTable</Name>
+				<Name>DELinitTmpTable</Name>
 				<Source><![CDATA[
     /// <summary>
     /// Initialise temporary table with calculations
     /// </summary>
     /// <returns><c>METTMSEngineSalesOrderProccessLinesTmp</c> object</returns>
-    METTMSEngineSalesOrderProccessLinesTmp initTmpTable()
+    METTMSEngineSalesOrderProccessLinesTmp DELinitTmpTable()
     {
         METTMSEngineSalesOrderProccessLinesTmp      linesTmp;
         SalesLine                   salesLine;
@@ -365,45 +394,35 @@ internal class METTMSEngineSalesOrderProccess
 
         while (qr.next())
         {
-            salesLine = qr.get(tableNum(SalesLine));
-            linesTmp.clear();
-            linesTmp.ItemId     = salesLine.ItemId;
-            linesTmp.SalesId    = salesLine.SalesId;
-            linesTmp.SalesUnit  = salesLine.SalesUnit;
-            linesTmp.SalesQty   = this.lineShipQty(salesLine);
-            //if the Sale line’s Item Type = Inventory & Warehouse Management Parameters’ “Tobacco Metcash item type” set IsTobaccoItem = Yes
-            select firstonly ItemType, FilterCode from metInventItemOrderSetup
-                where  metInventItemOrderSetup.SiteId == salesLine.inventDim().InventSiteId
-                    && metInventItemOrderSetup.ItemId == salesLine.ItemId;
-
-            //METTobaccoItemType should not be blank
-            linesTmp.IsTobaccoItem = (metInventItemOrderSetup.ItemType == inventParameters.METTobaccoItemType && inventParameters.METTobaccoItemType != '') ? NoYes::Yes : NoYes::No;
-
-            linesTmp.IsKegItem      = this.isKegItem(linesTmp.ItemId);
-            linesTmp.LineCommodity  = this.getLineCommodity(linesTmp.IsTobaccoItem, metInventItemOrderSetup.FilterCode);
-            linesTmp.CaseQty_CaseLines  = (linesTmp.IsKegItem == NoYes::No && linesTmp.IsTobaccoItem == NoYes::No && linesTmp.SalesUnit != unitEA) ? linesTmp.SalesQty : 0;
-            linesTmp.BrokenCasesCountSecurity = linesTmp.IsTobaccoItem == NoYes::Yes ? linesTmp.SalesQty : 0;
-            linesTmp.BrokenCasesCountNonSecurity = (linesTmp.IsKegItem == NoYes::No && linesTmp.IsTobaccoItem == NoYes::No && linesTmp.SalesUnit == unitEA) ? linesTmp.SalesQty : 0;
-            linesTmp.RepackCountSecurity = tobaccoRepackQtyFactor ? linesTmp.BrokenCasesCountSecurity/tobaccoRepackQtyFactor : 0;
-            linesTmp.RepackCountNonSecurity = standardRepackQtyFactor ? linesTmp.BrokenCasesCountNonSecurity/standardRepackQtyFactor : 0;
-            linesTmp.KegQtyUOM      = this.getKegQtyUOM(salesLine.ItemId);
-
-            [linesTmp.LineUnitVolume, linesTmp.LineUnitWeight] = this.getLineUnitVolumeWeight(salesLine.ItemId, salesLine.inventDim(),salesLine.SalesUnit);
-
-            linesTmp.LineVolume_CaseLines  = linesTmp.CaseQty_CaseLines * linesTmp.LineUnitVolume;
-            linesTmp.LineVolume_BrokenCaseSecurity = linesTmp.BrokenCasesCountSecurity * linesTmp.LineUnitVolume;
-            linesTmp.LineVolume_BrokenCaseNonSecurity = linesTmp.BrokenCasesCountNonSecurity * linesTmp.LineUnitVolume;
-            linesTmp.LineVolume_Kegs = linesTmp.IsKegItem ? linesTmp.SalesQty * linesTmp.LineUnitVolume : 0;
-            
-            linesTmp.LineWeight_BrokenCaseNonSecurity = linesTmp.BrokenCasesCountNonSecurity * linesTmp.LineUnitWeight;
-            linesTmp.LineWeight_BrokenCaseSecurity = linesTmp.BrokenCasesCountSecurity * linesTmp.LineUnitWeight;
-            linesTmp.LineWeight_CaseLines = linesTmp.CaseQty_CaseLines * linesTmp.LineUnitWeight;
-            linesTmp.LineWeight_Kegs = linesTmp.IsKegItem ? linesTmp.SalesQty * linesTmp.LineUnitWeight : 0;
-
-            linesTmp.insert();
+            linesTmp = this.DELcreateTempTableRecords(qr, linesTmp);
         }
 
         return linesTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTmpTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialise temporary table with calculations
+    /// </summary>
+    /// <returns><c>METTMSEngineSalesOrderProccessLinesTmp</c> object</returns>
+    void initTmpTable()
+    {
+        SalesLine                   salesLine;
+        METInventItemOrderSetup     metInventItemOrderSetup;
+        
+        splitGroupTable = MetSplitGroupTable::find(metSalesTable.OrderSplitGroup);
+        this.initRepackQtyFactor();
+
+        QueryRun qr = new QueryRun(this.initSalesLineQuery());
+
+        while (qr.next())
+        {
+            this.createTempTableRecords(qr);
+        }
     }
 
 ]]></Source>
@@ -495,6 +514,35 @@ internal class METTMSEngineSalesOrderProccess
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>hasCustomerToteAttributeType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// To check if the customer has Tote type (attribute type) defined under inventory parameters > Metcash > Attribute identifiers
+    /// </summary>
+    /// <returns></returns>
+    boolean hasCustomerToteAttributeType()
+    {
+        RetailEcoResInstanceAttributeValuesView attributeValuesTable;
+        CustomerInstanceValue   instanceValue;
+        METAttributeIdentifiers attributeIdentifiers;
+
+        select firstonly crosscompany RecId from instanceValue
+            where instanceValue.AccountNum == salesTable.CustAccount
+            && instanceValue.CustomerDataAreaId == salesTable.DataAreaId;
+
+        select firstonly InstanceRecId from attributeValuesTable
+            where   attributeValuesTable.InstanceRecId == instanceValue.RecId
+            exists join attributeIdentifiers
+                where   attributeIdentifiers.Attribute == attributeValuesTable.AttributeDefinitionRecId
+                    &&  attributeIdentifiers.AttributeSource == METAttributeSource::Customer
+                    &&  attributeIdentifiers.AttributeIdentifier == METAttributeIdentifier::TOTE;
+
+        return attributeValuesTable.InstanceRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>getLineCommodity</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -535,25 +583,29 @@ internal class METTMSEngineSalesOrderProccess
     {
         METContainerTypeTable   containerTypeTable;
 
-        //default
+        //default values when no containerTypeTable
         tobaccoRepackQtyFactor = tobaccoRepackQtyFactorDefault;
         standardRepackQtyFactor = standardRepackQtyFactorDefault;
 
-        if (!isToteCustomer)
+        if (this.hasCustomerToteAttributeType())
         {
-            tobaccoRepackQtyFactor = 1;
-            standardRepackQtyFactor = 1;
-        }
-        else
-        {
-            containerTypeTable   = METContainerTypeTable::find(inventParameters.METCardboardContainerID, salesTable.InventLocationId);
-            if (containerTypeTable.recId)
+            // Tote customer search for Plastic (tote) container ID else Cardboard container ID
+            WHSContainerTypeCode containerTypeCode = isToteCustomer ? inventParameters.METPlasticContainerID : inventParameters.METCardboardContainerID;
+            
+            containerTypeTable   = METContainerTypeTable::find(containerTypeCode, salesTable.InventLocationId);
+            if (containerTypeTable)
             {
                 tobaccoRepackQtyFactor  = containerTypeTable.TobaccoRepackQty;
-                standardRepackQtyFactor = containerTypeTable.TobaccoRepackQty;
+                standardRepackQtyFactor = containerTypeTable.GroceryRepackQty;
+                //whsPalletVolume = containerTypeTable.ContainerVolume; //Added as never initialise in class
             }
         }
-
+        // only when the customer doesn't have "Tote type" attribute type set repack qty to 1
+        else
+        {
+            tobaccoRepackQtyFactor = 1;
+            standardRepackQtyFactor = 1;                       
+        }
     }
 
 ]]></Source>
@@ -901,10 +953,21 @@ internal class METTMSEngineSalesOrderProccess
         _tmsShipmentOrderTable.ShipmentId = shipmentId;
         _tmsShipmentOrderTable.OrderNumber = salesTable.SalesId;
         _tmsShipmentOrderTable.IsCrossDockOrder = NoYes::No;
-        _tmsShipmentOrderTable.BrokenCaseItemQtySecurity = this.getBrokenCasesCountSecurity();
+
+        // Vincent change
+        METTMSEngineSalesOrderProccessLinesTmp  linesTmp;
+        linesTmp.linkPhysicalTableInstance(proccessLinesTmp);
+        select sum(BrokenCasesCountNonSecurity), sum(BrokenCasesCountSecurity), sum(RepackCountNonSecurity), sum(RepackCountSecurity) from linesTmp;
+
+        /*_tmsShipmentOrderTable.BrokenCaseItemQtySecurity = this.getBrokenCasesCountSecurity();
         _tmsShipmentOrderTable.BrokenCaseItemQtyNonSecurity = this.getBrokenCasesCountNonSecurity();
         _tmsShipmentOrderTable.RepackCaseCountSecurity = tobaccoRepackQtyFactor ? _tmsShipmentOrderTable.BrokenCaseItemQtySecurity/tobaccoRepackQtyFactor : 0;
-        _tmsShipmentOrderTable.RepackCaseCountNonSecurity = standardRepackQtyFactor ? _tmsShipmentOrderTable.RepackCaseCountNonSecurity/standardRepackQtyFactor : 0;
+        _tmsShipmentOrderTable.RepackCaseCountNonSecurity = standardRepackQtyFactor ? _tmsShipmentOrderTable.RepackCaseCountNonSecurity/standardRepackQtyFactor : 0;*/
+        _tmsShipmentOrderTable.BrokenCaseItemQtySecurity = linesTmp.BrokenCasesCountSecurity;
+        _tmsShipmentOrderTable.BrokenCaseItemQtyNonSecurity = linesTmp.BrokenCasesCountNonSecurity;
+        _tmsShipmentOrderTable.RepackCaseCountSecurity = linesTmp.RepackCountSecurity;
+        _tmsShipmentOrderTable.RepackCaseCountNonSecurity = linesTmp.RepackCountNonSecurity;
+
         _tmsShipmentOrderTable.CaseCountShipped = _tmsShipmentOrderTable.BrokenCaseItemQtyNonSecurity + this.getRepackContainersByCommodity();
         _tmsShipmentOrderTable.CaseCountSecurity = _tmsShipmentOrderTable.RepackCaseCountSecurity;
         _tmsShipmentOrderTable.SSCC = '';
@@ -925,8 +988,10 @@ internal class METTMSEngineSalesOrderProccess
     {
         METTMSEngineSalesOrderProccessLinesTmp  linesTmp;
         linesTmp.linkPhysicalTableInstance(proccessLinesTmp);
-        select sum(SalesQty) from linesTmp
-            where linesTmp.IsTobaccoItem == NoYes::Yes;
+        
+        /*select sum(SalesQty) from linesTmp
+            where linesTmp.IsTobaccoItem == NoYes::Yes;*/
+        select sum(BrokenCasesCountSecurity) from linesTmp;
 
         return linesTmp.SalesQty;
     }
@@ -945,7 +1010,8 @@ internal class METTMSEngineSalesOrderProccess
         METTMSEngineSalesOrderProccessLinesTmp  linesTmp;
         linesTmp.linkPhysicalTableInstance(proccessLinesTmp);
 
-        select sum(CaseQty_CaseLines) from linesTmp;
+        //select sum(CaseQty_CaseLines) from linesTmp;
+        select sum(BrokenCasesCountNonSecurity) from linesTmp;
 
         return linesTmp.CaseQty_CaseLines;
     }
@@ -1140,7 +1206,7 @@ internal class METTMSEngineSalesOrderProccess
             case unitCSE :
                 tmsShipmentItemGroup.Quantity   = isToteCustomer ? _lineTmp.CaseQty_CaseLines : (_lineTmp.CaseQty_CaseLines + repackContainersByCommodity);
                 tmsShipmentItemGroup.Weight     =  isToteCustomer ? _lineTmp.LineWeight_CaseLines : (_lineTmp.LineWeight_CaseLines + _lineTmp.LineWeight_BrokenCaseSecurity + _lineTmp.LineWeight_BrokenCaseNonSecurity);
-                tmsShipmentItemGroup.Cube       = isToteCustomer ? _lineTmp.LineVolume_CaseLines : (_lineTmp.LineVolume_CaseLines + whsPalletVolume * repackContainersByCommodity);
+                tmsShipmentItemGroup.Cube       = isToteCustomer ? _lineTmp.LineVolume_CaseLines : (_lineTmp.LineVolume_CaseLines + /*whsPalletVolume*/whsCaseVolume * repackContainersByCommodity);
                 break;
 
             case unitTOT :
@@ -1236,13 +1302,174 @@ internal class METTMSEngineSalesOrderProccess
 				<Name>lineShipQty</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// return sales order quantity
+    /// Manages the lineShipQty variable
     /// </summary>
-    /// <param name = "_salesLine"></param>
-    /// <returns></returns>
+    /// <param name = "_salesLine">Sales order line</param>
+    /// <returns>Sales order quantity</returns>
     Qty lineShipQty(SalesLine   _salesLine)
     {
         return _salesLine.SalesQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTablesQueryRun</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get tables from _queryRun object used to fill the temp table
+    /// </summary>
+    /// <param name = "_queryRun"><c>QueryRun</c> object used to fill the temp table</param>
+    /// <returns>Container of records from the <c>QueryRun</c> object</returns>
+    protected container getTablesQueryRun(QueryRun _queryRun)
+    {
+        return [_queryRun.get(tableNum(SalesLine))];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>DELcreateTempTableRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to create the METTMSEngineSalesOrderProccessLinesTmp records from the QueryRun
+    /// </summary>
+    /// <param name = "_queryRun"><c>QueryRun</c> object</param>
+    /// <param name = "_linesTmp">Temp table</param>
+    protected METTMSEngineSalesOrderProccessLinesTmp DELcreateTempTableRecords(QueryRun _queryRun, METTMSEngineSalesOrderProccessLinesTmp _linesTmp)
+    {
+        SalesLine   salesLine;
+        
+        [salesLine] = this.getTablesQueryRun(_queryRun);
+        
+        _linesTmp = this.DELinitLineTmp(salesLine);
+
+        _linesTmp.insert();
+
+        return _linesTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTempTableRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to create the METTMSEngineSalesOrderProccessLinesTmp records from the QueryRun
+    /// </summary>
+    /// <param name = "_queryRun"><c>QueryRun</c> object</param>
+    /// <param name = "_linesTmp">Temp table</param>
+    protected void createTempTableRecords(QueryRun _queryRun)
+    {
+        SalesLine   salesLine;
+        
+        [salesLine] = this.getTablesQueryRun(_queryRun);
+        
+        /*proccessLinesTmp = */this.initLineTmp(salesLine);
+
+        //proccessLinesTmp.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>DELinitLineTmp</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to initialise the METTMSEngineSalesOrderProccessLinesTmp temp record from SalesLine
+    /// </summary>
+    /// <param name = "_salesLine">Sales order line</param>
+    /// <returns>Initialised buffer <c>METTMSEngineSalesOrderProccessLinesTmp</c></returns>
+    protected METTMSEngineSalesOrderProccessLinesTmp DELinitLineTmp(SalesLine _salesLine)
+    {
+        METTMSEngineSalesOrderProccessLinesTmp linesTmp;
+        METInventItemOrderSetup     metInventItemOrderSetup;
+
+        linesTmp.ItemId     = _salesLine.ItemId;
+        linesTmp.SalesId    = _salesLine.SalesId;
+        linesTmp.SalesUnit  = _salesLine.SalesUnit;
+        linesTmp.SalesQty   = this.lineShipQty(_salesLine);
+        //if the Sale line’s Item Type = Inventory & Warehouse Management Parameters’ “Tobacco Metcash item type” set IsTobaccoItem = Yes
+        select firstonly ItemType, FilterCode from metInventItemOrderSetup
+                where  metInventItemOrderSetup.SiteId == _salesLine.inventDim().InventSiteId
+                    && metInventItemOrderSetup.ItemId == _salesLine.ItemId;
+
+        //METTobaccoItemType should not be blank
+        linesTmp.IsTobaccoItem = (metInventItemOrderSetup.ItemType == inventParameters.METTobaccoItemType && inventParameters.METTobaccoItemType != '') ? NoYes::Yes : NoYes::No;
+
+        linesTmp.IsKegItem      = this.isKegItem(linesTmp.ItemId);
+        linesTmp.LineCommodity  = this.getLineCommodity(linesTmp.IsTobaccoItem, metInventItemOrderSetup.FilterCode);
+        linesTmp.CaseQty_CaseLines  = (linesTmp.IsKegItem == NoYes::No && linesTmp.IsTobaccoItem == NoYes::No && linesTmp.SalesUnit != unitEA) ? linesTmp.SalesQty : 0;
+        linesTmp.BrokenCasesCountSecurity = linesTmp.IsTobaccoItem == NoYes::Yes ? linesTmp.SalesQty : 0;
+        linesTmp.BrokenCasesCountNonSecurity = (linesTmp.IsKegItem == NoYes::No && linesTmp.IsTobaccoItem == NoYes::No && linesTmp.SalesUnit == unitEA) ? linesTmp.SalesQty : 0;
+        linesTmp.RepackCountSecurity = tobaccoRepackQtyFactor ? linesTmp.BrokenCasesCountSecurity/tobaccoRepackQtyFactor : 0;
+        linesTmp.RepackCountNonSecurity = standardRepackQtyFactor ? linesTmp.BrokenCasesCountNonSecurity/standardRepackQtyFactor : 0;
+        linesTmp.KegQtyUOM      = this.getKegQtyUOM(_salesLine.ItemId);
+
+        [linesTmp.LineUnitVolume, linesTmp.LineUnitWeight] = this.getLineUnitVolumeWeight(_salesLine.ItemId, _salesLine.inventDim(),_salesLine.SalesUnit);
+
+        linesTmp.LineVolume_CaseLines  = linesTmp.CaseQty_CaseLines * linesTmp.LineUnitVolume;
+        linesTmp.LineVolume_BrokenCaseSecurity = linesTmp.BrokenCasesCountSecurity * linesTmp.LineUnitVolume;
+        linesTmp.LineVolume_BrokenCaseNonSecurity = linesTmp.BrokenCasesCountNonSecurity * linesTmp.LineUnitVolume;
+        linesTmp.LineVolume_Kegs = linesTmp.IsKegItem ? linesTmp.SalesQty * linesTmp.LineUnitVolume : 0;
+            
+        linesTmp.LineWeight_BrokenCaseNonSecurity = linesTmp.BrokenCasesCountNonSecurity * linesTmp.LineUnitWeight;
+        linesTmp.LineWeight_BrokenCaseSecurity = linesTmp.BrokenCasesCountSecurity * linesTmp.LineUnitWeight;
+        linesTmp.LineWeight_CaseLines = linesTmp.CaseQty_CaseLines * linesTmp.LineUnitWeight;
+        linesTmp.LineWeight_Kegs = linesTmp.IsKegItem ? linesTmp.SalesQty * linesTmp.LineUnitWeight : 0;
+
+        return linesTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initLineTmp</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to initialise the METTMSEngineSalesOrderProccessLinesTmp temp record from SalesLine
+    /// </summary>
+    /// <param name = "_salesLine">Sales order line</param>
+    /// <returns>Initialised buffer <c>METTMSEngineSalesOrderProccessLinesTmp</c></returns>
+    protected void initLineTmp(SalesLine _salesLine)
+    {
+        METInventItemOrderSetup     metInventItemOrderSetup;
+
+        proccessLinesTmp.clear();
+        proccessLinesTmp.ItemId     = _salesLine.ItemId;
+        proccessLinesTmp.SalesId    = _salesLine.SalesId;
+        proccessLinesTmp.SalesUnit  = _salesLine.SalesUnit;
+        proccessLinesTmp.SalesQty   = this.lineShipQty(_salesLine);
+        //if the Sale line’s Item Type = Inventory & Warehouse Management Parameters’ “Tobacco Metcash item type” set IsTobaccoItem = Yes
+        select firstonly ItemType, FilterCode from metInventItemOrderSetup
+                where  metInventItemOrderSetup.SiteId == _salesLine.inventDim().InventSiteId
+                    && metInventItemOrderSetup.ItemId == _salesLine.ItemId;
+
+        //METTobaccoItemType should not be blank
+        proccessLinesTmp.IsTobaccoItem = (metInventItemOrderSetup.ItemType == inventParameters.METTobaccoItemType && inventParameters.METTobaccoItemType != '') ? NoYes::Yes : NoYes::No;
+
+        proccessLinesTmp.IsKegItem      = this.isKegItem(proccessLinesTmp.ItemId);
+        proccessLinesTmp.LineCommodity  = this.getLineCommodity(proccessLinesTmp.IsTobaccoItem, metInventItemOrderSetup.FilterCode);
+        proccessLinesTmp.CaseQty_CaseLines  = (proccessLinesTmp.IsKegItem == NoYes::No && proccessLinesTmp.IsTobaccoItem == NoYes::No && proccessLinesTmp.SalesUnit != unitEA) ? proccessLinesTmp.SalesQty : 0;
+        proccessLinesTmp.BrokenCasesCountSecurity = proccessLinesTmp.IsTobaccoItem == NoYes::Yes ? proccessLinesTmp.SalesQty : 0;
+        proccessLinesTmp.BrokenCasesCountNonSecurity = (proccessLinesTmp.IsKegItem == NoYes::No && proccessLinesTmp.IsTobaccoItem == NoYes::No && proccessLinesTmp.SalesUnit == unitEA) ? proccessLinesTmp.SalesQty : 0;
+        proccessLinesTmp.RepackCountSecurity = tobaccoRepackQtyFactor ? proccessLinesTmp.BrokenCasesCountSecurity/tobaccoRepackQtyFactor : 0;
+        proccessLinesTmp.RepackCountNonSecurity = standardRepackQtyFactor ? proccessLinesTmp.BrokenCasesCountNonSecurity/standardRepackQtyFactor : 0;
+        proccessLinesTmp.KegQtyUOM      = this.getKegQtyUOM(_salesLine.ItemId);
+
+        [proccessLinesTmp.LineUnitVolume, proccessLinesTmp.LineUnitWeight] = this.getLineUnitVolumeWeight(_salesLine.ItemId, _salesLine.inventDim(),_salesLine.SalesUnit);
+
+        proccessLinesTmp.LineVolume_CaseLines  = proccessLinesTmp.CaseQty_CaseLines * proccessLinesTmp.LineUnitVolume;
+        proccessLinesTmp.LineVolume_BrokenCaseSecurity = proccessLinesTmp.BrokenCasesCountSecurity * proccessLinesTmp.LineUnitVolume;
+        proccessLinesTmp.LineVolume_BrokenCaseNonSecurity = proccessLinesTmp.BrokenCasesCountNonSecurity * proccessLinesTmp.LineUnitVolume;
+        proccessLinesTmp.LineVolume_Kegs = proccessLinesTmp.IsKegItem ? proccessLinesTmp.SalesQty * proccessLinesTmp.LineUnitVolume : 0;
+            
+        proccessLinesTmp.LineWeight_BrokenCaseNonSecurity = proccessLinesTmp.BrokenCasesCountNonSecurity * proccessLinesTmp.LineUnitWeight;
+        proccessLinesTmp.LineWeight_BrokenCaseSecurity = proccessLinesTmp.BrokenCasesCountSecurity * proccessLinesTmp.LineUnitWeight;
+        proccessLinesTmp.LineWeight_CaseLines = proccessLinesTmp.CaseQty_CaseLines * proccessLinesTmp.LineUnitWeight;
+        proccessLinesTmp.LineWeight_Kegs = proccessLinesTmp.IsKegItem ? proccessLinesTmp.SalesQty * proccessLinesTmp.LineUnitWeight : 0;
+
+        proccessLinesTmp.insert();
     }
 
 ]]></Source>
