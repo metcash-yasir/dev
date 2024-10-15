@@ -318,7 +318,7 @@ internal class METTMSEngineSalesOrderProccess
                     //Step 3a: check if there is an existing shipment this order can be made part of.
                     if (!tmsShipmentTable.RecId)
                     {
-                        tmsShipmentTable = this.createShipment();
+                        this.createShipment();
                     }
                     else
                     {
@@ -328,7 +328,7 @@ internal class METTMSEngineSalesOrderProccess
                 }
                 else
                 {
-                    this.initTMSShipment();
+                    tmsShipmentTable = this.initTMSShipment();
                     //Step 4: If order is on an existing shipment and there is a change to either Route or Ship date
                     if (tmsShipmentOrderTable.ShipmentId != shipmentId)
                     {
@@ -338,8 +338,8 @@ internal class METTMSEngineSalesOrderProccess
                         //Step 4c: Update the current “TMS Shipment” - cancel it
                         this.cancelShipment(salesTable.SalesId);
 
-                        //Step 4d: Link the sales order to a new shipment
-                        tmsShipmentTable = this.createShipment();
+                        //Step 4d: Link the sales order to a new or existing shipment
+                        this.createShipment(!tmsShipmentTable);
                     
                     }
                     else
@@ -361,7 +361,7 @@ internal class METTMSEngineSalesOrderProccess
                 this.updateTMSShipmentOrder();
 
                 //Step 6d: Update the shipment’s “Pallet lifts”
-                this.updateTMSShipment(tmsShipmentTable.ShipmentID);
+                this.updateTMSShipment(shipmentId);
 
                 ttscommit;
             }
@@ -702,6 +702,9 @@ internal class METTMSEngineSalesOrderProccess
                 tMSShipmentTable.ShipmentStatus = METCashShipmentStatus::Cancelled;
             }
             tMSShipmentTable.update();
+
+            // to update the PalletLifts after removing the TSO, excluding delivery note number
+            this.updateTMSShipment(tMSShipmentTable.shipmentId, false);
         }
         ttscommit;
     }
@@ -731,8 +734,7 @@ internal class METTMSEngineSalesOrderProccess
     /// create tms shipment tables
     /// </summary>
     /// <param name = "_isCreateTMSShipment">boolean</param>
-    /// <returns>Created <c>METTMSShipmentTable</c> record</returns>
-    protected METTMSShipmentTable createShipment(boolean     _isCreateTMSShipment = true)
+    protected void createShipment(boolean     _isCreateTMSShipment = true)
     {
         METTMSShipmentOrderTable    tmsShipmentOrderTable;
         METTMSShipmentTable         tmsShipmentTable;
@@ -740,14 +742,12 @@ internal class METTMSEngineSalesOrderProccess
         //Step 3b: If no shipment exists, create a new one
         if (_isCreateTMSShipment)
         {
-            tmsShipmentTable = this.createTMSShipment();
+            this.createTMSShipment();
         }
         //Step 3d: Create TMS Shipment Order record
         tmsShipmentOrderTable = this.createTMSShipmentOrder();
         //Step 3e: Create TMS Shipment Item Group records
         this.createTMSShipmentItemGroup(tmsShipmentOrderTable.TMSShipmentOrderIdentifier);
-
-        return tmsShipmentTable;
     }
 
 ]]></Source>
@@ -802,15 +802,12 @@ internal class METTMSEngineSalesOrderProccess
     /// <summary>
     /// Step 3b: If no shipment exists, create a new one
     /// </summary>
-    /// <returns>Created <c>METTMSShipmentTable</c> record</returns>
-    protected METTMSShipmentTable createTMSShipment()
+    protected void createTMSShipment()
     {
         METTMSShipmentTable tmsShipmentTable;
         
         this.setTMSShipmentFields(tmsShipmentTable);
         tmsShipmentTable.insert();
-
-        return tmsShipmentTable;
     }
 
 ]]></Source>
@@ -881,27 +878,48 @@ internal class METTMSEngineSalesOrderProccess
     /// <summary>
     /// Step 3c: If a shipment exists, update it
     /// </summary>
-    /// <param name = "_tmsShipmentId">TMS Shipment Id</param>
-    void updateTMSShipment(METTMSShipmentID _tmsShipmentId)
+    /// <param name = "_shipmentId">TMS shipment Id</param>
+    /// <param name = "_updateDeliveryNoteNumber">Update delivery note number</param>
+    void updateTMSShipment(METTMSShipmentID _shipmentId, boolean _updateDeliveryNoteNumber = true)
     {
         METTMSShipmentTable         tmsShipmentTable;
         METTMSShipmentOrderTable    tmsShipmentOrderTable;
 
         // calc sum PalletTotalFootprint for the shipment
         select sum(PalletTotalFootprint) from tmsShipmentOrderTable
-                where tmsShipmentOrderTable.ShipmentId == shipmentId;
+                where tmsShipmentOrderTable.ShipmentId == _shipmentId;
 
-        update_recordset tmsShipmentTable
-            setting TMSSendStatus = METTMSSendStatus::ToBeSent,
-                    ShipmentStatus = METCashShipmentStatus::Active,
-                    PalletLifts = tmsShipmentOrderTable.PalletTotalFootprint
-            // VNG join sum doesn't seem to work with update_recordset
-              where tmsShipmentTable.ShipmentID == shipmentId;
-        /*join sum(PalletTotalFootprint) from tmsShipmentOrderTable
-                where tmsShipmentOrderTable.ShipmentId == tmsShipmentTable.ShipmentID 
-                   && tmsShipmentOrderTable.OrderNumber == salesTable.SalesId;
-                   && tmsShipmentOrderTable.ShipmentId == _tmsShipmentId;*/
+        // Create SysDaUpdateObject object
+        var uo = new SysDaUpdateObject(tmsShipmentTable);
 
+        // Update setting clause
+        this.updateTMSShipmentSettingClause(uo, tmsShipmentOrderTable.PalletTotalFootprint, _updateDeliveryNoteNumber);
+
+        // Add where clause
+        uo.whereClause(new SysDaEqualsExpression(
+                       new SysDaFieldExpression(tmsShipmentTable, fieldStr(METTMSShipmentTable, ShipmentID)),
+                       new SysDaValueExpression(_shipmentId)));
+
+        // execute update_recordset
+        new SysDaUpdateStatement().execute(uo);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTMSShipmentSettingClause</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update TS setting clause
+    /// </summary>
+    /// <param name = "_uo"><c>SysDaUpdateObject</c> instance</param>
+    /// <param name = "_palletTotalFootprint">Pallet total footprint</param>
+    /// <param name = "_updateDeliveryNoteNumber">Update delivery note number</param>
+    void updateTMSShipmentSettingClause(SysDaUpdateObject _uo, METQty _palletTotalFootprint, boolean _updateDeliveryNoteNumber)
+    {
+        _uo.settingClause().add(fieldStr(METTMSShipmentTable, TMSSendStatus), new SysDaValueExpression(METTMSSendStatus::ToBeSent));
+        _uo.settingClause().add(fieldStr(METTMSShipmentTable, ShipmentStatus), new SysDaValueExpression(METCashShipmentStatus::Active));
+        _uo.settingClause().add(fieldStr(METTMSShipmentTable, PalletLifts), new SysDaValueExpression(_palletTotalFootprint));
     }
 
 ]]></Source>
