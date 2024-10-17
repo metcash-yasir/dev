@@ -1,0 +1,469 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METTMSEngineLinesTmpBuilder</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// CB626_TMSEngineSOPackingSlip
+/// Class responsible for populating the TMS engine temp table (calculation table)
+/// </summary>
+abstract class METTMSEngineLinesTmpBuilder
+{
+    METTMSEngineSalesOrderProccessLinesTmp processLinesTmp;
+    SalesTable          salesTable;
+    InventLocation      inventLocation;
+    METInventLocation   metInventLocation;
+    InventParameters    inventParameters;
+    METTobaccoRepackQty tobaccoRepackQtyFactor;
+    METTobaccoRepackQty standardRepackQtyFactor;
+    METWHSPalletVolume  whsPalletVolume;
+    METWHSPalletVolume  whsToteVolume;
+    METWHSPalletVolume  whsCaseVolume;
+    METWHSPalletWeight  whsToteWeight;
+    METWHSPalletWeight  whsPalletWeight;
+    TMSCarrierCode      carrierCode;
+    boolean             isSalesOrderPerishable;
+    boolean             isToteCustomer;
+    MetSalesTable       metSalesTable;
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>lineShipQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Manages the lineShipQty variable
+    /// </summary>
+    /// <param name = "_salesLine">Sales order line</param>
+    /// <returns>Sales order quantity</returns>
+    protected abstract SalesOrderedQty lineShipQty(SalesLine   _salesLine)
+    {
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs a new TMS engine lines temp builder.
+    /// </summary>
+    /// <param name = "_tmsEngineProcess">METTMSEngineSalesOrderProcess</param>
+    /// <param name = "_salesTable">Sales order header record</param>
+    /// <param name = "_shipmentId">SO finalisation shipment id</param>
+    /// <returns>An instance of <c>METTMSEngineLinesTmpBuilder</c></returns>
+    public static METTMSEngineLinesTmpBuilder construct(METTMSEngineSalesOrderProcess _tmsEngineProcess, SalesTable _salesTable, METShipmentId _shipmentId = "")
+    {
+        METTMSEngineLinesTmpBuilder result;
+        boolean error = false;
+
+        switch (_tmsEngineProcess)
+        {
+            case (METTMSEngineSalesOrderProcess::Cancellation) :
+            case (METTMSEngineSalesOrderProcess::Creation) :
+                result = new METTMSEngineLinesTmpBuilder_Creation(_salesTable);                
+                break;
+
+            // Evgeniya TODO CB625
+
+            // CB626_TMSEngineSOPackingSlip
+            case (METTMSEngineSalesOrderProcess::PackingSlip) :
+                result = new METTMSEngineLinesTmpBuilder_PackingSlip(_salesTable, _shipmentId);
+                break;
+
+            default:
+                error = true;
+                break;
+        }
+
+        if (error)
+        {
+            throw error(strFmt("@SYS19306", funcName()));
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populateTmpTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Similar to what we had in METTMSEngineSalesOrderProccess\initTmpTable
+    /// </summary>
+    /// <returns>Temp table with all records inserted</returns>
+    public METTMSEngineSalesOrderProccessLinesTmp populateTmpTable()
+    {
+        QueryRun qr = new QueryRun(this.initQuery());
+
+        while (qr.next())
+        {
+            this.createTempTableRecords(qr);
+        }
+
+        return processLinesTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// initialize default parameters
+    /// </summary>
+    /// <param name = "_salesTable">SalesTable record</param>
+    protected void init(SalesTable _salesTable)
+    {
+        salesTable              = _salesTable;
+        inventParameters        = InventParameters::find();
+        carrierCode             = TMSSalesTable::find(_salesTable.SalesId).CarrierCode;
+        isSalesOrderPerishable  = _salesTable.METIsSalesOrderPerishable();
+        metSalesTable           = METSalesTable::findByRefRecId(salesTable.RecId);
+        metInventLocation       = METInventLocation::findByInventLocationId(salesTable.InventLocationId);
+        inventLocation          = InventLocation::find(salesTable.InventLocationId);
+        
+        isToteCustomer          = CustTable::METIsToteCustomer(salesTable.CustAccount, salesTable.DataAreaId);
+      
+        // Added as never initialized
+        whsPalletVolume = METInventLocation.WHSPalletVolume;
+        whsPalletWeight = METInventLocation.WHSPalletWeight;
+
+        this.initValuesFromContainerType(inventParameters, salesTable.InventLocationId);
+
+        this.initRepackQtyFactor(salesTable, inventParameters, isToteCustomer);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initValuesFromContainerType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// init values from Container type
+    /// </summary>
+    /// <param name = "_inventParameters">Inventory parameters record</param>
+    /// <param name = "_inventLocationId">Warehouse id</param>
+    protected void initValuesFromContainerType(InventParameters _inventParameters, InventLocationId _inventLocationId)
+    {
+        METContainerTypeTable   containerTypeTable;
+        containerTypeTable   = METContainerTypeTable::find(_inventParameters.METCardboardContainerID, _inventLocationId);
+        whsCaseVolume   = containerTypeTable.ContainerVolume;
+
+        containerTypeTable   = METContainerTypeTable::find(_inventParameters.METPlasticContainerID, _inventLocationId);
+        whsToteVolume   = containerTypeTable.ContainerVolume;
+        whsToteWeight   = containerTypeTable.Weight;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initRepackQtyFactor</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// init tobaccoRepackQtyFactor and standardRepackQtyFactor
+    /// </summary>
+    /// <param name = "_salesTable">Sales order header record</param>
+    /// <param name = "_inventParameters">Inventory parameters record</param>
+    /// <param name = "_isToteCustomer">Is customer a Tote customer</param>
+    protected void initRepackQtyFactor(SalesTable _salesTable, InventParameters _inventParameters, boolean _isToteCustomer)
+    {
+        METContainerTypeTable   containerTypeTable;
+
+        //default values when no containerTypeTable
+        tobaccoRepackQtyFactor = METConstants::tobaccoRepackQtyFactorDefault;
+        standardRepackQtyFactor = METConstants::standardRepackQtyFactorDefault;
+
+        if (CustTable::METHasToteAttributeType(_salesTable.CustAccount, _salesTable.DataAreaId))
+        {
+            // Tote customer search for Plastic (tote) container ID else Cardboard container ID
+            WHSContainerTypeCode containerTypeCode = _isToteCustomer ? _inventParameters.METPlasticContainerID : _inventParameters.METCardboardContainerID;
+            
+            containerTypeTable   = METContainerTypeTable::find(containerTypeCode, _salesTable.inventLocationId);
+            if (containerTypeTable)
+            {
+                tobaccoRepackQtyFactor  = containerTypeTable.TobaccoRepackQty;
+                standardRepackQtyFactor = containerTypeTable.GroceryRepackQty;
+                //whsPalletVolume = containerTypeTable.ContainerVolume; //Added as never initialise in class
+            }
+        }
+        // only when the customer doesn't have "Tote type" attribute type set repack qty to 1
+        else
+        {
+            tobaccoRepackQtyFactor = 1;
+            standardRepackQtyFactor = 1;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialise the sales order line query
+    /// </summary>
+    /// <returns><c>Query</c> object</returns>
+    protected Query initQuery()
+    {
+        Query query = new Query();
+        QueryBuildDataSource qbds = query.addDataSource(tableNum(SalesLine));
+
+        qbds.addRange(fieldNum(SalesLine, SalesId)).value(queryValue(salesTable.SalesId));
+        // Exclude canceled lines
+        qbds.addRange(fieldNum(SalesLine, SalesStatus)).value(SysQuery::valueNot(SalesStatus::Canceled));
+        qbds.addRange(fieldNum(SalesLine, Blocked)).value(queryValue(NoYes::No));
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTempTableRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to create the METTMSEngineSalesOrderProccessLinesTmp records from the QueryRun
+    /// </summary>
+    /// <param name = "_queryRun"><c>QueryRun</c> object</param>
+    protected void createTempTableRecords(QueryRun _queryRun)
+    {
+        SalesLine   salesLine;
+        
+        [salesLine] = this.getTablesQueryRun(_queryRun);
+        
+        this.createLineTmp(salesLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTablesQueryRun</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get tables from _queryRun object used to fill the temp table
+    /// </summary>
+    /// <param name = "_queryRun"><c>QueryRun</c> object used to fill the temp table</param>
+    /// <returns>Container of records from the <c>QueryRun</c> object</returns>
+    protected container getTablesQueryRun(QueryRun _queryRun)
+    {
+        return [_queryRun.get(tableNum(SalesLine))];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLineTmp</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to initialise the METTMSEngineSalesOrderProccessLinesTmp temp record from SalesLine
+    /// </summary>
+    /// <param name = "_salesLine">Sales order line</param>
+    protected void createLineTmp(SalesLine _salesLine)
+    {
+        METInventItemOrderSetup     metInventItemOrderSetup;
+
+        processLinesTmp.clear();
+        processLinesTmp.ItemId     = _salesLine.ItemId;
+        processLinesTmp.SalesId    = _salesLine.SalesId;
+        processLinesTmp.SalesUnit  = _salesLine.SalesUnit;
+        processLinesTmp.SalesQty   = this.lineShipQty(_salesLine);
+        //if the Sale line’s Item Type = Inventory & Warehouse Management Parameters’ “Tobacco Metcash item type” set IsTobaccoItem = Yes
+        select firstonly ItemType, FilterCode from metInventItemOrderSetup
+                where  metInventItemOrderSetup.SiteId == _salesLine.inventDim().InventSiteId
+                    && metInventItemOrderSetup.ItemId == _salesLine.ItemId;
+
+        //METTobaccoItemType should not be blank
+        processLinesTmp.IsTobaccoItem = (metInventItemOrderSetup.ItemType == inventParameters.METTobaccoItemType && inventParameters.METTobaccoItemType != '') ? NoYes::Yes : NoYes::No;
+
+        processLinesTmp.IsKegItem      = this.isKegItem(processLinesTmp.ItemId);
+        processLinesTmp.LineCommodity  = this.getLineCommodity(processLinesTmp.IsTobaccoItem, metInventItemOrderSetup.FilterCode);
+        processLinesTmp.CaseQty_CaseLines  = (processLinesTmp.IsKegItem == NoYes::No && processLinesTmp.IsTobaccoItem == NoYes::No && processLinesTmp.SalesUnit != METConstants::unitEach) ? processLinesTmp.SalesQty : 0;
+        processLinesTmp.BrokenCasesCountSecurity = processLinesTmp.IsTobaccoItem == NoYes::Yes ? processLinesTmp.SalesQty : 0;
+        processLinesTmp.BrokenCasesCountNonSecurity = (processLinesTmp.IsKegItem == NoYes::No && processLinesTmp.IsTobaccoItem == NoYes::No && processLinesTmp.SalesUnit == METConstants::unitEach) ? processLinesTmp.SalesQty : 0;
+        processLinesTmp.RepackCountSecurity = tobaccoRepackQtyFactor ? processLinesTmp.BrokenCasesCountSecurity/tobaccoRepackQtyFactor : 0;
+        processLinesTmp.RepackCountNonSecurity = standardRepackQtyFactor ? processLinesTmp.BrokenCasesCountNonSecurity/standardRepackQtyFactor : 0;
+        processLinesTmp.KegQtyUOM      = this.getKegQtyUOM(_salesLine.ItemId);
+
+        [processLinesTmp.LineUnitVolume, processLinesTmp.LineUnitWeight] = this.getLineUnitVolumeWeight(_salesLine.ItemId, _salesLine.inventDim(), _salesLine.SalesUnit);
+
+        processLinesTmp.LineVolume_CaseLines  = processLinesTmp.CaseQty_CaseLines * processLinesTmp.LineUnitVolume;
+        processLinesTmp.LineVolume_BrokenCaseSecurity = processLinesTmp.BrokenCasesCountSecurity * processLinesTmp.LineUnitVolume;
+        processLinesTmp.LineVolume_BrokenCaseNonSecurity = processLinesTmp.BrokenCasesCountNonSecurity * processLinesTmp.LineUnitVolume;
+        processLinesTmp.LineVolume_Kegs = processLinesTmp.IsKegItem ? processLinesTmp.SalesQty * processLinesTmp.LineUnitVolume : 0;
+            
+        processLinesTmp.LineWeight_BrokenCaseNonSecurity = processLinesTmp.BrokenCasesCountNonSecurity * processLinesTmp.LineUnitWeight;
+        processLinesTmp.LineWeight_BrokenCaseSecurity = processLinesTmp.BrokenCasesCountSecurity * processLinesTmp.LineUnitWeight;
+        processLinesTmp.LineWeight_CaseLines = processLinesTmp.CaseQty_CaseLines * processLinesTmp.LineUnitWeight;
+        processLinesTmp.LineWeight_Kegs = processLinesTmp.IsKegItem ? processLinesTmp.SalesQty * processLinesTmp.LineUnitWeight : 0;
+
+        // CB626_TMSEngineSOPackingSlip set SuppWhsHasCCR
+        METSalesLine metSalesLine = METSalesLine::find(_salesLine.RecId);
+        if (metSalesLine.SecondaryInventLocationId)
+        {
+            InventLocation supplyingWH = InventLocation::find(metSalesLine.SecondaryInventLocationId);
+            processLinesTmp.SuppWhsHasCCR = supplyingWH.METCCR || supplyingWH.METPickDirector;
+        }
+        processLinesTmp.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isKegItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// If the item on the sales line has a Product attribute listed in the new setup table, set IsKegItem = Yes
+    /// </summary>
+    /// <param name = "_itemId">Item Id</param>
+    /// <returns><c>boolean</c> object</returns>
+    protected boolean isKegItem(ItemId    _itemId)
+    {
+        EcoResProductInstanceValue      ecoResProductInstanceValue;
+        METAttributeIdentifiers         attributeIdentifiers;
+        InventTable                     inventTable;
+        RetailEcoResInstanceAttributeValuesView attributeValuesTable;
+
+        select firstonly crosscompany RecId from inventTable
+            where inventTable.ItemId == _itemId
+            join  RecId from ecoResProductInstanceValue
+            where   ecoResProductInstanceValue.Product == inventTable.Product
+            join InstanceRecId from attributeValuesTable
+                where   attributeValuesTable.InstanceRecId == ecoResProductInstanceValue.RecId
+                exists join attributeIdentifiers
+                    where   attributeIdentifiers.Attribute == attributeValuesTable.AttributeDefinitionRecId
+                        &&  attributeIdentifiers.AttributeValueText == attributeValuesTable.TextValue
+                        &&  attributeIdentifiers.AttributeValueText != ''
+                        &&  attributeIdentifiers.AttributeSource == METAttributeSource::Product
+                        &&  attributeIdentifiers.AttributeIdentifier == METAttributeIdentifier::Keg;
+
+        return inventTable.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLineCommodity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get line commodity value
+    /// </summary>
+    /// <param name = "_isTobaccoItem">isTobaccoItem</param>
+    /// <param name = "_filterNum">WHSFilterNum</param>
+    /// <returns><c>METTMSCommodity</c> object</returns>
+    protected METTMSCommodity getLineCommodity(boolean _isTobaccoItem, WHSFilterNum  _filterNum)
+    {
+        METTMSCommodity ret;
+
+        if (_IsTobaccoItem)
+        {
+            return METConstants::tobCommodity;
+        }
+        else if(this.SplitPerishableItems())
+        {
+            ret = (select WHSFilters where WHSFilters.FilterNum == _filterNum).METTMSCommodity;
+        }
+        if (!ret)
+        {
+            ret = MetSplitGroupTable::find(metSalesTable.OrderSplitGroup).TMSCommodity;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getKegQtyUOM</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get KegQtyUOM
+    /// </summary>
+    /// <param name = "_itemId">ItemId</param>
+    /// <returns><c>string value</c> object</returns>
+    protected str getKegQtyUOM(ItemId _itemId)
+    {
+        str kegQtyUOM;
+        METInventTable  metInventTable;
+
+        select firstonly BottleSize from metInventTable
+            where metInventTable.ItemId == _itemId;
+        if (metInventTable.BottleSize)
+        {
+            kegQtyUOM   = strFmt('%1', metInventTable.BottleSize);
+            //kegQtyUOM   = strFmt('@MET:KegQtyUOM',strRem(kegQtyUOM, '.'));
+            kegQtyUOM   = strFmt('K%1',strRem(kegQtyUOM, '.'));
+        }
+
+        return kegQtyUOM;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLineUnitVolumeWeight</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get LineUnitVolume and LineUnitWeight
+    /// </summary>
+    /// <param name = "_itemId">ItemId</param>
+    /// <param name = "_inventDim">InventDim</param>
+    /// <param name = "_uom">WHSUOM</param>
+    /// <returns><c>container</c> object</returns>
+    protected container getLineUnitVolumeWeight(ItemId    _itemId,
+                                                InventDim _inventDim,
+                                                WHSUOM    _uom)
+    {
+        METWHSPhysDimUOMSite    metWHSPhysDimUOMSite;
+        WHSPhysDimUOM           whsPhysDimUOM;
+        METUOMVolume            volume;
+        Weight                  weight;
+        WHSUOM                  warehouseUnit;
+
+        select firstonly * from metWHSPhysDimUOMSite
+            where metWHSPhysDimUOMSite.ItemId == _itemId
+            && metWHSPhysDimUOMSite.UOM == _uom
+            && metWHSPhysDimUOMSite.SiteId == _inventDim.InventSiteId;
+
+        volume  = metWHSPhysDimUOMSite.displayVolume();
+        weight  = metWHSPhysDimUOMSite.Weight;
+
+        if (!volume || !weight)
+        {
+            warehouseUnit   = METInventLocation::getWarehouseUnit(_itemId, _inventDim);
+
+            select firstonly * from whsPhysDimUOM
+                where whsPhysDimUOM.ItemId == _itemId
+                && whsPhysDimUOM.UOM == warehouseUnit;
+
+            volume  = volume ? volume : whsPhysDimUOM.metDisplayVolume();
+            weight  = weight ? weight : metWHSPhysDimUOMSite.Weight;
+        }
+
+        return [volume, weight];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>SplitPerishableItems</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// An order is perishable if it’s “Order split group” = the Inventory Parameter’s custom field “Perishable order split group”
+    /// </summary>
+    /// <returns>
+    /// a boolean value<c>boolean</c> query.
+    /// </returns>
+    protected boolean SplitPerishableItems()
+    {
+        return metInventLocation.SplitPerishableItems;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
