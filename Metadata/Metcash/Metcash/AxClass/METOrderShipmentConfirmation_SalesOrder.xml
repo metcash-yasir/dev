@@ -1,0 +1,264 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METOrderShipmentConfirmation_SalesOrder</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Class to post the shipment confirmation
+/// </summary>
+class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmation
+{
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>post</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Business logic to post the shipment
+    /// </summary>
+    public boolean post()
+    {
+        boolean         isPosted;
+        AccountOrder    accountOrder;
+        METCustTable    metCustTable;
+
+        #OCCRetryCount
+        try
+        {
+            ttsBegin;
+
+            metCustTable = metCustTable::find(metSalesOrderShipmentLoadHeader.CustAccount);
+
+            if (metCustTable.FinalizationDocument != METFinalizationDocument::None)
+            {
+                documentStatus = metCustTable.FinalizationDocument == METFinalizationDocument::Invoice ? DocumentStatus::Invoice : DocumentStatus::PackingSlip;
+                accountOrder   = metSalesOrderShipmentLoadHeader.PostMultiDocument == NoYes::No ? AccountOrder::Account : AccountOrder::None;
+
+                isPosted = this.postPackingslipInvoiceReport(metSalesOrderShipmentLoadHeader, documentStatus, accountOrder);
+            }
+            else
+            {
+                warning (strFmt("@MET:SOFinalisationDocCheck", metSalesOrderShipmentLoadHeader.ShipmentId));
+            }
+            
+            ttsCommit;
+
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw;
+            }
+        }
+        catch
+        {
+            exceptionTextFallThrough();
+        }
+
+        return isPosted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postPackingslipInvoiceReport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to post the invoice report
+    /// </summary>
+    /// <param name = "_shipmentLoadHeader">Shipment load leader</param>
+    /// <param name = "_docStatus">Document status</param>
+    /// <param name = "_accountOrder">Account order</param>
+    /// <returns>Boolean result</returns>
+    private boolean postPackingslipInvoiceReport(METSalesOrderShipmentLoadHeader    _shipmentLoadHeader, DocumentStatus _docStatus, AccountOrder _accountOrder)
+    {
+        boolean                         isPosted = false;
+        JournalId                       jourId;
+        SalesFormLetter                 salesFormLetter;
+
+        if (_docStatus ==DocumentStatus::PackingSlip)
+        {
+            salesFormLetter = this.postPackingSlip(_shipmentLoadHeader, _docStatus, _accountOrder);
+        
+            if (salesFormLetter.parmJournalRecord().TableId == tableNum(CustPackingSlipJour))
+            {
+                CustPackingSlipJour     jourTable;
+                jourTable = salesFormLetter.parmJournalRecord();
+                jourId  = jourTable.packingSlipId;
+
+                if (jourTable)
+                {
+                    if (!_shipmentLoadHeader.PostMultiDocument)
+                    {
+                        jourTable.METUpdateLoadShipmentId(_shipmentLoadHeader);
+                    }
+                    else
+                    {
+                        CustPackingSlipJour::METUpdateLoadShipmentLines(_shipmentLoadHeader);
+                    }
+                    isPosted = true;
+                }
+            }
+        }
+        else if (_docStatus == DocumentStatus::Invoice)
+        {
+            METSalesOrderShipmentLoadLines      shipmentLoadLines;
+
+            while select shipmentLoadLines
+                group by orderNum 
+                    where shipmentLoadLines.ShipmentId == _shipmentLoadHeader.ShipmentId
+            {
+                salesFormLetter = this.postInvoice(shipmentLoadLines.OrderNum);
+
+                if (salesFormLetter.parmJournalRecord().TableId == tableNum(CustInvoiceJour))
+                {
+                    CustInvoiceJour     jourTable;
+                    jourTable = salesFormLetter.parmJournalRecord();
+                    jourId  = jourTable.InvoiceId;
+
+                    if (jourTable)
+                    {
+                        if (!_shipmentLoadHeader.PostMultiDocument)
+                        {
+                            jourTable.METUpdateLoadShipmentId(_shipmentLoadHeader);
+                        }
+                        else
+                        {
+                            CustInvoiceJour::METUpdateLoadShipmentLines(_shipmentLoadHeader);
+                        }
+                        isPosted = true;
+                    }
+                }
+            }
+        }
+
+        return isPosted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postPackingSlip</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to post the packing slip
+    /// </summary>
+    /// <param name = "_shipmentLoadHeader">ShipmentLoad header table reference</param>
+    /// <param name = "_docStatus">Document status</param>
+    /// <param name = "_accountOrder"> Account order</param>
+    /// <returns>SalesFormLetter</returns>
+    public SalesFormLetter postPackingSlip(METSalesOrderShipmentLoadHeader    _shipmentLoadHeader, DocumentStatus _docStatus, AccountOrder _accountOrder)
+    {
+        SalesFormLetter                 salesFormLetter;
+
+        salesFormLetter = SalesFormLetter::construct(_docStatus);
+
+        salesFormLetter.chooseLinesQuery(this.calcQuery(_shipmentLoadHeader.ShipmentId));
+        salesFormLetter.transDate(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));
+        salesFormLetter.specQty(SalesUpdate::PickingList);
+        salesFormLetter.proforma(NoYes::No);
+        salesFormLetter.printout(Printout::Current);
+        salesFormLetter.printFormLetter(NoYes::No);
+        salesFormLetter.usePrintManagement(NoYes::No);
+        salesFormLetter.chooseLines(false, true);
+        salesFormLetter.sumBy(_accountOrder);
+        salesFormLetter.reArrangeNow(!_shipmentLoadHeader.PostMultiDocument);
+
+        salesFormLetter.run();
+
+        return salesFormLetter;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Post the sales order invoice
+    /// </summary>
+    /// <param name = "_salesId">SalesId reference</param>
+    /// <returns>SalesFormLetter</returns>
+    public SalesFormLetter postInvoice(SalesId  _salesId)
+    {
+        SalesFormLetter salesFormLetter;
+        SalesLine       salesLine;
+        CustPackingSlipJour custPackingSlipJour;
+        TmpFrmVirtual   tmpFrmVirtual;
+        List packingSlipList = new List(Types::Record);
+
+        while select custPackingSlipJour where custPackingSlipJour.SalesId == _salesId
+        {
+            tmpFrmVirtual.TableNum = custPackingSlipJour.TableId;
+            tmpFrmVirtual.RecordNo = custPackingSlipJour.RecId;
+            tmpFrmVirtual.insert();
+            packingSlipList.addEnd(tmpFrmVirtual);
+        }
+        salesFormLetter = SalesFormLetter::construct(DocumentStatus::Invoice);
+       
+        salesFormLetter.salesTable(SalesTable::find(_salesId));
+        salesFormLetter.transDate(systemDateGet());
+        salesFormLetter.specQty(SalesUpdate::PackingSlip);
+        salesFormLetter.proforma(NoYes::No);
+        salesFormLetter.chooseLines(true);
+        salesFormLetter.selectFromJournal(packingSlipList.pack());
+        salesFormLetter.run();
+
+        return SalesFormLetter;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate query based on shipment Id
+    /// </summary>
+    /// <param name = "_shipmentId">Shipment Id reference</param>
+    /// <returns>SysQueryRun</returns>
+    private SysQueryRun calcQuery(WMSShipmentId _shipmentId)
+    {
+        METSalesOrderShipmentLoadLines  metLines;
+        RefRecId                salesLineRecId;
+        Query                   qry = new Query(QueryStr(SalesUpdate));
+        QueryBuildDataSource    queryBuildDataSource = qry.dataSourceTable(tableNum(SalesLine));
+        QueryBuildRange         queryBuildRange;
+        SalesLine               salesLine;
+
+        while select metLines
+                where metLines.ShipmentId == _shipmentId
+            join RecId from salesLine
+                where salesLine.SalesId == metLines.ordernum &&
+                    salesLine.LineNum == metLines.lineNum
+        {
+            salesLineRecId = salesLine.RecId;
+            queryBuildRange = queryBuildDataSource.addRange(fieldnum(SalesLine, RecId));
+            queryBuildRange.value(SysQuery::value(salesLineRecId));
+        }
+        return new sysQueryRun(qry);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
