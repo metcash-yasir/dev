@@ -13,13 +13,13 @@ abstract class METTMSShipmentItemGroupUOM
     METTMSShipmentOrderIdentifier          tmsShipmentOrderIdentifier;
     boolean                                isKegItem, isToteCustomer;
     InventParameters                       inventParameters;
-    int                                    repackContainersByCommodity;
     InventLocationId                       headerInventLocationId;
 
-    // TO be removed
-    METWHSPalletVolume  whsToteVolume;
-    METWHSPalletVolume  whsCaseVolume;
-    METWHSPalletWeight  whsToteWeight;
+    METWHSPalletVolume  sumRepackContainersByCommodityCaseVolume, sumRepackContainersByCommodityToteVolume;
+    int                 sumRepackContainersByCommodityQty;
+    METWHSPalletWeight  sumRepackContainersByCommodityToteWeight;
+
+    // Pallet volume & weight use SO's main warehouse
     METWHSPalletVolume  whsPalletVolume;
     METWHSPalletWeight  whsPalletWeight;
 
@@ -33,7 +33,8 @@ abstract class METTMSShipmentItemGroupUOM
     /// Constructs a new TMS engine lines temp builder.
     /// </summary>
     /// <param name = "_shipmentUOM">METTMSEngineSalesOrderProcess</param>
-    /// <param name = "_lineTmpSum">Sales order header record</param>
+    /// <param name = "_processLinesTmp">Temp table raw data</param>
+    /// <param name = "_lineTmpSum">Temp table summed by LineCommodity</param>
     /// <param name = "_tmsShipmentOrderIdentifier">SO finalisation shipment id</param>
     /// <param name = "_headerInventLocationId">Header warehouse</param>
     /// <param name = "_isCCR">Sales order header record</param>
@@ -41,6 +42,7 @@ abstract class METTMSShipmentItemGroupUOM
     /// <param name = "_isToteCustomer">Customer uses totes</param>
     /// <returns>An instance of <c>METTMSEngineLinesTmpBuilder</c></returns>
     public static METTMSShipmentItemGroupUOM construct(METShipmentUOM                         _shipmentUOM,
+                                                       METTMSEngineSalesOrderProccessLinesTmp _processLinesTmp,
                                                        METTMSEngineSalesOrderProccessLinesTmp _lineTmpSum,
                                                        METTMSShipmentOrderIdentifier          _tmsShipmentOrderIdentifier,
                                                        InventLocationId                       _headerInventLocationId,
@@ -78,7 +80,7 @@ abstract class METTMSShipmentItemGroupUOM
             throw error(strFmt("@SYS19306", funcName()));
         }
 
-        result.initParameters(_lineTmpSum, _tmsShipmentOrderIdentifier, _headerInventLocationId, _isKegItem, _isToteCustomer);
+        result.initParameters(_processLinesTmp, _lineTmpSum, _tmsShipmentOrderIdentifier, _headerInventLocationId, _isKegItem, _isToteCustomer);
 
         return result;
     }
@@ -91,12 +93,14 @@ abstract class METTMSShipmentItemGroupUOM
     /// <summary>
     /// Initialise class parameters
     /// </summary>
-    /// <param name = "_lineTmpSum">Sales order header record</param>
+    /// <param name = "_processLinesTmp">Temp table raw data</param>
+    /// <param name = "_lineTmpSum">Temp table summed by LineCommodity</param>
     /// <param name = "_tmsShipmentOrderIdentifier">SO finalisation shipment id</param>
     /// <param name = "_isKegItem">SO finalisation shipment id</param>
     /// <param name = "_isToteCustomer">Customer uses totes</param>
     /// <param name = "_headerInventLocationId">Header warehouse</param>
-    void initParameters(METTMSEngineSalesOrderProccessLinesTmp _lineTmpSum,
+    void initParameters(METTMSEngineSalesOrderProccessLinesTmp _processLinesTmp,
+                        METTMSEngineSalesOrderProccessLinesTmp _lineTmpSum,
                         METTMSShipmentOrderIdentifier          _tmsShipmentOrderIdentifier,
                         InventLocationId                       _headerInventLocationId,
                         boolean                                _isKegItem = false,
@@ -109,22 +113,64 @@ abstract class METTMSShipmentItemGroupUOM
 
         inventParameters = InventParameters::find();
 
-        repackContainersByCommodity = roundUp(lineTmpSum.RepackCountSecurity, 1) + roundUp(lineTmpSum.RepackCountNonSecurity, 1);
+        // calculate the sums for RepackContainersByCommodity
+        this.initSumRepackContainersByCommodity(_processLinesTmp, lineTmpSum.LineCommodity);
 
-        // TODO to be removed
-        METContainerTypeTable   containerTypeTable;
-        containerTypeTable   = METContainerTypeTable::find(inventParameters.METCardboardContainerID, _headerInventLocationId);
-        whsCaseVolume   = containerTypeTable.ContainerVolume;
-
-        containerTypeTable   = METContainerTypeTable::find(inventParameters.METPlasticContainerID, _headerInventLocationId);
-        whsToteVolume   = containerTypeTable.ContainerVolume;
-        whsToteWeight   = containerTypeTable.Weight;
-
+        // Pallet volume & weight use SO's main warehouse
         METInventLocation metInventLocation = METInventLocation::findByInventLocationId(_headerInventLocationId);
         whsPalletVolume = METInventLocation.WHSPalletVolume;
         whsPalletWeight = METInventLocation.WHSPalletWeight;
 
         headerInventLocationId = _headerInventLocationId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initSumRepackContainersByCommodity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculates the sum for RepackContainersByCommodity when WH are different in temp table (CSD, xDock)
+    /// </summary>
+    /// <param name = "_processLinesTmp">Temp table raw data</param>
+    /// <param name = "_commodity">Current commodity being processed by METTMSShipmentItemGroupHelper</param>
+    protected void initSumRepackContainersByCommodity(METTMSEngineSalesOrderProccessLinesTmp _processLinesTmp, METTMSCommodity _commodity)
+    {
+        METContainerTypeTable containerTypeTable;
+        METWHSPalletVolume  whsToteVolume;
+        METWHSPalletVolume  whsCaseVolume;
+        METWHSPalletWeight  whsToteWeight;
+        int repackContainersByCommodity;
+        METTMSEngineSalesOrderProccessLinesTmp  processLinesGroupByWh;
+
+        processLinesGroupByWh.linkPhysicalTableInstance(_processLinesTmp);
+
+        // Sum RepackCountSecurity and RepackCountSecurity by commodity and supplying warehouse
+        // could have multiple supplying WH for the same commodity
+        while select sum(RepackCountSecurity), sum(RepackCountNonSecurity)
+                from processLinesGroupByWh
+            group by LineCommodity, Line_SupplyWhs
+               where processLinesGroupByWh.LineCommodity == _commodity
+        {  
+            repackContainersByCommodity = roundUp(lineTmpSum.RepackCountSecurity, 1) + roundUp(lineTmpSum.RepackCountNonSecurity, 1);
+
+            containerTypeTable   = METContainerTypeTable::find(inventParameters.METCardboardContainerID, processLinesGroupByWh.Line_SupplyWhs);
+            whsCaseVolume   = containerTypeTable.ContainerVolume;
+
+            containerTypeTable   = METContainerTypeTable::find(inventParameters.METPlasticContainerID, processLinesGroupByWh.Line_SupplyWhs);
+            whsToteVolume   = containerTypeTable.ContainerVolume;
+            whsToteWeight   = containerTypeTable.Weight;
+
+            // sum qty
+            sumRepackContainersByCommodityQty += repackContainersByCommodity;
+
+            // sum volume
+            sumRepackContainersByCommodityCaseVolume += repackContainersByCommodity * whsCaseVolume;
+            sumRepackContainersByCommodityToteVolume += repackContainersByCommodity * whsToteVolume;
+
+            // sum weight
+            sumRepackContainersByCommodityToteWeight += repackContainersByCommodity * whsToteWeight;
+        }
     }
 
 ]]></Source>
