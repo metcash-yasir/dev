@@ -5,9 +5,9 @@
 		<Declaration><![CDATA[
 public class METInternalCrossDockTransferOrderService extends METSysOperationService
 {
-    private METReserveEventOrdersContract contract;
-    private guid topPickingProcessId;
-    
+    private METInternalCrossDockTransferOrderTaskContract contract;
+    private guid queueId;
+    Query userQuery;
 }
 ]]></Declaration>
 		<Methods>
@@ -20,7 +20,7 @@ public class METInternalCrossDockTransferOrderService extends METSysOperationSer
     /// <returns>Task service class name</returns>
     protected str getTaskServiceClass()
     {
-        return classStr(METReserveEventOrdersTaskService);
+        return classStr(METInternalCrossDockTransferOrderTaskService);
     }
 
 ]]></Source>
@@ -34,7 +34,7 @@ public class METInternalCrossDockTransferOrderService extends METSysOperationSer
     /// <returns>Task service class method</returns>
     protected str getTaskServiceClassMethod()
     {
-        return methodStr(METReserveEventOrdersTaskService, process);
+        return methodStr(METInternalCrossDockTransferOrderTaskService, process);
     }
 
 ]]></Source>
@@ -48,7 +48,26 @@ public class METInternalCrossDockTransferOrderService extends METSysOperationSer
     /// <returns>Task service class caption</returns>
     protected str getTaskServiceCaption()
     {
-        return "@MET:METReserveEventOrders";
+        return "Automatic sales order extraction process";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFieldMap</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// constructs the field maps used to insert data from user query to temporary staging table.
+    /// </summary>
+    /// <param name = "_dataSourceId">Unique data source of the query data source</param>
+    /// <returns>Field map</returns>
+    private Map getFieldMap(int _dataSourceId)
+    {
+        Map fieldsMap = new Map(Types::String, Types::Container);
+
+        fieldsMap.insert(fieldStr(METInternalTransferOrderQueueTmp, SalesId), [_dataSourceId, fieldStr(SalesTable, SalesId)]);
+
+        return fieldsMap;
     }
 
 ]]></Source>
@@ -64,16 +83,8 @@ public class METInternalCrossDockTransferOrderService extends METSysOperationSer
     /// </param>
     public void process(METInternalCrossDockTransferOrderContract _contract)
     {
-        Query q = new Query(_contract.parmPackedQuery());
-        QueryRun qr = new QueryRun(q);
-        
-
-        while(qr.next())
-        {
-            SalesLine salesLine = qr.get(tableNum(SalesLine));
-
-        }
-
+        userQuery = new Query(_contract.parmPackedQuery());
+        this.initialise();
         this.processInternal(_contract);
     }
 
@@ -83,7 +94,7 @@ public class METInternalCrossDockTransferOrderService extends METSysOperationSer
 				<Name>initialise</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Initialise global variables.
+    /// Initialise global variables and initiates data staging.
     /// </summary>
     public void initialise()
     {
@@ -98,21 +109,21 @@ public class METInternalCrossDockTransferOrderService extends METSysOperationSer
 				<Name>stageDataIntoQueue</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Stages data int table <c>METReserveEventOrdersQueue</c>.
+    /// Initializes process and stages data into table <t>METInternalTransferOrderQueue</t>.
     /// </summary>
     void stageDataIntoQueue()
     {
         #OCCRetryCount
 
-        contract            = dataContract as METReserveEventOrdersContract;
-        topPickingProcessId = newGuid();
+        contract            = dataContract as METInternalCrossDockTransferOrderTaskContract;
+        queueId = newGuid();
 
         try
         {
             ttsbegin;
 
-            METReserveEventOrdersQueue::cleanUpReserveEventOrdersQueue();
-            this.stageEventOrders();
+            METInternalTransferOrderQueue::cleanUpQueue();
+            this.stageQueue();
 
             ttscommit;
 
@@ -148,57 +159,55 @@ public class METInternalCrossDockTransferOrderService extends METSysOperationSer
         }
         catch (Exception::Error)
         {
-            // catch the errors so processing can continue
-            curext(); // avoids a warning about an empty block
+            curext(); 
         }
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>stageEventOrders</Name>
+				<Name>stageQueue</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Stages event orders.
+    /// Stages orders to be processed based on user selection and .
     /// </summary>
-    private void stageEventOrders()
+    private void stageQueue()
     {
-        METTransferOrderFromEventOrdersQueue crossDockTransferOrdersQueue;
-        SalesTable                 salesTable;
-        METSalesTable              metSalesTable;
-        METSalesEventId            eventId;
-        InventLocationId           warehouse;
-        METPOLink                  poLink;
+        METInternalTransferOrderQueueTmp metInternalTransferQueueTmp;
+        METInternalTransferOrderQueue processQueue;
+        SalesTable salesTable;
+        METSalesTable metSalesTable;
 
-        //xDock CB 238 >>>
-        boolean isSupplyFromTransfer = InventParameters::find().METSupplyFromTransfer;
-        boolean isFoodLE = CompanyInfo::find().METLegalEntityType == METLegalEntityType::Food;
+        QueryBuildDataSource qbdsSalesTable = userQuery.dataSourceName(tableStr(SalesTable));
+        Query::insert_recordset(metInternalTransferQueueTmp, this.getFieldMap(qbdsSalesTable.uniqueId()), userQuery);
 
-        InventLocation inventLocation;
-        //xDock CB 238 <<<
+        //Transfer the data from tmp table to Process queue with process Id. 
+        insert_recordset processQueue(ProcessId, SalesId)
+            select queueId, SalesId from metInternalTransferQueueTmp
+            group by metInternalTransferQueueTmp.SalesId;
 
-        eventId  = '';
-        warehouse = '';
-        
-        //xDock CB 238 >>>
-        //Added condition to skip stock reservation if,
-        // - The Supply from transfer is enabled
-        // - The sales order is internal cross dock order or the warehouse is CSD warehouse
-        if(isSupplyFromTransfer && isFoodLE)
-        {
-            insert_recordset crossDockTransferOrdersQueue(ProcessId, SalesId)
-            select topPickingProcessId, salesId from salesTable
-                    where (!warehouse || (warehouse && salesTable.InventLocationId == warehouse))
-                exists join metSalesTable
-                        where metSalesTable.SalesTable == salesTable.RecId
-                        &&    (!eventId || (eventId && metSalesTable.EventID == eventId))
-                        &&    metSalesTable.OrderReleaseDate == contract.parmReleaseDate()
-                    exists join inventLocation
-                        where inventLocation.InventLocationId == salesTable.InventLocationId
-                        && inventLocation.METCSDWarehouse == NoYes::Yes
-                && (metSalesTable.InternalCrossDockOrder == NoYes::Yes || inventLocation.METCSDWarehouse == NoYes::Yes);
-        }
-        
+        // Since the data in processing queue is populated based on user query, 
+        // we need to make sure that orders that match below conditions are exculded
+        // 1. Orders that are already extracted 
+        // 2. Orders that has future release dates (Release date > today()).
+        // 3. Event orders (Event Id != '')
+        delete_from processQueue
+            where processQueue.ProcessId == queueId
+            exists join salesTable
+            where salesTable.SalesId == processQueue.SalesId
+            && salesTable.METOrderExtractStatus == METOrderExtractStatus::Extracted
+            exists join metSalesTable
+            where metSalesTable.SalesTable == salesTable.RecId
+            && metSalesTable.EventID != ''
+            && metSalesTable.ReleaseDate > DateTimeUtil::getToday(DateTimeUtil::getCompanyTimeZone());
+
+        //Update the order extraction status to Ready For Extraction so the extraction process will pick this up.
+        update_recordset salesTable
+            setting METOrderExtractStatus = METOrderExtractStatus::ReadyForExtract
+            where processQueue.ProcessId == queueId
+            exists join processQueue
+            where processQueue.SalesId == salesTable.SalesId
+            && salesTable.METOrderExtractStatus == METOrderExtractStatus::Open;
     }
 
 ]]></Source>
@@ -213,8 +222,8 @@ public class METInternalCrossDockTransferOrderService extends METSysOperationSer
     protected void initTaskDataContract(METSysOperationTaskDataContract _taskDataContract)
     {
         super(_taskDataContract);
-        contract = _taskDataContract as METReserveEventOrdersContract;
-        contract.parmTopPickingProcessId(topPickingProcessId);
+        contract = _taskDataContract as METInternalCrossDockTransferOrderTaskContract;
+        contract.parmTopPickingProcessId(queueId);
     }
 
 ]]></Source>
