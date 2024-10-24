@@ -21,6 +21,9 @@ internal class METTMSEngineSalesOrderProccess
     boolean             shipmentCreated;
     METTMSEngineSalesOrderProccessLinesTmp      proccessLinesTmp;
     TransDate                                   deliveryDate;
+    boolean                                     hasCCR;
+    METTMSShipmentItemGroupHelper TSIGHelper;
+    Set                           ccrToteIds;
 
 }
 ]]></Declaration>
@@ -124,6 +127,13 @@ internal class METTMSEngineSalesOrderProccess
             default:
                 error = true;
                 break;
+
+            // Evgeniya TODO CB625
+
+            // CB626_TMSEngineSOPackingSlip
+            case (METTMSEngineSalesOrderProcess::PackingSlip) :
+                process = new METTMSEngineSalesOrderProccess_PackingSlip();
+                break;
         }
 
         if (error)
@@ -184,7 +194,7 @@ internal class METTMSEngineSalesOrderProccess
 				<Name>init</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// initialize default parameters
+    /// initialize default parameters and variables
     /// </summary>
     /// <param name = "_salesTable">SalesTable record</param>
     protected void init(SalesTable    _salesTable)
@@ -197,6 +207,13 @@ internal class METTMSEngineSalesOrderProccess
         inventLocation          = InventLocation::find(salesTable.InventLocationId);
         
         isToteCustomer          = CustTable::METIsToteCustomer(salesTable.CustAccount, salesTable.DataAreaId);
+
+        // initialise shipping and delivery date variables
+        shippingDate = this.shippingDate();
+        deliveryDate = this.deliveryDate();
+
+        // initialise the Set for CCR Tote ID, object instanciated here but not used for CB624, only CB626
+        ccrToteIds = new Set(Types::String);
     }
 
 ]]></Source>
@@ -277,6 +294,49 @@ internal class METTMSEngineSalesOrderProccess
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Refactored new validate method
+    /// </summary>
+    /// <returns>true if valdidation successful; otherwise, false.</returns>
+    protected boolean validate()
+    {
+        //Step 1: check if order should be excluded from TMS Engine processing
+        if (!salesTable.METIsSalesOrderExcluded() &&
+            carrierCode &&
+            salesTable.METRoute &&
+            this.useTMSEngine() &&
+            (!isSalesOrderPerishable ||
+            (isSalesOrderPerishable  && !this.excludePerishable())))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTMSShipmentOrderTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// New method to retrieve the METTMSShipmentOrderTable
+    /// For creation, straight forward with sales order number
+    /// Overridden in child classes for packing slip
+    /// </summary>
+    /// <param name = "_salesId">Sales order number</param>
+    /// <param name = "_pickingRouteId">Picking list number</param>
+    /// <returns><c>METTMSShipmentOrderTable</c> record found or empty.</returns>
+    protected METTMSShipmentOrderTable getTMSShipmentOrderTable(SalesIdBase _salesId, WMSPickingRouteID _pickingRouteId = '')
+    {
+        return METTMSShipmentOrderTable::findByOrder(_salesId, _pickingRouteId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>run</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -291,7 +351,7 @@ internal class METTMSEngineSalesOrderProccess
         //Step 1: check if order should be excluded from TMS Engine processing
         if (this.validate())
         {
-            this.initTmpTable();            
+            this.initTmpTable();
 
             try
             {
@@ -392,6 +452,7 @@ internal class METTMSEngineSalesOrderProccess
     {        
         METTMSEngineLinesTmpBuilder tmpBuilder = this.getTmpBuilderInstance(METTMSEngineSalesOrderProcess::Creation, salesTable);
         proccessLinesTmp = tmpBuilder.populateTmpTable();
+        hasCCR = tmpBuilder.hasCCR();
     }
 
 ]]></Source>
@@ -475,8 +536,45 @@ internal class METTMSEngineSalesOrderProccess
         //Step 3e: Create TMS Shipment Item Group records
         // CB626_TMSEngineSOPackingSlip refactoring TSIG record creation
         //this.createTMSShipmentItemGroup(tmsShipmentOrderTable.TMSShipmentOrderIdentifier);
-        // TODO remove salesTable.InventLocationId as a parameter
-        shipmentCreated = METTMSShipmentItemGroupHelper::construct(proccessLinesTmp, tmsShipmentOrderTable.TMSShipmentOrderIdentifier, isToteCustomer, salesTable.InventLocationId).create();
+        shipmentCreated = this.createTMSShipmentItemGroup(proccessLinesTmp, tmsShipmentOrderTable.TMSShipmentOrderIdentifier, isToteCustomer, salesTable.InventLocationId, hasCCR);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTSIGHelperInstance</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create an instance of <c>METTMSShipmentItemGroupHelper</c>
+    /// </summary>
+    /// <param name = "_processLinesTmp">Temporary TMS calculation table</param>
+    /// <param name = "_tmsShipmentOrderIdentifier">TSO identifier</param>
+    /// <param name = "_isToteCustomer">Customer uses totes</param>
+    /// <param name = "_headerInventLocationId">Header warehouse</param>
+    /// <param name = "_hasCCR">If any of the lines on the SO have a warehouse with SuppWhsHasCCR = Yes</param>
+    /// <param name = "_salesId">Sales order number</param>
+    /// <param name = "_pickingRouteId">Picking list number</param>
+    /// <returns>New instance of <c>METTMSShipmentItemGroupHelper</c></returns>
+    METTMSShipmentItemGroupHelper getTSIGHelperInstance(METTMSEngineSalesOrderProccessLinesTmp _processLinesTmp, METTMSShipmentOrderIdentifier _tmsShipmentOrderIdentifier, boolean _isToteCustomer, InventLocationId _headerInventLocationId, boolean _hasCCR, SalesId _salesId = "", WMSPickingRouteID _pickingRouteId = "")
+    {
+        return METTMSShipmentItemGroupHelper::construct(_processLinesTmp,
+                                                        _tmsShipmentOrderIdentifier,
+                                                        _isToteCustomer,
+                                                        _headerInventLocationId,
+                                                        _hasCCR);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTMSShipmentItemGroup</Name>
+				<Source><![CDATA[
+    protected boolean createTMSShipmentItemGroup(METTMSEngineSalesOrderProccessLinesTmp _processLinesTmp, METTMSShipmentOrderIdentifier _tmsShipmentOrderIdentifier, boolean _isToteCustomer, InventLocationId _headerInventLocationId, boolean _hasCCR, SalesId _salesId = "", WMSPickingRouteID _pickingRouteId = "")
+    {
+        boolean ret;
+        TSIGHelper = this.getTSIGHelperInstance(_processLinesTmp, _tmsShipmentOrderIdentifier, _isToteCustomer, _headerInventLocationId, _hasCCR, _salesId, _pickingRouteId);
+        ret = TSIGHelper.create();
+        return ret;
     }
 
 ]]></Source>
@@ -492,10 +590,6 @@ internal class METTMSEngineSalesOrderProccess
     {
         str     shippingDateStr;
 
-        shippingDate = metSalesTable.SecondShipDate ? metSalesTable.SecondShipDate :
-            salesTable.ShippingDateConfirmed ? salesTable.ShippingDateConfirmed :
-            salesTable.ShippingDateRequested;
-
         shippingDateStr = date2Str
             (shippingDate,
                 321,
@@ -508,19 +602,6 @@ internal class METTMSEngineSalesOrderProccess
         shipmentId  = strFmt("@MET:ShipmentStrFmt", salesTable.InventLocationId, salesTable.CustAccount, salesTable.METRoute, shippingDateStr);
 
         return METTMSShipmentTable::find(shipmentId);
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>initDeliveryDate</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// init Delivery date
-    /// </summary>
-    private void initDeliveryDate()
-    {
-        deliveryDate = SalesTable.ReceiptDateConfirmed ? SalesTable.ReceiptDateConfirmed : SalesTable.ReceiptDateRequested;
     }
 
 ]]></Source>
@@ -565,10 +646,10 @@ internal class METTMSEngineSalesOrderProccess
         _tmsShipmentTable.RouteStop = int2str(salesTable.METRouteStopNum);
         _tmsShipmentTable.WarehouseZone = routeStopTable.Zone ? routeStopTable.Zone : routeTable.Zone;
         _tmsShipmentTable.StagingLane = metSalesTable.StagingLaneId;
-        _tmsShipmentTable.PickupEarliest = routeTable.ReadyTime;
-        _tmsShipmentTable.PickupLatest = routeTable.DispatchTime;
-        _tmsShipmentTable.DeliveryEarliest = routeStopTable.TimeWindowStart;
-        _tmsShipmentTable.DeliveryLatest = routeStopTable.TimeWindowEnd;
+        _tmsShipmentTable.PickupEarliest = this.formatUSDate(shippingDate, routeTable.ReadyTime);
+        _tmsShipmentTable.PickupLatest = this.formatUSDate(shippingDate, routeTable.DispatchTime);
+        _tmsShipmentTable.DeliveryEarliest = this.formatUSDate(deliveryDate, routeStopTable.TimeWindowStart);
+        _tmsShipmentTable.DeliveryLatest = this.formatUSDate(deliveryDate, routeStopTable.TimeWindowEnd);
         _tmsShipmentTable.Carrier = carrierCode;
         _tmsShipmentTable.SpecialDeliveryInstructions = this.getCustomerInstruction();
         _tmsShipmentTable.DeliveryNoteNumber = '';
@@ -772,6 +853,52 @@ internal class METTMSEngineSalesOrderProccess
                     && tmsShipmentOrderTable.OrderNumber == salesTable.SalesId
                     && tmsShipmentItemGroup.TMSShipmentOrderIdentifier == tmsShipmentOrderTable.TMSShipmentOrderIdentifier
                     && tmsShipmentItemGroup.QuantityUOM == METConstants::unitPal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shippingDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Shipping date variable
+    /// </summary>
+    /// <returns>Shipping date based on CB624 formula</returns>
+    TransDate shippingDate()
+    {
+        return metSalesTable.SecondShipDate ? metSalesTable.SecondShipDate :
+            salesTable.ShippingDateConfirmed ? salesTable.ShippingDateConfirmed :
+            salesTable.ShippingDateRequested;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deliveryDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delivery date variable
+    /// </summary>
+    /// <returns>Delivery date based on CB624 formula</returns>
+    TransDate deliveryDate()
+    {
+        return salesTable.ReceiptDateConfirmed ? salesTable.ReceiptDateConfirmed : salesTable.ReceiptDateRequested;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>formatUSDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// TMS needs US date format, concatenate date and time(str)
+    /// </summary>
+    /// <param name = "_date">TMS delivery or shipping date</param>
+    /// <param name = "_time">Route or route stop time format HHmm</param>
+    /// <returns>Formatted date and time in US format mm/dd/yyyy hh:mm</returns>
+    METDelivery formatUSDate(TransDate _date, METRouteTime _time)
+    {
+        return strFmt(METConstants::value1SpaceValue2, date2Str(_date, 213, DateDay::Digits2, DateSeparator::Slash, DateMonth::Digits2, DateSeparator::Slash, DateYear::Digits4), strIns(_time, METConstants::colon, 3));
     }
 
 ]]></Source>

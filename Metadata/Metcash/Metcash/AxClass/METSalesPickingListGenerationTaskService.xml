@@ -12,14 +12,17 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
     SalesTable                                      salesTable, csdSalesTable;
     WMSPickingRoute                                 wmsPickingRoute;
     CompanyInfo                                     companyInfo;
-
-			
+	//CB123_SalesOrderExtractScreenforCSD -start
+    RefRecId                                        salesOrderCount;
 }
 ]]></Declaration>
 		<Methods>
 			<Method>
 				<Name>process</Name>
 				<Source><![CDATA[
+	//CB123_SalesOrderExtractScreenforCSD -end
+
+			
     /// <summary>
     /// processing logic
     /// </summary>
@@ -43,7 +46,7 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
                 && inventLocation.METWaveRequired == NoYes::Yes && inventLocation.METCSDWarehouse == NoYes::Yes
                 && inventLocation.METPickDirector == NoYes::Yes)
             {
-                salesTable.createWaveFromSalesTable(inventLocation.METPickDirector);
+                salesTable.createWaveFromSalesTable(inventLocation.METPickDirector, salesOrderCount);
             }
             //Task 162245-CB123 - SalesOrderExtractScreenforCSD -end
 
@@ -82,6 +85,7 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
     {
         dataContract    =   _dataContract;
         salesTable      =   salesTable::find(_dataContract.parmSalesId());
+        salesOrderCount =   dataContract.parmCSDSalesOrderCount();
     }
 
 ]]></Source>
@@ -119,24 +123,31 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
     /// Post picking list
     /// </summary>
     /// <param name = "_salesTable">SalesTable buffer.</param>
-    private void postPickingList(SalesTable     _salesTable)
+    private void postPickingList(SalesTable _salesTable)
     {
-        SalesFormLetter             salesFormLetter;
-        SalesParmLine               salesParmLine;
-        boolean                     isError;
+        boolean             isError;
+        QueryRun            queryRun;
+        SalesParmLine       salesParmLine;
+        SalesFormLetter     salesFormLetter;
 
         try
         {
             ttsbegin;
 
+            //NS-Created for CB274 - Intercompany Transfers.
+            queryRun = this.calcQuery(_salesTable);
+            //NE-Created for CB274 - Intercompany Transfers.
+
             salesFormLetter = SalesFormLetter::construct(DocumentStatus::PickingList);
+            
+            salesFormLetter.chooseLinesQuery(queryRun);
             salesFormLetter.salesTable(_salestable);
             salesFormLetter.initParmSalesTable(salesFormLetter.salesTable());
             salesFormLetter.transDate(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
             salesFormLetter.specQty(SalesUpdate::All);
             salesFormLetter.printFormLetter(salesFormLetter.printFormLetter());
-
             salesFormLetter.createParmUpdateFromParmUpdateRecord(SalesFormletterParmData::initSalesParmUpdateFormletter(salesFormLetter.documentStatus(), salesFormLetter.pack()));
+            
             //For intercompany orders we always pick the reserved quantity
             if (!InventLocation::find(salesFormLetter.salesTable().InventLocationId).METPickDirector || _salesTable.InterCompanyOrder)
             {
@@ -151,12 +162,12 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
             else
             {
                 salesFormLetter.initParameters(salesFormLetter.salesParmUpdate(), Printout::Current);
-            
             }
             // CB123 - SalesOrderExtractScreenforCSD -end
             salesFormLetter.initLinesQuery();
 
-            SalesLine       salesLineLoc;
+            SalesLine salesLineLoc;
+
             while select forupdate salesParmLine
                 where salesParmLine.ParmId == salesFormLetter.parmId()
             {
@@ -172,16 +183,18 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
                         salesLineLoc.metSalesLine().OrderExtractStatus == METOrderExtractStatus::ReadyForExtract)
                     {
                         salesParmLine.DeliverNow = salesLineLoc.reservedPhysical();
+                        
                         salesParmLine.setQty(DocumentStatus::PickingList, false);
                         salesParmLine.update();
                     }
-                }
-
-                
+                } 
             }
             salesFormLetter.run();
-            METSalesOrderShipmentLoadHeader::createShippmentLoadFromSalesTable(salesTable.SalesId, true, false);
-            //METSalesOrderShipmentLoadHeader::generateShipmentLoadFromExtraction([_salestable.SalesId], true, false);
+
+            METOrderShipmentLoadCreation shipmentLoadCreation = 
+                METOrderShipmentLoadCreation::construct(METOrderTransactionType::SalesOrder, _salesTable.SalesId);
+            
+            shipmentLoadCreation.createShippmentLoad(true,false);
             ttscommit;
 
             select firstonly wmsPickingRoute 
@@ -189,13 +202,13 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
 
             if (wmsPickingRoute)
             {
-                if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METSalesOrderExtractionBusinessEvent)))
+                if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METPicklistExtractionBusinessEvent)))
                 {
-                    METSalesOrderExtractionBusinessEvent::newFromWMSPickingRoute(wmsPickingRoute).send();
+                    METPicklistExtractionBusinessEvent::newFromWMSPickingRoute(wmsPickingRoute).send();
                 }
                 else
                 {
-                    throw error("@MET:SalesOrderExtractionBusinessEventNotEnabled");
+                     throw error("@MET:PicklistExtractionBusinessEventNotEnabled");
                 }
             }
         }
@@ -221,6 +234,49 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
             }
             //levkova, CB625_TMSSOPickingListExtraction
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Created for the CB274 - Intercompany Transfers.
+    /// Exclude the SO  line for extraction if it's a food item.
+    /// Create a Purchase order for the food item line.
+    /// </summary>
+    /// <param name = "_shipmentId">Shipment Id reference</param>
+    /// <returns>SysQueryRun</returns>
+    private SysQueryRun calcQuery(SalesTable _salesTable)
+    {
+        const str               oscCode = 'G-Grocery';
+        Query                   qry = new Query(QueryStr(SalesUpdate));
+        RefRecId                salesLineRecId;
+        SalesLine               salesLine;
+        QueryBuildRange         qbrSalesLine;
+        QueryBuildDataSource    qbdsSalesLine;
+
+        qbdsSalesLine = qry.dataSourceTable(tableNum(SalesLine));
+
+        while select salesLine
+            where salesLine.SalesId == _salesTable.SalesId
+        {   
+            if (InventTable::metGetOSCCode(salesLine.ItemId, salesLine.inventDim()) == oscCode && 
+                _salesTable.METIntercompanyTransferFulfillment == NoYes::Yes
+                && _salesTable.InterCompanyOrigin != InterCompanyOrigin::Derived)
+            {
+                METSalesOrderProcessHelper::createPOForIntercompanyFulfillment(_salesTable, salesLine);
+            }
+            else
+            {
+                salesLineRecId  = salesLine.RecId;
+                qbrSalesLine    = qbdsSalesLine.addRange(fieldnum(SalesLine, RecId));
+                
+                qbrSalesLine.value(SysQuery::value(salesLineRecId));
+            }
+        }
+        return new sysQueryRun(qry);
     }
 
 ]]></Source>
