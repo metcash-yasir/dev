@@ -1,0 +1,453 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METInternalCrossDockTransferOrderTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class METInternalCrossDockTransferOrderTaskService extends METSysOperationTaskService
+{
+    InventParameters inventParameter;
+    guid      topPickingProcessId;
+    SalesId   salesId;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Initializes the object.
+    /// </summary>
+    protected void initialise()
+    {
+        METInternalCrossDockTransferOrderTaskContract contract;
+        
+        super();
+
+        // get the topPickingProcessId from the contract
+        contract            = dataContract as METInternalCrossDockTransferOrderTaskContract;
+        topPickingProcessId = contract.parmTopPickingProcessId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs tasks of the task service class.
+    /// </summary>
+    /// <param name = "_readPast">Table read past setting</param>
+    protected void processTask(boolean _readPast)
+    {
+        METSalesPickingListGenerationContract dataContractTask;
+        container csdSalesOrderCon;
+        METSalesPickingListGenerationController controller;
+        Map conParm = new Map(Types::String, Types::Container);
+        Map conSOCDS = new Map(Types::String, Types::String);
+        container salesOrders;
+        SalesTable salesTableLoc;
+
+        while (this.getDataFromTopPickingQueue(topPickingProcessId, _readPast))
+        {
+            select firstonly METOrderExtractStatus, SalesId, CustAccount from salesTableLoc
+                where salesTableLoc.SalesId == salesId;
+           
+            if (salesTableLoc.METOrderExtractStatus != METOrderExtractStatus::ReadyForExtract)
+            {
+                return;
+            }
+
+            if(!conParm.exists(salesId))
+            {
+                conParm.insert(salesId, ['']);
+                salesOrders += salesId;
+            }
+
+            METCSDWarehouse csdWarehouse = InventLocation::find(SalesTable::find(salesId).InventLocationId).METCSDWarehouse;
+                
+            if (csdWarehouse)
+            {
+                if(!conSOCDS.exists(salesId))
+                {
+                    csdSalesOrderCon += salesId;
+                }
+            }
+        }
+
+        controller = METSalesPickingListGenerationController::construct(new Args());
+        dataContractTask = controller.getDataContractObject();
+        dataContractTask.parmCSDSalesOrderList(csdSalesOrderCon);
+        dataContractTask.parmSalesOrderList(salesOrders);
+        controller.parmShowDialog(false);
+        controller.startOperation();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDataFromTopPickingQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets data to reserve event orders.
+    ///</summary>
+    /// <param name = "_processId">Guid created and added in the contract <c>METReserveEventOrdersContract</c>.</param>
+    /// <param name = "_readPast">boolean to read past records or not</param>
+    /// <returns>True, if data is retrieved from the queue; otherwise; false.</returns>
+    private boolean getDataFromTopPickingQueue(guid _processId, boolean _readPast)
+    {
+        #OCCRetryCount
+    
+        METInternalTransferOrderQueue topPickingQueue;
+        int                        backOffWait;
+    
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockException;
+        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
+        Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
+        
+        topPickingQueue.readPast(_readPast);
+
+        try
+        {
+            ttsbegin;
+    
+            select firstonly pessimisticlock topPickingQueue
+                where topPickingQueue.ProcessId == _processId;
+
+            if (topPickingQueue.RecId)
+            {
+                salesId = topPickingQueue.SalesId;
+
+                topPickingQueue.delete();
+            }
+            else
+            {
+                salesId = '';
+            }
+           
+            ttscommit;
+        }
+        catch (deadLockException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw deadLockException;
+                }
+            }
+            else
+            {
+                throw deadLockException;
+            }
+        }
+        catch (updateConflictException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+            }
+            else
+            {
+                throw updateConflictException;
+            }
+        }
+        catch (transientSqlConnectionError)
+        {
+            if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw transientSqlConnectionError;
+            }
+        }
+
+        return (salesId != '');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    /// <param name = "_contract">
+    /// <c>METReserveEventOrdersContract</c>.
+    /// </param>
+    public void process(METInternalCrossDockTransferOrderTaskContract _contract)
+    {
+        this.processInternal(_contract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isUnderBondItem</Name>
+				<Source><![CDATA[
+    public NoYes isUnderBondItem(ItemId _itemId)
+    {
+        NoYes ret = NoYes::No;
+        METInventTable metInventTable;
+        metTariffItemCodeBase metTariffItemCodeBase;
+
+        select firstonly METTariffItemCodeBaseRecid from metInventTable
+                where metInventTable.ItemId == _itemId
+                exists join metTariffItemCodeBase
+                where metTariffItemCodeBase.RecId == metInventTable.METTariffItemCodeBaseRecid;
+
+        ret = metInventTable.METTariffItemCodeBaseRecid ? NoYes::Yes : NoYes::No;
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findOrCreateTransferHeader</Name>
+				<Source><![CDATA[
+    public container findOrCreateTransferHeader(SalesLine _salesLine, METSalesLine _metSalesLine, SalesTable _salesTable, METSalesTable _metSalesTable)
+    {
+        InventTransferTable transferTable;
+        METInventTransferTableExt metTransferTable;
+
+        NoYes underBond = this.isUnderBondItem(_salesLine.ItemId);
+
+        InventLocationId fromWh = _metSalesLine.SecondaryInventLocationId;
+        InventLocationId toWh = _salesLine.inventDim().InventLocationId;
+
+        select firstonly metTransferTable
+            where metTransferTable.SalesId == _salesLine.SalesId
+            && metTransferTable.UnderBond == underBond
+            join transferTable
+            where transferTable.RecId == metTransferTable.InventTransferTable
+            && transferTable.InventLocationIdFrom == fromWh
+            && transferTable.InventLocationIdTo == toWh;
+
+        if(!metTransferTable)
+        {
+            transferTable.clear();
+            transferTable.initValue();
+            transferTable.TransferId = InventTransferTable::numberSeq().num();
+            transferTable.InventLocationIdFrom = fromWh;
+            transferTable.modifiedField(fieldNum(InventTransferTable, InventLocationIdFrom));
+            transferTable.InventLocationIdTo = toWh;
+            transferTable.modifiedField(fieldNum(InventTransferTable, InventLocationIdTo));
+            transferTable.initFromAddress();
+            transferTable.initToAddress();
+            transferTable.ShipDate = _metSalesTable.SecondShipDate;
+            transferTable.ReceiveDate = _salesTable.ShippingDateConfirmed;
+            transferTable.AutoReservation = (inventParameter.InventTransferAutoReservation || _metSalesTable.EventID != '');
+            
+            if (transferTable.validateWrite())
+            {
+                transferTable.insert();
+            }
+            else
+            {
+                throw error("@SCM:FailTransferOrder");
+            }
+
+            metTransferTable.clear();
+            metTransferTable.InventTransferTable = transferTable.RecId;
+            metTransferTable.Route = _metSalesTable.SecondRoute;
+            metTransferTable.RouteStopIdentifier = _metSalesTable.SecondRouteStop;
+            metTransferTable.DeliveryInstructions = _metSalesTable.DeliveryInstructions;
+            metTransferTable.SalesId = _salesLine.SalesId;
+            metTransferTable.UnderBond = underBond;
+            metTransferTable.TransferType = _metSalesTable.InternalCrossDockOrder == NoYes::Yes ? METCrossDockTransferType::CrossDock : METCrossDockTransferType::None;
+            metTransferTable.insert();
+        }
+
+        return [transferTable, metTransferTable];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateTransferOrder</Name>
+				<Source><![CDATA[
+    public void CreateTransferOrder(SalesTable _salesTable)
+    {
+        SalesLine salesLine;
+        METSalesLine metSalesLine;
+        METSalesTable metSalesTable = METSalesTable::findByRefRecId(_salesTable.RecId);
+        METSubstitutionSalesLineProcess subSalesLineProcess;
+        InventDim inventDim;
+        inventParameter = InventParameters::find();
+        
+        ttsbegin;
+        while select salesLine
+            order by metSalesLine.SecondaryInventLocationId
+            where salesLine.SalesId == _salesTable.SalesId
+            join metSalesLine where metSalesLine.SalesLine == salesLine.RecId
+            join inventDim where inventDim.inventDimId == salesLine.InventDimId
+        {
+            SalesQty qtyReserved = salesLine.mcrSalesQtyReserved();
+
+            if (qtyReserved < salesLine.QtyOrdered)
+            {
+                InventTransferTable transferTable;
+                InventTransferLine transferLine;
+
+                METInventTransferTableExt metTransferTable;
+                METInventTransferLine metTransferLine;
+
+                [transferTable, metTransferTable] = this.findOrCreateTransferHeader(salesLine, metSalesLine, _salesTable, metSalesTable);
+
+                if(metTransferTable)
+                {
+                    if(!METInventTransferLine::existsForSalesLine(salesLine.InventTransId))
+                    {
+                        transferLine.initFromSalesLine(salesLine);
+                        transferLine.initFromInventTransferTable(transferTable, true);
+                        transferLine.QtyTransfer = (salesLine.QtyOrdered - qtyReserved);
+                        
+                        if(salesLine.PdsCWQty)
+                        {
+                            transferLine.PdsCWQtyTransfer = salesLine.pdsCWQtyActivateRemainder();
+                            transferLine.modifiedField(fieldNum(InventTransferLine, PdsCWQtyTransfer));
+                        }
+
+                        transferLine.LineNum = salesLine.LineNum;
+
+                        if(transferLine.validateWrite())
+                        {
+                            transferLine.insert();
+                        }
+                        this.insertSupplyRelation(salesLine, transferLine);
+
+                        metTransferLine.clear();
+                        metTransferLine.initValue();
+                        metTransferLine.InventTransferLine = transferLine.RecId;
+                        metTransferLine.SalesLineTransId = salesLine.InventTransId;
+                        metTransferLine.AllowSubstitution = qtyReserved == 0;
+
+                        InventMovement::bufferSetRemainQty(metTransferLine, InventMovSubType::None);
+                        InventMovement::bufferSetRemainQty(metTransferLine, InventMovSubType::TransferOrderTransitFrom);
+
+                        metTransferLine.insert();
+
+                        if(metTransferLine)
+                        {
+                            metSalesLine.selectForUpdate(true);
+                            metSalesLine.TransferOrderNumber = transferTable.TransferId;
+                            metSalesLine.InventTransIdReceive = transferLine.InventTransIdReceive;
+                            metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+
+                            metSalesLine.update();
+                        }
+                    }
+                }
+                //subSalesLineProcess = METSubstitutionSalesLineProcess::construct(salesLine);
+                //subSalesLineProcess.run();
+            }
+        }
+        
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkAndUpdateMarking</Name>
+				<Source><![CDATA[
+    private void checkAndUpdateMarking(SalesLine _salesLine, InventTransferLine _transferLine)
+    {
+        //&& this.shouldAutoMarking(_salesLine.ItemId) - check if this needs to be enabled later.
+        if (!PdsGlobal::pdsIsCWItem(_salesLine.ItemId))
+        {
+            InventTransOriginId salesLineTransOriginId    = InventTransOrigin::findByInventTransId(_salesLine.InventTransId).RecId;
+            InventTransOriginId transferLineTransOriginId = InventTransOrigin::findByInventTransId(_transferLine.InventTransIdReceive).RecId;
+
+            InventDimParm inventDimParm;
+            InventDim     inventDim = _salesLine.inventDim();
+            inventDimParm.initFromInventDim(inventDim);
+
+            this.updateMarking(salesLineTransOriginId, transferLineTransOriginId, -_transferLine.QtyTransfer, -_transferLine.PdsCWQtyTransfer, inventDim, inventDimParm);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMarking</Name>
+				<Source><![CDATA[
+    private void updateMarking(
+        InventTransOriginId     _inventTransOriginId,           // Issue
+        InventTransOriginId     _markingRefInventTransOriginId, // Receipt
+        InventQty               _markQty,
+        PdsCWInventQty          _cwMarkQty,
+        InventDim               _inventDimCriteria = null,
+        InventDimParm           _inventDimParm = null)
+    {
+        PmfQtyDataCarrier outQuantities = new PmfQtyDataCarrier();
+
+        // mark sales line
+        InventQty markedQty = InventTransOrigin::updateMarking(_inventTransOriginId, _markingRefInventTransOriginId, _markQty, '', SortOrder::Descending, true, _inventDimCriteria, _inventDimParm, _cwMarkQty, outQuantities);
+
+        if (!markedQty)
+        {
+            return;
+        }
+
+        // mark transfer line receive
+        InventQty markedReverseQty = InventTransOrigin::updateMarking(_markingRefInventTransOriginId, _inventTransOriginId, markedQty, '', SortOrder::Descending, true, _inventDimCriteria, _inventDimParm, outQuantities.parmCwQty());
+
+        if (markedReverseQty)
+        {
+            // update reservation for the issue.
+            InventUpd_Reservation::updateReserveRefTransId(InventTransOrigin::find(_inventTransOriginId).inventMovement(InventDirection::Issue), true);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertSupplyRelation</Name>
+				<Source><![CDATA[
+    private void insertSupplyRelation(SalesLine _salesLine, InventTransferLine _inventTransferLine)
+    {
+        ttsbegin;
+        InventTransferOrderSalesLineSupplyRelation relation;
+        relation.SalesId                         = _salesLine.SalesId;
+        relation.SalesLineCreationSequenceNumber = _salesLine.LineCreationSequenceNumber;
+        relation.TransferId                      = _inventTransferLine.TransferId;
+        relation.TransferLineNum                 = _inventTransferLine.LineNum;
+        relation.insert();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static METInternalCrossDockTransferOrderTaskService construct()
+    {
+        return new METInternalCrossDockTransferOrderTaskService();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

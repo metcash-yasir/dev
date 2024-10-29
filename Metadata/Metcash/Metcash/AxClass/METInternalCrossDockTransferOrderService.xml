@@ -1,0 +1,247 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METInternalCrossDockTransferOrderService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class METInternalCrossDockTransferOrderService extends METSysOperationService
+{
+    private METInternalCrossDockTransferOrderTaskContract contract;
+    private guid queueId;
+    Query userQuery;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getTaskServiceClass</Name>
+				<Source><![CDATA[
+    // <summary>
+    /// Returns task service class name.
+    /// </summary>
+    /// <returns>Task service class name</returns>
+    protected str getTaskServiceClass()
+    {
+        return classStr(METInternalCrossDockTransferOrderTaskService);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTaskServiceClassMethod</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns task service class method.
+    /// </summary>
+    /// <returns>Task service class method</returns>
+    protected str getTaskServiceClassMethod()
+    {
+        return methodStr(METInternalCrossDockTransferOrderTaskService, process);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTaskServiceCaption</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns caption of the task service class.
+    /// </summary>
+    /// <returns>Task service class caption</returns>
+    protected str getTaskServiceCaption()
+    {
+        return "Automatic sales order extraction process";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFieldMap</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// constructs the field maps used to insert data from user query to temporary staging table.
+    /// </summary>
+    /// <param name = "_dataSourceId">Unique data source of the query data source</param>
+    /// <returns>Field map</returns>
+    private Map getFieldMap(int _dataSourceId)
+    {
+        Map fieldsMap = new Map(Types::String, Types::Container);
+
+        fieldsMap.insert(fieldStr(METInternalTransferOrderQueueTmp, SalesId), [_dataSourceId, fieldStr(SalesTable, SalesId)]);
+
+        return fieldsMap;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    /// <param name = "_contract">
+    /// <c>METReserveEventOrdersContract</c>
+    /// </param>
+    public void process(METInternalCrossDockTransferOrderContract _contract)
+    {
+        userQuery = new Query(_contract.parmPackedQuery());
+        this.initialise();
+        this.processInternal(_contract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialise global variables and initiates data staging.
+    /// </summary>
+    public void initialise()
+    {
+        super();
+
+        this.stageDataIntoQueue();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stageDataIntoQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes process and stages data into table <t>METInternalTransferOrderQueue</t>.
+    /// </summary>
+    void stageDataIntoQueue()
+    {
+        #OCCRetryCount
+
+        contract            = dataContract as METInternalCrossDockTransferOrderTaskContract;
+        queueId = newGuid();
+
+        try
+        {
+            ttsbegin;
+
+            METInternalTransferOrderQueue::cleanUpQueue();
+            this.stageQueue();
+
+            ttscommit;
+
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Error)
+        {
+            curext(); 
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stageQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Stages orders to be processed based on user selection and .
+    /// </summary>
+    private void stageQueue()
+    {
+        METInternalTransferOrderQueueTmp metInternalTransferQueueTmp;
+        METInternalTransferOrderQueue processQueue;
+        SalesTable salesTable;
+        METSalesTable metSalesTable;
+
+        QueryBuildDataSource qbdsSalesTable = userQuery.dataSourceName(tableStr(SalesTable));
+        Query::insert_recordset(metInternalTransferQueueTmp, this.getFieldMap(qbdsSalesTable.uniqueId()), userQuery);
+
+        //Transfer the data from tmp table to Process queue with process Id. 
+        insert_recordset processQueue(ProcessId, SalesId)
+            select queueId, SalesId from metInternalTransferQueueTmp
+            group by metInternalTransferQueueTmp.SalesId;
+
+        // Since the data in processing queue is populated based on user query, 
+        // we need to make sure that orders that match below conditions are exculded
+        // 1. Orders that are already extracted 
+        // 2. Orders that has future release dates (Release date > today()).
+        // 3. Event orders (Event Id != '')
+        delete_from processQueue
+            where processQueue.ProcessId == queueId
+            exists join salesTable
+            where salesTable.SalesId == processQueue.SalesId
+            && salesTable.METOrderExtractStatus == METOrderExtractStatus::Extracted
+            exists join metSalesTable
+            where metSalesTable.SalesTable == salesTable.RecId
+            && metSalesTable.EventID != ''
+            && metSalesTable.ReleaseDate > DateTimeUtil::getToday(DateTimeUtil::getCompanyTimeZone());
+
+        //Update the order extraction status to Ready For Extraction so the extraction process will pick this up.
+        update_recordset salesTable
+            setting METOrderExtractStatus = METOrderExtractStatus::ReadyForExtract
+            where processQueue.ProcessId == queueId
+            exists join processQueue
+            where processQueue.SalesId == salesTable.SalesId
+            && salesTable.METOrderExtractStatus == METOrderExtractStatus::Open;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTaskDataContract</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the task data contract.
+    /// </summary>
+    /// <param name = "_taskDataContract">task data contract</param>
+    protected void initTaskDataContract(METSysOperationTaskDataContract _taskDataContract)
+    {
+        super(_taskDataContract);
+        contract = _taskDataContract as METInternalCrossDockTransferOrderTaskContract;
+        contract.parmTopPickingProcessId(queueId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>taskDataContractObject</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Provides task data contract.
+    /// </summary>
+    /// <returns>task data contract</returns>
+    protected METSysOperationTaskDataContract taskDataContractObject()
+    {
+        return new METInternalCrossDockTransferOrderTaskContract();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
