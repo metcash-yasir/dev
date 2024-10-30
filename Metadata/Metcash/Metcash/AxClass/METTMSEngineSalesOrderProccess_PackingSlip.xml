@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
 	<Name>METTMSEngineSalesOrderProccess_PackingSlip</Name>
 	<SourceCode>
@@ -12,6 +12,9 @@ internal final class METTMSEngineSalesOrderProccess_PackingSlip extends METTMSEn
     METSalesOrderShipmentLoadLines  salesOrderShipmentLoadLines, salesOrderShipmentLoadLinesQueryRun;
     PackingSlipId                   packingSlipId; 
     WMSPickingRouteID               pickingRouteId;
+    METTMSCCRTableHelper            ccrHelper;
+    Set                             ccrToteIds;
+    METWMSPicklistNumber            wmsPicklistNumber;
 
 }
 ]]></Declaration>
@@ -30,7 +33,10 @@ internal final class METTMSEngineSalesOrderProccess_PackingSlip extends METTMSEn
         salesOrderShipmentLoadHeader = _salesOrderShipmentLoadHeader;
 
         // Generated delivery note number
-        packingSlipId = _packingSlipId;        
+        packingSlipId = _packingSlipId; 
+       
+        // initialise the Set for CCR Tote ID, object instanciated here but not used for CB624, only CB626
+        ccrToteIds = new Set(Types::String);
     }
 
 ]]></Source>
@@ -46,7 +52,33 @@ internal final class METTMSEngineSalesOrderProccess_PackingSlip extends METTMSEn
     /// <returns>New instance of <c>METTMSEngineLinesTmpBuilder</c></returns>
     METTMSEngineLinesTmpBuilder getTmpBuilderInstance(METTMSEngineSalesOrderProcess _tmsEngineProcess, SalesTable _salesTable)
     {
-        return METTMSEngineLinesTmpBuilder::construct(_tmsEngineProcess, _salesTable, salesOrderShipmentLoadHeader.ShipmentId);
+        return METTMSEngineLinesTmpBuilder::construct(METTMSEngineSalesOrderProcess::PackingSlip, _salesTable, salesOrderShipmentLoadHeader.ShipmentId, wmsPicklistNumber);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTmpTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialise temporary table with calculations and CCR if required.
+    /// </summary>
+    void initTmpTable()
+    {
+        super();
+
+        // if there is at least one line with CCR
+        if (hasCCR)
+        {
+            // Trigger the CCR calculation
+            ccrHelper = METTMSCCRTableHelper::construct(proccessLinesTmp,
+                                                        ccrToteIds,
+                                                        salesTable.SalesId,
+                                                        wmsPicklistNumber);
+            
+            // calc CCR variables and returns set of unique tote ids to avoid double counting for the next SOs
+            ccrToteIds = ccrHelper.calc();
+        }
     }
 
 ]]></Source>
@@ -86,24 +118,23 @@ internal final class METTMSEngineSalesOrderProccess_PackingSlip extends METTMSEn
     /// </summary>
     public void run()
     {        
-        SalesTable                      salesTableLoop;
+        SalesTable salesTableLoop;
 
         // For each combination of sales order - picking list number in the F&O finalisation shipment lines
         while select salesOrderShipmentLoadLines
             group by ShipmentId, OrderNum, PickingListNum          
                where salesOrderShipmentLoadLines.ShipmentId == salesOrderShipmentLoadHeader.ShipmentId
         {
-            pickingRouteId = salesOrderShipmentLoadLines.PickingListNum;
-            
+            pickingRouteId = salesOrderShipmentLoadLines.PickingListNum;          
+
             // cannot join in the while select because of the group by...
             salesTableLoop = SalesTable::find(salesOrderShipmentLoadLines.OrderNum);
             
             this.init(salesTableLoop);
 
-            // Before calling the super() need to reset the temp table
-            //this.resetTmpTable();
+            wmsPicklistNumber = WMSPickingRoute::METGetWMSPicklistNumber(pickingRouteId, inventLocation.METCSDWarehouse, metSalesTable.InternalCrossDockOrder);
 
-            // Assumption we can process the SO from shipment one by one (Need to check)
+            // Process the SO/picking list number from shipment one by one
             super();
         }
     }
@@ -167,7 +198,65 @@ internal final class METTMSEngineSalesOrderProccess_PackingSlip extends METTMSEn
         // what was defined in “Step 3d” of the CB624 FSD, with the following differences an extra Pick List ID field as defined in the table below.
         _tmsShipmentOrderTable.PickListId = salesOrderShipmentLoadLines.PickingListNum;
 
-        // TODO Where CCR data is available, calculations of some of the quantity / counts are different, as shown in the table below.
+        // If any of the lines on the SO have a warehouse with SuppWhsHasCCR = Yes
+        // New calc formulas for Repack case count – Security/Non Security and Case count – Shipped/Security
+        if (hasCCR)
+        {
+            this.setTMSShipmentOrderFieldsCCR(_tmsShipmentOrderTable);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setTMSShipmentOrderFieldsCCR</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to set the CCR fields for <c>METTMSShipmentOrderTable</c> record
+    /// </summary>
+    /// <param name = "_tmsShipmentOrderTable"><c>METTMSShipmentOrderTable</c> record</param>
+    protected void setTMSShipmentOrderFieldsCCR(METTMSShipmentOrderTable _tmsShipmentOrderTable)
+    {
+        METWHSPalletVolume  sumRepackContainersCaseVolumeCCR, sumRepackContainersToteVolumeCCR;
+        int                 sumRepackContainersQtyCCR, sumRepackContainersQtyTOBCCR, sumRepackContainersQtyNotTOBCCR;
+        METWHSPalletWeight  sumRepackContainersToteWeightCCR;
+            
+        // calc RepackContainersByCommodity for the order with LineCommodity = TOB and <> TOB
+        METTMSEngineSalesOrderProccessLinesTmp  linesTmpTOB, linesTmpNotTOB;
+        linesTmpTOB.linkPhysicalTableInstance(proccessLinesTmp);
+        linesTmpNotTOB.linkPhysicalTableInstance(proccessLinesTmp);
+        
+        // BrokenCaseItemQtySecurity and BrokenCaseItemQtyNonSecurity are sum from temp table
+        select sum(RepackCountNonSecurity), sum(RepackCountSecurity) from linesTmpTOB where linesTmpTOB.LineCommodity == METConstants::tobCommodity;
+        select sum(RepackCountNonSecurity), sum(RepackCountSecurity) from linesTmpNotTOB where linesTmpNotTOB.LineCommodity != METConstants::tobCommodity;
+
+        [sumRepackContainersQtyCCR,
+         sumRepackContainersQtyTOBCCR,
+         sumRepackContainersQtyNotTOBCCR,
+         sumRepackContainersCaseVolumeCCR,
+         sumRepackContainersToteVolumeCCR,
+         sumRepackContainersToteWeightCCR] = ccrHelper.getSumCommodityResults();
+            
+        // Case count – Shipped
+        // Add Count(CCR_RepackContainersByCommodity) for all CCR records for the SO to existing calculated value
+        _tmsShipmentOrderTable.CaseCountShipped += sumRepackContainersQtyCCR;
+
+        // Repack case count – Security
+        // Sum(RepackContainersByCommodity) for the order with LineCommodity = TOB
+        // + Count(CCR_RepackContainersByCommodity) for CCR records for the SO with CCR_LineCommodity = TOB.
+        _tmsShipmentOrderTable.RepackCaseCountSecurity = this.getRepackContainersByCommodity(linesTmpTOB.RepackCountSecurity, linesTmpTOB.RepackCountNonSecurity)
+                                                       + sumRepackContainersQtyTOBCCR;
+
+        // Repack case count – Non security
+        // Sum(RepackContainersByCommodity) for the order with LineCommodity <> TOB
+        // + Count(CCR_RepackContainersByCommodity) for CCR records for the SO with CCR_ LineCommodity <> TOB
+        _tmsShipmentOrderTable.RepackCaseCountNonSecurity = this.getRepackContainersByCommodity(linesTmpNotTOB.RepackCountSecurity, linesTmpNotTOB.RepackCountNonSecurity)
+                                                          + sumRepackContainersQtyNotTOBCCR;
+            
+        // Case count – Security
+        // Sum(RepackContainersByCommodity) for all LineCommodity-s on the order with LineCommodity = TOB
+        // + Count(CCR_RepackContainersByCommodity) for all CCR records for the SO with CCR_LineCommodity = TOB
+        _tmsShipmentOrderTable.CaseCountSecurity = _tmsShipmentOrderTable.RepackCaseCountSecurity;
     }
 
 ]]></Source>
@@ -175,73 +264,6 @@ internal final class METTMSEngineSalesOrderProccess_PackingSlip extends METTMSEn
 			<Method>
 				<Name>shippingDate</Name>
 				<Source><![CDATA[
-    /*protected int repackContainersByCommodity(SalesOrderedQty _repackCountSecurity, SalesOrderedQty _repackCountNonSecurity, METCommodity _commodity)
-    {
-        METTMSEngineSalesOrderProccessLinesTmp  processLinesGroup;
-        processLinesGroup.linkPhysicalTableInstance(proccessLinesTmp);
-        
-        // RoundUp the sum of (RepackCountSecurity) for all the lines on the order per LineCommodity with SuppWhsHasCCR = No +
-        // RoundUp the sum of (RepackCountNonSecurity) for all the lines on the order per LineCommodity with SuppWhsHasCCR = No
-        select sum(RepackCountSecurity), sum(RepackCountNonSecurity)
-            from processLinesGroup
-            group by LineCommodity
-            where processLinesGroup.LineCommodity == _commodity
-               && processLinesGroup.SuppWhsHasCCR == NoYes::No;
-        
-        return roundUp(processLinesGroup.RepackCountSecurity, 1) + roundUp(processLinesGroup.RepackCountNonSecurity, 1);
-    }*/
-
-    /* now done in METTMSShipmentItemGroupUOM classes
-    protected METQty TSIGCSEQuantity(boolean _isToteCustomer, SalesOrderedQty _caseQty_CaseLines, int _repackContainersByCommodity, METCommodity _commodity)
-    {
-        int CCR_RepackContainersByCommodity = 0, CCR_ContainerCountByCommodity = 0;
-        METCCRTable ccrTable;
-        METTMSEngineSalesOrderProccessLinesTmp  processLinesGroup;
-        processLinesGroup.linkPhysicalTableInstance(proccessLinesTmp);
-        
-        // Sum of (CaseQty_CaseLines) for all the lines of the order that have this LineCommodity and has SuppWhsHasCCR = No
-        select sum(CaseQty_CaseLines)
-            from processLinesGroup
-            group by LineCommodity
-            where processLinesGroup.LineCommodity == _commodity
-               && processLinesGroup.SuppWhsHasCCR == NoYes::No;        
-
-        // CCR_ContainerCountByCommodity for this CCR_LineCommodity.
-        // can't sum the value as FSD and field is string.... :(
-        /*select sum(UOIPickedQuantity)
-            from ccrTable
-            where ccrTable.PickingRoute  == salesOrderShipmentLoadLines.PickingListNum
-               && ccrTable.SalesOrder    == salesTable.SalesId
-               //&& ccrTable.LineCommodity == _commodity //doesn't exist in CCR table, not sure how I can join with the temp table, no straightforward link...
-               && ccrTable.ToteId == '';
-        */
-
-        // If DoesCustUseTotes = Y and any of the lines on the SO have a warehouse with SuppWhsHasCCR = Yes set to:
-        if (_isToteCustomer)
-        {
-            return processLinesGroup.CaseQty_CaseLines + CCR_ContainerCountByCommodity;
-        }
-
-        // CCR_RepackContainersByCommodity for this CCR_LineCommodity
-        while select ccrTable
-            group by ToteId
-               where ccrTable.PickingRoute  == salesOrderShipmentLoadLines.PickingListNum // TODO this is way more complex than that
-                  && ccrTable.SalesOrder    == salesTable.SalesId
-                  //&& ccrTable.LineCommodity == _commodity //doesn't exist in CCR table, not sure how I can join with the temp table, no straightforward link...
-        {
-            if (!ccrToteIds.in(ccrTable.ToteId))
-            {
-                CCR_RepackContainersByCommodity++;
-                // this is to make sure we are not double counting Tote id as they can be split across multiple orders in CCR table
-                ccrToteIds.add(ccrTable.ToteId);
-            }
-        }
-
-        
-        // If DoesCustUseTotes = N
-        return processLinesGroup.CaseQty_CaseLines + _repackContainersByCommodity + CCR_RepackContainersByCommodity + CCR_ContainerCountByCommodity;
-    }*/
-
     /// <summary>
     /// Shipping date variable from the shipment header
     /// </summary>
@@ -279,35 +301,18 @@ internal final class METTMSEngineSalesOrderProccess_PackingSlip extends METTMSEn
     /// <param name = "_headerInventLocationId">Header warehouse</param>
     /// <param name = "_hasCCR">If any of the lines on the SO have a warehouse with SuppWhsHasCCR = Yes</param>
     /// <returns>New instance of <c>METTMSShipmentItemGroupHelper</c></returns>
-    METTMSShipmentItemGroupHelper getTSIGHelperInstance(METTMSEngineSalesOrderProccessLinesTmp _processLinesTmp, METTMSShipmentOrderIdentifier _tmsShipmentOrderIdentifier, boolean _isToteCustomer, InventLocationId _headerInventLocationId, boolean _hasCCR, SalesId _salesId = "", WMSPickingRouteID _pickingRouteId = "")
+    METTMSShipmentItemGroupHelper getTSIGHelperInstance(METTMSEngineSalesOrderProccessLinesTmp _processLinesTmp, METTMSShipmentOrderIdentifier _tmsShipmentOrderIdentifier, boolean _isToteCustomer, InventLocationId _headerInventLocationId, boolean _hasCCR)
     {
         return METTMSShipmentItemGroupHelper::construct(_processLinesTmp,
                                                         _tmsShipmentOrderIdentifier,
                                                         _isToteCustomer,
                                                         _headerInventLocationId,
                                                         _hasCCR,
-                                                        salesTable.SalesId,
-                                                        pickingRouteId,
-                                                        ccrToteIds);
+                                                        ccrHelper);
     }
 
 ]]></Source>
 			</Method>
-			<Method>
-				<Name>createTMSShipmentItemGroup</Name>
-				<Source><![CDATA[
-    protected boolean createTMSShipmentItemGroup(METTMSEngineSalesOrderProccessLinesTmp _processLinesTmp, METTMSShipmentOrderIdentifier _tmsShipmentOrderIdentifier, boolean _isToteCustomer, InventLocationId _headerInventLocationId, boolean _hasCCR, SalesId _salesId = "", WMSPickingRouteID _pickingRouteId = "")
-    {
-        boolean ret = super(_processLinesTmp, _tmsShipmentOrderIdentifier, _isToteCustomer, _headerInventLocationId, _hasCCR, _salesId, _pickingRouteId);
-
-        // get the ccrToteIds updated within TSIGHelper.create()
-        ccrToteIds = TSIGHelper.getCCRToteIdsSet();
-
-        return ret;
-    }
-
-]]></Source>
-			</Method>			
 		</Methods>
 	</SourceCode>
 </AxClass>
