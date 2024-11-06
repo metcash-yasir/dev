@@ -1,0 +1,363 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METCrossDockSalesFinalizationFacade</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class METCrossDockSalesFinalizationFacade
+{
+
+    WMSPickingRouteID wmsPickingRouteId = '';
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>postIntercompanyPickingList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Post intercompany picking list
+    /// </summary>
+    private void postIntercompanyPickingList(SalesTable _salesTable)
+    {
+        PurchTable                      purchTable_Reference    = _salesTable.referencePurchTable();
+
+        if ((!purchTable_Reference.RecId && !purchTable_Reference.InterCompanySalesId) || !TradeInterCompany::checkDataAreaAccess(purchTable_Reference.InterCompanyCompanyId))
+        {
+            return;
+        }
+        else if (purchTable_Reference.RecId)
+        {
+            changeCompany(purchTable_Reference.InterCompanyCompanyId)
+            {
+                this.postPickingList(purchTable_Reference.interCompanySalesTable());
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static METCrossDockSalesFinalizationFacade construct()
+    {
+        return new METCrossDockSalesFinalizationFacade();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isWaveRequired</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if wave details need to be created in the system for the sales order
+    /// </summary>
+    /// <param name = "_salesTable">Table buffer of of <t>SalesTable</t></param>
+    /// <param name = "_inventLocation">Table buffer of type <t>InventLocation</t></param>
+    /// <returns>true if wave is required, otherwise false</returns>
+    private boolean isWaveRequired(SalesTable _salesTable, InventLocation _inventLocation)
+    {
+        boolean ret = false;
+
+        if (_salesTable.salesid && DateTimeUtil::minValue() != _salesTable.METOrderExtractDateTime
+                && _inventLocation.METWaveRequired == NoYes::Yes && _inventLocation.METCSDWarehouse == NoYes::Yes
+                && _inventLocation.METPickDirector == NoYes::Yes)
+        {
+            ret = true;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    private boolean validate(SalesTable _salesTable, InventTransferId _transferId)
+    {
+        METInventTransferTableExt metTransTable;
+        InventTransferTable inventTransferTable;
+
+
+        select firstonly inventTransferTable
+            exists join metTransTable
+            where inventTransferTable.RecId == metTransTable.InventTransferTable
+            && metTransTable.SalesId == _salesTable.SalesId
+            && inventTransferTable.TransferStatus != InventTransferStatus::Received
+            && inventTransferTable.TransferId != _transferId;
+
+        return inventTransferTable.RecId == 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate and process sales order document posting and shipment process.
+    /// </summary>
+    /// <param name = "_transferId">Transfer order reference</param>
+    public void process(InventTransferId _transferId)
+    {
+        InventParameters inventParameters = InventParameters::find();
+        InventTransferTable inventTransferTable;
+        METInventTransferTableExt metTransferTable;
+        SalesTable salesTable;
+        InventLocation inventLocation;
+
+        CompanyInfo companyInfo = CompanyInfo::find();
+        
+        select firstonly salesTable
+            where salesTable.METOrderExtractStatus == METOrderExtractStatus::Extracted
+                  && salesTable.SalesStatus == SalesStatus::Backorder
+            join firstonly inventLocation
+            where inventLocation.InventLocationId == salesTable.InventLocationId
+            join TransferType from metTransferTable
+            where metTransferTable.SalesId == salesTable.SalesId
+                && metTransferTable.OrderExtractStatus == METOrderExtractStatus::Extracted
+                && metTransferTable.TransferType != METCrossDockTransferType::None
+            exists join inventTransferTable
+            where inventTransferTable.RecId == metTransferTable.InventTransferTable
+            && inventTransferTable.TransferId == _transferId;
+
+        if(!this.validate(salesTable, _transferId))
+        {
+            return;
+        }
+
+        //exists join metSalesTable
+        //where metSalesTable.SalesTable == salesTable.RecId;
+
+        if(this.isWaveRequired(salesTable, inventLocation))
+        {
+            salesTable.createWaveFromSalesTable();
+        }
+
+        if((metTransferTable.TransferType == METCrossDockTransferType::CrossDock) || (metTransferTable.TransferType == METCrossDockTransferType::CSD && salesTable))
+        {
+            //Task152245-CB123-SalesOrderExtractScreenforCSD - start
+            //if ((inventLocation.METWaveRequired == NoYes::Yes && inventLocation.METPickDirector == NoYes::No
+            //     && inventLocation.METCSDWarehouse == NoYes::Yes)
+            //    || (inventLocation.METCSDWarehouse == NoYes::No))
+            //{
+                //Post picking list
+                this.postPickingList(salesTable);
+
+                //Post intercompany picking list. Sourcing all lines from a single company
+                this.postIntercompanyPickingList(salesTable);
+            //}
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postPickingListRegistration</Name>
+				<Source><![CDATA[
+    private void postPickingListRegistration(WMSPickingRouteID _pickingRouteID)
+    {
+        List list = new List(Types::String);
+ 
+        list.addEnd(_pickingRouteID);
+ 
+        WMSPickingRoute::finishMulti(list.pack());   // Note - this is not in a single tts, so some routes might be posted and others fail
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTransferPickListReference</Name>
+				<Source><![CDATA[
+    private WMSPickingRouteID getTransferPickListReference(WMSPickingRoute _wmsPickingRoute)
+    {
+        SalesLine salesLine;
+        WMSOrderTrans orderTrans;
+        
+        select firstonly orderTrans
+            where orderTrans.shipmentId == _wmsPickingRoute.shipmentId
+            && orderTrans.routeId == _wmsPickingRoute.pickingRouteID
+            join salesLine
+            where salesLine.InventTransId == orderTrans.inventTransId
+            && salesLine.SalesId == orderTrans.inventTransRefId;
+        
+        WMSPickingRoute transferPickingRoute;
+
+        if(salesLine)
+        {
+            METInventTransferLine metTransLine;
+            InventTransferLine transferLine;
+
+            select firstonly metTransLine
+                where metTransLine.SalesLineTransId == salesLine.InventTransId
+                join transferLine 
+                where transferLine.RecId == metTransLine.InventTransferLine;
+
+            select firstonly transferPickingRoute
+                where transferPickingRoute.transRefId == transferLine.TransferId
+                && transferPickingRoute.transType == InventTransType::TransferOrderShip;
+
+        }
+
+        return transferPickingRoute.pickingRouteID;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postPickingList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Post picking list
+    /// </summary>
+    /// <param name = "_salesTable">SalesTable buffer.</param>
+    private void postPickingList(SalesTable _salesTable)
+    {
+        boolean             isError;
+        QueryRun            queryRun;
+        SalesParmLine       salesParmLine;
+        SalesFormLetter     salesFormLetter;
+
+        try
+        {
+            ttsbegin;
+
+            //NS-Created for CB274 - Intercompany Transfers.
+            queryRun = this.calcQuery(_salesTable);
+            //NE-Created for CB274 - Intercompany Transfers.
+
+            salesFormLetter = SalesFormLetter::construct(DocumentStatus::PickingList);
+            
+            salesFormLetter.chooseLinesQuery(queryRun);
+            salesFormLetter.salesTable(_salestable);
+            salesFormLetter.initParmSalesTable(salesFormLetter.salesTable());
+            salesFormLetter.transDate(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+            salesFormLetter.specQty(SalesUpdate::All);
+            salesFormLetter.printFormLetter(salesFormLetter.printFormLetter());
+            salesFormLetter.createParmUpdateFromParmUpdateRecord(SalesFormletterParmData::initSalesParmUpdateFormletter(salesFormLetter.documentStatus(), salesFormLetter.pack()));
+            
+            //For intercompany orders we always pick the reserved quantity
+            if (!InventLocation::find(salesFormLetter.salesTable().InventLocationId).METPickDirector || _salesTable.InterCompanyOrder)
+            {
+                salesFormLetter.salesParmUpdate().ReduceOnHand  = NoYes::Yes;
+                salesFormLetter.salesParmUpdate().Reserve       = NoYes::Yes;
+            }
+           
+            salesFormLetter.initParameters(salesFormLetter.salesParmUpdate(), Printout::Current);
+            salesFormLetter.initLinesQuery();
+
+            SalesLine salesLineLoc;
+            
+            while select forupdate salesParmLine
+                where salesParmLine.ParmId == salesFormLetter.parmId()
+            {
+                salesLineLoc = salesParmLine.salesLine();
+                
+                salesParmLine.DeliverNow = salesLineLoc.reservedPhysical();
+                InventDim inventDimLoc = salesLineLoc.inventDim();
+                if(InventDimLoc.wMSLocationId == '')
+                {
+                    inventDimLoc.wMSLocationId = inventDimLoc.inventLocation().DefaultFinalShipmentLocation;
+                    salesParmLine.InventDimId = InventDim::findOrCreate(inventDimLoc).inventDimId;
+                }
+
+                salesParmLine.setQty(DocumentStatus::PickingList, false);
+                salesParmLine.update();
+            }
+
+            salesFormLetter.run();
+
+            METOrderShipmentLoadCreation shipmentLoadCreation =
+                METOrderShipmentLoadCreation::construct(METOrderTransactionType::SalesOrder, _salesTable.SalesId);
+            
+            shipmentLoadCreation.createShippmentLoad(true,false);
+            ttscommit;
+            WMSPickingRoute wmsPickingRoute;
+            
+            select firstonly wmsPickingRoute
+                where wmsPickingRoute.parmid == salesFormLetter.parmId();
+            
+            if (wmsPickingRoute)
+            {
+                wmsPickingRoute.selectForUpdate(true);
+                ttsbegin;
+                wmsPickingRoute.METTransferOrderPickingRouteId = this.getTransferPickListReference(wmsPickingRoute);
+                wmsPickingRoute.doUpdate();
+                ttscommit;
+
+                //this.postPickingListRegistration(wmsPickingRoute.pickingRouteID);
+                METOrderShipmentConfirmation orderShipmentConfirmation = METOrderShipmentConfirmation::construct(wmsPickingRoute.shipmentId);
+                orderShipmentConfirmation.run();
+
+                if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METPicklistExtractionBusinessEvent)))
+                {
+                    METPicklistExtractionBusinessEvent::newFromWMSPickingRoute(wmsPickingRoute).send();
+                }
+                else
+                {
+                    throw error("@MET:PicklistExtractionBusinessEventNotEnabled");
+                }
+            }
+        }
+        catch
+        {
+            error ("@WAX:UpdateCancelled");
+            isError = true;
+        }
+
+        if (isError)
+        {
+            // If picking list generation failed with error revert extract status back to Open
+            _salesTable.selectForUpdate(true);
+            _salesTable.metUpdateExtractStatus();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Created for the CB274 - Intercompany Transfers.
+    /// Exclude the SO  line for extraction if it's a food item.
+    /// Create a Purchase order for the food item line.
+    /// </summary>
+    /// <param name = "_shipmentId">Shipment Id reference</param>
+    /// <returns>SysQueryRun</returns>
+    private SysQueryRun calcQuery(SalesTable _salesTable)
+    {
+        const str               oscCode = 'G-Grocery';
+        Query                   qry = new Query(QueryStr(SalesUpdate));
+        SalesLine               salesLine;
+        QueryBuildRange         qbrSalesLine;
+        QueryBuildDataSource    qbdsSalesLine;
+
+        qbdsSalesLine = qry.dataSourceTable(tableNum(SalesLine));
+
+        while select salesLine
+            where salesLine.SalesId == _salesTable.SalesId
+        {
+            if (InventTable::metGetOSCCode(salesLine.ItemId, salesLine.inventDim()) == oscCode &&
+                _salesTable.METIntercompanyTransferFulfillment == NoYes::Yes
+                && _salesTable.InterCompanyOrigin != InterCompanyOrigin::Derived)
+            {
+                METSalesOrderProcessHelper::createPOForIntercompanyFulfillment(_salesTable, salesLine);
+            }
+            else
+            {
+                qbrSalesLine    = qbdsSalesLine.addRange(fieldnum(SalesLine, RecId));
+                
+                qbrSalesLine.value(SysQuery::value(salesLine.RecId));
+            }
+        }
+
+        return new sysQueryRun(qry);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

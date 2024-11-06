@@ -9,6 +9,8 @@
 class METTransferPickingListGenerationTaskService extends SysOperationServiceBase
 {
 
+    boolean lineSubstituted = false;
+
 }
 ]]></Declaration>
 		<Methods>
@@ -89,6 +91,38 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>postSalesOrder</Name>
+				<Source><![CDATA[
+    private void postSalesOrder(InventTransferId _transferId)
+    {
+        InventTransferTable transferTable;
+        METInventTransferTableExt transferTableExt;
+
+        select transferTable
+            join transferTableExt
+            where transferTableExt.InventTransferTable == transferTable.RecId
+            && transferTable.TransferId == _transferId
+            && transferTableExt.SalesId != '';
+
+        SalesTable salesTable;
+        METSalesPickingListGenerationTaskController         salesPickingListGenerationTaskController;
+        METSalesPickingListGenerationTaskContract           salesPickingListGenerationTaskContract;
+
+        if(transferTableExt)
+        {
+            salesTable = SalesTable::find(transferTableExt.SalesId);
+        }
+
+        if(salesTable)
+        {
+            METStockReservation::construct(salesTable).process();
+        }
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>process</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -99,38 +133,48 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
     {
         InventTransferJour inventTransferJour;
         InventTransferParmTable inventTransferParmTable;
+        InventParameters inventParameters = InventParameters::find();
+
         try
         {
-
+            ttsbegin;
             [InventTransferJour, inventTransferParmTable] = this.pick(_dataContract);
             
+            //CB-238 - Internal cross dock : Perform substitution re-pick of transfer order lines when
+            //1. Supply from transfer order is enabled
             this.applySubstitutions(_dataContract.parmTransferId());
             
-            //[InventTransferJour, inventTransferParmTable] = this.pick(_dataContract);
+            if(lineSubstituted)
+            {
+                [InventTransferJour, inventTransferParmTable] = this.pick(_dataContract);
+            }
 
-            WMSPickingRoute                 wmsPickingRoute;
+            WMSPickingRoute wmsPickingRoute;
 
             select firstonly wmsPickingRoute
                 where wmsPickingRoute.parmid == inventTransferParmTable.ParmId;
 
             if (wmsPickingRoute)
             {
-                METOrderShipmentLoadCreation        metOrderShipmentloadCreation = METOrderShipmentLoadCreation::construct(METOrderTransactionType::TransferOrder,
+                METOrderShipmentLoadCreation metOrderShipmentloadCreation = METOrderShipmentLoadCreation::construct(METOrderTransactionType::TransferOrder,
                                                                                                                             _dataContract.parmTransferId());
-
                 metOrderShipmentloadCreation.createShippmentLoad(true, false);
 
-                //if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METPicklistExtractionBusinessEvent)))
-                //{
-                //    METPicklistExtractionBusinessEvent::newFromWMSPickingRoute(wmsPickingRoute).send();
-                //}
-                //else
-                //{
-                //    throw error("@MET:PickListExtractionBusinessEventNotEnabled");
-                //}
+                //CB238 - xDock perform sales reservation once the transfer order picking list is created. 
+                //this.postSalesOrder(_dataContract.parmTransferId());
+
+                if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METPicklistExtractionBusinessEvent)))
+                {
+                    METPicklistExtractionBusinessEvent::newFromWMSPickingRoute(wmsPickingRoute).send();
+                }
+                else
+                {
+                    throw error("@MET:PickListExtractionBusinessEventNotEnabled");
+                }
             }
 
-            this.processSalesRegistrationAndPicking(_dataContract.parmTransferId());
+            ttscommit;
+
         }
         catch
         {
@@ -156,14 +200,16 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
         METInventTransferLine metTransferLine;
         InventTransferTable transferTable;
         METSubstitutionSalesLineProcess subSalesLineProcess;
-        boolean           lineSubstituted;
+        
+        lineSubstituted = false;
 
         while select transferLine
             where transferLine.TransferId == _transferId
             join metTransferLine
             where metTransferLine.InventTransferLine == transferLine.RecId
+            && metTransferLine.AllowSubstitution == NoYes::Yes
         {
-            if(metTransferLine.AllowSubstitution == NoYes::Yes && transferLine.qtyReservedOnOrder() == 0)
+            if(transferLine.qtyReservedOnOrder() == 0)
             {
                 SalesLine salesLineLoc = metTransferLine.salesLine_InventTransId();
 
@@ -173,30 +219,13 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
 
                     if (subSalesLineProcess.run())
                     {
-                        
+                        lineSubstituted = true;
                     }
                 }
             }
         }
-    }
 
-]]></Source>
-			</Method>
-			<Method>
-				<Name>processSalesRegistrationAndPicking</Name>
-				<Source><![CDATA[
-    private void processSalesRegistrationAndPicking(InventTransferId _transferId)
-    {
-        InventParameters inventParameters = InventParameters::find();
-        InventTransferTable _inventTransferTable = InventTransferTable::find(_transferId);
-        METInventTransferTableExt metTransferTable;
 
-        CompanyInfo companyInfo = CompanyInfo::find();
-
-        if(inventParameters.METSupplyFromTransfer == NoYes::Yes)
-        {
-            
-        }
     }
 
 ]]></Source>
