@@ -1,0 +1,241 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METTOContinuingPermissionNoticeDP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[SRSReportParameterAttribute(classstr(METTOContinuingPermissionNoticeContract))]
+class METTOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
+{
+    METTOContinuingPermissionNoticeHeaderTmp header;
+    METTOContinuingPermissionNoticeLineTmp line;
+    PurchId purchId;
+    PurchTable purchTable;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processReport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process report
+    /// </summary>
+    public void processReport()
+    {
+        METTOContinuingPermissionNoticeContract contract = this.parmDataContract() as METTOContinuingPermissionNoticeContract;
+        purchId = contract.parmPurchId();
+        
+        delete_from header
+            where header.ReturnPurchaseOrder == purchId;
+
+        delete_from line
+            where line.PurchId == purchId;
+
+        select firstonly RecId from purchTable
+            where purchTable.PurchId == purchId;
+
+        if (purchTable.RecId && METPurchTable::find(purchTable.PurchId).UnderBond)
+        {
+            this.insertHeaderData(purchTable);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertHeaderData</Name>
+				<Source><![CDATA[
+    /// Insert Header data
+    /// </summary>
+    /// <param name = "_shipmentTable">_shipmentTable</param>
+    public void insertHeaderData(PurchTable _purchTable)
+    {
+        METVendTable vendTable = METVendTable::find(_purchTable.OrderAccount);
+
+        NumberSequenceReference numberSequenceReference;
+
+        //numberSequenceReference = NumberSeqReference::findReference(extendedTypeNum(METCPNumber));
+
+        //if (numberSequenceReference.RecId)
+        //{
+        //    METCPNumber num = NumberSeq::newGetNum(numberSequenceReference).num();
+        //    header.ContinuingPermissionNoticeNumber = num;
+        //}
+
+        CompanyInfo companyInfo = CompanyInfo::find();
+        InventSite site = InventSite::find(_purchTable.InventSiteId);
+        InventLocation inventLocation = inventLocation::find(_purchTable.InventLocationId);
+        
+        header.CompanyLogo = this.getCompanyLogo(companyInfo.METLegalEntityType, inventLocation.METWHSubEntity);
+        LogisticsEntityPostalAddressView postalAddressView = this.getWareHousePrimaryAddress(inventLocation.RecId);
+
+        header.SendingBranchAddress = postalAddressView.Address;
+        header.SendingBranchName = inventLocation.Name;
+        header.ReceivingBranchAddress = VendTable::find(_purchTable.OrderAccount).postalAddress().Address;
+        header.ReceivingBranchName = VendTable::find(_purchTable.OrderAccount).name(); // TODO
+        header.NoticeDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::getSystemDateTime(), DateTimeUtil::getUserPreferredTimeZone()));
+        header.NoticeTimeString = int2Str(DateTimeUtil::time(header.NoticeDate));
+        header.CompanyName = companyInfo.Name;
+        header.SenderBranchExciseNumber = site.METBondNumber;  // ToDo Doubts
+        header.SenderBranchBondNumber = site.METBondNumber;
+        header.ReceivingBranchExciseNumber = vendTable.ExciseNumber;
+        header.ReceivingBranchBondNumber = vendTable.BondNumber;
+        header.ReturnPurchaseOrder = _purchTable.PurchId;
+        header.insert();
+
+        this.insertLineData(_purchTable);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertLineData</Name>
+				<Source><![CDATA[
+    /// Insert Line Data
+    /// </summary>
+    /// <param name = "_ShipmentTableLine">_ShipmentTableLine</param>
+    public void insertLineData(PurchTable _purchTable)
+    {
+        const str defaultUOM = 'EA';
+        PurchLine purchLine;
+        InventTable inventTable;
+        METInventTable metInventTable;
+        METExciseSiteDutySetup exciseSite;
+        METExciseRegisterEntry exciseRegister;
+        METTariffItemCodeBase tariffCodeBase;
+        RecordInsertList insertSet = new RecordInsertList(tableNum(METTOContinuingPermissionNoticeLineTmp));
+
+        while select purchLine
+            where purchLine.PurchId == _purchTable.PurchId
+        join inventTable
+            where purchLine.ItemId == inventTable.ItemId
+        outer join metInventTable
+            where metInventTable.ItemId == inventTable.ItemId
+        outer join exciseSite
+            where exciseSite.ItemId == inventTable.ItemId
+        outer join exciseRegister
+            where exciseRegister.ItemId == inventTable.ItemId
+        outer join tariffCodeBase
+            where tariffCodeBase.RecId == metInventTable.METTariffItemCodeBaseRecid
+        {
+            line.BondMark = '';
+            METPurchaseWMSFactor purchaseWMSFactor = UnitOfMeasureConversion::findByConversion(UnitOfMeasure::findBySymbol(purchLine.PurchUnit).RecId, UnitOfMeasure::findBySymbol(defaultUOM).RecId, EcoResProduct::findByProductNumber(purchLine.ItemId).RecId).Factor;
+            line.BottlesSupplied = purchaseWMSFactor * purchLine.PurchQty;
+            line.ItemId = purchLine.ItemId;
+            line.ItemDescription = InventTable::find(purchLine.ItemId).productName('EN-US');
+            line.BottleSize = metInventTable.BottleSize;
+            line.PackQty = metInventTable.ItemPack;
+            line.Strength = metInventTable.AlcoholContent;
+            line.PurchUoM = purchLine.PurchUnit;
+            line.Quantity = purchLine.PurchQty;
+            line.LitresOfAlcoholCalculated = metInventTable.BottleSize * line.BottlesSupplied * metInventTable.AlcoholContent;
+            line.ValueTIU = exciseRegister.TIUV;
+            line.TariffItem = tariffCodeBase.TariffItem; // ToDO confirm
+            line.CountryOfOrigin = metInventTable.CountryCode;
+            line.StatCode = metInventTable.statcode();
+            line.ValueDuty = exciseSite.ValueForDuty;
+            line.InvoiceAccount = _purchTable.InvoiceAccount;
+            //line.InvoiceDateTime = '';
+            line.PurchId = _purchTable.PurchId;
+            insertSet.add(line);
+        }
+        insertSet.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dsHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// dsHeader
+    /// </summary>
+    /// <returns>METContinuingPermissionNoticeHeaderTmp</returns>
+    [SrsReportDataSet(tableStr(METTOContinuingPermissionNoticeHeaderTmp))]
+    public METTOContinuingPermissionNoticeHeaderTmp dsHeader()
+    {
+        select header;
+
+        return header;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dsLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// dsLines
+    /// </summary>
+    /// <returns>METContinuingPermissionNoticeLineTmp</returns>
+    [SRSReportDataSet(tableStr(METTOContinuingPermissionNoticeLineTmp))]
+    public METTOContinuingPermissionNoticeLineTmp dsLines()
+    {
+        select line;
+
+        return line;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCompanyLogo</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get METcash logo based on entity
+    /// </summary>
+    /// <param name = "_legalEntityType">LegalEntityType</param>
+    /// <param name = "_subEntityWareHouse">SubEntity warehouse</param>
+    /// <returns>Image</returns>
+    public container getCompanyLogo(METLegalEntityType _legalEntityType, InventLocationId _subEntityWareHouse)
+    {
+        container image;
+
+        switch(_legalEntityType)
+        {
+            case METLegalEntityType::Food:
+                image = SysDocuBrandImages::getImage(_subEntityWareHouse);
+                break;
+
+            case METLegalEntityType::Liquor:
+                image = SysDocuBrandImages::getImage(METConstants::LiquorLogo);
+                break;
+
+            default:
+                break;
+
+        }
+        return image;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getWareHousePrimaryAddress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get WareHouse address By recevingdock role
+    /// </summary>
+    /// <param name = "_inventLocationRecId">Location RecId</param>
+    /// <param name = "_roleRecId">Role Recid</param>
+    /// <param name = "_type">LogisticsElectronicAddressMethodType</param>
+    /// <returns>Locator</returns>
+    private LogisticsEntityPostalAddressView getWareHousePrimaryAddress(RefRecId _inventLocationRecId)
+    {
+        LogisticsEntityPostalAddressView  logisticsEntityPostalAddressView;
+        
+        select firstonly logisticsEntityPostalAddressView
+            where logisticsEntityPostalAddressView.Entity == _inventLocationRecId
+            && logisticsEntityPostalAddressView.EntityType == LogisticsLocationEntityType::Warehouse
+            && logisticsEntityPostalAddressView.ValidFrom <= DateTimeUtil::getSystemDateTime()
+            && logisticsEntityPostalAddressView.ValidTo >= DateTimeUtil::getSystemDateTime()
+            && logisticsEntityPostalAddressView.IsPrimary == NoYes::Yes;
+        
+        return logisticsEntityPostalAddressView;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
