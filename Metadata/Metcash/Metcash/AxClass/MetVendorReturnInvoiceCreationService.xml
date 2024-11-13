@@ -1,0 +1,239 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>MetVendorReturnInvoiceCreationService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Service class for CB525 - Vendor Returns - Invoicing.
+/// </summary>
+class MetVendorReturnInvoiceCreationService
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the main logic of the class.
+    /// Fetch the PO from query and create the pending vendor invoice after validation.
+    /// </summary>
+    /// <param name = "_contract">MetVendorReturnInvoiceCreationContract</param>
+    public void process(MetVendorReturnInvoiceCreationContract _contract)
+    {
+        Query       query       = new Query(SysOperationHelper::base64Decode(_contract.parmPackedQuery()));
+        QueryRun    queryRun    = new QueryRun(query);
+         
+        while (queryRun.next())
+        {
+            boolean                 createInvoice   = false;
+            PurchTable              purchTable      = queryRun.get(tableNum(PurchTable));
+
+            if (purchTable.PurchStatus == PurchStatus::Received)
+            {
+                VendInvoiceJour         vendInvoiceJour;
+                VendPackingSlipJour     vendPackingSlipJour;
+                VendInvoiceInfoTable    vendInvoiceInfoTableLoc;
+                VendInvoiceInfoLine     vendInvoiceInfoLine;
+                VendPackingSlipTrans    vendPackingSlipTrans;
+                VendInvoiceInfoSubLine  vendInvoiceInfoSubLine;
+
+                //Iterate through all the product receipt on the PO.
+                while select vendPackingSlipJour
+                    where vendPackingSlipJour.PurchId == purchTable.PurchId
+                {
+                    VendInvoicePackingSlipQuantityMatch vendInvoicePkSlipQtyMatch;
+
+                    //Validate if a pending vendor invoice jour exists for the PO or one of the product receipt in case of multiple records.
+                    select firstonly RecId from vendInvoiceInfoTableLoc where vendInvoiceInfoTableLoc.PurchId == purchTable.PurchId
+                        exists join vendInvoiceInfoLine
+                        where vendInvoiceInfoLine.ParmId == vendInvoiceInfoTableLoc.ParmId
+                            && vendInvoiceInfoLine.TableRefId == vendInvoiceInfoTableLoc.TableRefId
+                        exists join vendInvoiceInfoSubLine
+                        where vendInvoiceInfoSubLine.LineRefRecId == vendInvoiceInfoLine.RecId
+                        && vendInvoiceInfoSubLine.DocumentId == vendPackingSlipJour.PackingSlipId;
+
+                    //Check if the invoice journal already exists for the packing slip.
+                    select firstonly RecId from vendInvoicePkSlipQtyMatch
+                        join vendPackingSlipTrans
+                        where vendPackingSlipTrans.VendPackingSlipJour == vendPackingSlipJour.RecId
+                        && vendInvoicePkSlipQtyMatch.PackingSlipSourceDocumentLine == vendPackingSlipTrans.SourceDocumentLine;
+
+                    if (!vendInvoiceInfoTableLoc.RecId && !vendInvoicePkSlipQtyMatch.RecId)
+                    {
+                        createInvoice = true;
+
+                        VendInvoiceInfoTable vendInvoiceInfoTable = this.createPendingVendorInvoice(purchTable, vendPackingSlipTrans);
+            
+                        this.submitClaimInvoiceToWorkflow(vendInvoiceInfoTable);
+                    }
+                }
+                if (!createInvoice)
+                {
+                    checkFailed(strFmt("@MET:PendintInvoiceExistsError", vendInvoiceInfoTableLoc.Num, purchTable.PurchId));
+                }
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPendingVendorInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create the pending vendor invoice of the PO.
+    /// </summary>
+    /// <param name = "_purchTable">PurchTable</param>
+    /// <param name = "_invoiceQty">VendPackingSlipTrans</param>
+    /// <returns></returns>
+    public VendInvoiceInfoTable createPendingVendorInvoice(PurchTable _purchTable, VendPackingSlipTrans _vendPackingSlipTrans)
+    {
+        MetImportGST            importGST;
+        MetImportAmount         importAmount;
+        Purchtotals             purchTotals = Purchtotals::newPurchTable(_purchTable);
+        VendInvoiceInfoTable    vendInvoiceInfoTable;
+
+        purchTotals.calc();
+
+        importGST    = purchTotals.taxTotal();
+        importAmount = purchTotals.purchTotalAmount();
+
+        vendInvoiceInfoTable.clear();
+        vendInvoiceInfoTable.initValue();
+        vendInvoiceInfoTable.initFromPurchTable(_purchTable);
+        vendInvoiceInfoTable.DocumentOrigin = DocumentOrigin::Manual;
+        vendInvoiceInfoTable.defaultRow(null, null, true);
+
+        vendInvoiceInfoTable.ParmId                 = formletterParmData::getNewParmId();
+        vendInvoiceInfoTable.DocumentDate           = vendInvoiceInfoTable.ReceivedDate;
+        vendInvoiceInfoTable.TableRefId             = formletterParmData::getNewTableRefId();
+        vendInvoiceInfoTable.Approved               = NoYes::Yes;
+        vendInvoiceInfoTable.MetImportAmount        = importAmount;
+        vendInvoiceInfoTable.MetImportGST           = importGST;
+        vendInvoiceInfoTable.METClaimInvoice        = NoYes::Yes;
+        vendInvoiceInfoTable.LastMatchVariance      = LastMatchVarianceOptions::Unknown;
+        vendInvoiceInfoTable.Payment                = VendTable::find(_purchTable.InvoiceAccount).PaymTermId;
+        vendInvoiceInfoTable.METSkipInvoiceMatching = NoYes::Yes;
+        vendInvoiceInfoTable.METReturnInvoice       = NoYes::Yes;
+
+        NumberSequenceReference numberSequenceReference;
+
+        numberSequenceReference = NumberSeqReference::findReference(extendedTypeNum(METVendReturnInvoiceNumber));
+
+        if (numberSequenceReference.RecId)
+        {
+            METVendReturnInvoiceNumber num  = NumberSeq::newGetNum(numberSequenceReference).num();
+            vendInvoiceInfoTable.Num        = num;
+        }
+
+        vendInvoiceInfoTable.Description = _purchTable.PurchId;
+
+        if(vendInvoiceInfoTable.validateWrite())
+        {
+            vendInvoiceInfoTable.insert();
+
+            VendInvoiceInfoSubTable vendInvoiceInfoSubTable;
+
+            vendInvoiceInfoSubTable.clear();
+            vendInvoiceInfoSubTable.initValue();
+            vendInvoiceInfoSubTable.defaultRow();
+ 
+            vendInvoiceInfoSubTable.ParmId              = vendInvoiceInfoTable.ParmId;
+            vendInvoiceInfoSubTable.OrigPurchId         = vendInvoiceInfoTable.PurchId;
+            vendInvoiceInfoSubTable.PurchName           = vendInvoiceInfoTable.PurchName;
+            vendInvoiceInfoSubTable.TableRefId          = vendInvoiceInfoTable.TableRefId;
+ 
+            vendInvoiceInfoSubTable.insert();
+        }
+
+        PurchLine purchLine;
+
+        while select purchLine
+            where purchLine.PurchId == _purchTable.PurchId
+        {
+            this.createPendingVendorInvoiceLines(vendInvoiceInfoTable, purchLine, _vendPackingSlipTrans);
+        }
+
+        return vendInvoiceInfoTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPendingVendorInvoiceLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create the pending vendor invoice lines of the PO.
+    /// </summary>
+    /// <param name = "_vendInvoiceInfoTable">VendInvoiceInfoTable</param>
+    /// <param name = "_purchLine">PurchLine</param>
+    /// <param name = "_invoiceQty">VendPackingSlipTrans</param>
+    public void createPendingVendorInvoiceLines(VendInvoiceInfoTable _vendInvoiceInfoTable, PurchLine _purchLine, VendPackingSlipTrans _vendPackingSlipTrans)
+    {
+        VendInvoiceInfoLine     vendInvoiceInfoLine;
+        VendInvoiceInfoSubLine  vendInvoiceInfoSubLine;
+
+        vendInvoiceInfoLine.clear();
+        vendInvoiceInfoLine.initValue();
+        vendInvoiceInfoLine.initFromPurchLine(_purchLine);
+
+        vendInvoiceInfoLine.OrigPurchId         = _purchLine.PurchId;
+        vendInvoiceInfoLine.DeliveryName        = _vendInvoiceInfoTable.DeliveryName;
+        vendInvoiceInfoLine.ParmId              = _vendInvoiceInfoTable.ParmId;
+        vendInvoiceInfoLine.TableRefId          = _vendInvoiceInfoTable.TableRefId;
+        vendInvoiceInfoLine.currencyCode        = _vendInvoiceInfoTable.CurrencyCode;
+        vendInvoiceInfoLine.OrderAccount        = _vendInvoiceInfoTable.OrderAccount;
+        vendInvoiceInfoLine.InvoiceAccount      = _vendInvoiceInfoTable.InvoiceAccount;
+        vendInvoiceInfoLine.DocumentOrigin      = DocumentOrigin::Manual;
+        vendInvoiceInfoLine.ReceiveNow          = _vendPackingSlipTrans.Qty;
+        vendInvoiceInfoLine.ItemId              = _purchLine.ItemId;
+        vendInvoiceInfoLine.PurchPrice          = _purchLine.PurchPrice;
+        vendInvoiceInfoLine.PurchUnit           = _purchLine.PurchUnit;
+        vendInvoiceInfoLine.InventNow           = _purchLine.PurchQty;
+        vendInvoiceInfoLine.LineAmount          = _purchLine.LineAmount;
+        vendInvoiceInfoLine.ProcurementCategory = EcoResProductCategory::findByItemIdCategoryHierarchyRole(_purchLine.ItemId, EcoResCategoryNamedHierarchyRole::Procurement).Category;
+        
+        vendInvoiceInfoLine.insert();
+
+        if (vendInvoiceInfoLine.RecId)
+        {
+            vendInvoiceInfoSubLine.clear();
+            vendInvoiceInfoSubLine.initValue();
+            vendInvoiceInfoSubLine.defaultRow();
+
+            vendInvoiceInfoSubLine.ParmId               = _vendInvoiceInfoTable.ParmId;
+            vendInvoiceInfoSubLine.InventNow            = _vendPackingSlipTrans.Qty;
+            vendInvoiceInfoSubLine.ReceiveNow           = _vendPackingSlipTrans.Qty;
+            vendInvoiceInfoSubLine.DocumentId           = _vendPackingSlipTrans.PackingSlipId;
+            vendInvoiceInfoSubLine.LineRefRecId         = vendInvoiceInfoLine.RecId;
+            vendInvoiceInfoSubLine.JournalRefRecId      = _vendPackingSlipTrans.RecId;
+            vendInvoiceInfoSubLine.JournalRefTableId    = _vendPackingSlipTrans.TableId;
+            
+            vendInvoiceInfoSubLine.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>submitClaimInvoiceToWorkflow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Submit claim to workflow.
+    /// </summary>
+    /// <param name = "_claimInvoiceTable">VendInvoiceInfoTable</param>
+    private void submitClaimInvoiceToWorkflow(VendInvoiceInfoTable _claimInvoiceTable)
+    {
+        if(_claimInvoiceTable && _claimInvoiceTable.existLine() && _claimInvoiceTable.canSubmitToWorkflow())
+        {
+            VendInvoiceHeaderWorkflow::submitToWorkflow(_claimInvoiceTable, _claimInvoiceTable.Description);
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
