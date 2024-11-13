@@ -8,34 +8,623 @@
 /// Class to proceede with the creation process for TMS engine
 /// </summary>
 internal final class METTMSEngineSalesOrderProccess_Creation extends METTMSEngineSalesOrderProccess
-{    
+{
+    METTMSEngineSalesOrderProccessLinesTmp      proccessLinesTmp;
+    TransDate                                   deliveryDate;
+
+    const str  unitCSE = "@MET:CSE";
+    const str  unitTOT = "@MET:TOT";
+    const str  unitPal = "@MET:PAL";
+
 }
 ]]></Declaration>
 		<Methods>
 			<Method>
-				<Name>new</Name>
+				<Name>init</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// New method
+    /// initialize default parameters
     /// </summary>
     /// <param name = "_salesTable">SalesTable record</param>
-    public void new(SalesTable _salesTable)
+    void init(SalesTable    _salesTable)
     {
-        this.init(_salesTable);
+        super(_salesTable);
+
+        this.initValuesFromContainerType();
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>errorMessage</Name>
+				<Name>run</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// error message
+    /// run creation steps
     /// </summary>
-    /// <returns>error txt</returns>
-    protected ErrorTxt errorMessage()
+    void run()
     {
-        return strFmt("@MET:TMSEngineSalesOrderProcessCreation", salesTable.SalesId);
+        METTMSShipmentTable         tmsShipmentTable;
+        METTMSShipmentTable         tmsShipmentTableCancel;
+        METTMSShipmentOrderTable    tmsShipmentOrderTable;
+
+        //Step 1: check if order should be excluded from TMS Engine processing
+        if (!salesTable.METIsSalesOrderExcluded() &&
+            carrierCode &&
+            salesTable.METRoute &&
+            this.useTMSEngine() &&
+            (!isSalesOrderPerishable ||
+            (isSalesOrderPerishable  && !this.excludePerishable())))
+        {
+            proccessLinesTmp = this.initTmpTable();
+            try
+            {
+                ttsbegin;
+
+                tmsShipmentOrderTable   = METTMSShipmentOrderTable::findByOrder(salesTable.SalesId);
+                //Step 2: Check if the order is already on a shipment
+                if (!tmsShipmentOrderTable.RecId)
+                {
+                    //Step 3: If order is not on any existing shipment
+                    tmsShipmentTable = this.initTMSShipment();
+               
+                    //Step 3a: check if there is an existing shipment this order can be made part of.
+                    if (!tmsShipmentTable.RecId)
+                    {
+                        this.createShipment();
+                    }
+                    else
+                    {
+                        //Step 3c: If a shipment exists, update it
+                        this.createShipment(false);
+                    }
+                }
+                else
+                {
+                    tmsShipmentTable = this.initTMSShipment();
+                    //Step 4: If order is on an existing shipment and there is a change to either Route or Ship date
+                    if (tmsShipmentOrderTable.ShipmentId != shipmentId)
+                    {
+                        //Step 4a: Get the “TMS Shipment” record related to the “TMS Shipment Order”
+                        tmsShipmentTableCancel = METTMSShipmentTable::find(tmsShipmentOrderTable.ShipmentId);
+
+                        //Step 4c: Update the current “TMS Shipment” - cancel it
+                        this.cancelShipment(salesTable.SalesId);
+
+                        //Step 4d: Link the sales order to a new shipment
+                        this.createShipment();
+                    
+                    }
+                    else
+                    {
+                        //Step 5: If order is on an existing shipment and there is no change to both Route and Ship date
+                        //delete Shipment itemgroup - recreate
+                        delete_from tmsShipmentOrderTable
+                            where tmsShipmentOrderTable.ShipmentId == shipmentId;
+                        //Step 3d: Create TMS Shipment Order record
+                        //Step 4d: Link the sales order to a new shipment
+                        this.createShipment(false);
+                    }
+                }
+
+                //Step 6: Update order and shipment totals
+                //Step 6a: Update the order’s “Order weight”
+                //Step 6b: Update the order’s “Order volume”
+                //Step 6c: Update order’s “Pallet Total footprint”
+                this.updateTMSShipmentOrder();
+
+                //Step 6d: Update the shipment’s “Pallet lifts”
+                this.updateTMSShipment();
+
+                ttscommit;
+            }
+            catch (Exception::Error)
+            {
+                //An error occurs during the creation or updates of the staging records
+                error(strFmt("@MET:TMSEngineSalesOrderProcessCreation", salesTable.SalesId));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createShipment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// create tms shipment tables
+    /// </summary>
+    /// <param name = "_isCreateTMSShipment">boolean</param>
+    private void createShipment(boolean     _isCreateTMSShipment = true)
+    {
+        METTMSShipmentOrderTable    tmsShipmentOrderTable;
+
+        //Step 3b: If no shipment exists, create a new one
+        if (_isCreateTMSShipment)
+        {
+            this.createTMSShipment();
+        }
+        //Step 3d: Create TMS Shipment Order record
+        tmsShipmentOrderTable = this.createTMSShipmentOrder();
+        //Step 3e: Create TMS Shipment Item Group records
+        this.createTMSShipmentItemGroup(tmsShipmentOrderTable.TMSShipmentOrderIdentifier);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTMSShipment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Step 3a: check if there is an existing shipment this order can be made part of.
+    /// </summary>
+    /// <returns>Instance of <c>METTMSShipmentTable</c></returns>
+    private METTMSShipmentTable initTMSShipment()
+    {
+        str     shippingDateStr;
+
+        shippingDate = metSalesTable.SecondShipDate ? metSalesTable.SecondShipDate : 
+            salesTable.ShippingDateConfirmed ? salesTable.ShippingDateConfirmed :
+            salesTable.ShippingDateRequested;
+
+        shippingDateStr = date2Str
+            (shippingDate, 
+                321, 
+                DateDay::Digits2, 
+                DateSeparator::None, 
+                DateMonth::Digits2, 
+                DateSeparator::None, 
+                DateYear::Digits4);
+
+        shipmentId  = strFmt("@MET:ShipmentStrFmt", salesTable.InventLocationId, salesTable.CustAccount, salesTable.METRoute, shippingDateStr);
+
+        return METTMSShipmentTable::find(shipmentId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initDeliveryDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// init Delivery date
+    /// </summary>
+    private void initDeliveryDate()
+    {
+        deliveryDate = SalesTable.ReceiptDateConfirmed ? SalesTable.ReceiptDateConfirmed : SalesTable.ReceiptDateRequested;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTMSShipment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Step 3b: If no shipment exists, create a new one
+    /// </summary>
+    void createTMSShipment()
+    {
+        METTMSShipmentTable tmsShipmentTable;
+        METRouteStopTable   routeStopTable = METRouteStopTable::findByRouteIdentifier(metSalesTable.OriginalSecondRouteStopIdentifier ? metSalesTable.OriginalSecondRouteStopIdentifier : metSalesTable.OriginalRouteStopIdentifier);
+        METRouteTable       routeTable = METRouteTable::findByRouteIdentifier(metSalesTable.OriginalSecondRouteIdentifier ? metSalesTable.OriginalSecondRouteIdentifier : metSalesTable.OriginalRouteIdentifier);
+        ;
+        tmsShipmentTable.clear();
+        tmsShipmentTable.ShipmentID = shipmentId;
+        tmsShipmentTable.SourceWarehouse = salesTable.InventLocationId;
+        tmsShipmentTable.DestinationType = METDestinationType::Customer;
+        tmsShipmentTable.DestinationCustomer = salesTable.CustAccount;
+        tmsShipmentTable.DestinationWarehouse = '';
+        tmsShipmentTable.Route = salesTable.METRoute;
+        tmsShipmentTable.ConfirmedShipDate  = shippingDate;
+        tmsShipmentTable.TMSSendStatus = METTMSSendStatus::ToBeSent;
+        tmsShipmentTable.ShipmentStatus = METCashShipmentStatus::Active;
+        tmsShipmentTable.RouteStop = int2str(salesTable.METRouteStopNum);
+        tmsShipmentTable.WarehouseZone = routeStopTable.Zone ? routeStopTable.Zone : routeTable.Zone;
+        tmsShipmentTable.StagingLane = metSalesTable.StagingLaneId;
+        tmsShipmentTable.PickupEarliest = routeTable.ReadyTime;
+        tmsShipmentTable.PickupLatest = routeTable.DispatchTime;
+        tmsShipmentTable.DeliveryEarliest = routeStopTable.TimeWindowStart;
+        tmsShipmentTable.DeliveryLatest = routeStopTable.TimeWindowEnd;
+        tmsShipmentTable.Carrier = carrierCode;
+        tmsShipmentTable.SpecialDeliveryInstructions = this.getCustomerInstruction();
+        tmsShipmentTable.DeliveryNoteNumber = '';
+        tmsShipmentTable.ChepPalletCount    = 0;
+        tmsShipmentTable.LoscamPalletCount  = 0;
+        tmsShipmentTable.PlainPalletCount   = 0;
+        tmsShipmentTable.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCustomerInstruction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// init Customer instruction
+    /// </summary>
+    /// <returns>value for <c>METCustomerInstruction</c></returns>
+    private METCustomerInstruction getCustomerInstruction()
+    {
+        METWarehouseCarrierCustomerView warehouseCarrierCustomerView;
+        TransDate                       today = DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone());
+
+        select firstonly CustomerInstruction from warehouseCarrierCustomerView
+            where warehouseCarrierCustomerView.CustAccount == salesTable.CustAccount
+                && warehouseCarrierCustomerView.StartDate <= today
+                && warehouseCarrierCustomerView.EndDate >= today;
+
+        return warehouseCarrierCustomerView.CustomerInstruction;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTMSShipment</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Step 3c: If a shipment exists, update it
+    /// </summary>
+    void updateTMSShipment()
+    {
+        METTMSShipmentTable         tmsShipmentTable;
+        METTMSShipmentOrderTable    tmsShipmentOrderTable;
+
+        update_recordset tmsShipmentTable
+            setting TMSSendStatus = METTMSSendStatus::ToBeSent,
+                    ShipmentStatus = METCashShipmentStatus::Active,
+                    PalletLifts = tmsShipmentOrderTable.PalletTotalFootprint
+            join sum(PalletTotalFootprint) from tmsShipmentOrderTable
+                where tmsShipmentOrderTable.ShipmentId == tmsShipmentTable.ShipmentID
+                    && tmsShipmentOrderTable.OrderNumber == salesTable.SalesId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTMSShipmentOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Step 3d: Create TMS Shipment Order record
+    /// </summary>
+    /// <returns>Instance of <c>METTMSShipmentOrderTable</c></returns>
+    METTMSShipmentOrderTable createTMSShipmentOrder()
+    {  
+        METTMSShipmentOrderTable    tmsShipmentOrderTable;
+        ;
+        tmsShipmentOrderTable.clear();
+        tmsShipmentOrderTable.initValue();
+        tmsShipmentOrderTable.ShipmentId = shipmentId;
+        tmsShipmentOrderTable.OrderNumber = salesTable.SalesId;
+        tmsShipmentOrderTable.IsCrossDockOrder = NoYes::No;
+        tmsShipmentOrderTable.BrokenCaseItemQtySecurity = this.getBrokenCasesCountSecurity();
+        tmsShipmentOrderTable.BrokenCaseItemQtyNonSecurity = this.getBrokenCasesCountNonSecurity();
+        tmsShipmentOrderTable.RepackCaseCountSecurity = tobaccoRepackQtyFactor ? tmsShipmentOrderTable.BrokenCaseItemQtySecurity/tobaccoRepackQtyFactor : 0;
+        tmsShipmentOrderTable.RepackCaseCountNonSecurity = standardRepackQtyFactor ? tmsShipmentOrderTable.RepackCaseCountNonSecurity/standardRepackQtyFactor : 0;
+        tmsShipmentOrderTable.CaseCountShipped = tmsShipmentOrderTable.BrokenCaseItemQtyNonSecurity + this.getRepackContainersByCommodity();
+        tmsShipmentOrderTable.CaseCountSecurity = tmsShipmentOrderTable.RepackCaseCountSecurity;
+        tmsShipmentOrderTable.SSCC = '';
+        tmsShipmentOrderTable.XDockWMSUpdateReceived = NoYes::No;
+        tmsShipmentOrderTable.VendorNumber = '';
+        tmsShipmentOrderTable.insert();
+
+        return tmsShipmentOrderTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBrokenCasesCountSecurity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get BrokenCasesCountSecurity
+    /// </summary>
+    /// <returns>Qty <c>Qty</c></returns>
+    private Qty getBrokenCasesCountSecurity()
+    {
+        METTMSEngineSalesOrderProccessLinesTmp  linesTmp;
+        linesTmp.linkPhysicalTableInstance(proccessLinesTmp);
+        select sum(SalesQty) from linesTmp
+            where linesTmp.IsTobaccoItem == NoYes::Yes;
+
+        return linesTmp.SalesQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBrokenCasesCountNonSecurity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get BrokenCasesCountNonSecurity
+    /// </summary>
+    /// <returns>Qty <c>Qty</c></returns>
+    private Qty getBrokenCasesCountNonSecurity()
+    {
+        METTMSEngineSalesOrderProccessLinesTmp  linesTmp;
+        linesTmp.linkPhysicalTableInstance(proccessLinesTmp);
+
+        select sum(CaseQty_CaseLines) from linesTmp;
+
+        return linesTmp.CaseQty_CaseLines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRepackContainersByCommodity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// RepackContainersByCommodity = RoundUp the sum of (RepackCountSecurity + RepackCountNonSecurity) for all the lines on the order per LineCommodity
+    /// </summary>
+    /// <returns>int <c>Int</c></returns>
+    private int getRepackContainersByCommodity()
+    {
+        METTMSEngineSalesOrderProccessLinesTmp  processLinesGroup;
+        METTMSEngineSalesOrderProccessLinesTmp  proccessLines;
+        int     ret;
+
+        processLinesGroup.linkPhysicalTableInstance(proccessLinesTmp);
+        proccessLines.linkPhysicalTableInstance(proccessLinesTmp);
+
+        while select processLinesGroup
+            group by LineCommodity
+        {
+            select sum(RepackCountSecurity), sum(RepackCountNonSecurity) from proccessLines
+                where  proccessLines.LineCommodity == processLinesGroup.LineCommodity;
+
+            ret += roundUp(proccessLines.RepackCountSecurity + proccessLines.RepackCountNonSecurity, 1);
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBrokenCasesCountNonSecurityByCommodity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get BrokenCasesCountNonSecurityByCommodity
+    /// </summary>
+    /// <returns>Qty <c>Qty</c></returns>
+    private Qty getBrokenCasesCountNonSecurityByCommodity()
+    {
+        METTMSEngineSalesOrderProccessLinesTmp  processLinesGroup;
+        METTMSEngineSalesOrderProccessLinesTmp  proccessLines;
+        int     ret;
+
+        processLinesGroup.linkPhysicalTableInstance(proccessLinesTmp);
+        proccessLines.linkPhysicalTableInstance(proccessLinesTmp);
+
+        while select processLinesGroup
+            group by LineCommodity
+        {
+            select sum(SalesQty) from proccessLines
+                where   proccessLines.IsTobaccoItem == NoYes::No
+                    &&  proccessLines.IsKegItem == NoYes::No
+                    &&  proccessLines.SalesUnit == unitEA
+                    &&  proccessLines.LineCommodity == processLinesGroup.LineCommodity;
+            
+            ret += roundUp(proccessLines.SalesQty, 1);
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTMSShipmentItemGroup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Step 3e: Create TMS Shipment Item Group records
+    /// </summary>
+    /// <param name = "_tmsShipmentOrderIdentifier">METTMSShipmentOrderIdentifier</param>
+    void createTMSShipmentItemGroup(METTMSShipmentOrderIdentifier   _tmsShipmentOrderIdentifier)
+    {
+        METTMSEngineSalesOrderProccessLinesTmp  processLinesGroup;
+
+        processLinesGroup.linkPhysicalTableInstance(proccessLinesTmp);
+
+        while select sum(CaseQty_CaseLines),
+                    sum(RepackCountSecurity), 
+                    sum(RepackCountNonSecurity), 
+                    sum(LineWeight_CaseLines),
+                    sum(LineWeight_BrokenCaseSecurity),
+                    sum(LineWeight_BrokenCaseNonSecurity),
+                    sum(LineVolume_CaseLines),
+                    sum(LineVolume_BrokenCaseSecurity),
+                    sum(LineVolume_BrokenCaseNonSecurity),
+                    sum(SalesQty)
+        from processLinesGroup
+            group by LineCommodity
+        {
+            if (!isToteCustomer && (processLinesGroup.CaseQty_CaseLines + processLinesGroup.RepackCountSecurity + processLinesGroup.RepackCountNonSecurity) > 0
+                || processLinesGroup.CaseQty_CaseLines > 0)
+            {
+                this.createTMSShipmentItemGroupByUOM(unitCSE, processLinesGroup, _tmsShipmentOrderIdentifier);
+            }
+
+            if (isToteCustomer && (processLinesGroup.RepackCountSecurity + processLinesGroup.RepackCountNonSecurity)>0)
+            {
+                this.createTMSShipmentItemGroupByUOM(unitTOT, processLinesGroup, _tmsShipmentOrderIdentifier);
+            }
+            
+        }
+
+        while select sum(CaseQty_CaseLines),
+                    sum(RepackCountSecurity),
+                    sum(RepackCountNonSecurity),
+                    sum(LineWeight_CaseLines),
+                    sum(LineWeight_BrokenCaseSecurity),
+                    sum(LineWeight_BrokenCaseNonSecurity),
+                    sum(LineVolume_CaseLines),
+                    sum(LineVolume_BrokenCaseSecurity),
+                    sum(LineVolume_BrokenCaseNonSecurity),
+                    sum(SalesQty)
+        from processLinesGroup
+            group by LineCommodity, IsKegItem
+            where processLinesGroup.IsKegItem == NoYes::No
+        {
+            this.createTMSShipmentItemGroupByUOM(unitPAL, processLinesGroup, _tmsShipmentOrderIdentifier);
+        }
+        
+        while select sum(SalesQty),
+                    sum(CaseQty_CaseLines),
+                    sum(RepackCountSecurity),
+                    sum(RepackCountNonSecurity),
+                    sum(LineWeight_CaseLines),
+                    sum(LineWeight_BrokenCaseSecurity),
+                    sum(LineWeight_BrokenCaseNonSecurity),
+                    sum(LineVolume_CaseLines),
+                    sum(LineVolume_BrokenCaseSecurity),
+                    sum(LineVolume_BrokenCaseNonSecurity),
+                    sum(SalesQty)
+        from processLinesGroup
+            group by LineCommodity, KegQtyUOM
+            where processLinesGroup.KegQtyUOM  != ''
+            && processLinesGroup.IsKegItem == NoYes::Yes
+        {
+            this.createTMSShipmentItemGroupByUOM(processLinesGroup.KegQtyUOM , processLinesGroup, _tmsShipmentOrderIdentifier);
+        }
+
+        while select sum(CaseQty_CaseLines),
+                    sum(RepackCountSecurity),
+                    sum(RepackCountNonSecurity),
+                    sum(LineWeight_CaseLines),
+                    sum(LineWeight_BrokenCaseSecurity),
+                    sum(LineWeight_BrokenCaseNonSecurity),
+                    sum(LineVolume_CaseLines),
+                    sum(LineVolume_BrokenCaseSecurity),
+                    sum(LineVolume_BrokenCaseNonSecurity),
+                    sum(SalesQty)
+        from processLinesGroup
+            group by LineCommodity, IsKegItem
+            where processLinesGroup.IsKegItem == NoYes::Yes
+        {
+            this.createTMSShipmentItemGroupByUOM(unitPAL, processLinesGroup, _tmsShipmentOrderIdentifier, NoYes::Yes);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTMSShipmentItemGroupByUOM</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Step 3e: Create TMS Shipment Item Group records
+    /// </summary>
+    /// <param name = "_shipmentUOM">METShipmentUOM</param>
+    /// <param name = "_lineTmp">METTMSEngineSalesOrderProccessLinesTmp</param>
+    /// <param name = "_tmsShipmentOrderIdentifier">METTMSShipmentOrderIdentifier</param>
+    /// <param name = "_isKegItem">boolean</param>
+    void createTMSShipmentItemGroupByUOM(METShipmentUOM                         _shipmentUOM, 
+                                        METTMSEngineSalesOrderProccessLinesTmp  _lineTmp, 
+                                        METTMSShipmentOrderIdentifier           _tmsShipmentOrderIdentifier,
+                                        boolean                                 _isKegItem = false)
+    {
+        
+        METTMSShipmentItemGroup     tmsShipmentItemGroup;
+        int                         repackContainersByCommodity;
+
+        repackContainersByCommodity = roundUp(_lineTmp.RepackCountSecurity, 1) + roundUp(_lineTmp.RepackCountNonSecurity, 1);
+
+        tmsShipmentItemGroup.clear();
+        tmsShipmentItemGroup.initValue();
+        tmsShipmentItemGroup.TMSShipmentOrderIdentifier = _tmsShipmentOrderIdentifier;
+        tmsShipmentItemGroup.QuantityUOM = _shipmentUOM;
+        tmsShipmentItemGroup.Commodity  = _lineTmp.LineCommodity;
+        switch (_shipmentUOM)
+        {
+            case unitCSE :
+                tmsShipmentItemGroup.Quantity   = isToteCustomer ? _lineTmp.CaseQty_CaseLines : (_lineTmp.CaseQty_CaseLines + repackContainersByCommodity);
+                tmsShipmentItemGroup.Weight     =  isToteCustomer ? _lineTmp.LineWeight_CaseLines : (_lineTmp.LineWeight_CaseLines + _lineTmp.LineWeight_BrokenCaseSecurity + _lineTmp.LineWeight_BrokenCaseNonSecurity);
+                tmsShipmentItemGroup.Cube       = isToteCustomer ? _lineTmp.LineVolume_CaseLines : (_lineTmp.LineVolume_CaseLines + whsPalletVolume * repackContainersByCommodity);
+                break;
+
+            case unitTOT :
+                tmsShipmentItemGroup.Quantity   = repackContainersByCommodity;
+                tmsShipmentItemGroup.Weight     =  _lineTmp.LineWeight_BrokenCaseSecurity + _lineTmp.LineWeight_BrokenCaseNonSecurity + whsToteWeight * tmsShipmentItemGroup.Quantity;
+                tmsShipmentItemGroup.Cube       = whsToteVolume * tmsShipmentItemGroup.Quantity;
+                break;
+
+            case unitPAL :
+                if (_isKegItem)
+                {
+                    tmsShipmentItemGroup.Quantity   = inventParameters.METKegsPerPallet ? decRound(_lineTmp.SalesQty / inventParameters.METKegsPerPallet, 2) : 0;
+                    tmsShipmentItemGroup.Weight     = _lineTmp.LineWeight_Kegs + decRound(tmsShipmentItemGroup.Quantity,0) * whsPalletWeight;
+                    tmsShipmentItemGroup.Cube       = _lineTmp.LineVolume_Kegs;
+                }
+                else
+                {
+                    tmsShipmentItemGroup.Cube       = isToteCustomer ? (_lineTmp.LineVolume_CaseLines + whsToteVolume * RepackContainersByCommodity): (_lineTmp.LineVolume_CaseLines + whsCaseVolume * repackContainersByCommodity);
+                    tmsShipmentItemGroup.Quantity   = whsPalletVolume ? tmsShipmentItemGroup.Cube/whsPalletVolume : 0;
+                    tmsShipmentItemGroup.Weight     =  _lineTmp.LineWeight_CaseLines + _lineTmp.LineWeight_BrokenCaseSecurity + _lineTmp.LineWeight_BrokenCaseNonSecurity + decRound(tmsShipmentItemGroup.Quantity, 0) * whsPalletWeight;
+                }
+                if (tmsShipmentItemGroup.Quantity < 0.01)
+                {
+                    tmsShipmentItemGroup.Quantity = 0.01;
+                }
+                break;
+
+            case _lineTmp.KegQtyUOM :
+                tmsShipmentItemGroup.Quantity   = _lineTmp.SalesQty;
+                tmsShipmentItemGroup.Weight     = _lineTmp.LineWeight_Kegs;
+                tmsShipmentItemGroup.Cube       = _lineTmp.LineVolume_Kegs;
+                break;
+        }
+        tmsShipmentItemGroup.IsRatingUnit = this.isRatingUnit(_shipmentUOM);
+        tmsShipmentItemGroup.insert();
+
+        shipmentCreated = true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRatingUnit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// return Rating unit
+    /// </summary>
+    /// <param name = "_shipmentUOM">METShipmentUOM</param>
+    /// <returns>boolean <c>boolean</c></returns>
+    private boolean isRatingUnit(METShipmentUOM _shipmentUOM)
+    {
+        return METTMSShipmentRatingUnit::find(SalesTable.InventLocationId, _shipmentUOM).RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTMSShipmentOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Step 6a: Update the order’s “Order weight”
+    /// Step 6b: Update the order’s “Order volume”
+    /// Step 6c: Update order’s “Pallet Total footprint”
+    /// </summary>
+    void updateTMSShipmentOrder()
+    {
+        METTMSShipmentOrderTable    tmsShipmentOrderTable;
+        METTMSShipmentItemGroup     tmsShipmentItemGroup;
+
+        update_recordset tmsShipmentOrderTable
+            setting OrderWeight = tmsShipmentItemGroup.Weight,
+                    OrderVolume = tmsShipmentItemGroup.Cube
+            join sum(Weight), sum(Cube) from tmsShipmentItemGroup
+                where tmsShipmentOrderTable.ShipmentId == shipmentId
+                    && tmsShipmentOrderTable.OrderNumber == salesTable.SalesId
+                    && tmsShipmentItemGroup.TMSShipmentOrderIdentifier == tmsShipmentOrderTable.TMSShipmentOrderIdentifier
+                    && (tmsShipmentItemGroup.QuantityUOM == unitCSE
+                    || tmsShipmentItemGroup.QuantityUOM like "@MET:KegQtyUOM"
+                    || tmsShipmentItemGroup.QuantityUOM == unitTOT);
+
+        update_recordset tmsShipmentOrderTable
+            setting PalletTotalFootprint = tmsShipmentItemGroup.Quantity
+            join sum(Quantity) from tmsShipmentItemGroup
+                where tmsShipmentOrderTable.ShipmentId == shipmentId
+                    && tmsShipmentOrderTable.OrderNumber == salesTable.SalesId
+                    && tmsShipmentItemGroup.TMSShipmentOrderIdentifier == tmsShipmentOrderTable.TMSShipmentOrderIdentifier
+                    && tmsShipmentItemGroup.QuantityUOM == unitPal;
     }
 
 ]]></Source>
