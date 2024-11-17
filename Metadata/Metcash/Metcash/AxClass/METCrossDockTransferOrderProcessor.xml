@@ -6,6 +6,9 @@
 public class METCrossDockTransferOrderProcessor
 {
     InventParameters inventParameter;
+    InventTransferTable transferTable;
+    METInventTransferTableExt metTransferTable;
+
 }
 ]]></Declaration>
 		<Methods>
@@ -31,6 +34,31 @@ public class METCrossDockTransferOrderProcessor
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>CreateTransferOrderFromSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Primarily used to create transfer order lines during substitution process. As the substitution will process each sales lines
+    /// </summary>
+    /// <param name = "_salesLine"></param>
+    public void CreateTransferOrderFromSalesLine(SalesLine _salesLine)
+    {
+        SalesTable salesTable;
+        METSalesTable metSalesTable;
+        METSalesLine metSalesLine = _salesLine.metSalesLine();
+        
+        select firstonly salesTable
+            where salesTable.SalesId == _salesLine.SalesId
+            join metSalesTable
+            where metSalesTable.SalesTable == salesTable.RecId;
+
+        ttsbegin;
+        this.CreateTransferOrderLine(_salesLine, metSalesLine, salesTable, metSalesTable);
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>construct</Name>
 				<Source><![CDATA[
     public static METCrossDockTransferOrderProcessor construct()
@@ -43,10 +71,10 @@ public class METCrossDockTransferOrderProcessor
 			<Method>
 				<Name>findOrCreateTransferHeader</Name>
 				<Source><![CDATA[
-    public container findOrCreateTransferHeader(SalesLine _salesLine, METSalesLine _metSalesLine, SalesTable _salesTable, METSalesTable _metSalesTable)
+    public void findOrCreateTransferHeader(SalesLine _salesLine, METSalesLine _metSalesLine, SalesTable _salesTable, METSalesTable _metSalesTable)
     {
-        InventTransferTable transferTable;
-        METInventTransferTableExt metTransferTable;
+        //InventTransferTable transferTable;
+        //METInventTransferTableExt metTransferTable;
 
         NoYes underBond = this.isUnderBondItem(_salesLine.ItemId);
 
@@ -74,6 +102,7 @@ public class METCrossDockTransferOrderProcessor
             transferTable.initToAddress();
             transferTable.ShipDate = _metSalesTable.SecondShipDate;
             transferTable.ReceiveDate = _salesTable.ShippingDateConfirmed;
+            //Mark the Auto reservation to true if the Reserve items automatically flag is enabled or the sales order is an event order.
             transferTable.AutoReservation = (inventParameter.InventTransferAutoReservation || _metSalesTable.EventID != '');
             
             if (transferTable.validateWrite())
@@ -103,8 +132,127 @@ public class METCrossDockTransferOrderProcessor
                 metTransferTable.insert();
             }
         }
+    }
 
-        return [transferTable, metTransferTable];
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getUnitConversionFactor</Name>
+				<Source><![CDATA[
+    private UnitOfMeasureConversionFactor getUnitConversionFactor(ItemId _itemId, SalesUnit _fromUnit)
+    {
+        InventUnitId inventUnit = InventTableModule::find(_itemId, ModuleInventPurchSales::Invent).UnitId;
+                
+        UnitOfMeasureConversionFactor convFact = 1;
+
+        if(inventUnit != _fromUnit)
+        {
+            convFact = UnitOfMeasureConversion::findByConversion(UnitOfMeasure::findBySymbol(_fromUnit).RecId, UnitOfMeasure::findBySymbol(inventUnit).RecId).Factor;
+        }
+
+        return convFact;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateTransferOrderLine</Name>
+				<Source><![CDATA[
+    private void CreateTransferOrderLine(SalesLine _salesLine, METSalesLine _metSalesLine, SalesTable _salesTable, METSalesTable _metSalesTable)
+    {
+        SalesQty qtyReserved = _salesLine.mcrSalesQtyReserved();
+
+        if (qtyReserved < _salesLine.QtyOrdered)
+        {
+            InventTransferLine transferLine;
+            METInventTransferLine metTransferLine;
+
+            this.findOrCreateTransferHeader(_salesLine, _metSalesLine, _salesTable, _metSalesTable);
+                
+            if(metTransferTable)
+            {
+                if(!METInventTransferLine::existsForSalesLine(_salesLine.InventTransId))
+                {
+                    transferLine.initFromSalesLine(_salesLine);
+                    transferLine.initFromInventTransferTable(transferTable, true);
+
+                    UnitOfMeasureConversionFactor convFact = this.getUnitConversionFactor(_salesLine.ItemId, _salesLine.SalesUnit);
+
+                    //Create transfer order for the remaining quantity of sales order line and it should be converted to the inventory unit.
+                    transferLine.QtyTransfer = (_salesLine.QtyOrdered - qtyReserved) * convFact;
+                        
+                    if(_salesLine.PdsCWQty)
+                    {
+                        transferLine.PdsCWQtyTransfer = _salesLine.pdsCWQtyActivateRemainder() * convFact;
+                        transferLine.modifiedField(fieldNum(InventTransferLine, PdsCWQtyTransfer));
+                    }
+
+                    transferLine.QtyRemainReceive = transferLine.QtyTransfer;
+                    transferLine.QtyRemainShip = transferLine.QtyTransfer;
+
+                    InventDim inventDimTO;
+                    InventDim inventDimTOOrig = transferLine.inventDim();
+
+                    inventDimTO.data(_salesLine.inventDim());
+                    inventDimTO.InventSiteId = inventDimTOOrig.InventSiteId;
+                    inventDimTO.InventLocationId = inventDimTOOrig.InventLocationId;
+
+                    inventDimTO.wMSLocationId = InventLocation::find(inventDimTO.InventLocationId).DefaultFinalShipmentLocation;
+
+                    transferLine.LineNum = _salesLine.LineNum;
+                    transferLine.InventDimId = inventDim::findOrCreate(inventDimTO).inventDimId;
+
+                    if(transferLine.validateWrite())
+                    {
+                        transferLine.insert();
+                    }
+
+                    this.insertSupplyRelation(_salesLine, transferLine);
+                    this.checkAndUpdateMarking(_salesLine, transferLine);
+
+                    metTransferLine.clear();
+                    metTransferLine.initValue();
+                    metTransferLine.InventTransferLine = transferLine.RecId;
+                    metTransferLine.SalesLineTransId = _salesLine.InventTransId;
+
+                    // Allow substitution only when,
+                    // 1. Metcash sales order type allows substitution
+                    // 2. No quantity is reserved on the origin sales line
+                    METSalesOrderTypes metOrderType = _salesTable.METSalesOrderTypes();
+                    if(metOrderType && metOrderType.SubstitutesAllowed == NoYes::Yes)
+                    {
+                        metTransferLine.AllowSubstitution = qtyReserved == 0 ? NoYes::Yes : NoYes::No;
+                    }
+                    else
+                    {
+                        metTransferLine.AllowSubstitution = NoYes::No;
+                    }
+
+                    InventMovement::bufferSetRemainQty(transferLine, InventMovSubType::None);
+                    InventMovement::bufferSetRemainQty(transferLine, InventMovSubType::TransferOrderTransitFrom);
+                    //If the Salesline order extraction status is already extracted means the transfer order line is being created as an effect of a substitution process.
+                    //In that case we need to set the transfer line extraction status to Ready to Extract, so the line is picked in the second pick list attempt.
+                    if(_metSalesLine.OrderExtractStatus == METOrderExtractStatus::Extracted)
+                    {
+                        metTransferLine.OrderExtractStatus = METOrderExtractStatus::ReadyForExtract;
+                    }
+
+                    metTransferLine.insert();
+                    metTransferLine.updateUnitFields();
+
+                    if(metTransferLine)
+                    {
+                        _metSalesLine.selectForUpdate(true);
+                        _metSalesLine.TransferOrderNumber = transferTable.TransferId;
+                        _metSalesLine.InventTransIdReceive = transferLine.InventTransIdReceive;
+                        _metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                            
+                        _metSalesLine.update();
+                    }
+                }
+            }
+        }
+
     }
 
 ]]></Source>
@@ -112,7 +260,7 @@ public class METCrossDockTransferOrderProcessor
 			<Method>
 				<Name>CreateTransferOrder</Name>
 				<Source><![CDATA[
-    public void CreateTransferOrder(SalesTable _salesTable, SalesLineRefRecId _salesLine = 0)
+    public void CreateTransferOrder(SalesTable _salesTable)
     {
         SalesLine salesLine;
         METSalesLine metSalesLine;
@@ -125,105 +273,10 @@ public class METCrossDockTransferOrderProcessor
         while select salesLine
             order by metSalesLine.SupplyingWarehouse
             where salesLine.SalesId == _salesTable.SalesId
-            && (_salesLine == 0 || salesLine.RecId == _salesLine)
             join metSalesLine where metSalesLine.SalesLine == salesLine.RecId
             && metSalesLine.OrderExtractStatus != METOrderExtractStatus::Extracted
-            join inventDim where inventDim.inventDimId == salesLine.InventDimId
         {
-            SalesQty qtyReserved = salesLine.mcrSalesQtyReserved();
-
-            if (qtyReserved < salesLine.QtyOrdered)
-            {
-                InventTransferTable transferTable;
-                InventTransferLine transferLine;
-
-                METInventTransferTableExt metTransferTable;
-                METInventTransferLine metTransferLine;
-
-                [transferTable, metTransferTable] = this.findOrCreateTransferHeader(salesLine, metSalesLine, _salesTable, metSalesTable);
-                
-                if(metTransferTable)
-                {
-                    if(!METInventTransferLine::existsForSalesLine(salesLine.InventTransId))
-                    {
-                        transferLine.initFromSalesLine(salesLine);
-                        transferLine.initFromInventTransferTable(transferTable, true);
-
-                        InventUnitId inventUnit = InventTableModule::find(salesLine.ItemId, ModuleInventPurchSales::Invent).UnitId;
-                
-                        UnitOfMeasureConversionFactor convFact = 1;
-
-                        if(inventUnit != salesLine.SalesUnit)
-                        {
-                            convFact = UnitOfMeasureConversion::findByConversion(UnitOfMeasure::findBySymbol(salesLine.SalesUnit).RecId, UnitOfMeasure::findBySymbol(inventUnit).RecId).Factor;
-                        }
-
-                        //Create transfer order for the remaining quantity of sales order line and it should be converted to the inventory unit.
-                        transferLine.QtyTransfer = (salesLine.QtyOrdered - qtyReserved) * convFact;
-                        
-                        if(salesLine.PdsCWQty)
-                        {
-                            transferLine.PdsCWQtyTransfer = salesLine.pdsCWQtyActivateRemainder() * convFact;
-                            transferLine.modifiedField(fieldNum(InventTransferLine, PdsCWQtyTransfer));
-                        }
-                        transferLine.QtyRemainReceive = transferLine.QtyTransfer;
-                        transferLine.QtyRemainShip = transferLine.QtyTransfer;
-                        InventDim inventDimTO;
-                        InventDim inventDimTOOrig = transferLine.inventDim();
-
-                        inventDimTO.data(inventDim);
-                        inventDimTO.InventSiteId = inventDimTOOrig.InventSiteId;
-                        inventDimTO.InventLocationId = inventDimTOOrig.InventLocationId;
-
-                        inventDimTO.wMSLocationId = InventLocation::find(inventDimTO.InventLocationId).DefaultFinalShipmentLocation;
-
-                        transferLine.LineNum = salesLine.LineNum;
-                        transferLine.InventDimId = inventDim::findOrCreate(inventDimTO).inventDimId;
-
-                        if(transferLine.validateWrite())
-                        {
-                            transferLine.insert();
-                        }
-
-                        this.insertSupplyRelation(salesLine, transferLine);
-                        this.checkAndUpdateMarking(salesLine, transferLine);
-
-                        metTransferLine.clear();
-                        metTransferLine.initValue();
-                        metTransferLine.InventTransferLine = transferLine.RecId;
-                        metTransferLine.SalesLineTransId = salesLine.InventTransId;
-
-                        //Allow substitution only when, 
-                        // 1. Metcash sales order type allows substitution
-                        // 2. No quantity is reserved on the origin sales line
-                        METSalesOrderTypes metOrderType = _salesTable.METSalesOrderTypes();
-                        if(metOrderType && metOrderType.SubstitutesAllowed == NoYes::Yes)
-                        {
-                            metTransferLine.AllowSubstitution = qtyReserved == 0 ? NoYes::Yes : NoYes::No;
-                        }
-                        else
-                        {
-                            metTransferLine.AllowSubstitution = NoYes::No;
-                        }
-
-                        InventMovement::bufferSetRemainQty(transferLine, InventMovSubType::None);
-                        InventMovement::bufferSetRemainQty(transferLine, InventMovSubType::TransferOrderTransitFrom);
-                        
-                        metTransferLine.insert();
-                        metTransferLine.updateUnitFields();
-
-                        if(metTransferLine)
-                        {
-                            metSalesLine.selectForUpdate(true);
-                            metSalesLine.TransferOrderNumber = transferTable.TransferId;
-                            metSalesLine.InventTransIdReceive = transferLine.InventTransIdReceive;
-                            metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
-                            
-                            metSalesLine.update();
-                        }
-                    }
-                }
-            }
+            this.CreateTransferOrderLine(salesLine, metSalesLine, _salesTable, metSalesTable);
         }
 
         this.updateOrderExtractionStatus(_salesTable);
