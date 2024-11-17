@@ -39,6 +39,10 @@ public class METCrossDockSalesFinalizationFacade
 			<Method>
 				<Name>construct</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Constructs a new object instance of <c>METCrossDockSalesFinalizationFacade</c>
+    /// </summary>
+    /// <returns>Returns a new instance of <c>METCrossDockSalesFinalizationFacade</c></returns>
     public static METCrossDockSalesFinalizationFacade construct()
     {
         return new METCrossDockSalesFinalizationFacade();
@@ -78,7 +82,6 @@ public class METCrossDockSalesFinalizationFacade
     {
         METInventTransferTableExt metTransTable;
         InventTransferTable inventTransferTable;
-
 
         select firstonly inventTransferTable
             exists join metTransTable
@@ -122,32 +125,29 @@ public class METCrossDockSalesFinalizationFacade
             where inventTransferTable.RecId == metTransferTable.InventTransferTable
             && inventTransferTable.TransferId == _transferId;
 
-        if(!this.validate(salesTable, _transferId))
-        {
-            return;
-        }
-
-        //exists join metSalesTable
-        //where metSalesTable.SalesTable == salesTable.RecId;
-
         if(this.isWaveRequired(salesTable, inventLocation))
         {
             salesTable.createWaveFromSalesTable();
         }
 
-        if((metTransferTable.TransferType == METCrossDockTransferType::CrossDock) || (metTransferTable.TransferType == METCrossDockTransferType::CSD && salesTable))
+        if(salesTable && metTransferTable.TransferType != METCrossDockTransferType::None)
         {
-            //Task152245-CB123-SalesOrderExtractScreenforCSD - start
-            //if ((inventLocation.METWaveRequired == NoYes::Yes && inventLocation.METPickDirector == NoYes::No
-            //     && inventLocation.METCSDWarehouse == NoYes::Yes)
-            //    || (inventLocation.METCSDWarehouse == NoYes::No))
-            //{
-                //Post picking list
-                this.postPickingList(salesTable);
+            //Post picking list
+            WMSShipmentId wmsShipmentId = this.postPickingList(salesTable);
+            //Post intercompany picking list. Sourcing all lines from a single company
+            this.postIntercompanyPickingList(salesTable);
 
-                //Post intercompany picking list. Sourcing all lines from a single company
-                this.postIntercompanyPickingList(salesTable);
-            //}
+            ////Create shipment header and loads to prevent the batch task dead lock issue.
+            //METOrderShipmentLoadCreation  shipmentLoadCreation = METOrderShipmentLoadCreation::construct(METOrderTransactionType::SalesOrder,
+            //                                                                                                        salesTable.SalesId);
+            //WMSShipmentId wmsShipmentId = shipmentLoadCreation.createShippmentLoad(true,false);
+
+            if(wmsShipmentId != '')
+            {
+                //Initialize and run the sales order finalization process. 
+                METOrderShipmentConfirmation orderShipmentConfirmation = METOrderShipmentConfirmation::construct(wmsShipmentId);
+                orderShipmentConfirmation.run();
+            }
         }
     }
 
@@ -212,12 +212,14 @@ public class METCrossDockSalesFinalizationFacade
     /// Post picking list
     /// </summary>
     /// <param name = "_salesTable">SalesTable buffer.</param>
-    private void postPickingList(SalesTable _salesTable)
+    private WMSShipmentId postPickingList(SalesTable _salesTable)
     {
         boolean             isError;
         QueryRun            queryRun;
         SalesParmLine       salesParmLine;
         SalesFormLetter     salesFormLetter;
+
+        WMSShipmentId wmsShipmentId = '';
 
         try
         {
@@ -256,6 +258,7 @@ public class METCrossDockSalesFinalizationFacade
                 
                 salesParmLine.DeliverNow = salesLineLoc.reservedPhysical();
                 InventDim inventDimLoc = salesLineLoc.inventDim();
+
                 if(InventDimLoc.wMSLocationId == '')
                 {
                     inventDimLoc.wMSLocationId = inventDimLoc.inventLocation().DefaultFinalShipmentLocation;
@@ -272,23 +275,24 @@ public class METCrossDockSalesFinalizationFacade
                 METOrderShipmentLoadCreation::construct(METOrderTransactionType::SalesOrder, _salesTable.SalesId);
             
             shipmentLoadCreation.createShippmentLoad(true,false);
-            ttscommit;
+            
             WMSPickingRoute wmsPickingRoute;
             
             select firstonly wmsPickingRoute
                 where wmsPickingRoute.parmid == salesFormLetter.parmId();
-            
+
             if (wmsPickingRoute)
             {
                 wmsPickingRoute.selectForUpdate(true);
-                ttsbegin;
                 wmsPickingRoute.METTransferOrderPickingRouteId = this.getTransferPickListReference(wmsPickingRoute);
                 wmsPickingRoute.doUpdate();
-                ttscommit;
 
-                //this.postPickingListRegistration(wmsPickingRoute.pickingRouteID);
-                METOrderShipmentConfirmation orderShipmentConfirmation = METOrderShipmentConfirmation::construct(wmsPickingRoute.shipmentId);
-                orderShipmentConfirmation.run();
+                //If the default wmsLocation is not set at the Sales order level, update the same before pick list registration.
+                this.updateWMSPickLocation(wmsPickingRoute);
+
+                this.postPickingListRegistration(wmsPickingRoute.pickingRouteID);
+                
+                wmsShipmentId = wmsPickingRoute.shipmentId;
 
                 if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METPicklistExtractionBusinessEvent)))
                 {
@@ -299,6 +303,7 @@ public class METCrossDockSalesFinalizationFacade
                     throw error("@MET:PicklistExtractionBusinessEventNotEnabled");
                 }
             }
+            ttscommit;
         }
         catch
         {
@@ -311,6 +316,33 @@ public class METCrossDockSalesFinalizationFacade
             // If picking list generation failed with error revert extract status back to Open
             _salesTable.selectForUpdate(true);
             _salesTable.metUpdateExtractStatus();
+        }
+        
+        return wmsShipmentId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateWMSPickLocation</Name>
+				<Source><![CDATA[
+    private void updateWMSPickLocation(WMSPickingRoute _wmsPickingRoute)
+    {
+        WMSOrderTrans orderTrans;
+        InventDim inventDim;
+
+        while select forupdate orderTrans
+            where orderTrans.routeId == _wmsPickingRoute.pickingRouteID
+            join inventDim
+            where inventDim.inventDimId == orderTrans.inventDimId
+            && inventDim.wMSLocationId == ''
+        {
+            InventDim inventDimLoc = inventDim;
+            ttsbegin;
+            inventDimLoc.wMSLocationId = InventLocation::find(inventDim.InventLocationId).WMSlocationIdDefaultIssue;
+            orderTrans.inventDimId = inventDim::findOrCreate(inventDimLoc).inventDimId;
+            orderTrans.update();
+            ttscommit;
         }
     }
 
