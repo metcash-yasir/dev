@@ -1,0 +1,304 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSOContinuingPermissionNoticeDP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[SRSReportParameterAttribute(classstr(METCommonContinuingPermissionNoticeContract))]
+class METSOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
+{
+    METSOContinuingPermissionNoticeHeaderTmp header;
+    METSOContinuingPermissionNoticeLineTmp line;
+    SalesTable salesTable;
+    CustInvoiceJour invoiceJour;
+    #ISOCountryRegionCodes
+    #PrintMgmtSetup
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processReport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process report
+    /// </summary>
+    public void processReport()
+    {
+        METCommonContinuingPermissionNoticeContract contract = this.parmDataContract() as METCommonContinuingPermissionNoticeContract;
+       
+        SalesId salesId = contract.parmSalesId();
+        salesTable =  SalesTable::find(salesId);
+
+        RefRecId jourRecId = contract.parmInvJourRecId();
+        InvoiceJour = CustInvoiceJour::findRecId(jourRecId);
+
+        if (!contract.parmIsRePrint())
+        {
+            delete_from header
+                where header.SalesId == salesId
+                && header.InvoiceJourRecId == jourRecId;
+
+            delete_from line
+                where line.SalesId == salesId
+                && line.InvoiceJourRecId == jourRecId;
+
+            if (salesTable.RecId)
+            {
+                this.insertHeaderData();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertHeaderData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts the report header data.
+    /// </summary>
+    public void insertHeaderData()
+    {
+        METCustTable metCustTable = METCustTable::find(salesTable.CustAccount);
+
+        NumberSequenceReference numberSequenceReference;
+
+        numberSequenceReference = NumberSeqReference::findReference(extendedTypeNum(METCPNumber));
+
+        if (numberSequenceReference.RecId)
+        {
+            METCPNumber num = NumberSeq::newGetNum(numberSequenceReference).num();
+            header.ContinuingPermissionNoticeNumber = num;
+        }
+
+        CompanyInfo companyInfo = CompanyInfo::find();
+        InventSite site;
+
+        select firstonly METBondNumber from site
+            where site.SiteId == salesTable.InventSiteId;
+
+        InventLocation inventLocation;
+
+        select firstonly METWHSubEntity, Name, RecId from inventLocation
+            where inventLocation.InventLocationId == salesTable.InventLocationId;
+        
+        header.CompanyLogo = this.getCompanyLogo(companyInfo.METLegalEntityType, inventLocation.METWHSubEntity);
+        LogisticsEntityPostalAddressView postalAddressView = this.getWareHousePrimaryAddress(inventLocation.RecId);
+
+        PrintMgmtReportFormat printMgmtReportFormat = PrintMgmtReportFormat::findByType(PrintMgmtDocumentType::SalesOrderConfirmation,
+                                                                                        ssrsReportStr(METSalesConfirm, ReportLiquor), #NoCountryRegionId);
+        RecId PrintMgmtDocInstanceRecId = PrintMgmtDocInstance::find(0, 0, PrintMgmtNodeType::Sales,
+                                                                     PrintMgmtDocumentType::SalesOrderConfirmation, 1).RecId;
+
+        if (PrintMgmtDocInstanceRecId != 0 && printMgmtReportFormat)
+        {
+            int dotPosition = strScan(printMgmtReportFormat.Name, '.', 0, strLen(printMgmtReportFormat.Name));
+
+            if (dotPosition > 0)
+            {
+                METIndustryKeyTable industryKey;
+                SysDocuBrandDetails docuBrandDetails;
+
+                select firstonly METTaxRegNumber from docuBrandDetails
+                    where docuBrandDetails.ReportName == subStr(printMgmtReportFormat.Name, 1, dotPosition - 1)
+                exists join industryKey
+                    where docuBrandDetails.METIndustryKey == industryKey.IndustryKey;
+                
+                header.CompanyCoRegNum = docuBrandDetails.METTaxRegNumber;
+            }
+        }
+
+        header.SendingBranchAddress = postalAddressView.Address;
+        header.SendingBranchName = inventLocation.Name;
+        header.ReceivingBranchAddress = VendTable::find(salesTable.CustAccount).postalAddress().Address;
+        header.ReceivingBranchName = VendTable::find(salesTable.CustAccount).name();
+        header.NoticeDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::getSystemDateTime(), DateTimeUtil::getUserPreferredTimeZone()));
+        header.NoticeTimeString = int2Str(DateTimeUtil::time(DateTimeUtil::utcNow()));
+        header.CompanyName = companyInfo.Name;
+
+        List metBondList = strSplit(site.METBondNumber, ' ');
+        Container metBondCon = list2con(metBondList);
+
+        header.SenderBranchExciseNumber = conpeek(metBondCon, 1);
+        header.SenderBranchBondNumber = conpeek(metBondCon, 2);
+        header.ReceivingBranchExciseNumber = metCustTable.ExciseNumber;
+        header.ReceivingBranchBondNumber = metCustTable.BondNumber;
+        header.SalesId = salesTable.SalesId;
+        header.InvoiceJourRecId = invoiceJour.RecId;
+        header.insert();
+
+        this.insertLineData();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertLineData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Inserts the report line data.
+    /// </summary>
+    public void insertLineData()
+    {
+        const str defaultUOM = 'EA';
+        salesLine salesLine;
+        InventTable inventTable;
+        METInventTable metInventTable;
+        
+        METExciseRegisterEntry exciseRegister;
+        METTariffItemCodeBase tariffCodeBase;
+        VendPackingSlipJour packingSlip;
+        RecordInsertList insertSet = new RecordInsertList(tableNum(METPOContinuingPermissionNoticeLineTmp));
+
+       while select salesLine
+            where salesLine.SalesId == salesTable.SalesId
+       join inventTable
+            where salesLine.ItemId == inventTable.ItemId
+       join metInventTable
+            where metInventTable.ItemId == inventTable.ItemId
+       join TariffItem from tariffCodeBase
+            where tariffCodeBase.RecId == metInventTable.METTariffItemCodeBaseRecid
+            && (tariffCodeBase.CustomsExcise == METCustomExcise::C ||
+                 tariffCodeBase.CustomsExcise == METCustomExcise::E)
+        {
+            METExciseInformationTable metExciseInformationTablePO;
+            InventDim inventDim = salesLine.inventDim();
+
+            select firstonly Lodgement from metExciseInformationTablePO
+            order by CreatedDateTime
+                where metExciseInformationTablePO.InventTransType == InventTransType::Purch &&
+                    metExciseInformationTablePO.ItemId == salesLine.ItemId &&
+                    metExciseInformationTablePO.SiteId == inventDim.InventSiteId &&
+                    metExciseInformationTablePO.LodgementClosed == NoYes::No;
+
+            line.BondMark = metExciseInformationTablePO.Lodgement;
+
+            select TIUV, DutyRateReceived from exciseRegister
+                where exciseRegister.OrderNumber == salesTable.SalesId
+                && exciseRegister.OriginDocumentNumber == invoiceJour.InvoiceId
+                && exciseRegister.ItemId == salesLine.ItemId;
+
+            METPurchaseWMSFactor purchaseWMSFactor = UnitOfMeasureConversion::findByConversion(UnitOfMeasure::findBySymbol(salesLine.SalesUnit).RecId, UnitOfMeasure::findBySymbol(defaultUOM).RecId, EcoResProduct::findByProductNumber(salesLine.ItemId).RecId).Factor;
+            line.BottlesSupplied = purchaseWMSFactor * salesLine.SalesQty;
+            line.ItemId = salesLine.ItemId;
+            line.ItemDescription = inventTable.productName(SystemParameters::getSystemLanguageId());
+            line.BottleSize = metInventTable.BottleSize;
+            line.PackQty = metInventTable.ItemPack;
+            line.Strength = metInventTable.AlcoholContent;
+            line.PurchUoM = salesLine.SalesUnit;
+            line.Quantity = salesLine.SalesQty;
+            line.LitresOfAlcoholCalculated = metInventTable.BottleSize * line.BottlesSupplied * metInventTable.AlcoholContent;
+            line.ValueTIU = exciseRegister.TIUV;
+            line.TariffItem = tariffCodeBase.TariffItem;
+            line.CountryOfOrigin = metInventTable.CountryCode;
+            line.StatCode = metInventTable.statcode();
+            line.ValueDuty = exciseRegister.DutyRateReceived;
+            line.InvoiceAccount = salesTable.InvoiceAccount;
+            line.SalesId = salesTable.SalesId;
+            line.InvoiceJourRecId = invoiceJour.RecId;
+            insertSet.add(line);
+        }
+        insertSet.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dsHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// dsHeader
+    /// </summary>
+    /// <returns>METSOContinuingPermissionNoticeHeaderTmp</returns>
+    [SRSReportDataSetAttribute(tableStr(METSOContinuingPermissionNoticeHeaderTmp))]
+    public METSOContinuingPermissionNoticeHeaderTmp dsHeader()
+    {
+        select header
+            where header.SalesId == salesTable.SalesId
+            && header.InvoiceJourRecId == invoiceJour.RecId;
+
+        return header;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dsLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// dsLines
+    /// </summary>
+    /// <returns>METSOContinuingPermissionNoticeLineTmp</returns>
+    [SRSReportDataSetAttribute(tableStr(METSOContinuingPermissionNoticeLineTmp))]
+    public METSOContinuingPermissionNoticeLineTmp dsLines()
+    {
+        select line
+            where line.SalesId == salesTable.SalesId
+            && line.InvoiceJourRecId == invoiceJour.RecId;
+
+        return line;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCompanyLogo</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get METcash logo based on entity
+    /// </summary>
+    /// <param name = "_legalEntityType">LegalEntityType</param>
+    /// <param name = "_subEntityWareHouse">SubEntity warehouse</param>
+    /// <returns>Image</returns>
+    public container getCompanyLogo(METLegalEntityType _legalEntityType, InventLocationId _subEntityWareHouse)
+    {
+        container image;
+
+        switch (_legalEntityType)
+        {
+            case METLegalEntityType::Food:
+                image = SysDocuBrandImages::getImage(_subEntityWareHouse);
+                break;
+
+            case METLegalEntityType::Liquor:
+                image = SysDocuBrandImages::getImage(METConstants::LiquorLogo);
+                break;
+
+            default:
+                break;
+
+        }
+        return image;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getWareHousePrimaryAddress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get WareHouse address By recevingdock role
+    /// </summary>
+    /// <param name = "_inventLocationRecId">Location RecId</param>
+    /// <param name = "_roleRecId">Role Recid</param>
+    /// <param name = "_type">LogisticsElectronicAddressMethodType</param>
+    /// <returns>Locator</returns>
+    private LogisticsEntityPostalAddressView getWareHousePrimaryAddress(RefRecId _inventLocationRecId)
+    {
+        LogisticsEntityPostalAddressView  logisticsEntityPostalAddressView;
+        
+        select firstonly logisticsEntityPostalAddressView
+            where logisticsEntityPostalAddressView.Entity == _inventLocationRecId
+            && logisticsEntityPostalAddressView.EntityType == LogisticsLocationEntityType::Warehouse
+            && logisticsEntityPostalAddressView.ValidFrom <= DateTimeUtil::getSystemDateTime()
+            && logisticsEntityPostalAddressView.ValidTo >= DateTimeUtil::getSystemDateTime()
+            && logisticsEntityPostalAddressView.IsPrimary == NoYes::Yes;
+        
+        return logisticsEntityPostalAddressView;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
