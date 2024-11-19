@@ -1,0 +1,1001 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METCreateCSDTransferOrder</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Abstract class responsible for creating CSD transfer orders.
+/// </summary>
+abstract class METCreateCSDTransferOrder
+{
+    METFulfilmentProfileId    profileId;
+    List                      salesLineList;
+    Map                       transferOrderMap,
+                              custStagingLaneMap;
+    Set                       profileRuleSet,
+                              transferIdSet, 
+                              stagingLaneUpdateSet;
+    RecordInsertList          transferTableInsertList;
+    RecordInsertList          transferLineInsertList;
+    METNumberOfCustomers      custCurrentPosition;
+    boolean                   doSetStagingLane;
+    Qty                       unitConvFactor,
+                              unitConvConvertedQty,
+                              unitConvStoredQty;
+    int                       unitConvStoredQtyFactored;
+
+    //Table variables.
+    InventTransferTable       transferTable;
+    METInventTransferTableExt metTransferTable;
+    METInventTransferLine     metTransferLine;
+    InventTransferLine        transferLine;
+    SalesLine                 salesLine;
+    SalesTable                salestable;
+    METSalesTable             metSalesTable;
+    METSalesLine              metSalesLine;
+    InventLocation            toInventLocation;
+    METInventLocation         metToInventLocaiton;
+    METFulfilmentProfile      profile;
+    METWaveTable              waveTable;
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getWaveTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets waveTable.
+    /// </summary>
+    /// <returns>WaveTable</returns>
+    public METWaveTable getWaveTable()
+    {
+        if (!waveTable)
+        {   
+            METWaveLine waveLine;
+            /*waveTable = METWaveTable::findByWarehouseOrderExtractDateTime(salestable.InventLocationId,
+                                                                          salestable.METOrderExtractDateTime);*/
+            select firstonly waveTable
+                exists join waveLine
+                    where waveLine.WaveId == waveTable.WaveId
+                    &&  waveLine.DocumentNumber == salestable.SalesId
+                    &&  waveLine.Type == METType::SalesOrder;
+        }
+       
+        return waveTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmCustCurrentPosition</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets and sets customer current positon.
+    /// </summary>
+    /// <param name = "_custCurrentPostion">Current position.</param>
+    /// <returns>Current position.</returns>
+    protected METNumberOfCustomers parmCustCurrentPosition(METNumberOfCustomers _custCurrentPosition = custCurrentPosition)
+    {
+        custCurrentPosition = _custCurrentPosition;
+        return custCurrentPosition;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>init</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes class variables.
+    /// </summary>
+    protected void init()
+    {
+        transferIdSet = new Set(Types::String);
+        transferOrderMap = new Map(Types::Record, Types::Class);
+        transferTableInsertList = new RecordInsertList(tableNum(InventTransferTable));
+        transferLineInsertList = new RecordInsertList(tableNum(InventTransferLine));
+        profile = METFulfilmentProfile::find(profileId);
+        toInventLocation = InventLocation::find(profile.InventLocationId);
+        metToInventLocaiton = toInventLocation.metInventLocation();
+
+        this.initProfileRulesSet();
+        this.initStagingLaneSetup();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initProfileRulesSet</Name>
+				<Source><![CDATA[
+    private void initProfileRulesSet()
+    {
+        METFulfilmentRule rule;
+
+        profileRuleSet = new Set(Types::Record);
+
+        while select Type, Apply, value from rule
+                order by rule.Sequence
+            where rule.ProfileId == profileId
+            &&    rule.Type != METFulfilmentRuleType::TOCreation
+        {
+            profileRuleSet.add(rule);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initStagingLaneSetup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialize staging lane setup.
+    /// 
+    /// </summary>
+    private void initStagingLaneSetup()
+    {
+        if (toInventLocation.METCustStartingPosition > 0)
+        {
+            doSetStagingLane = true;
+            custCurrentPosition = toInventLocation.METCustStartingPosition;
+            custStagingLaneMap = new Map(Types::String, Types::Integer);
+            stagingLaneUpdateSet = new Set(Types::Container);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyRules</Name>
+				<Source><![CDATA[
+    protected void applyRules()
+    {
+        SetEnumerator setEnum;
+
+        setEnum = profileRuleSet.getEnumerator() as SetEnumerator;
+
+        while (setEnum && setEnum.moveNext())
+        {
+            METFulfilmentRule rule = setEnum.current();
+
+            switch (rule.Type)
+            {
+                case METFulfilmentRuleType::UOMConversion:
+                    this.applyUOMConversionRule(rule.Apply);
+                    break;
+
+                case METFulfilmentRuleType::Substitutes:
+                    this.applySubstitutesRule(rule.Apply);
+                    break;
+
+                case METFulfilmentRuleType::CSDTOType:
+                    this.applyCSDTOTypeRule(rule.Apply, rule.Value);
+                    break;
+
+                case METFulfilmentRuleType::Route:
+                    this.applyRouteRule(rule.Apply);
+                    break;
+
+                case METFulfilmentRuleType::Customer:
+                    this.applyCustomerRule(rule.Apply);
+                    break;
+
+                case METFulfilmentRuleType::OrderType:
+                    this.applyOrderTypeRule(rule.Apply, rule.Value);
+                    break;
+            }
+        }
+
+        transferTable.metPackMETInventTransferTableExt(metTransferTable);
+        transferLine.metPackMETInventTransferLine(metTransferLine, true);
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyUOMConversionRule</Name>
+				<Source><![CDATA[
+    protected void applyUOMConversionRule(METFulfilmentRuleApply _apply)
+    {
+        Qty qty;
+
+        if (_apply == METFulfilmentRuleApply::SalesUnitToEA)
+        {
+            if (salesLine.SalesUnit != 'EA')
+            {
+                qty = UnitOfMeasureConverter::convert(transferLine.QtyTransfer,
+                                                      UnitOfMeasure::unitOfMeasureIdBySymbol(salesLine.SalesUnit),
+                                                      UnitOfMeasure::unitOfMeasureIdBySymbol('EA'),
+                                                      NoYes::No,
+                                                      InventTable::itemProduct(transferLine.ItemId));
+
+                transferLine.QtyTransfer = qty;
+                transferLine.UnitId = 'EA';
+            }
+        }
+        else if (_apply == METFulfilmentRuleApply::EAToSalesUnit)
+        {
+            if (salesLine.SalesUnit == 'EA')
+            {
+                SalesUnit unit;
+                
+                unit = InventItemSalesSetup::find(transferLine.ItemId, transferLine.InventDimId).METSalesUnit;
+                
+                if (!unit)
+                {
+                    return;
+                }
+
+                unitConvFactor = UnitOfMeasureConverter::convert(1,
+                                                                 UnitOfMeasure::unitOfMeasureIdBySymbol(unit),
+                                                                 UnitOfMeasure::unitOfMeasureIdBySymbol('EA'),
+                                                                 NoYes::No,
+                                                                 InventTable::itemProduct(transferLine.ItemId));
+
+                unitConvStoredQty = transferLine.QtyTransfer;
+                unitConvStoredQtyFactored = (unitConvStoredQty / unitConvFactor);
+                unitConvConvertedQty = unitConvFactor * unitConvStoredQtyFactored;
+                
+                transferLine.QtyTransfer = unitConvConvertedQty;
+            }
+        }
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applySubstitutesRule</Name>
+				<Source><![CDATA[
+    protected void applySubstitutesRule(METFulfilmentRuleApply _apply)
+    {
+        if (_apply == METFulfilmentRuleApply::NotAllowSubstitutes)
+        {
+            metTransferLine.AllowSubstitution = NoYes::No;
+        }
+        else if (_apply == METFulfilmentRuleApply::CopyFromSOTypes)
+        {
+            METSalesOrderTypes orderType = salestable.METSalesOrderTypes();
+
+            metTransferLine.AllowSubstitution = orderType.SubstitutesAllowed;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyCSDTOTypeRule</Name>
+				<Source><![CDATA[
+    protected void applyCSDTOTypeRule(METFulfilmentRuleApply _apply, METFulfilmentRuleValue _value)
+    {
+        if (_apply == METFulfilmentRuleApply::SetValue && _value)
+        {
+            METCSDTOType csdTOType;
+
+            metTransferTable.CSDTOType = str2Enum(csdTOType, _value);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyRouteRule</Name>
+				<Source><![CDATA[
+    protected void applyRouteRule(METFulfilmentRuleApply _apply)
+    {
+        if (_apply == METFulfilmentRuleApply::InternalTORoute)
+        {
+            if (metTransferTable.InternalCustomer)
+            {
+                METInternalTORouteLine toRouteLine;
+
+                int weekDay = System.DateTime::Now.DayOfWeek;
+
+                toRouteLine = METInternalTORouteLine::find(metTransferTable.InternalCustomer,
+                                                           transferTable.InventLocationIdFrom,
+                                                           weekDay);
+
+                if (toRouteLine)
+                {
+                    metTransferTable.Route = toRouteLine.Route;
+                    metTransferTable.RouteStopNum = toRouteLine.RouteStopNum;
+                    metTransferTable.StagingLane = toRouteLine.StagingLane;
+                    metTransferTable.Door = toRouteLine.Door;
+                }
+                                                            
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyCustomerRule</Name>
+				<Source><![CDATA[
+    protected void applyCustomerRule(METFulfilmentRuleApply _apply)
+    {
+        if (_apply == METFulfilmentRuleApply::CSDInternalCustomer)
+        {
+            if (!metTransferTable.InternalCustomer && metTransferLine.OSCCode)
+            {
+                METOSCCode oscCode;
+                DirPartyName custName;
+
+                waveTable = this.getWaveTable();
+
+                oscCode = metTransferLine.OSCCode;
+
+                switch (metTransferTable.CSDTOType)
+                {
+                    case METCSDTOType::FullCaseGrid:
+
+                        if (oscCode == METConstants::PPerishableOSCC)
+                        {
+                            custName = strFmt(METConstants::CustNameFormat1,
+                                              METConstants::CSDCustName,
+                                              METConstants::RunCustName,
+                                              waveTable.WaveNumber,
+                                              METConstants::PerishCustName,
+                                              METConstants::CaseCustName);
+                        }
+                        else
+                        {
+                            custName = strFmt(METConstants::CustNameFormat2,
+                                              METConstants::CSDCustName,
+                                              METConstants::WaveCustName,
+                                              waveTable.WaveNumber,
+                                              METConstants::FullCustName);
+                        }
+                        break;
+
+                    case METCSDTOType::FullCaseBelt:
+
+                        if (oscCode != METConstants::PPerishableOSCC)
+                        {
+                            custName = strFmt(METConstants::CustNameFormat2,
+                                              METConstants::CSDCustName,
+                                              METConstants::WaveCustName,
+                                              waveTable.WaveNumber,
+                                              METConstants::P2LCustName);
+                        }
+                        break;
+
+                    case METCSDTOType::SplitCaseBelt:
+
+                        if (oscCode == METConstants::PPerishableOSCC)
+                        {
+                            custName = strFmt(METConstants::CustNameFormat1,
+                                              METConstants::CSDCustName,
+                                              METConstants::RunCustName,
+                                              waveTable.WaveNumber,
+                                              METConstants::PerishCustName,
+                                              METConstants::PartCustName);
+                        }
+                        else
+                        {
+                            custName = strFmt(METConstants::CustNameFormat2,
+                                              METConstants::CSDCustName,
+                                              METConstants::WaveCustName,
+                                              waveTable.WaveNumber,
+                                              METConstants::SplitCustName);
+                        }
+                        break;
+                  
+                    case METCSDTOType::Inners:
+
+                        if (oscCode == METConstants::PPerishableOSCC)
+                        {
+                            custName = strFmt(METConstants::CustNameFormat3,
+                                              METConstants::CSDCustName,
+                                              METConstants::ReplenishCustName,
+                                              METConstants::PerishableCustName);
+                        }
+                        else
+                        {
+                            custName = strFmt(METConstants::CustNameFormat2,
+                                              METConstants::CSDCustName,
+                                              METConstants::WaveCustName,
+                                              waveTable.WaveNumber,
+                                              METConstants::UnitCustName);
+                        }
+                        break;
+                }
+
+                if (custName)
+                {
+                    CustTable custTable;
+                    DirPartyTable dirPartyTable;
+
+                    select firstonly AccountNum from custTable
+                        where custTable.InventLocation == transferTable.InventLocationIdFrom
+                        exists join dirPartyTable
+                            where dirPartyTable.RecId == custTable.Party
+                            &&    DirPartyTable.Name == custName;
+
+                    metTransferTable.InternalCustomer = custTable.AccountNum;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyOrderTypeRule</Name>
+				<Source><![CDATA[
+    protected void applyOrderTypeRule(METFulfilmentRuleApply _apply,  METFulfilmentRuleValue _value)
+    {
+        if (_apply == METFulfilmentRuleApply::DallasOrderType && _value)
+        {
+            metTransferTable.WMSOrderType = _value;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addRecordsToTransferOrdeMap</Name>
+				<Source><![CDATA[
+    protected void addRecordsToTransferOrdeMap()
+    {
+        ListEnumerator enumerator;
+       
+        enumerator = salesLineList.getEnumerator() as ListEnumerator;
+
+        while (enumerator && enumerator.moveNext())
+        {
+            InventTransIdBase salesLineInventTransId = enumerator.current();
+
+            salesLine     = SalesLine::findInventTransId(salesLineInventTransId);
+            salestable    = salesLine.salesTable();
+            metSalesLine  = salesLine.metSalesLine();
+            metSalesTable = salestable.metSalesTable();
+
+            this.initTransferOrder();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTransferTable</Name>
+				<Source><![CDATA[
+    protected void initTransferTable()
+    {
+        /*Note will set on insert list on header and lines.*/
+        //transferTable.TransferId = InventTransferTable::numberSeq().num();
+        transferTable.clear();
+        transferTable.initValue();
+        transferTable.InventLocationIdFrom = metSalesLine.SupplyingWarehouse;
+        transferTable.InventLocationIdTo = salestable.InventLocationId;
+        transferTable.ShipDate = metSalesTable.SecondShipDate;
+        transferTable.ReceiveDate = salestable.ShippingDateConfirmed;
+
+        metTransferTable.clear();
+        metTransferTable.WMSOrderType = metSalesTable.WMSOrderType;
+        metTransferTable.Route = metSalesTable.SecondRoute;
+        //metTransferTable.RouteStopNum = metSalesTable.Second
+        metTransferTable.RouteStopIdentifier = metSalesTable.OriginalSecondRouteStopIdentifier;
+        metTransferTable.RouteIdentifier = metSalesTable.OriginalSecondRouteIdentifier;
+        metTransferTable.DeliveryInstructions = metSalesTable.DeliveryInstructions;
+        metTransferTable.UnderBond = NoYes::No;
+        //metTransferTable.CSDTransfer = NoYes::Yes;
+
+        transferTable.initFromAddress();
+        transferTable.initToAddress();
+
+        transferTable.metPackMETInventTransferTableExt(metTransferTable);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTransferLine</Name>
+				<Source><![CDATA[
+    protected void initTransferLine()
+    {
+        transferLine.clear();
+        transferLine.initFromSalesLine(salesLine);
+        
+        InventDim inventDim = InventDim::find(transferLine.InventDimId);
+
+        inventDim.InventLocationId = transferTable.InventLocationIdFrom;
+        inventDim.InventSiteId = InventLocation::find(inventDim.InventLocationId).InventSiteId;
+        transferLine.InventDimId = InventDim::findOrCreate(inventDim).InventDimId;
+
+        transferLine.QtyTransfer = salesLine.SalesQty;
+        transferLine.AutoReservation = NoYes::No;
+
+        metTransferLine.clear();
+        metTransferLine.WarehouseCategory = salesLine.displayMETFilterCodeOne();
+        metTransferLine.OSCCode = salesLine.displayMETOSCCode();
+        metTransferLine.SalesId = salesLine.SalesId;
+        metTransferLine.SalesLineTransId = salesLine.InventTransId;
+
+        transferLine.metPackMETInventTransferLine(metTransferLine, true);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTransferOrder</Name>
+				<Source><![CDATA[
+    protected void initTransferOrder()
+    {
+        this.initTransferTable();
+        this.initTransferLine();
+        this.setShipCaseQty();
+        this.setStagingLane();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setShipCaseQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets unit ship value.
+    /// </summary>
+    protected void setShipCaseQty()
+    {
+        UnitOfMeasureSymbol unit;
+        InventDim           salesLineDim,
+                            setupDim;
+
+        switch (metToInventLocaiton.ExternalWMSUnit)
+        {
+            case METExtWMSUnit::DefaultInventoryUnit:
+                metTransferLine.ShipCaseQty = 1;
+                break;
+
+            case METExtWMSUnit::DefaultSellUnit:
+                InventItemSalesSetup salesSetup;
+
+                salesLineDim = salesLine.inventDim();
+
+                select firstonly METSalesUnit from salesSetup
+                    where salesSetup.ItemId == salesLine.ItemId
+                        exists join setupDim
+                            where setupDim.inventDimId == salesSetup.InventDimId
+                            &&    setupDim.InventSiteId == salesLineDim.InventSiteId;
+
+                unit = salesSetup.METSalesUnit;
+                break;
+
+            case METExtWMSUnit::DefaultPurchaseUnit:
+                InventItemPurchSetup purchSetup;
+
+                salesLineDim = salesLine.inventDim();
+
+                select firstonly METPurchUnit from purchSetup
+                    where purchSetup.ItemId == salesLine.ItemId
+                        exists join setupDim
+                            where setupDim.inventDimId == purchSetup.InventDimId
+                            &&    setupDim.InventSiteId == salesLineDim.InventSiteId;
+
+                unit = purchSetup.METPurchUnit;
+                break;
+        }
+
+        if (unit)
+        {
+            if (unit == 'EA')
+            {
+                metTransferLine.ShipCaseQty = 1;
+            }
+            else
+            {
+                metTransferLine.ShipCaseQty  = UnitOfMeasureConverter::convert(1,
+                                                                            UnitOfMeasure::unitOfMeasureIdBySymbol(unit),
+                                                                            UnitOfMeasure::unitOfMeasureIdBySymbol('EA'),
+                                                                            NoYes::No,
+                                                                            InventTable::itemProduct(transferLine.ItemId));
+            }
+
+            transferLine.metPackMETInventTransferLine(metTransferLine, true);
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCSDWave</Name>
+				<Source><![CDATA[
+    protected void createCSDWave()
+    {
+        METWaveTable waveTableLocal;
+        
+        if (!toInventLocation.METWaveRequired)
+        {
+            return;
+        }
+
+        waveTableLocal = this.getWaveTable();
+
+        if (waveTableLocal)
+        {
+            this.createTransferOrderWaveLines(waveTableLocal);
+        }
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTransferOrderWaveLines</Name>
+				<Source><![CDATA[
+    private void createTransferOrderWaveLines(METWaveTable _WaveTable)
+    {
+        InventTransferLine   transferLineLocal;
+        METWaveLine          waveLine;
+        SysDaQueryExpression whereQueryExp;
+
+        var transferLineQueryObject = new SysDaQueryObject(transferLineLocal);
+        var insertObject = new SysDaInsertObject(waveLine);
+
+        var setEnum = transferIdSet.getEnumerator() as SetEnumerator;
+
+        while (setEnum && setEnum.moveNext())
+        {
+            InventTransferId transferId = setEnum.current();
+            SysDaQueryExpression transferIdExp = new SysDaEqualsExpression(
+                                                        new SysDaFieldExpression(transferLineLocal, fieldStr(InventTransferLine, TransferId)),
+                                                        new SysDaValueExpression(transferId));
+
+            if (!whereQueryExp)
+            {
+                whereQueryExp = transferIdExp;
+            }
+            else
+            {
+                whereQueryExp.or(transferIdExp);
+            }
+        }
+        
+        transferLineQueryObject.whereClause(whereQueryExp);
+             
+        transferLineQueryObject.projection().add(fieldStr(InventTransferLine, TransferId))
+                                            .addValue(_waveTable.WaveId)
+                                            .addValue(METType::TransferOrder)
+                                            .add(fieldStr(InventTransferLine, RecId))
+                                            .addValue(_waveTable.OrderExtractDateTime);
+
+        insertObject.fields().add(fieldStr(METWaveLine, DocumentNumber))
+                             .add(fieldStr(METWaveLine, WaveId))
+                             .add(fieldStr(METWaveLine, Type))
+                             .add(fieldStr(METWaveLine, DocNumRefRecId))
+                             .add(fieldStr(METWaveLine, OrderExtractDateTime));
+
+        insertObject.query(transferLineQueryObject);
+
+        var insertStatement = new SysDaInsertStatement();
+
+        ttsbegin;
+        insertStatement.execute(insertObject);
+        ttscommit;
+       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>create</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates transfer header and lines records.
+    /// </summary>
+    public final void create()
+    {
+        #OCCRetryCount
+
+        try
+        {
+            ttsbegin;
+            
+            this.addRecordsToTransferOrdeMap();
+            this.addRecordsInList();
+            this.insertRecordsInList();
+            this.createCSDWave();
+            this.updateSalesTableStagingLane();
+
+            ttscommit;
+        }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::Deadlock;
+                }
+            }
+            catch
+            {
+                throw Exception::Error;
+            }
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addRecordsInList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds records in list.
+    /// </summary>
+    private void addRecordsInList()
+    {
+        MapEnumerator mapEnum;
+ 
+        mapEnum = transferOrderMap.getEnumerator() as MapEnumerator;
+
+        while (mapEnum && mapEnum.moveNext())
+        {
+            ListEnumerator      listEnum;
+            List                transferLineList;
+            InventTransferTable transferTableLocal;
+            InventTransferLine  transferLineLocal;
+
+            transferTableLocal = mapEnum.currentKey();
+            
+            transferTableLocal.TransferId =  InventTransferTable::numberSeq().num();
+
+            transferLineList  = mapEnum.currentValue();
+            listEnum = transferLineList.getEnumerator() as ListEnumerator;
+
+            while (listEnum && listEnum.moveNext())
+            {
+                transferLineLocal = listEnum.current();
+                transferLineLocal.TransferId = transferTableLocal.TransferId;
+
+                transferLineInsertList.add(transferLineLocal);
+
+                if (doSetStagingLane)
+                {
+                    METInventTransferLine metTOLine;
+                    
+                    metTOLine = transferLineLocal.metInventTransferLine();
+
+                    stagingLaneUpdateSet.add([metTOLine.SalesId, transferTableLocal.TransferId]);
+                }
+            }
+
+            transferTableInsertList.add(transferTableLocal);
+            transferIdSet.add(transferTableLocal.TransferId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertRecordsInList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts records in list.
+    /// </summary>
+    private void insertRecordsInList()
+    {
+        ttsbegin;
+        transferTableInsertList.insertDatabase();
+        transferLineInsertList.insertDatabase();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addToTransferOrderMap</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds transfer order records to map.
+    /// </summary>
+    protected final void addToTransferOrderMap()
+    {
+        List transferLineList;
+        
+        if (!transferOrderMap.exists(transferTable))
+        {
+            transferLineList = new List(Types::Record);
+        }
+        else
+        {
+            transferLineList = transferOrderMap.lookup(transferTable);
+        }
+
+        transferLineList.addEnd(transferLine);
+        transferOrderMap.insert(transferTable, transferLineList);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmProfileId</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets and sets profile Id.
+    /// </summary>
+    /// <param name = "_profileId">Profile Id.</param>
+    /// <returns>Profile Id.</returns>
+    public METFulfilmentProfileId parmProfileId(METFulfilmentProfileId _profileId = profileId)
+    {
+        profileId = _profileId;
+        return profileId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmSalesLineList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets and sets SalesLine list.
+    /// </summary>
+    /// <param name = "_salesLineList">SalesLine list.</param>
+    /// <returns>SalesLine list.</returns>
+    public List parmSalesLineList(List _salesLineList = salesLineList)
+    {
+        salesLineList = _salesLineList;
+        return salesLineList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Constructs an object on the basis of rules defined in fulfilment profile.
+    /// </summary>
+    /// <param name = "_profileId">Profile Id.</param>
+    /// <param name = "_salesLineList">Salesline list.</param>
+    /// <returns>
+    /// Objects of type <c>METCreateCSDTransferOrder</c>.
+    /// </returns>
+    public static METCreateCSDTransferOrder construct(METFulfilmentProfileId _profileId, List _salesLineList)
+    {
+        METCreateCSDTransferOrder createCSDTransferOrder;
+        METFulfilmentRule rule;
+
+        rule = METFulfilmentRule::find(_profileId, METFulfilmentRuleType::TOCreation);
+
+        switch (rule.Apply)
+        {
+            case METFulfilmentRuleApply::TOSOOneToOne:
+                createCSDTransferOrder = new METCreateCSDTransferOrder_TOSOOneToOne();
+                break;
+
+            case METFulfilmentRuleApply::BulkTransferForSO:
+                createCSDTransferOrder = new METCreateCSDTransferOrder_BulkTransferForSO();
+                break;
+
+            case METFulfilmentRuleApply::BulkTransferToSupplyWarehouse:
+                createCSDTransferOrder = new METCreateCSDTransferOrder_BulkTransferToSupplyWarehouse();
+                break;
+            
+            default:
+                throw error(error::wrongUseOfFunction(funcName()));
+        }
+
+        createCSDTransferOrder.parmProfileId(_profileId);
+        createCSDTransferOrder.parmSalesLineList(_salesLineList);
+        createCSDTransferOrder.init();
+
+        return createCSDTransferOrder;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setStagingLane</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets staging lane on transfer orders..
+    /// </summary>
+    protected void setStagingLane()
+    {
+        METNumberOfCustomers stagingLane;
+
+        if (!doSetStagingLane && metTransferTable.StagingLane)
+        {
+            return;
+        }
+
+        if (custStagingLaneMap.exists(salestable.CustAccount))
+        {
+            stagingLane = custStagingLaneMap.lookup(salestable.CustAccount);
+        }
+        else
+        {
+            stagingLane = custCurrentPosition;
+            custCurrentPosition++;
+        }
+
+        metTransferTable.StagingLane = int2Str(stagingLane);
+        custStagingLaneMap.insert(salestable.CustAccount, stagingLane);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSalesTableStagingLane</Name>
+				<Source><![CDATA[
+    protected void updateSalesTableStagingLane()
+    {
+        SetEnumerator              enum;
+        SalesId                    salesId;
+        InventTransferId           transferId;
+        METInventTransferTableExt  metTransferTableLocal;
+        InventTransferTable        transferTableLocal;
+        METSalesTable              metSalesTableUpdate;
+        Salestable                 salestableUpdate;
+
+        if (!doSetStagingLane)
+        {
+            return;
+        }
+
+        enum = stagingLaneUpdateSet.getEnumerator() as SetEnumerator;
+
+        while (enum && enum.moveNext())
+        {
+            [salesId, transferId] = enum.current();
+
+            metTransferTableLocal = METInventTransferTableExt::findByTransferId(transferId);
+
+            if (metTransferTableLocal.StagingLane)
+            {
+                ttsbegin;
+
+                metSalesTableUpdate.clear();
+                metSalesTableUpdate.readPast(true);
+
+                metSalesTableUpdate = METSalesTable::findBySalesId(salesId, true);
+
+                if (metSalesTableUpdate.RecId)
+                {
+                    metSalesTableUpdate.StagingLaneId = metTransferTableLocal.StagingLane;
+
+                    metSalesTableUpdate.update();
+                }
+
+                ttscommit;
+
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
