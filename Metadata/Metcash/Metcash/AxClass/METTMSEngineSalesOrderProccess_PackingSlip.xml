@@ -1,0 +1,507 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METTMSEngineSalesOrderProccess_PackingSlip</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// CB626_TMSEngineSOPackingSlip
+/// </summary>
+internal final class METTMSEngineSalesOrderProccess_PackingSlip extends METTMSEngineSalesOrderProccess
+{
+    METSalesOrderShipmentLoadHeader salesOrderShipmentLoadHeader;
+    METSalesOrderShipmentLoadLines  salesOrderShipmentLoadLines, salesOrderShipmentLoadLinesQueryRun;
+    WMSPickingRouteID               pickingRouteId;
+    METTMSCCRTableHelper            ccrHelper;
+    Set                             ccrToteIds;
+    METWMSPicklistNumber            wmsPicklistNumber;
+    InventParameters                inventParameters; 
+    MetContainerQty                 actualPalletCount_Loscam, actualPalletCount_Chep, actualPalletCount_Plain, sumActualPalletCount;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>new</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// New method
+    /// </summary>
+    /// <param name = "_salesOrderShipmentLoadHeader">SO finalisation shipment load header</param>
+    public void new(METSalesOrderShipmentLoadHeader _salesOrderShipmentLoadHeader)
+    {
+        // Shipment record being confirmed
+        salesOrderShipmentLoadHeader = _salesOrderShipmentLoadHeader;
+       
+        // initialise the Set for CCR Tote ID, object instanciated here but not used for CB624, only CB626
+        ccrToteIds = new Set(Types::String);
+
+        inventParameters = InventParameters::find();  
+      
+        // Step 8 variables
+        actualPalletCount_Loscam = MetContainerTable::find(salesOrderShipmentLoadHeader.ShipmentId, inventParameters.METLoscamPalletID).ContainerQty;
+        actualPalletCount_Chep   = MetContainerTable::find(salesOrderShipmentLoadHeader.ShipmentId, inventParameters.METCHEPPalletID).ContainerQty;
+        actualPalletCount_Plain  = MetContainerTable::find(salesOrderShipmentLoadHeader.ShipmentId, inventParameters.METPlainPalletID).ContainerQty;
+
+        sumActualPalletCount = actualPalletCount_Loscam + actualPalletCount_Chep + actualPalletCount_Plain;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTmpBuilderInstance</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create an instance of <c>METTMSEngineLinesTmpBuilder</c>
+    /// </summary>
+    /// <param name = "_tmsEngineProcess">METTMSEngineSalesOrderProcess enum</param>
+    /// <param name = "_salesTable"><c>SalesTable</c> record</param>
+    /// <returns>New instance of <c>METTMSEngineLinesTmpBuilder</c></returns>
+    METTMSEngineLinesTmpBuilder getTmpBuilderInstance(METTMSEngineSalesOrderProcess _tmsEngineProcess, SalesTable _salesTable)
+    {
+        return METTMSEngineLinesTmpBuilder::construct(METTMSEngineSalesOrderProcess::PackingSlip, _salesTable, salesOrderShipmentLoadHeader.ShipmentId, wmsPicklistNumber);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTmpTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialise temporary table with calculations and CCR if required.
+    /// </summary>
+    void initTmpTable()
+    {
+        super();
+
+        // if there is at least one line with CCR
+        if (hasCCR)
+        {
+            // Trigger the CCR calculation
+            ccrHelper = METTMSCCRTableHelper::construct(proccessLinesTmp,
+                                                        ccrToteIds,
+                                                        salesTable.SalesId,
+                                                        wmsPicklistNumber);
+            
+            // calc CCR variables and returns set of unique tote ids to avoid double counting for the next SOs
+            ccrToteIds = ccrHelper.calc();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTMSShipmentOrderTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieve the METTMSShipmentOrderTable record based on the TMS engine delivery note posting logic
+    /// </summary>
+    /// <param name = "_salesId">Sales order number</param>
+    /// <param name = "_forUpdate">Select record for update</param>
+    /// <param name = "_pickingRouteId">Picking list number</param>
+    /// <returns><c>METTMSShipmentOrderTable</c> record found or empty.</returns>
+    protected METTMSShipmentOrderTable getTMSShipmentOrderTable(SalesIdBase _salesId, boolean _forUpdate = false, WMSPickingRouteID _pickingRouteId = '')
+    {
+        METTMSShipmentOrderTable TMSShipmentOrderTable;
+
+        // check to see if there is a TSO with Order number = SalesOrderID, and Pick List ID = PickListID that this order is being added to
+        TMSShipmentOrderTable = super(_salesId, _forUpdate, salesOrderShipmentLoadLines.PickingListNum);
+
+        if (!TMSShipmentOrderTable)
+        {
+            // check to see if there is a TSO with Order number = SalesOrderID, and Pick List ID is blank (order had only been processed at creation, and something went wrong at SO Extraction)
+            TMSShipmentOrderTable = super(_salesId, _forUpdate, METConstants::emptyString);
+        }
+
+        return TMSShipmentOrderTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Run the TMS engine
+    /// </summary>
+    public void run()
+    {        
+        SalesTable salesTableLoop;
+        RecordSortedList movedOutOrders;
+
+        try
+        {
+            ttsbegin;            
+
+            // capture orders that were removed from the SO shipment by comparing what was in the TSO
+            movedOutOrders = this.captureMovedOutOrders();
+
+            // For each combination of sales order - picking list number in the F&O finalisation shipment lines
+            while select salesOrderShipmentLoadLines
+                group by ShipmentId, OrderNum, PickingListNum          
+                   where salesOrderShipmentLoadLines.ShipmentId == salesOrderShipmentLoadHeader.ShipmentId
+            {
+                pickingRouteId = salesOrderShipmentLoadLines.PickingListNum;          
+
+                // cannot join in the while select because of the group by...
+                salesTableLoop = SalesTable::find(salesOrderShipmentLoadLines.OrderNum);
+            
+                this.init(salesTableLoop);                
+
+                wmsPicklistNumber = WMSPickingRoute::METGetWMSPicklistNumber(pickingRouteId, inventLocation.METCSDWarehouse, metSalesTable.InternalCrossDockOrder);
+
+                // Process the SO/picking list number from shipment one by one
+                super();                
+            }            
+
+            // Step 8: Update pallet counts
+            this.updatePalletCounts();            
+
+            // Only once all “SO-PickList” combinations have been processed, then go to Step 7.
+            // Step 7: Remove orders that are not on a “F&O finalisation Shipment” for the same route and ship date
+            // Recreate moved orders into a new or existing TS
+            this.processMovedOutOrders(movedOutOrders);
+
+            ttscommit;
+        }
+        catch (Exception::Error)
+        {
+            //An error occurs during the creation or updates of the staging records
+            error(this.errorMessage());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processMovedOutOrders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process orders that moved out of the current shipment (route update) so they can be added in the new TS and PalletLifts recalc
+    /// </summary>
+    /// <param name = "_movedOutOrders">List of records that were removed from the SO finalisation shipment but still exist as a TSO under the old TS</param>
+    void processMovedOutOrders(RecordSortedList _movedOutOrders)
+    {
+        METTMSShipmentOrderTable tmsShipmentOrderTable;
+        boolean moreRecords;
+
+        // step through the list
+        moreRecords = _movedOutOrders.first(tmsShipmentOrderTable);
+        while (moreRecords)
+        {
+            // Retrieve the SO finalisation shipment line
+            METSalesOrderShipmentLoadLines shipmentLines = METSalesOrderShipmentLoadLines::findOrderAndPickListNum(tmsShipmentOrderTable.OrderNumber, tmsShipmentOrderTable.PickListId);
+            
+            if (shipmentLines)
+            {
+                METSalesOrderShipmentLoadHeader shipmentHeader = shipmentLines.salesOrderShipmentLoadHeader();
+
+                if (shipmentHeader)
+                {
+                    // trigger the TMS logic the SO finalisation shipment the order moved to
+                    METTMSEngineSalesOrderProccess  metTMSEngineSalesOrderProccess = METTMSEngineSalesOrderProccess::construct(METTMSEngineSalesOrderProcess::PackingSlip, shipmentHeader);
+                    metTMSEngineSalesOrderProccess.run();
+                }
+            }
+            moreRecords = _movedOutOrders.next(tmsShipmentOrderTable);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePalletCounts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Step 8: Update pallet counts
+    /// </summary>
+    void updatePalletCounts()
+    {
+        //MetContainerQty actualPalletCount_Loscam, actualPalletCount_Chep, actualPalletCount_Plain, sumActualPalletCount;
+        METTMSShipmentOrderTable    tmsShipmentOrderTable;
+        METTMSShipmentItemGroup     tmsShipmentItemGroup;
+        METTMSShipmentTable         tmsShipmentTable;        
+
+        // Step 8a: Update TSIGs if Actual Pallet counts were entered
+        // This is calculated for original shipment in cancelShipment and then for the current shipment at the end of the run in updateTMSShipment
+        // so the sumActualPalletCount value here is for the current shipment
+        if (sumActualPalletCount > 0)
+        {
+            // For all TSIGs in this TS with “Quantity UOM” = PAL, update the “Quantity” = 0
+            update_recordset tmsShipmentItemGroup
+                setting Quantity = 0
+                    join tmsShipmentOrderTable
+                        where tmsShipmentItemGroup.TMSShipmentOrderIdentifier == tmsShipmentOrderTable.TMSShipmentOrderIdentifier
+                    join tmsShipmentTable
+                        where tmsShipmentTable.ShipmentID == tmsShipmentOrderTable.ShipmentId
+                           && tmsShipmentTable.ShipmentID == shipmentId
+                           && tmsShipmentItemGroup.QuantityUOM == METConstants::unitPal;
+
+            // For the first TSIG (only one) in this shipment with “Quantity UOM” = PAL and update:
+            // “Quantity” = ActualPalletCount_Loscam + ActualPalletCount_Chep + ActualPalletCount_Plain.
+            select firstonly forupdate tmsShipmentItemGroup
+                exists join tmsShipmentOrderTable
+                        where tmsShipmentItemGroup.TMSShipmentOrderIdentifier == tmsShipmentOrderTable.TMSShipmentOrderIdentifier
+                    exists join tmsShipmentTable
+                        where tmsShipmentTable.ShipmentID == tmsShipmentOrderTable.ShipmentId
+                           && tmsShipmentTable.ShipmentID == shipmentId
+                           && tmsShipmentItemGroup.QuantityUOM == METConstants::unitPal;
+
+            if (tmsShipmentItemGroup)
+            {
+                tmsShipmentItemGroup.Quantity = sumActualPalletCount;
+                tmsShipmentItemGroup.update();
+            }
+              
+            // Step 8b: Update TS pallet counts for current ship confirmed order
+            this.updateTMSShipment(shipmentId, false, true);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setTMSShipmentFields</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to set the fields for <c>METTMSShipmentTable</c> record
+    /// For packing slip need to set the delivery note number fields from the delivery note posting
+    /// </summary>
+    /// <param name = "_tmsShipmentTable"><c>METTMSShipmentTable</c> record</param>
+    protected void setTMSShipmentFields(METTMSShipmentTable _tmsShipmentTable)
+    {
+        super(_tmsShipmentTable);
+
+        // If a TS record is not found for the selection in step 3a, create a new one with values as defined in Step 3b of the CB624 FSD, 
+        // with the extra value for Delivery note number from The Delivery Note journals Delivery note
+        _tmsShipmentTable.FinalisationtId = salesOrderShipmentLoadHeader.ShipmentId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTMSShipmentSettingClause</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update TS setting clause
+    /// </summary>
+    /// <param name = "_uo"><c>SysDaUpdateObject</c> instance</param>
+    /// <param name = "_palletTotalFootprint">Pallet total footprint</param>
+    /// <param name = "_updateFinalisationId">Update finalisation id</param>
+    /// <param name = "_updateActuals">Update actual pallet counts</param>
+    void updateTMSShipmentSettingClause(SysDaUpdateObject _uo, METQty _palletTotalFootprint, boolean _updateFinalisationId, boolean _updateActuals)
+    {
+        //super(_uo, _palletTotalFootprint, _updateFinalisationId, _updateActuals);
+        _uo.settingClause().add(fieldStr(METTMSShipmentTable, TMSSendStatus), new SysDaValueExpression(METTMSSendStatus::ToBeSent));
+        _uo.settingClause().add(fieldStr(METTMSShipmentTable, ShipmentStatus), new SysDaValueExpression(METCashShipmentStatus::Active));
+
+        // Step 8b: Update TS pallet counts
+        // Step 8c: Update other TS pallet counts where it had a TSO moved from it to this current TS triggered from cancelShipment  
+        if (_updateActuals && sumActualPalletCount > 0)
+        {
+            _uo.settingClause().add(fieldStr(METTMSShipmentTable, PalletLifts), new SysDaValueExpression(sumActualPalletCount)); 
+            _uo.settingClause().add(fieldStr(METTMSShipmentTable, ChepPalletCount), new SysDaValueExpression(actualPalletCount_Chep));
+            _uo.settingClause().add(fieldStr(METTMSShipmentTable, LoscamPalletCount), new SysDaValueExpression(actualPalletCount_Loscam));
+            _uo.settingClause().add(fieldStr(METTMSShipmentTable, PlainPalletCount), new SysDaValueExpression(actualPalletCount_Plain));
+        }
+        else
+        {
+            _uo.settingClause().add(fieldStr(METTMSShipmentTable, PalletLifts), new SysDaValueExpression(_palletTotalFootprint));
+        }
+        
+        // this is to exclude shipment delivery note update when a TSO is removed from previous TS
+        if (_updateFinalisationId)
+        {
+            _uo.settingClause().add(fieldStr(METTMSShipmentTable, FinalisationtId), new SysDaValueExpression(salesOrderShipmentLoadHeader.ShipmentId));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setTMSShipmentOrderFields</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to set the fields for <c>METTMSShipmentOrderTable</c> record
+    /// </summary>
+    /// <param name = "_tmsShipmentOrderTable"><c>METTMSShipmentOrderTable</c> record</param>
+    protected void setTMSShipmentOrderFields(METTMSShipmentOrderTable _tmsShipmentOrderTable)
+    {
+        super(_tmsShipmentOrderTable);
+
+        // Step 3d: Create TSO record
+        // As this is an order not processed by “TMS Engine” in past, create a TSO record to capture details of this order similar to 
+        // what was defined in “Step 3d” of the CB624 FSD, with the following differences an extra Pick List ID field as defined in the table below.
+        _tmsShipmentOrderTable.PickListId = salesOrderShipmentLoadLines.PickingListNum;
+
+        // If any of the lines on the SO have a warehouse with SuppWhsHasCCR = Yes
+        // New calc formulas for Repack case count – Security/Non Security and Case count – Shipped/Security
+        if (hasCCR)
+        {
+            this.setTMSShipmentOrderFieldsCCR(_tmsShipmentOrderTable);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setTMSShipmentOrderFieldsCCR</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to set the CCR fields for <c>METTMSShipmentOrderTable</c> record
+    /// </summary>
+    /// <param name = "_tmsShipmentOrderTable"><c>METTMSShipmentOrderTable</c> record</param>
+    protected void setTMSShipmentOrderFieldsCCR(METTMSShipmentOrderTable _tmsShipmentOrderTable)
+    {
+        METWHSPalletVolume  sumRepackContainersCaseVolumeCCR, sumRepackContainersToteVolumeCCR;
+        int                 sumRepackContainersQtyCCR, sumRepackContainersQtyTOBCCR, sumRepackContainersQtyNotTOBCCR;
+        METWHSPalletWeight  sumRepackContainersToteWeightCCR;
+            
+        // calc RepackContainersByCommodity for the order with LineCommodity = TOB and <> TOB
+        METTMSEngineSalesOrderProccessLinesTmp  linesTmpTOB, linesTmpNotTOB;
+        linesTmpTOB.linkPhysicalTableInstance(proccessLinesTmp);
+        linesTmpNotTOB.linkPhysicalTableInstance(proccessLinesTmp);
+        
+        // BrokenCaseItemQtySecurity and BrokenCaseItemQtyNonSecurity are sum from temp table
+        select sum(RepackCountNonSecurity), sum(RepackCountSecurity) from linesTmpTOB where linesTmpTOB.LineCommodity == METConstants::tobCommodity;
+        select sum(RepackCountNonSecurity), sum(RepackCountSecurity) from linesTmpNotTOB where linesTmpNotTOB.LineCommodity != METConstants::tobCommodity;
+
+        [sumRepackContainersQtyCCR,
+         sumRepackContainersQtyTOBCCR,
+         sumRepackContainersQtyNotTOBCCR,
+         sumRepackContainersCaseVolumeCCR,
+         sumRepackContainersToteVolumeCCR,
+         sumRepackContainersToteWeightCCR] = ccrHelper.getSumCommodityResults();
+            
+        // Case count – Shipped
+        // Add Count(CCR_RepackContainersByCommodity) for all CCR records for the SO to existing calculated value
+        _tmsShipmentOrderTable.CaseCountShipped += sumRepackContainersQtyCCR;
+
+        // Repack case count – Security
+        // Sum(RepackContainersByCommodity) for the order with LineCommodity = TOB
+        // + Count(CCR_RepackContainersByCommodity) for CCR records for the SO with CCR_LineCommodity = TOB.
+        _tmsShipmentOrderTable.RepackCaseCountSecurity = this.getRepackContainersByCommodity(linesTmpTOB.RepackCountSecurity, linesTmpTOB.RepackCountNonSecurity)
+                                                       + sumRepackContainersQtyTOBCCR;
+
+        // Repack case count – Non security
+        // Sum(RepackContainersByCommodity) for the order with LineCommodity <> TOB
+        // + Count(CCR_RepackContainersByCommodity) for CCR records for the SO with CCR_ LineCommodity <> TOB
+        _tmsShipmentOrderTable.RepackCaseCountNonSecurity = this.getRepackContainersByCommodity(linesTmpNotTOB.RepackCountSecurity, linesTmpNotTOB.RepackCountNonSecurity)
+                                                          + sumRepackContainersQtyNotTOBCCR;
+            
+        // Case count – Security
+        // Sum(RepackContainersByCommodity) for all LineCommodity-s on the order with LineCommodity = TOB
+        // + Count(CCR_RepackContainersByCommodity) for all CCR records for the SO with CCR_LineCommodity = TOB
+        _tmsShipmentOrderTable.CaseCountSecurity = _tmsShipmentOrderTable.RepackCaseCountSecurity;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shippingDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Shipping date variable from the shipment header
+    /// </summary>
+    /// <returns>Shipping date based on CB626 formula</returns>
+    TransDate shippingDate()
+    {
+        return salesOrderShipmentLoadHeader.ConfirmedShipDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deliveryDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Delivery date variable from the shipment header
+    /// </summary>
+    /// <returns>Delivery date based on CB626 formula</returns>
+    TransDate deliveryDate()
+    {
+        return salesOrderShipmentLoadHeader.ReceiptDateConfirmed;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTSIGHelperInstance</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create an instance of <c>METTMSShipmentItemGroupHelper</c>
+    /// </summary>
+    /// <param name = "_processLinesTmp">Temporary TMS calculation table</param>
+    /// <param name = "_tmsShipmentOrderIdentifier">TSO identifier</param>
+    /// <param name = "_isToteCustomer">Customer uses totes</param>
+    /// <param name = "_headerInventLocationId">Header warehouse</param>
+    /// <param name = "_hasCCR">If any of the lines on the SO have a warehouse with SuppWhsHasCCR = Yes</param>
+    /// <returns>New instance of <c>METTMSShipmentItemGroupHelper</c></returns>
+    METTMSShipmentItemGroupHelper getTSIGHelperInstance(METTMSEngineSalesOrderProccessLinesTmp _processLinesTmp, METTMSShipmentOrderIdentifier _tmsShipmentOrderIdentifier, boolean _isToteCustomer, InventLocationId _headerInventLocationId, boolean _hasCCR)
+    {
+        return METTMSShipmentItemGroupHelper::construct(_processLinesTmp,
+                                                        _tmsShipmentOrderIdentifier,
+                                                        _isToteCustomer,
+                                                        _headerInventLocationId,
+                                                        _hasCCR,
+                                                        ccrHelper);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>errorMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Error message
+    /// </summary>
+    /// <returns>Sales error txt</returns>
+    protected ErrorTxt errorMessage()
+    {
+        return strFmt("@MET:TMSEngineSalesOrderProcessPackingSlipError", salesOrderShipmentLoadHeader.ShipmentId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>captureMovedOutOrders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Step 3a: check if there is an existing shipment this order can be made part of.
+    /// </summary>
+    /// <returns>Instance of <c>METTMSShipmentTable</c></returns>
+    protected RecordSortedList captureMovedOutOrders()
+    {
+        RecordSortedList         movedOutOrdersLocal = new RecordSortedList(tableNum(METTMSShipmentOrderTable));
+        METTMSShipmentOrderTable tmsShipmentOrderTable;
+        METTMSShipmentTable      tmsShipmentTable = this.initTMSShipment(salesOrderShipmentLoadHeader.Warehouse,
+                                                                         salesOrderShipmentLoadHeader.CustAccount,
+                                                                         salesOrderShipmentLoadHeader.Route,
+                                                                         salesOrderShipmentLoadHeader.ConfirmedShipDate);
+
+        movedOutOrdersLocal.sortOrder(fieldNum(METTMSShipmentOrderTable, OrderNumber));
+
+        if (tmsShipmentTable)
+        {
+            // Step 7 capture all orders that moved out of the current TMS shipment
+            while select tmsShipmentOrderTable
+                   where tmsShipmentOrderTable.ShipmentId == tmsShipmentTable.ShipmentID
+            {
+                if (!METSalesOrderShipmentLoadLines::existOrderAndPickListNum(salesOrderShipmentLoadHeader.ShipmentId, tmsShipmentOrderTable.OrderNumber, tmsShipmentOrderTable.PickListId))
+                {
+                    movedOutOrdersLocal.ins(tmsShipmentOrderTable);
+                    // delete TSO record so it's recreated in the processMovedOutOrders
+                    // this is to avoid reupdating pallet lift in the original shipment in cancelShipment method
+                    tmsShipmentOrderTable.selectForUpdate(true);
+                    tmsShipmentOrderTable.delete();
+                }
+            }
+        }
+
+        return movedOutOrdersLocal;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
