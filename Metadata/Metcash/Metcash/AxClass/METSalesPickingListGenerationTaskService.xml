@@ -18,11 +18,36 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
 ]]></Declaration>
 		<Methods>
 			<Method>
-				<Name>process</Name>
+				<Name>isWaveRequired</Name>
 				<Source><![CDATA[
 	//CB123_SalesOrderExtractScreenforCSD -end
 
-			
+	
+    /// <summary>
+    /// Check if wave details need to be created in the system for the sales order
+    /// </summary>
+    /// <param name = "_salesTable">Table buffer of of <t>SalesTable</t></param>
+    /// <param name = "_inventLocation">Table buffer of type <t>InventLocation</t></param>
+    /// <returns>true if wave is required, otherwise false</returns>
+    private boolean isWaveRequired(SalesTable _salesTable, InventLocation _inventLocation)
+    {
+        boolean ret = false;
+
+        if (_salesTable.salesid && DateTimeUtil::minValue() != _salesTable.METOrderExtractDateTime
+                && _inventLocation.METWaveRequired == NoYes::Yes && _inventLocation.METCSDWarehouse == NoYes::Yes
+                && _inventLocation.METPickDirector == NoYes::Yes)
+        {
+            ret = true;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
     /// <summary>
     /// processing logic
     /// </summary>
@@ -37,28 +62,46 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
         {
 		    //Task 162245-CB123 - SalesOrderExtractScreenforCSD- start
             InventLocation inventLocation;
+            InventParameters inventParameter = InventParameters::find();
 
-            select firstonly METWaveRequired, METPickDirector, METCSDWarehouse from inventLocation
+            select firstonly METWaveRequired, METPickDirector, METCSDWarehouse 
+                from inventLocation
                 where inventLocation.InventLocationId == salesTable.InventLocationId;
 
+            //Task 162245-CB123 - SalesOrderExtractScreenforCSD -end
+            METSalesTable metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId);
+
             //Task 162245-CB123 - SalesOrderExtractScreenforCSD
-            if (salesTable.salesid && DateTimeUtil::minValue() != salesTable.METOrderExtractDateTime
-                && inventLocation.METWaveRequired == NoYes::Yes && inventLocation.METCSDWarehouse == NoYes::Yes
-                && inventLocation.METPickDirector == NoYes::Yes)
+            if(this.isWaveRequired(salesTable, inventLocation))
             {
                 salesTable.createWaveFromSalesTable(inventLocation.METPickDirector, salesOrderCount);
             }
-            //Task 162245-CB123 - SalesOrderExtractScreenforCSD -end
 
-            if (companyInfo.METLegalEntityType == METLegalEntityType::Food || companyInfo.METLegalEntityType == METLegalEntityType::Liquor)
+            //If the sales order is cross dock order or the sales order warehouse is a CSD warehouse then
+            //Create transfer order for the unreserved quantity from supplying warehouse to sales order warehouse
+            if(metSalesTable.InternalCrossDockOrder || inventLocation.METCSDWarehouse)
             {
-                METStockReservation::construct(salesTable).process();
+                // If the supply from transfer option is enabled,
+                // 1. Do not attempt stock reservation on local warehouse.
+                // 2. create TO for the whole sales order quantity from NDC to CSD warehouse.
+                // else, Attempt reservation locally and then create transfer order for any remaining quantity. 
+                if(inventParameter.METSupplyFromTransfer)
+                {
+                    METCrossDockTransferOrderProcessor::construct().CreateTransferOrder(salesTable);
+                }
+                else
+                {
+                    METStockReservation::construct(salesTable).process();
+
+                    METCrossDockTransferOrderProcessor::construct().CreateTransferOrder(salesTable);
+                }
             }
 
-            //Task152245-CB123-SalesOrderExtractScreenforCSD - start
+            //Task 152245-CB123-SalesOrderExtractScreenforCSD - start
+            //CB238 - Corss dock - Do not post the picking list if the supply from transfer is enabled as no stock should be picked from local WH.
             if ((inventLocation.METWaveRequired == NoYes::Yes && inventLocation.METPickDirector == NoYes::No
                  && inventLocation.METCSDWarehouse == NoYes::Yes)
-                || (inventLocation.METCSDWarehouse == NoYes::No))
+                || (inventLocation.METCSDWarehouse == NoYes::No) && inventParameter.METSupplyFromTransfer == NoYes::No)
             {
                 //Post picking list
                 this.postPickingList(salesTable);
@@ -67,7 +110,6 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
                 this.postIntercompanyPickingList();
             }
             //Task152245-CB123-SalesOrderExtractScreenforCSD -end
-           
         }
 
     }
