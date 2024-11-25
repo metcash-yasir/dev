@@ -16,6 +16,9 @@ abstract class METSubstitutionSalesLineProcess
     CustParameters          custParameters;
     boolean                 updateSalesOrderProcessingStatus;
 
+    //CB238 - xDock order processing
+    boolean isCrossDockOrder;
+
 }
 ]]></Declaration>
 		<Methods>
@@ -29,17 +32,18 @@ abstract class METSubstitutionSalesLineProcess
     /// <param name = "_validate">Validate</param>
     /// <param name = "_updateSalesOrderProcessingStatus">Update sales order header processing status</param>
     /// <returns>Instance of <c>METSubstitutionSalesLineProcess</c></returns>
-    public static METSubstitutionSalesLineProcess construct(SalesLine _salesLine, boolean _validate = true, boolean _updateSalesOrderProcessingStatus = true)
+    public static METSubstitutionSalesLineProcess construct(SalesLine _salesLine, boolean _validate = true, boolean _updateSalesOrderProcessingStatus = true, boolean _xDockProcess = false)
     {
         METSalesItemSubstituteSearch    salesItemSubstituteSearch;
         METSalesItemSubstitute          salesItemSubstitute;
-        
-        METSalesItemSubstitutionEnabled custSubstituteEnabled = CustTable::find(_salesLine.CustAccount).METSalesItemSubstitutionEnabled;
 
-        salesItemSubstituteSearch = METSalesItemSubstituteSearch::construct(_salesLine, custSubstituteEnabled);
+        METSalesItemSubstitutionEnabled custSubstituteEnabled = CustTable::find(_salesLine.CustAccount).METSalesItemSubstitutionEnabled;
+        
+        salesItemSubstituteSearch = METSalesItemSubstituteSearch::construct(_salesLine, custSubstituteEnabled, _xDockProcess);
+
         salesItemSubstitute = salesItemSubstituteSearch.search();
 
-        return METSubstitutionSalesLineProcess::constructFromSubstituteSearch(_salesLine, custSubstituteEnabled, salesItemSubstitute, _validate, _updateSalesOrderProcessingStatus);
+        return METSubstitutionSalesLineProcess::constructFromSubstituteSearch(_salesLine, custSubstituteEnabled, salesItemSubstitute, _validate, _updateSalesOrderProcessingStatus, _xDockProcess);
     }
 
 ]]></Source>
@@ -56,27 +60,28 @@ abstract class METSubstitutionSalesLineProcess
     /// <param name = "_validate">Validate</param>
     /// <param name = "_updateSalesOrderProcessingStatus">Update sales order header processing status</param>
     /// <returns>Instance of <c>METSubstitutionSalesLineProcess</c></returns>
-    protected static METSubstitutionSalesLineProcess constructFromSubstituteSearch(SalesLine _salesLine, METSalesItemSubstitutionEnabled _custSubstituteEnabled, METSalesItemSubstitute _salesItemSubstitute, boolean _validate = true, boolean _updateSalesOrderProcessingStatus = true)
+    protected static METSubstitutionSalesLineProcess constructFromSubstituteSearch(SalesLine _salesLine, METSalesItemSubstitutionEnabled _custSubstituteEnabled, METSalesItemSubstitute _salesItemSubstitute, boolean _validate = true, boolean _updateSalesOrderProcessingStatus = true, boolean _xDockOrder = false)
     {
         METSubstitutionSalesLineProcess ret;
+        
         
         if (_salesItemSubstitute)
         {
             // if customer substitute enabled and substitution code is not never
             if (_custSubstituteEnabled && _salesItemSubstitute.SubstitutionCode != METSalesItemSubstitutionCode::Never)
             {
-                ret = new METSubstitutionSalesLineProcess_Enabled(_salesLine, _salesItemSubstitute, _validate, _updateSalesOrderProcessingStatus);
+                ret = new METSubstitutionSalesLineProcess_Enabled(_salesLine, _salesItemSubstitute, _validate, _updateSalesOrderProcessingStatus, _xDockOrder);
             }
             else
             {
                 // Never is treated as disabled as logic dependent on previous substitution or not
-                ret = new METSubstitutionSalesLineProcess_Disabled(_salesLine, _salesItemSubstitute, _validate, _updateSalesOrderProcessingStatus);
+                ret = new METSubstitutionSalesLineProcess_Disabled(_salesLine, _salesItemSubstitute, _validate, _updateSalesOrderProcessingStatus, _xDockOrder);
             }
         }
         else
         {
             // When no substitute found, METSubstitutionSalesLineProcess_None will not do anything
-            ret = new METSubstitutionSalesLineProcess_None(_salesLine, _salesItemSubstitute, _validate, _updateSalesOrderProcessingStatus);
+            ret = new METSubstitutionSalesLineProcess_None(_salesLine, _salesItemSubstitute, _validate, _updateSalesOrderProcessingStatus, _xDockOrder);
         }
 
         return ret;
@@ -97,13 +102,17 @@ abstract class METSubstitutionSalesLineProcess
     protected void new(SalesLine               _salesLine, 
                        METSalesItemSubstitute  _salesItemSubstitute,
                        boolean                 _validate,
-                       boolean                 _updateSalesOrderProcessingStatus)
+                       boolean                 _updateSalesOrderProcessingStatus,
+                       boolean                 _xDockOrder = false)
     {
         salesLine   = _salesLine;
         salesTable  = salesLine.salesTable();
         salesItemSubstitute = _salesItemSubstitute;
         validate = _validate;
         updateSalesOrderProcessingStatus = _updateSalesOrderProcessingStatus;
+        
+        //CB238 - xDock order processing
+        isCrossDockOrder = _xDockOrder;
 
         custParameters = CustParameters::find();
         
@@ -182,6 +191,8 @@ abstract class METSubstitutionSalesLineProcess
         SalesLine salesLineUpd = SalesLine::findRecId(_salesLine.RecId, true);
         salesLineUpd.metCancelSalesOrderLine();
 
+        //CB238 - xDock - update the respective transfer order lines
+        this.updateTransferOrders(_salesLine);
         ttscommit;
     }
 
@@ -265,10 +276,47 @@ abstract class METSubstitutionSalesLineProcess
         }
 
         //metSalesLine    = metSalesLineNew
+        if(isCrossDockOrder && salesLineNew)
+        {
+            this.updateTransferOrders(existingLine, salesLineNew);
+        }
 
         ttscommit;
 
         return salesLineNew;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTransferOrders</Name>
+				<Source><![CDATA[
+    private void updateTransferOrders(SalesLine _origSalesLine, SalesLine _newSalesLine = null)
+    {
+        METInventTransferLine metTransferLine;
+        InventTransferLine transferLine;
+        InventTransferId transferId;
+
+        select firstonly metTransferLine
+            where metTransferLine.SalesLineTransId == _origSalesLine.InventTransId
+            join transferLine
+            where transferLine.RecId == metTransferLine.InventTransferLine;
+        
+        transferId = transferLine.TransferId;
+
+        if(metTransferLine && _origSalesLine.SalesStatus == SalesStatus::Canceled)
+        {
+            delete_from transferLine 
+                where transferLine.RecId == metTransferLine.InventTransferLine;
+
+            metTransferLine.selectForUpdate(true);
+            metTransferLine.delete();
+        }
+
+        if(_newSalesLine && _newSalesLine.SalesStatus != SalesStatus::Canceled)
+        {
+            METCrossDockTransferOrderProcessor::construct().CreateTransferOrderFromSalesLine(_newSalesLine);
+        }
     }
 
 ]]></Source>
@@ -283,13 +331,17 @@ abstract class METSubstitutionSalesLineProcess
     protected boolean validateSubs()
     {
         boolean ret = true;
-
+        
         // Step 2.1: Check the lines are to be included / excluded
         // Exit the substitution process for this sales line (skip the steps 2.2 -2.6), and attempt to process substitution for the next sales line if:
         // The line has any reservation at all (even if it is partial and not for the full quantity)
-        if (salesLine.mcrSalesQtyReserved())
+        // xDock orders will have reserved quantity from transfer order so, we shall skip this validaton 
+        if (!isCrossDockOrder)
         {
-            ret = checkFailed("@MET:ValidateQtyReserved");
+            if(salesLine.mcrSalesQtyReserved())
+            {
+                ret = checkFailed("@MET:ValidateQtyReserved");
+            }
         }
 
         // Exit the substitution process for this sales line (skip the steps 2.2 -2.6), and attempt to process substitution for the next sales line if:

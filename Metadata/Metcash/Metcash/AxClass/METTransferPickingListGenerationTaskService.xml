@@ -8,9 +8,126 @@
 /// </summary>
 class METTransferPickingListGenerationTaskService extends SysOperationServiceBase
 {
+
+    boolean lineSubstituted = false;
+
 }
 ]]></Declaration>
 		<Methods>
+			<Method>
+				<Name>shouldAutoReceive</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// If the transfer order is a CSD or a Cross dock order, then it should be auto received
+    /// </summary>
+    /// <param name = "_transferId">Transfer order number to check if this can be auto-received</param>
+    /// <returns>Yes if the order should be auto received, otherwise false</returns>
+    private NoYes shouldAutoReceive(InventTransferId _transferId)
+    {
+        METInventTransferTableExt transExt;
+        InventTransferTable trans;
+        NoYes ret = NoYes::No;
+
+        select TransferType from transExt
+            exists join trans
+            where trans.RecId == transExt.InventTransferTable
+            && trans.TransferId == _transferId;
+        
+        if(transExt.TransferType == METCrossDockTransferType::CrossDock || transExt.TransferType == METCrossDockTransferType::CSD)
+        {
+            ret = NoYes::Yes;
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pick</Name>
+				<Source><![CDATA[
+    private container pick(METTransferPickingListGenerationTaskContract _dataContract)
+    {
+        InventTransferParmTable         inventTransferParmTable;
+        InventTransferParmLine          inventTransferParmLine;
+        InventTransferUpd               inventTransferUpd;
+        
+        //CB238 - xDock
+        InventTransferTable inventTransferTable = InventTransferTable::find(_dataContract.parmTransferId());
+
+        inventTransferParmTable.TransferId          = _dataContract.parmTransferId();
+        inventTransferParmTable.UpdateType          = InventTransferUpdateType::PickingList;
+        // CB715_TransferOrderExtract
+        // generate picklist for the order lines where reservation has occurred
+        //inventTransferParmTable.PickUpdateQty       = InventTransferPickUpdateQty::AvailableQty;
+        inventTransferParmTable.PickUpdateQty       = InventTransferPickUpdateQty::ReservedQty;
+        inventTransferParmTable.Reservation         = NoYes::Yes;
+        inventTransferParmTable.EditLines           = NoYes::Yes;
+        inventTransferParmTable.TransDate           = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        
+        // CB238 - xDock process - Mark auto-reserve for cross dock and CSD transfer orders
+        inventTransferParmTable.AutoReceiveQty = this.shouldAutoReceive(_dataContract.parmTransferId());
+
+        // CB715_TransferOrderExtract
+        // This will populate inventTransferParmLine with only TO lines where extraction status=”Ready for extract” only.
+        //inventTransferUpd = InventTransferUpdPick::NewParmBuffer(inventTransferParmTable);
+        inventTransferUpd = InventTransferUpdPick::METNewParmBuffer(inventTransferParmTable);
+        int linesCount = 0;
+        while select forupdate inventTransferParmLine
+            where inventTransferParmLine.ParmId     == inventTransferParmTable.ParmId
+                && inventTransferParmLine.TransferId == inventTransferParmTable.TransferId
+        {
+            if (conFind(_dataContract.parmOSCCodeList(), InventTable::metGetOSCCode(inventTransferParmLine.ItemId, inventTransferParmLine.inventTransferLine().inventDim())) == 0)
+            {
+                inventTransferParmLine.delete();
+            }
+            else
+            {
+                linesCount++;
+            }
+        }
+        if(linesCount > 0)
+        {
+            inventTransferUpd.run();
+        }
+
+        return [inventTransferUpd.parmInventTransferJour(), inventTransferParmTable];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postSalesOrder</Name>
+				<Source><![CDATA[
+    private void postSalesOrder(InventTransferId _transferId)
+    {
+        InventTransferTable transferTable;
+        METInventTransferTableExt transferTableExt;
+
+        select transferTable
+            join transferTableExt
+            where transferTableExt.InventTransferTable == transferTable.RecId
+            && transferTable.TransferId == _transferId
+            && transferTableExt.SalesId != '';
+
+        SalesTable salesTable;
+        METSalesPickingListGenerationTaskController         salesPickingListGenerationTaskController;
+        METSalesPickingListGenerationTaskContract           salesPickingListGenerationTaskContract;
+
+        if(transferTableExt)
+        {
+            salesTable = SalesTable::find(transferTableExt.SalesId);
+        }
+
+        if(salesTable)
+        {
+            METStockReservation::construct(salesTable).process();
+        }
+        
+    }
+
+]]></Source>
+			</Method>
 			<Method>
 				<Name>process</Name>
 				<Source><![CDATA[
@@ -20,50 +137,37 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
     /// <param name = "_dataContract">The data contract</param>
     public void process(METTransferPickingListGenerationTaskContract _dataContract)
     {
-        InventTransferParmTable         inventTransferParmTable;
-        InventTransferParmLine          inventTransferParmLine;
-        InventTransferUpd               inventTransferUpd;
-        WMSPickingRoute                 wmsPickingRoute;
+        InventTransferJour inventTransferJour;
+        InventTransferParmTable inventTransferParmTable;
+        InventParameters inventParameters = InventParameters::find();
 
         try
         {
-
-            inventTransferParmTable.TransferId          = _dataContract.parmTransferId();
-            inventTransferParmTable.UpdateType          = InventTransferUpdateType::PickingList;
-            // CB715_TransferOrderExtract
-            // generate picklist for the order lines where reservation has occurred
-            //inventTransferParmTable.PickUpdateQty       = InventTransferPickUpdateQty::AvailableQty;
-            inventTransferParmTable.PickUpdateQty       = InventTransferPickUpdateQty::ReservedQty;
-            inventTransferParmTable.Reservation         = NoYes::Yes;
-            inventTransferParmTable.EditLines           = NoYes::Yes;
-            inventTransferParmTable.TransDate           = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
-
-            // CB715_TransferOrderExtract
-            // This will populate inventTransferParmLine with only TO lines where extraction status=”Ready for extract” only.
-            //inventTransferUpd = InventTransferUpdPick::NewParmBuffer(inventTransferParmTable);
-            inventTransferUpd = InventTransferUpdPick::METNewParmBuffer(inventTransferParmTable);
-
-            while select forupdate inventTransferParmLine
-                where inventTransferParmLine.ParmId     == inventTransferParmTable.ParmId
-                    && inventTransferParmLine.TransferId == inventTransferParmTable.TransferId
+            ttsbegin;
+            [InventTransferJour, inventTransferParmTable] = this.pick(_dataContract);
+            
+            //CB-238 - Internal cross dock : Perform substitution re-pick of transfer order lines when
+            //1. Supply from transfer order is enabled
+            this.applySubstitutions(_dataContract.parmTransferId());
+            
+            if(lineSubstituted)
             {
-                if (conFind(_dataContract.parmOSCCodeList(), InventTable::metGetOSCCode(inventTransferParmLine.ItemId, inventTransferParmLine.inventTransferLine().inventDim())) == 0)
-                {
-                    inventTransferParmLine.delete();
-                }
+                [InventTransferJour, inventTransferParmTable] = this.pick(_dataContract);
             }
 
-            inventTransferUpd.run();
+            WMSPickingRoute wmsPickingRoute;
 
             select firstonly wmsPickingRoute
                 where wmsPickingRoute.parmid == inventTransferParmTable.ParmId;
 
             if (wmsPickingRoute)
             {
-                METOrderShipmentLoadCreation        metOrderShipmentloadCreation = METOrderShipmentLoadCreation::construct(METOrderTransactionType::TransferOrder,
-                                                                                                                            inventTransferParmTable.TransferId);
-
+                METOrderShipmentLoadCreation metOrderShipmentloadCreation = METOrderShipmentLoadCreation::construct(METOrderTransactionType::TransferOrder,
+                                                                                                                            _dataContract.parmTransferId());
                 metOrderShipmentloadCreation.createShippmentLoad(true, false);
+
+                //CB238 - xDock perform sales reservation once the transfer order picking list is created. 
+                //this.postSalesOrder(_dataContract.parmTransferId());
 
                 if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METPicklistExtractionBusinessEvent)))
                 {
@@ -74,17 +178,61 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
                     throw error("@MET:PickListExtractionBusinessEventNotEnabled");
                 }
             }
+
+            ttscommit;
+
         }
         catch
         {
             error ("@WAX:UpdateCancelled");
         }
 
-        if (!inventTransferUpd.parmInventTransferJour())
+        if (!inventTransferJour)
         {
             //Update transfer header extraction status
             METInventTransferTableExt::UpdateExtractionStatus(_dataContract.parmTransferId());
         }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applySubstitutions</Name>
+				<Source><![CDATA[
+    private void applySubstitutions(InventTransferId _transferId)
+    {
+        InventTransferLine transferLine;
+        METInventTransferLine metTransferLine;
+        InventTransferTable transferTable;
+        METSubstitutionSalesLineProcess subSalesLineProcess;
+        
+        lineSubstituted = false;
+
+        while select transferLine
+            where transferLine.TransferId == _transferId
+            join metTransferLine
+            where metTransferLine.InventTransferLine == transferLine.RecId
+            && metTransferLine.AllowSubstitution == NoYes::Yes
+        {
+            if(transferLine.qtyReservedOnOrder() == 0)
+            {
+                SalesLine salesLineLoc = metTransferLine.salesLine_InventTransId();
+
+                //if (salesLineLoc.mcrSalesQtyReserved() == transferLine.QtyTransfer && salesLineLoc.mcrSalesQtyReserved() <= transferLine.QtyTransfer)
+                {
+                    subSalesLineProcess = METSubstitutionSalesLineProcess::construct(salesLineLoc, true, true, true);
+
+                    if (subSalesLineProcess.run())
+                    {
+                        lineSubstituted = true;
+                        //salesLineLoc.reread();
+                        //subSalesLineProcess = METSubstitutionSalesLineProcess::construct(salesLineLoc, true, true, true);
+                    }
+                }
+            }
+        }
+
 
     }
 
