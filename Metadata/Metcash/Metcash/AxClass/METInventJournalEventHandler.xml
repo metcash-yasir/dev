@@ -26,7 +26,7 @@ class METInventJournalEventHandler
         FormRun formRun = sender.datasource().formRun();
        
         InventDim inventDim = formRun.dataSource(formdatasourcestr(SalesTable, InventDim)).cursor();
-        SalesLine salesLine = formRun.dataSource(formdatasourcestr(SalesTable, SalesLine)).cursor();
+        SalesLine salesLine = formRun.dataSource(formdatasourcestr(SalesTable, SalesLine)).cursor();  
 
         if (inventDim.InventLocationId)
         {
@@ -155,6 +155,140 @@ class METInventJournalEventHandler
             
         }
         
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>finalUnitConvsersion</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Find the last unit conversion value
+    /// </summary>
+    /// <param name="_itemId">Item Id value</param>
+    /// <param name="_ToUnitConvserion">To unit conversion</param>
+    public UnitOfMeasureConversion finalUnitConvsersion(ItemId _itemId, RecId _ToUnitConvserion)
+    {
+        UnitOfMeasure           allToUnitOfMeasure;
+        EcoResProduct           ecoProduct;
+        UnitOfMeasureConversion unitOfMeasureConversion;
+        InventTableModule       inventModule;
+        
+        // To get the last unit convserion value 
+        select unitOfMeasureConversion where unitOfMeasureConversion.FromUnitOfMeasure == _ToUnitConvserion
+                        join allToUnitOfMeasure where unitOfMeasureConversion.ToUnitOfMeasure == allToUnitOfMeasure.RecId
+                        join ecoProduct where ecoProduct.recid == unitOfMeasureConversion.Product 
+                        join inventModule where inventModule.ItemId == ecoProduct.DisplayProductNumber &&
+                        inventModule.ModuleType == ModuleInventPurchSales::Invent &&
+                        ecoProduct.DisplayProductNumber == _itemId;
+
+        // To avoid infinite loop
+        if (unitOfMeasureConversion.RecId !=0)
+        {
+            if (allToUnitOfMeasure.Symbol  == inventModule.UnitId)
+            {  
+                return unitOfMeasureConversion;
+            }
+            else
+            {
+                this.finalUnitConvsersion(_itemId,unitOfMeasureConversion.ToUnitOfMeasure);
+            }
+        }
+        
+        return unitOfMeasureConversion;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTotalDutyValue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the value of duty and total duty
+    /// </summary>
+    /// <param name="_inventJourTrans">invent journal table</param>
+    public static container getTotalDutyValue(InventJournalTrans _inventJourTrans)
+    {
+        METinventtable          inventTable;
+        METTariffItemCodeBase   dutyItemCode;
+        METExciseSiteDutySetup  exciseSiteDutySetup;
+        UnitOfMeasureConversion unitOfMeasureConversion,finalUnitConversion;
+        UnitOfMeasure           allFromUnitOfMeasure;
+        EcoResProduct           ecoProduct;
+        real                    metValueForDuty,metDutyTotal;
+        #define.CA('CA')
+        
+        METInventJournalEventHandler unitConvserion = new METInventJournalEventHandler();
+        
+        // To find the Container unit value for the item first level
+        select firstonly unitOfMeasureConversion
+                join allFromUnitOfMeasure where unitOfMeasureConversion.FromUnitOfMeasure == allFromUnitOfMeasure.RecId
+                join ecoProduct where ecoProduct.recid == unitOfMeasureConversion.Product &&
+                ecoProduct.DisplayProductNumber == _inventJourTrans.ItemId &&
+                allFromUnitOfMeasure.Symbol == #CA;
+
+       
+        finalUnitConversion  = unitConvserion.finalUnitConvsersion(_inventJourTrans.ItemId,unitOfMeasureConversion.ToUnitOfMeasure);
+        
+        // TO find the Customexcise value
+        select firstonly inventTable join dutyItemCode
+                where dutyItemCode.RecId == inventTable.METTariffItemCodeBaseRecid
+                 join exciseSiteDutySetup where exciseSiteDutySetup.ItemId == inventTable.ItemId &&
+                    inventTable.ItemId == _inventJourTrans.ItemId;
+
+        // Few items qty and some are cwqty
+        real dutyQty = _inventJourTrans.Qty != 0.000000 ? _inventJourTrans.Qty : _inventJourTrans.PdsCWQty;
+
+        if (dutyItemCode.CustomsExcise)
+        {
+            metValueForDuty  = exciseSiteDutySetup.DutyTotal/finalUnitConversion.Factor;
+            metDutyTotal     = dutyQty * _inventJourTrans.METValueForDuty;
+        }
+
+        return [metValueForDuty, metDutyTotal];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>InventJournalTrans_onUpdated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// On update the value of qty, update the value of duty and total duty
+    /// </summary>
+    /// <param name="sender">Pass the value</param>
+    /// <param name="e">Data event value</param>
+    [DataEventHandler(tableStr(InventJournalTrans), DataEventType::Updated)]
+    public static void InventJournalTrans_onUpdated(Common sender, DataEventArgs e)
+    {
+        InventJournalTrans   inventJournalTrans = sender as InventJournalTrans;
+        container result = METInventJournalEventHandler::getTotalDutyValue(inventJournalTrans);
+
+        inventJournalTrans.METValueForDuty  = conPeek(result, 1);
+        inventJournalTrans.METDutyTotal     = conPeek(result, 2);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>InventJournalTrans_onInserted</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// On insert update the value of duty and total value
+    /// </summary>
+    /// <param name="sender">Pass the value</param>
+    /// <param name="e">Data event value</param>
+    [DataEventHandler(tableStr(InventJournalTrans), DataEventType::Inserted)]
+    public static void InventJournalTrans_onInserted(Common sender, DataEventArgs e)
+    {
+        InventJournalTrans      inventJournalTrans = sender as InventJournalTrans;
+        container result = METInventJournalEventHandler::getTotalDutyValue(inventJournalTrans);
+
+        // To assign the value based on the total duty logic
+        inventJournalTrans.METValueForDuty  = conPeek(result, 1);
+        inventJournalTrans.METDutyTotal     = conPeek(result, 2);
+       
     }
 
 ]]></Source>
