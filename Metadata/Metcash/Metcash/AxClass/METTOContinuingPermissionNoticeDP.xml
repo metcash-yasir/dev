@@ -1,0 +1,307 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METTOContinuingPermissionNoticeDP</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[SRSReportParameterAttribute(classstr(METCommonContinuingPermissionNoticeContract))]
+class METTOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
+{
+    METTOContinuingPermissionNoticeHeaderTmp header;
+    METTOContinuingPermissionNoticeLineTmp line;
+    InventTransferTable inventTransferTable;
+    CustInvoiceJour invoiceJour;
+    #ISOCountryRegionCodes
+    #PrintMgmtSetup
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processReport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process report
+    /// </summary>
+    public void processReport()
+    {
+        METCommonContinuingPermissionNoticeContract contract = this.parmDataContract() as METCommonContinuingPermissionNoticeContract;
+       
+        InventTransferId TransferId = contract.parmSalesId();
+        inventTransferTable =  inventTransferTable::find(TransferId);
+
+        RefRecId jourRecId = contract.parmInvJourRecId();
+        InvoiceJour = CustInvoiceJour::findRecId(jourRecId);
+
+        if (!contract.parmIsRePrint())
+        {
+            delete_from header
+                where header.TransferId == TransferId;
+
+            delete_from line
+                where line.TransferId == TransferId;
+
+            METInventTransferTableExt metTransferExt;
+
+            select firstonly UnderBond from metTransferExt
+                where metTransferExt.InventTransferTable == inventTransferTable.RecId;
+
+            if (inventTransferTable.RecId && metTransferExt.UnderBond && InventSite::find(inventTransferTable.InventLocationIdTo).METBondedWarehouse)
+            {
+                this.insertHeaderData();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertHeaderData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts the report header data.
+    /// </summary>
+    public void insertHeaderData()
+    {
+        WHSShipmentTable shipment;
+
+        select firstonly AccountNum from shipment
+            where shipment.OrderNum == inventTransferTable.TransferId
+            && shipment.WorkTransType == WhsWorkTransType::TransferIssue;
+
+        METCustTable metCustTable = METCustTable::find(shipment.AccountNum);
+
+        NumberSequenceReference numberSequenceReference;
+
+        numberSequenceReference = NumberSeqReference::findReference(extendedTypeNum(METCPNumber));
+
+        if (numberSequenceReference.RecId)
+        {
+            METCPNumber num = NumberSeq::newGetNum(numberSequenceReference).num();
+            header.ContinuingPermissionNoticeNumber = num;
+        }
+
+        CompanyInfo companyInfo = CompanyInfo::find();
+        InventSite site;
+
+        select firstonly METBondNumber from site
+            where site.SiteId == shipment.InventSiteId;
+
+        InventLocation inventLocation;
+
+        select firstonly METWHSubEntity, Name, RecId from inventLocation
+            where inventLocation.InventLocationId == shipment.InventLocationId;
+        
+        header.CompanyLogo = this.getCompanyLogo(companyInfo.METLegalEntityType, inventLocation.METWHSubEntity);
+        LogisticsEntityPostalAddressView postalAddressView = this.getWareHousePrimaryAddress(inventLocation.RecId);
+
+        PrintMgmtReportFormat printMgmtReportFormat = PrintMgmtReportFormat::findByType(PrintMgmtDocumentType::METTOContinuingPermissionNote,
+                                                                                        ssrsReportStr(METTOContinuingPermissionNotice, CPReport), #NoCountryRegionId);
+        RecId PrintMgmtDocInstanceRecId = PrintMgmtDocInstance::find(0, 0, PrintMgmtNodeType::Sales,
+            PrintMgmtDocumentType::METTOContinuingPermissionNote, 1).RecId;
+
+        if (PrintMgmtDocInstanceRecId != 0 && printMgmtReportFormat)
+        {
+            int dotPosition = strScan(printMgmtReportFormat.Name, '.', 0, strLen(printMgmtReportFormat.Name));
+
+            if (dotPosition > 0)
+            {
+                METIndustryKeyTable industryKey;
+                SysDocuBrandDetails docuBrandDetails;
+
+                select firstonly METTaxRegNumber from docuBrandDetails
+                    where docuBrandDetails.ReportName == subStr(printMgmtReportFormat.Name, 1, dotPosition - 1)
+                exists join industryKey
+                    where docuBrandDetails.METIndustryKey == industryKey.IndustryKey;
+                
+                header.CompanyCoRegNum = docuBrandDetails.METTaxRegNumber;
+            }
+        }
+
+        InventLocation inventLocationTo = InventLocation::find(inventTransferTable.InventLocationIdTo);
+        header.SendingBranchAddress = postalAddressView.Address;
+        header.SendingBranchName = inventLocation.Name;
+        header.ReceivingBranchAddress = inventLocationTo.address();
+        header.ReceivingBranchName = inventLocationTo.Name;
+        header.NoticeDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::getSystemDateTime(), DateTimeUtil::getUserPreferredTimeZone()));
+        header.NoticeTimeString = int2Str(DateTimeUtil::time(DateTimeUtil::utcNow()));
+        header.CompanyName = companyInfo.Name;
+
+        List metBondList = strSplit(site.METBondNumber, ' ');
+        Container metBondCon = list2con(metBondList);
+
+        header.SenderBranchExciseNumber = conpeek(metBondCon, 1);
+        header.SenderBranchBondNumber = conpeek(metBondCon, 2);
+        header.ReceivingBranchExciseNumber = metCustTable.ExciseNumber;
+        header.ReceivingBranchBondNumber = metCustTable.BondNumber;
+        header.TransferId = inventTransferTable.TransferId;
+        header.insert();
+
+        this.insertLineData();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertLineData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Inserts the report line data.
+    /// </summary>
+    public void insertLineData()
+    {
+        const str defaultUOM = 'EA';
+        InventTransferLine inventTransferLine;
+        InventTable inventTable;
+        METInventTable metInventTable;
+        InventDim inventDim;
+        
+        METExciseRegisterEntry exciseRegister;
+        METTariffItemCodeBase tariffCodeBase;
+        VendPackingSlipJour packingSlip;
+        RecordInsertList insertSet = new RecordInsertList(tableNum(METPOContinuingPermissionNoticeLineTmp));
+
+        while select inventTransferLine
+            where inventTransferLine.TransferId == inventTransferTable.TransferId
+        join inventTable
+            where inventTransferLine.ItemId == inventTable.ItemId
+        outer join metInventTable
+            where metInventTable.ItemId == inventTable.ItemId
+        outer join TariffItem from tariffCodeBase
+            where tariffCodeBase.RecId == metInventTable.METTariffItemCodeBaseRecid
+        outer join RecId from inventDim
+            where inventDim.inventDimId == inventTransferLine.InventDimId
+        {
+            METExciseInformationTable metExciseInformationTablePO;
+
+            select firstonly Lodgement from metExciseInformationTablePO
+            order by CreatedDateTime
+                where metExciseInformationTablePO.InventTransType == InventTransType::Purch &&
+                    metExciseInformationTablePO.ItemId == inventTransferLine.ItemId &&
+                    metExciseInformationTablePO.SiteId == inventDim.InventSiteId &&
+                    metExciseInformationTablePO.LodgementClosed == NoYes::No;
+
+            line.BondMark = metExciseInformationTablePO.Lodgement;
+
+            select TIUV, DutyRateReceived from exciseRegister
+                where exciseRegister.OrderNumber == inventTransferTable.TransferId
+                && exciseRegister.OriginDocumentNumber == invoiceJour.InvoiceId
+                && exciseRegister.ItemId == inventTransferLine.ItemId;
+
+            METPurchaseWMSFactor purchaseWMSFactor = UnitOfMeasureConversion::findByConversion(UnitOfMeasure::findBySymbol(inventTransferLine.UnitId).RecId, UnitOfMeasure::findBySymbol(defaultUOM).RecId, EcoResProduct::findByProductNumber(inventTransferLine.ItemId).RecId).Factor;
+            line.BottlesSupplied = purchaseWMSFactor * inventTransferLine.QtyReceived;
+            line.ItemId = inventTransferLine.ItemId;
+            line.ItemDescription = inventTable.productName(SystemParameters::getSystemLanguageId());
+            line.BottleSize = metInventTable.BottleSize;
+            line.PackQty = metInventTable.ItemPack;
+            line.Strength = metInventTable.AlcoholContent;
+            line.LitresOfAlcoholCalculated = metInventTable.BottleSize * line.BottlesSupplied * metInventTable.AlcoholContent;
+            line.ValueTIU = exciseRegister.TIUV;
+            line.TariffItem = tariffCodeBase.TariffItem;
+            line.CountryOfOrigin = metInventTable.CountryCode;
+            line.StatCode = metInventTable.statcode();
+            line.ValueDuty = exciseRegister.DutyRateReceived;
+            line.TransferId = inventTransferTable.TransferId;
+            insertSet.add(line);
+        }
+        insertSet.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dsHeader</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// dsHeader
+    /// </summary>
+    /// <returns>METTOContinuingPermissionNoticeHeaderTmp</returns>
+    [SRSReportDataSetAttribute(tableStr(METTOContinuingPermissionNoticeHeaderTmp))]
+    public METTOContinuingPermissionNoticeHeaderTmp dsHeader()
+    {
+        select header
+            where header.TransferId == inventTransferTable.TransferId;
+
+        return header;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dsLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// dsLines
+    /// </summary>
+    /// <returns>METTOContinuingPermissionNoticeLineTmp</returns>
+    [SRSReportDataSetAttribute(tableStr(METTOContinuingPermissionNoticeLineTmp))]
+    public METTOContinuingPermissionNoticeLineTmp dsLines()
+    {
+        select line
+            where line.TransferId == inventTransferTable.TransferId;
+
+        return line;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCompanyLogo</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get METcash logo based on entity
+    /// </summary>
+    /// <param name = "_legalEntityType">LegalEntityType</param>
+    /// <param name = "_subEntityWareHouse">SubEntity warehouse</param>
+    /// <returns>Image</returns>
+    public container getCompanyLogo(METLegalEntityType _legalEntityType, InventLocationId _subEntityWareHouse)
+    {
+        container image;
+
+        switch (_legalEntityType)
+        {
+            case METLegalEntityType::Food:
+                image = SysDocuBrandImages::getImage(_subEntityWareHouse);
+                break;
+
+            case METLegalEntityType::Liquor:
+                image = SysDocuBrandImages::getImage(METConstants::LiquorLogo);
+                break;
+
+            default:
+                break;
+
+        }
+        return image;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getWareHousePrimaryAddress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get WareHouse address By recevingdock role
+    /// </summary>
+    /// <param name = "_inventLocationRecId">Location RecId</param>
+    /// <param name = "_roleRecId">Role Recid</param>
+    /// <param name = "_type">LogisticsElectronicAddressMethodType</param>
+    /// <returns>Locator</returns>
+    private LogisticsEntityPostalAddressView getWareHousePrimaryAddress(RefRecId _inventLocationRecId)
+    {
+        LogisticsEntityPostalAddressView  logisticsEntityPostalAddressView;
+        
+        select firstonly Address from logisticsEntityPostalAddressView
+            where logisticsEntityPostalAddressView.Entity == _inventLocationRecId
+            && logisticsEntityPostalAddressView.EntityType == LogisticsLocationEntityType::Warehouse
+            && logisticsEntityPostalAddressView.ValidFrom <= DateTimeUtil::getSystemDateTime()
+            && logisticsEntityPostalAddressView.ValidTo >= DateTimeUtil::getSystemDateTime()
+            && logisticsEntityPostalAddressView.IsPrimary == NoYes::Yes;
+        
+        return logisticsEntityPostalAddressView;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
