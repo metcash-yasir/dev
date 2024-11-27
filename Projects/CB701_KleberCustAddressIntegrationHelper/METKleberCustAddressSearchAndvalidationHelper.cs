@@ -8,6 +8,9 @@ using System.Threading.Tasks;
 
 namespace CB701_KleberCustAddressIntegrationHelper
 {
+    /// <summary>
+    /// Klerber customer address search and validation helper
+    /// </summary>
     public class METKleberCustAddressSearchAndvalidationHelper
     {
         private string _accessToken;
@@ -42,7 +45,14 @@ namespace CB701_KleberCustAddressIntegrationHelper
             }
         }
 
-
+        /// <summary>
+        /// Perform post request Async
+        /// </summary>
+        /// <param name="url">APIM url</param>
+        /// <param name="subscriptionKey">APIM subscription key</param>
+        /// <param name="jsonBody">Json body of the request</param>
+        /// <param name="addressValidation">is this address validation</param>
+        /// <returns>response or error message</returns>
         public async Task<string> PerformPostRequestAsync(string url, string subscriptionKey, string jsonBody, bool addressValidation)
         {
             HttpRequestMessage requestMessage = new HttpRequestMessage(HttpMethod.Post, url)
@@ -73,7 +83,7 @@ namespace CB701_KleberCustAddressIntegrationHelper
                 if (ex.InnerException is WebException webEx && webEx.Response is HttpWebResponse errorResponse)
                 {
                     string errorContent = await new StreamReader(errorResponse.GetResponseStream()).ReadToEndAsync();
-                    throw new Exception($"Error in AIS service call for messae {jsonBody} with {errorResponse.StatusCode}, {errorContent}");
+                    throw new Exception($"Error in AIS service call for message {jsonBody} with {errorResponse.StatusCode}, {errorContent}");
                 }
                 else if (ex.InnerException is WebException webExTimeout &&
                         (webExTimeout.Status == WebExceptionStatus.Timeout || webExTimeout.Status == WebExceptionStatus.ConnectFailure))
@@ -81,20 +91,39 @@ namespace CB701_KleberCustAddressIntegrationHelper
                     string serviceName = addressValidation ? "address validation" : "predictive address search";
                     throw new Exception($"Call to {serviceName} service failed for {jsonBody}");
                 }
+                else if (ex.InnerException == null)
+                {
+                    // Handle the case where InnerException is null
+                    string serviceName = addressValidation ? "address validation" : "predictive address search";
+                    throw new Exception($"Call to {serviceName} service failed for: {jsonBody}. {ex.Message}.");
+                }
                 else
                 {
-                    throw new Exception($"Unexpected error occurred during the AIS service call for {jsonBody} with error {ex.Message}");
+                    // Generic fallback for unexpected errors
+                    throw new Exception($"Unexpected error occurred during the AIS service call for {jsonBody}. Error: {ex.Message}");
                 }
             }        
         }
 
-        // Synchronous wrapper for X++
+
+        /// <summary>
+        /// Perform post request Sync
+        /// Synchronous wrapper for X++
+        /// </summary>
+        /// <param name="url">APIM url</param>
+        /// <param name="subscriptionKey">APIM subscription key</param>
+        /// <param name="jsonBody">Json body of the request</param>
+        /// <param name="addressValidation">is this address validation</param>
+        /// <returns>response or error message</returns>
         public string PerformPostRequestSync(string url, string subscriptionKey, string jsonBody, bool addressValidation)
         {
             // Call the async method and wait for the result synchronously
             return PerformPostRequestAsync(url, subscriptionKey, jsonBody, addressValidation).GetAwaiter().GetResult();
         }
 
+        /// <summary>
+        /// Token response contract
+        /// </summary>
         public class TokenResponse
         {
             [JsonProperty("access_token")]
@@ -107,6 +136,9 @@ namespace CB701_KleberCustAddressIntegrationHelper
             public string ExpiresIn { get; set; }
         }
 
+        /// <summary>
+        /// WebResponse contract
+        /// </summary>
         public class WebResponse
         {
             [JsonProperty("StatusCode")]
@@ -116,11 +148,17 @@ namespace CB701_KleberCustAddressIntegrationHelper
             public string utputResponse { get; set; }
         }
 
+        /// <summary>
+        /// Address validation response contract
+        /// </summary>
         public class AddressValidationResponse
         {
             public DtResponse DtResponse { get; set; }
         }
 
+        /// <summary>
+        /// Kleber response contract
+        /// </summary>
         public class DtResponse
         {
             public string ErrorMessage { get; set; }
