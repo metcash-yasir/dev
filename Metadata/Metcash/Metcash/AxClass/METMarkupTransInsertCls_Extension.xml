@@ -12,7 +12,6 @@ internal final class METMarkupTransInsertCls_Extension
     private boolean metCalledFromPriceSimulator;
 
 }
-
 ]]></Declaration>
 		<Methods>
 			<Method>
@@ -93,6 +92,8 @@ internal final class METMarkupTransInsertCls_Extension
     /// <returns>MarkupTrans object with updated TaxItemGroup if previously blank</returns>
     protected MarkupTrans initializeMarkupTrans(MarkupAutoLine _markupAutoLine)
     {
+        MarkupTrans ret;
+        
         if( !_markupAutoLine.TaxItemGroup &&
             !_markupAutoLine.markupTable().TaxItemGroup &&
             parameters.Source.TableId == tableNum(SalesLine))
@@ -102,7 +103,27 @@ internal final class METMarkupTransInsertCls_Extension
             _markupAutoLine.TaxItemGroup = METInventTable::find(salesLine.ItemId).AutoChargeTaxGroupId;
         }
 
-        return next initializeMarkupTrans(_markupAutoLine);
+        ret =  next initializeMarkupTrans(_markupAutoLine);
+
+        // CB748_PricingConditions
+        // Follow transaction item GST group
+        if (parameters.METRebateCodes
+        &&  parameters.ModuleCategory == HeadingLine::Line
+        &&  parameters.ModuleType     == MarkupModuleType::Vend
+        &&  parameters.Source.TableId == tableNum(VendInvoiceInfoLine))
+        {
+            VendInvoiceInfoLine vendInvoiceInfoLine = parameters.Source as VendInvoiceInfoLine;
+            MarkupTable markupTable = ret.markupTable();
+
+            // if Follow transaction item GST group
+            if (markupTable.METIsRebateCode && markupTable.METFollowTransactionTaxItemGroup)
+            {
+                // Apply the item GST group set on the invoice line to the rebate charge code
+                ret.TaxItemGroup = vendInvoiceInfoLine.TaxItemGroup;
+            }
+        }
+
+        return ret;
     }
 
 ]]></Source>
@@ -118,10 +139,8 @@ internal final class METMarkupTransInsertCls_Extension
     protected Query buildMarkupAutoLineQuery(MarkupAutoTable _markupAutoTable)
     {
         Query query = next buildMarkupAutoLineQuery(_markupAutoTable);
- 
-        // For PO header auto charges
-        if (parameters.Source.TableId == tableNum(PurchLine)
-        &&  parameters.ModuleCategory == HeadingLine::Line
+         
+        if (parameters.ModuleCategory == HeadingLine::Line
         &&  parameters.ModuleType     == MarkupModuleType::Vend)
         {
             // Exclude rebate charge codes from PO creation
@@ -131,7 +150,50 @@ internal final class METMarkupTransInsertCls_Extension
             qbdsMarkupTable.joinMode(JoinMode::ExistsJoin);
             qbdsMarkupTable.relations(true);
  
-            qbdsMarkupTable.addRange(fieldNum(MarkupTable, METIsRebateCode)).value(queryValue(NoYes::No));
+            // For PO line auto charges exclude the rebate charge codes
+            // OR VendInvoiceInfoLine.insert calling Markup::insertMarkupTrans to bring the OOTB non rebate charge codes
+            if (parameters.Source.TableId == tableNum(PurchLine)
+            || (parameters.Source.TableId == tableNum(VendInvoiceInfoLine)
+            &&  !parameters.METRebateCodes))
+            {
+                qbdsMarkupTable.addRange(fieldNum(MarkupTable, METIsRebateCode)).value(queryValue(NoYes::No));
+            }
+            // When called from METPendingVendorInvoiceOffRemittanceRebate
+            else if (parameters.Source.TableId == tableNum(VendInvoiceInfoLine)
+                 &&  parameters.METRebateCodes)
+            {
+                VendInvoiceInfoLine     vendInvoiceInfoLine = parameters.Source as VendInvoiceInfoLine;
+                VendInvoiceInfoTable    vendInvoiceInfoTable = vendInvoiceInfoLine.vendInvoiceInfoTable();
+                
+                // else for pending vendor invoice line, include the rebate charge codes (not at creation, triggered from workflow in METPendingVendorInvoiceOffRemittanceRebate)
+                qbdsMarkupTable.addRange(fieldNum(MarkupTable, METIsRebateCode)).value(queryValue(NoYes::Yes));
+
+                // Add the purchasing group filter
+                QueryBuildDataSource qbdsPurchGroup = qbds.addDataSource(tableNum(METPurchGroup));
+                qbdsPurchGroup.joinMode(JoinMode::ExistsJoin);
+                qbdsPurchGroup.relations(true);
+
+                if (vendInvoiceInfoTable.METChargeThrough || vendInvoiceInfoTable.METCrossDock)
+                {
+                    qbdsPurchGroup.addRange(fieldNum(METPurchGroup, ChargeThrough)).value(queryValue(NoYes::Yes));
+                }
+                else if (!vendInvoiceInfoTable.METChargeThrough && !vendInvoiceInfoTable.METCrossDock)
+                {
+                    qbdsPurchGroup.addRange(fieldNum(METPurchGroup, Warehouse)).value(queryValue(NoYes::Yes));
+                }
+
+                // Add date filter for auto charge lines (copied from MarkupTransInsertGUP_Extension)
+                str formatedDateRange;
+                DocumentDate invoiceDate = vendInvoiceInfoTable.DocumentDate;
+                formatedDateRange = strFmt('(((%1 <= %3) || (%1 == %4)) && ((%2 >= %3) || (%2 == %4)))',
+                                            fieldStr(MarkupAutoLine, FromDate), //%1: FromDate
+                                            fieldStr(MarkupAutoLine, ToDate),   //%2: ToDate
+                                            date2StrXpp(invoiceDate),           //%3: invoiceDate
+                                            date2StrXpp(dateNull()));           //%4: dateNull
+
+                qbds.addRange(fieldNum(MarkupAutoLine, FromDate)).value(formatedDateRange);
+
+            }
         }
  
         return query;
