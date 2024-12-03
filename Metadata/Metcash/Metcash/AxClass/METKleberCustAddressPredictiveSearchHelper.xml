@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METKleberCustAddressPredictiveSearchHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+using CB701_KleberCustAddressIntegrationHelper;
+/// <summary>
+/// Kleber customer predictive search helper
+/// </summary>
+class METKleberCustAddressPredictiveSearchHelper
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// start of the logic for Predictive Search
+    /// </summary>
+    /// <param name = "_args">Args instance</param>
+    public static void main(Args _args)
+    {
+        FormRun caller = _args.caller();
+        
+        if (caller.name() == formStr(LogisticsPostalAddress))
+        {
+            METCustParameters custParameters = METCustParameters::Find();
+
+            if (custParameters.KleberPredictiveServiceAPIMSecretKeyVaultRef == 0
+                || custParameters.KleberPredictiveServiceAPIMURL == '' || custParameters.TenantIdKeyVaultRef == 0)
+            {
+                return;
+            }
+
+            FormStringControl addressSearch = caller.design().controlName(formControlStr(LogisticsPostalAddress, METAddressSearch)) as FormStringControl;
+            int requestId = RandomGenerate::construct().randomInt(10000, 5000000);
+             
+            METKleberCustAddressPredictiveSearchRequestContract custAddressPredictiveSearchRequestContract = new METKleberCustAddressPredictiveSearchRequestContract();
+            custAddressPredictiveSearchRequestContract.parmAddressLine(addressSearch.text());
+            custAddressPredictiveSearchRequestContract.parmDepartmentCode(custParameters.KleberDepartmentCode);
+            custAddressPredictiveSearchRequestContract.parmRequestId(int2Str(requestId));
+            
+            if (custParameters.KleberMaxReturnCount > 0)
+            {
+                custAddressPredictiveSearchRequestContract.parmRequestLimit(int2Str(custParameters.KleberMaxReturnCount));
+            }
+
+            str jsonString = FormJsonSerializer::serializeClass(custAddressPredictiveSearchRequestContract);
+
+            METKleberCustAddressPredictiveSearchHelper::performKleberPredictiveSearch(custParameters, jsonString, caller, requestId);
+        }
+        else
+        {
+            throw Error("@MET:KleberPredictiveSearchFormCalledError");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>performKleberPredictiveSearch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Perform kleber Predictive search
+    /// </summary>
+    /// <param name = "_custParameters">METCustParameters buffer</param>
+    /// <param name = "_requestBody">searilized body for search</param>
+    /// <param name = "_caller">Formrun instance</param>
+    /// <param name = "_requestId">Request id for search</param>
+    private static void performKleberPredictiveSearch(METCustParameters _custParameters, str _requestBody, FormRun _caller, int _requestId)
+    {
+        KeyVaultParameters keyVaultParameter = KeyVaultParameters::findRecId(KeyVaultCertificateTable::findRecId(_custParameters.KleberPredictiveServiceAPIMSecretKeyVaultRef).KeyVaultRef);
+            
+        if (!keyVaultParameter)
+        {
+            throw error("@MET:KleberPredictiveSearchAPIMKeyVaultParameterNotFound");
+        }
+
+        try
+        {
+            str oauthToken = METTokenGenerator::generateOAuthToken(keyVaultParameter.AppClientId, keyVaultParameter.getClientSecretKey(), _custParameters.getTenantIdSecret());
+            
+            if (strLen(oauthToken) < 0)
+            {
+                throw error("@MET:KleberOAuthTokenNotGenerated");
+            }
+
+            METKleberCustAddressSearchAndvalidationHelper custAddressSearchAndvalidationHelper = new METKleberCustAddressSearchAndvalidationHelper();
+            str predictiveSearchResponse = custAddressSearchAndvalidationHelper.PerformPostRequestSync(oauthToken, _custParameters.KleberPredictiveServiceAPIMURL,
+                                                                                                       _custParameters.getKleberPredictiveSearchApimKeySecret(),
+                                                                                                       _requestBody, false);
+
+            if (strLen(predictiveSearchResponse) > 0)
+            {
+                List custPredictiveResultList = new List(Types::Class);
+                custPredictiveResultList = FormJsonSerializer::deserializeCollection(classNum(list), predictiveSearchResponse, Types::Class, classStr(METKleberCustAddressPredictiveSearchResponseContract));
+                METKleberCustAddressPredictiveSearchResponseContract predictiveResponseContract = FormJsonSerializer::deserializeObject(className2Id(classStr(METKleberCustAddressPredictiveSearchResponseContract)), predictiveSearchResponse);
+                ListEnumerator le = custPredictiveResultList.getEnumerator();
+                RecordInsertList recordinsertList = new RecordInsertList(tableNum(METKleberPredictiveSearchTmp));
+                METKleberCustAddressPredictiveSearchResponseContract custAddressPredictiveSearchResponseContract = new METKleberCustAddressPredictiveSearchResponseContract();
+                boolean recordsFound = false;
+
+                while (le.moveNext())
+                {
+                    custAddressPredictiveSearchResponseContract = le.current();
+
+                    METKleberPredictiveSearchTmp kleberPredictiveSearchTmp;
+                    kleberPredictiveSearchTmp.AddressLine = custAddressPredictiveSearchResponseContract.parmAddressLine();
+                    kleberPredictiveSearchTmp.RequestId = predictiveResponseContract.parmRequestId();
+                    kleberPredictiveSearchTmp.Locality = custAddressPredictiveSearchResponseContract.parmLocality();
+                    kleberPredictiveSearchTmp.State = custAddressPredictiveSearchResponseContract.parmState();
+                    kleberPredictiveSearchTmp.Postcode = custAddressPredictiveSearchResponseContract.parmPostcode();
+                    kleberPredictiveSearchTmp.RecordId = custAddressPredictiveSearchResponseContract.parmRecordId();
+
+                    recordinsertList.add(kleberPredictiveSearchTmp);
+
+                    if (!recordsFound)
+                    {
+                        recordsFound = true;
+                    }
+           
+                }
+
+                if (recordsFound)
+                {
+                    ttsbegin;
+                    recordinsertList.insertDatabase();
+                    ttscommit;
+
+                    FormDataSource logisticsPostalAddress_ds = _caller.dataSource(formDataSourceStr(LogisticsPostalAddress, LogisticsPostalAddress)) as FormDataSource;
+                    LogisticsPostalAddress logisticsPostalAddress = logisticsPostalAddress_ds.cursor();
+
+                    Args args = new Args();
+                    args.name(formStr(METKleberCustAddressPredictiveSearch));
+                    args.record(logisticsPostalAddress);
+                    args.parm(int2Str(_requestId));
+                    args.caller(_caller);
+
+                    FormRun predictiveSearchForm = classfactory.formRunClass(args);
+
+                    if (predictiveSearchForm)
+                    {
+                        predictiveSearchForm.init();
+                        predictiveSearchForm.run();
+                        predictiveSearchForm.wait();
+                    }
+                }
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            System.Exception ex = ClrInterop::getLastException();
+            if (ex != null)
+            {
+                ex = ex.get_InnerException();
+                if (ex != null)
+                {
+                    error(ex.ToString());
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
