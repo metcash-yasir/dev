@@ -13,6 +13,7 @@ namespace CB701_KleberCustAddressIntegrationHelper
     /// </summary>
     public class METKleberCustAddressSearchAndvalidationHelper
     {
+
         /// <summary>
         /// Perform post request Async
         /// </summary>
@@ -53,7 +54,7 @@ namespace CB701_KleberCustAddressIntegrationHelper
                 if (ex.InnerException is WebException webEx && webEx.Response is HttpWebResponse errorResponse)
                 {
                     string errorContent = await new StreamReader(errorResponse.GetResponseStream()).ReadToEndAsync();
-                    throw new Exception($"Error in AIS service call for message {jsonBody} with {errorResponse.StatusCode}, {errorContent}");
+                    throw new Exception($"Error in AIS service call for messae {jsonBody} with {errorResponse.StatusCode}, {errorContent}");
                 }
                 else if (ex.InnerException is WebException webExTimeout &&
                         (webExTimeout.Status == WebExceptionStatus.Timeout || webExTimeout.Status == WebExceptionStatus.ConnectFailure))
@@ -61,20 +62,12 @@ namespace CB701_KleberCustAddressIntegrationHelper
                     string serviceName = addressValidation ? "address validation" : "predictive address search";
                     throw new Exception($"Call to {serviceName} service failed for {jsonBody}");
                 }
-                else if (ex.InnerException == null)
-                {
-                    // Handle the case where InnerException is null
-                    string serviceName = addressValidation ? "address validation" : "predictive address search";
-                    throw new Exception($"Call to {serviceName} service failed for: {jsonBody}. {ex.Message}.");
-                }
                 else
                 {
-                    // Generic fallback for unexpected errors
-                    throw new Exception($"Unexpected error occurred during the AIS service call for {jsonBody}. Error: {ex.Message}");
+                    throw new Exception($"Unexpected error occurred during the AIS service call for {jsonBody} with error {ex.Message}");
                 }
             }        
         }
-
 
         /// <summary>
         /// Perform post request Sync
@@ -92,17 +85,11 @@ namespace CB701_KleberCustAddressIntegrationHelper
             return PerformPostRequestAsync(oauthToken, url, subscriptionKey, jsonBody, addressValidation).GetAwaiter().GetResult();
         }
 
-        /// <summary>
-        /// Address validation response contract
-        /// </summary>
         public class AddressValidationResponse
         {
             public DtResponse DtResponse { get; set; }
         }
 
-        /// <summary>
-        /// Kleber response contract
-        /// </summary>
         public class DtResponse
         {
             public string ErrorMessage { get; set; }

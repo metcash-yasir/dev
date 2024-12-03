@@ -8,7 +8,6 @@
 /// </summary>
 class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmation
 {
-
 }
 ]]></Declaration>
 		<Methods>
@@ -18,31 +17,21 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
     /// <summary>
     /// Business logic to post the shipment
     /// </summary>
+    /// <returns>Return tag</returns>
     public boolean post()
     {
         boolean         isPosted;
         AccountOrder    accountOrder;
-        METCustTable    metCustTable;
 
         #OCCRetryCount
         try
         {
             ttsBegin;
 
-            metCustTable = metCustTable::find(metSalesOrderShipmentLoadHeader.CustAccount);
+            accountOrder = metSalesOrderShipmentLoadHeader.PostMultiDocument == NoYes::No ? AccountOrder::Account : AccountOrder::None;
 
-            if (metCustTable.FinalizationDocument != METFinalizationDocument::None)
-            {
-                documentStatus = metCustTable.FinalizationDocument == METFinalizationDocument::Invoice ? DocumentStatus::Invoice : DocumentStatus::PackingSlip;
-                accountOrder   = metSalesOrderShipmentLoadHeader.PostMultiDocument == NoYes::No ? AccountOrder::Account : AccountOrder::None;
+            isPosted = this.postPackingslipInvoiceReport(metSalesOrderShipmentLoadHeader, accountOrder);
 
-                isPosted = this.postPackingslipInvoiceReport(metSalesOrderShipmentLoadHeader, documentStatus, accountOrder);
-            }
-            else
-            {
-                warning (strFmt("@MET:SOFinalisationDocCheck", metSalesOrderShipmentLoadHeader.ShipmentId));
-            }
-            
             ttsCommit;
 
             // CB626_TMSEngineSOPackingSlip Triggers for the TMS Engine processing on SO Delivery Note Posting
@@ -90,40 +79,38 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
     /// Method to post the invoice report
     /// </summary>
     /// <param name = "_shipmentLoadHeader">Shipment load leader</param>
-    /// <param name = "_docStatus">Document status</param>
     /// <param name = "_accountOrder">Account order</param>
     /// <returns>Boolean result</returns>
-    private boolean postPackingslipInvoiceReport(METSalesOrderShipmentLoadHeader    _shipmentLoadHeader, DocumentStatus _docStatus, AccountOrder _accountOrder)
+    private boolean postPackingslipInvoiceReport(METSalesOrderShipmentLoadHeader    _shipmentLoadHeader, AccountOrder _accountOrder)
     {
         boolean                         isPosted = false;
         JournalId                       jourId;
         SalesFormLetter                 salesFormLetter;
 
-        if (_docStatus ==DocumentStatus::PackingSlip)
-        {
-            salesFormLetter = this.postPackingSlip(_shipmentLoadHeader, _docStatus, _accountOrder);
+        salesFormLetter = this.postPackingSlip(_shipmentLoadHeader, _accountOrder);
         
-            if (salesFormLetter.parmJournalRecord().TableId == tableNum(CustPackingSlipJour))
-            {
-                CustPackingSlipJour     jourTable;
-                jourTable = salesFormLetter.parmJournalRecord();
-                jourId  = jourTable.packingSlipId;
+        if (salesFormLetter.parmJournalRecord().TableId == tableNum(CustPackingSlipJour))
+        {
+            CustPackingSlipJour     jourTable;
+            jourTable = salesFormLetter.parmJournalRecord();
+            jourId  = jourTable.packingSlipId;
 
-                if (jourTable)
+            if (jourTable)
+            {
+                if (!_shipmentLoadHeader.PostMultiDocument)
                 {
-                    if (!_shipmentLoadHeader.PostMultiDocument)
-                    {
-                        jourTable.METUpdateLoadShipmentId(_shipmentLoadHeader);
-                    }
-                    else
-                    {
-                        CustPackingSlipJour::METUpdateLoadShipmentLines(_shipmentLoadHeader);
-                    }
-                    isPosted = true;
+                    jourTable.METUpdateLoadShipmentId(_shipmentLoadHeader);
                 }
+                else
+                {
+                    CustPackingSlipJour::METUpdateLoadShipmentLines(_shipmentLoadHeader);
+                }
+
+                isPosted = true;
             }
         }
-        else if (_docStatus == DocumentStatus::Invoice)
+        
+        if (isPosted)
         {
             METSalesOrderShipmentLoadLines      shipmentLoadLines;
 
@@ -134,35 +121,62 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
                         where shipmentLoadLines.ShipmentId == _shipmentLoadHeader.ShipmentId
                 {
                     salesFormLetter = this.postInvoice(shipmentLoadLines.OrderNum);
+                    isPosted = this.updateInvoiceDetails(salesFormLetter, _shipmentLoadHeader);
                 }
             }
             else
             {
                 salesFormLetter = this.postInvoiceForShipment(_shipmentLoadHeader.ShipmentId);
+                isPosted = this.updateInvoiceDetails(salesFormLetter, _shipmentLoadHeader);
             }
-
-            if (salesFormLetter.parmJournalRecord().TableId == tableNum(CustInvoiceJour))
-            {
-                CustInvoiceJour     jourTable;
-                jourTable = salesFormLetter.parmJournalRecord();
-                jourId  = jourTable.InvoiceId;
-
-                if (jourTable)
-                {
-                    if (!_shipmentLoadHeader.PostMultiDocument)
-                    {
-                        jourTable.METUpdateLoadShipmentId(_shipmentLoadHeader);
-                    }
-                    else
-                    {
-                        CustInvoiceJour::METUpdateLoadShipmentLines(_shipmentLoadHeader);
-                    }
-                    isPosted = true;
-                }
-            }
+        }
+        else
+        {
+            throw Error (strFmt("@MET:PackingSlipError", _shipmentLoadHeader.ShipmentId));
         }
 
         return isPosted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateInvoiceDetails</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the invoice details with shipment
+    /// </summary>
+    /// <param name = "_salesFormLetter">Sales form letter</param>
+    /// <param name = "_shipmentLoadHeader">Shipment laod header reference</param>
+    /// <returns>boolean value</returns>
+    public boolean updateInvoiceDetails(SalesFormLetter    _salesFormLetter, METSalesOrderShipmentLoadHeader   _shipmentLoadHeader)
+    {
+        boolean     ret;
+
+        if (_salesFormLetter.parmJournalRecord().TableId == tableNum(CustInvoiceJour))
+        {
+            CustInvoiceJour     jourTable;
+            jourTable = _salesFormLetter.parmJournalRecord();
+
+            if (jourTable)
+            {
+                if (!_shipmentLoadHeader.PostMultiDocument)
+                {
+                    jourTable.METUpdateLoadShipmentId(_shipmentLoadHeader);
+                }
+                else
+                {
+                    CustInvoiceJour::METUpdateLoadShipmentLines(_shipmentLoadHeader);
+                }
+                ret = true;
+            }
+        }
+        else
+        {
+            throw Error(strFmt("@MET:InvoiceNotPosted", _shipmentLoadHeader.ShipmentId));
+        }
+
+        return ret;
     }
 
 ]]></Source>
@@ -177,11 +191,11 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
     /// <param name = "_docStatus">Document status</param>
     /// <param name = "_accountOrder"> Account order</param>
     /// <returns>SalesFormLetter</returns>
-    public SalesFormLetter postPackingSlip(METSalesOrderShipmentLoadHeader    _shipmentLoadHeader, DocumentStatus _docStatus, AccountOrder _accountOrder)
+    public SalesFormLetter postPackingSlip(METSalesOrderShipmentLoadHeader    _shipmentLoadHeader, AccountOrder _accountOrder)
     {
         SalesFormLetter                 salesFormLetter;
 
-        salesFormLetter = SalesFormLetter::construct(_docStatus);
+        salesFormLetter = SalesFormLetter::construct(DocumentStatus::PackingSlip);
 
         salesFormLetter.chooseLinesQuery(this.calcQuery(_shipmentLoadHeader.ShipmentId));
         salesFormLetter.transDate(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));
@@ -224,6 +238,12 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
             tmpFrmVirtual.insert();
             packingSlipList.addEnd(tmpFrmVirtual);
         }
+
+        if (packingSlipList.empty())
+        {
+            throw Error(strFmt("@MET:SOPackingError", _salesId));
+        }
+
         salesFormLetter = SalesFormLetter::construct(DocumentStatus::Invoice);
        
         salesFormLetter.salesTable(SalesTable::find(_salesId));
@@ -272,6 +292,11 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
             tmpFrmVirtual.RecordNo = custPackingSlipJour.RecId;
             tmpFrmVirtual.insert();
             packingSlipList.addEnd(tmpFrmVirtual);
+        }
+
+        if (packingSlipList.empty())
+        {
+            throw Error(strFmt("@MET:ShipmentNotDelivered", _shipmentId));
         }
 
         salesFormLetter = SalesFormLetter::construct(DocumentStatus::Invoice);
