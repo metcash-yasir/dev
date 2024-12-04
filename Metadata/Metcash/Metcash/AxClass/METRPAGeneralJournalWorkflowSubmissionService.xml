@@ -1,0 +1,208 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METRPAGeneralJournalWorkflowSubmissionService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// MET_122589_RPAGeneralLedgerIntegration developed by yadavpa on 25/03/2024
+/// RPA Ledger Integration
+/// </summary>
+Public class METRPAGeneralJournalWorkflowSubmissionService
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>create</Name>
+				<Source><![CDATA[
+    public Object create(METRPAGeneralJournalWorkflowSubmissionRequest _request)
+    {
+        Object                                          jsonString;
+        METRPAGeneralJournalWorkflowSubmissionResponse  generalJournalBatchStatusResponse;
+        Map                                             map                 = new Map (Types::Integer, Types::String);
+        str                                             batchJournalId      = _request.ParmBatchJournalId();
+        DataAreaId                                      dataAreaId          = _request.ParmDataAreaId();
+        boolean                                         JournalHeaderStatus = false, submitToWorkflow    = _request.parmSubmitToWorkflow();
+        LedgerJournalCheckPost                          ledgerJournalCheckPost;
+        LedgerJournalTable                              ledgerJournalTable, ledgerJournalTableVoucherCheck;
+        LedgerJournalTrans                              ledgerJournalTransValidation;
+        LedgerJournalCheckPost                          jourPost;
+        str                                             workflowTrackingStatus;
+        str                                             headerError, lineError;
+        int                                             voucherErrorCount = 0;
+        WorkflowTrackingStatusTable                     workflowTrackingStatusTable;
+        List                                            orderList = new List(Types::String);
+        
+        generalJournalBatchStatusResponse = new METRPAGeneralJournalWorkflowSubmissionResponse();
+
+        changecompany(dataAreaId)
+        {
+            try
+            {
+                ledgerJournalTable = this.getCrossCompanyLedgerJournalTable(batchJournalId, dataAreaId);
+
+                select firstonly RecId from workflowtrackingstatustable where
+                    workflowtrackingstatustable.ContextRecId == ledgerJournalTable.RecId &&
+                    (workflowtrackingstatustable.TrackingStatus == WorkflowTrackingStatus::Completed ||
+                    workflowtrackingstatustable.TrackingStatus == WorkflowTrackingStatus::Pending);
+                if(workflowtrackingstatustable.RecId)
+                    ledgerJournalTable.Log = strFmt("@MET:JournalValidation", ledgerJournalTable.JournalNum);
+                
+                // Journal validation
+                if (ledgerJournalTable.recid && workflowtrackingstatustable.RecId == 0)
+                {
+                    ledgerJournalCheckPost = ledgerJournalCheckPost::newLedgerJournalTable(ledgerJournalTable, NoYes::No);
+                    ledgerJournalCheckPost.run();
+                }
+
+                if(ledgerJournalTable.Log)
+                    JournalHeaderStatus = true;
+                else
+                    if(ledgerJournalTable.UserBlockId)
+                        ledgerJournalTable.Log = strFmt("@MET:JournalLockedError",ledgerJournalTable.JournalNum,ledgerJournalTable.UserBlockId);
+
+                headerError = ledgerJournalTable.Log;   // Header level validation error
+
+                // Line level validation
+                while select ledgerJournalTransValidation where
+                    ledgerJournalTransValidation.JournalNum == ledgerJournalTable.JournalNum
+                {
+                    lineError = '';
+                    ledgerJournalCheckPost = LedgerJournalCheckPost::newLedgerJournalTrans(ledgerJournalTransValidation,
+                        LedgerJournalVoucher::Voucher,
+                        NoYes::No,
+                        NoYes::No,
+                        NoYes::No);
+                    ledgerJournalCheckPost.run();
+                    
+                    select firstonly METErrorLog from ledgerJournalTableVoucherCheck
+                        where ledgerJournalTableVoucherCheck.journalNum == ledgerJournalTransValidation.JournalNum;
+                    if(ledgerJournalTableVoucherCheck.Log)
+                        voucherErrorCount++;
+                    else
+                        ledgerJournalTableVoucherCheck.Log = "No line error";
+
+                    lineError = strFmt("%1",ledgerJournalTransValidation.LineNum) + '-' + ledgerJournalTransValidation.Voucher + '-' + ledgerJournalTableVoucherCheck.Log;
+                    orderList.addEnd(lineError);
+                }
+
+                generalJournalBatchStatusResponse.parmVoucherValidation(orderList); //Voucher validation
+                generalJournalBatchStatusResponse.parmSubmitToWorkflowOutcome(false);  // Workflow status TRUE/FALSE
+
+                // Workflow submission
+                if(!JournalHeaderStatus && submitToWorkflow && workflowtrackingstatustable.RecId == 0 && voucherErrorCount == 0)
+                {
+                    this.submitToWorkflow(ledgerJournalTable.JournalNum);
+                    generalJournalBatchStatusResponse.parmSubmitToWorkflowOutcome(true);  // Workflow status TRUE/FALSE
+                }
+
+                generalJournalBatchStatusResponse.parmHeaderLevelStatus(!JournalHeaderStatus);  // Header status
+                generalJournalBatchStatusResponse.ParmHeaderLevelError(headerError);  // Header validation error
+            }
+            catch
+            {
+                headerError = headerError + "@MET:ExceptionJournalError";
+                generalJournalBatchStatusResponse.ParmHeaderLevelError(headerError);
+                generalJournalBatchStatusResponse.parmHeaderLevelStatus(false);
+               
+                JournalHeaderStatus = 0;
+            }
+            
+            if(submitToWorkflow)
+            {
+                select firstonly RecId, TrackingStatus from workflowtrackingstatustable where
+                    workflowtrackingstatustable.ContextRecId == ledgerJournalTable.RecId;
+                if(workflowtrackingstatustable.RecId)
+                    workflowTrackingStatus = enum2Str(workflowtrackingstatustable.TrackingStatus);
+                else
+                    workflowTrackingStatus = "Workflow hasn't submitted";
+            }
+            else
+                workflowTrackingStatus = "Workflow hasn't submitted";
+
+            generalJournalBatchStatusResponse.parmWorkflowStatus(strFmt("@MET:StringPlaceHolder",workflowTrackingStatus));  // Workflow submission status
+            generalJournalBatchStatusResponse.ParmBatchJournalId(strFmt("@MET:StringPlaceHolder",ledgerJournalTable.JournalNum));
+        }
+        
+        jsonString = generalJournalBatchStatusResponse;
+
+        return jsonString;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>submitToWorkflow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Workflow submission
+    /// </summary>
+    /// <param name = "_journalId">JournalId</param>
+    public void submitToWorkflow(JournalId  _journalId)
+    {
+        LedgerJournalTable          ledgerJournalTable;
+        LedgerJournalName           ledgerJournalName;
+        WorkflowTable               workflowTable;
+
+        ledgerJournalTable      =   ledgerJournalTable::find(_journalId);
+        ledgerJournalName       =   LedgerJournalName::find(ledgerJournalTable.JournalName);
+
+        if(ledgerJournalName.WorkflowApproval)
+        {
+            try
+            {
+                select firstonly crosscompany TemplateName from workflowTable
+                    where workflowTable.SequenceNumber == ledgerJournalName.Configuration;
+
+                //If workflow is active then submit the workflow.
+                if (ledgerJournalTable.RecId)
+                {
+                    ttsbegin;
+                    //submitting to workflow
+                    Workflow::activateFromWorkflowSequenceNumber(workflowTable.SequenceNumber,
+                                                ledgerJournalTable.RecId,
+                                                "@MET:RPAWorkflowSubmission",
+                                                false,
+                                                curUserid());
+                    ttscommit;
+                }
+            }
+            
+            catch (Exception::CLRError)
+            {
+                System.Exception interopException = CLRInterop::getLastException();
+                error(strFmt("%1", interopException));
+            }
+            catch (Exception::Error)
+            {
+                error(strFmt("@MET:ExceptionError"));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCrossCompanyLedgerJournalTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get LedgerJournalTable
+    /// </summary>
+    /// <param name = "_ledgerJournalId">LedgerJournalId</param>
+    /// <param name = "_dataAreaId">Legal entity</param>
+    /// <returns></returns>
+    private LedgerJournalTable getCrossCompanyLedgerJournalTable(LedgerJournalId _ledgerJournalId, DataAreaId _dataAreaId)
+    {
+        LedgerJournalTable ledgerJournalTable;
+
+        select firstonly crosscompany  ledgerJournalTable
+            where ledgerJournalTable.journalNum == _ledgerJournalId && ledgerJournalTable.DataAreaId == _dataAreaId;
+
+        return ledgerJournalTable;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
