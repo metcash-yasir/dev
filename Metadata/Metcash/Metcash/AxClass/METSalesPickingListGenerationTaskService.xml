@@ -54,6 +54,7 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
     /// <param name = "_dataContract">The data contract</param>
     public void process(METSalesPickingListGenerationTaskContract _dataContract)
     {
+        boolean     pickListForOrderedQty = false;
         companyInfo  = CompanyInfo::find();
 
         this.initParms(_dataContract);
@@ -72,46 +73,46 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
             METSalesTable metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId);
 
             //Task 162245-CB123 - SalesOrderExtractScreenforCSD
-            if(this.isWaveRequired(salesTable, inventLocation))
+            if (this.isWaveRequired(salesTable, inventLocation))
             {
                 salesTable.createWaveFromSalesTable(inventLocation.METPickDirector, salesOrderCount);
             }
 
+            ///Stock will be reserved only if below condition satisfied, else either system should create picking list with Ordered qty or cancel the delivery reminder for line.
+            if (inventLocation.METWaveRequired == NoYes::Yes && inventLocation.METPickDirector == NoYes::No && inventLocation.METCSDWarehouse == NoYes::Yes)
+            {
+                pickListForOrderedQty = true;
+            }
+            else if (inventParameter.METSupplyFromTransfer == NoYes::No)
+            {
+                METStockReservation::construct(salesTable).process();
+            }
+
             //If the sales order is cross dock order or the sales order warehouse is a CSD warehouse then
             //Create transfer order for the unreserved quantity from supplying warehouse to sales order warehouse
-            if(metSalesTable.InternalCrossDockOrder || inventLocation.METCSDWarehouse)
+            if (metSalesTable.InternalCrossDockOrder || inventLocation.METCSDWarehouse)
             {
                 // If the supply from transfer option is enabled,
                 // 1. Do not attempt stock reservation on local warehouse.
                 // 2. create TO for the whole sales order quantity from NDC to CSD warehouse.
                 // else, Attempt reservation locally and then create transfer order for any remaining quantity. 
-                if(inventParameter.METSupplyFromTransfer)
-                {
-                    METCrossDockTransferOrderProcessor::construct().CreateTransferOrder(salesTable);
-                }
-                else
-                {
-                    METStockReservation::construct(salesTable).process();
-
-                    METCrossDockTransferOrderProcessor::construct().CreateTransferOrder(salesTable);
-                }
-            }
-            else
-            {
-                METStockReservation::construct(salesTable).process();
+                
+                METCrossDockTransferOrderProcessor::construct().CreateTransferOrder(salesTable);
             }
 
             //Task 152245-CB123-SalesOrderExtractScreenforCSD - start
             //CB238 - Corss dock - Do not post the picking list if the supply from transfer is enabled as no stock should be picked from local WH.
-            if ((inventLocation.METWaveRequired == NoYes::Yes && inventLocation.METPickDirector == NoYes::No
-                 && inventLocation.METCSDWarehouse == NoYes::Yes)
-                || (inventLocation.METCSDWarehouse == NoYes::No) && inventParameter.METSupplyFromTransfer == NoYes::No)
+            if (inventLocation.METCSDWarehouse == NoYes::No && inventParameter.METSupplyFromTransfer == NoYes::No)
             {
                 //Post picking list
-                this.postPickingList(salesTable);
+                this.postPickingList(salesTable, pickListForOrderedQty);
 
                 //Post intercompany picking list. Sourcing all lines from a single company
                 this.postIntercompanyPickingList();
+            }
+            else 
+            {
+                Info(strFmt("@MET:PickListNotGenerate", salesTable.SalesId));
             }
             //Task152245-CB123-SalesOrderExtractScreenforCSD -end
         }
@@ -170,7 +171,7 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
     /// Post picking list
     /// </summary>
     /// <param name = "_salesTable">SalesTable buffer.</param>
-    private void postPickingList(SalesTable _salesTable)
+    private void postPickingList(SalesTable _salesTable, boolean        _pickListOrderedQty = false)
     {
         boolean             isError;
         QueryRun            queryRun;
@@ -180,7 +181,7 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
         try
         {
             //NS-Created for CB274 - Intercompany Transfers.
-            queryRun = this.calcQuery(_salesTable);
+            queryRun = this.calcQuery(_salesTable, _pickListOrderedQty);
             //NE-Created for CB274 - Intercompany Transfers.
 
             if (processExtraction == true)
@@ -214,22 +215,31 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
                 // CB123 - SalesOrderExtractScreenforCSD -end
                 salesFormLetter.initLinesQuery();
 
-                SalesLine salesLineLoc;
 
-                while select forupdate salesParmLine
-                    where salesParmLine.ParmId == salesFormLetter.parmId()
+                if (_pickListOrderedQty == false)
                 {
-                    salesLineLoc = salesParmLine.salesLine();
+                    SalesLine salesLineLoc;
 
-                    if (salesLineLoc.metSalesLine().OrderExtractStatus == METOrderExtractStatus::Open ||
-                        salesLineLoc.metSalesLine().OrderExtractStatus == METOrderExtractStatus::ReadyForExtract)
+                    while select forupdate salesParmLine
+                        where salesParmLine.ParmId == salesFormLetter.parmId()
                     {
-                        salesParmLine.DeliverNow = salesLineLoc.reservedPhysicalInSalesUnit();
+                        salesLineLoc = salesParmLine.salesLine();
+
+                        if (salesLineLoc.metSalesLine().OrderExtractStatus == METOrderExtractStatus::Open ||
+                            salesLineLoc.metSalesLine().OrderExtractStatus == METOrderExtractStatus::ReadyForExtract)
+                        {
+                            salesParmLine.DeliverNow = salesLineLoc.reservedPhysicalInSalesUnit();
                         
-                        salesParmLine.setQty(DocumentStatus::PickingList, false);
-                        salesParmLine.update();
+                            salesParmLine.setQty(DocumentStatus::PickingList, false);
+                            salesParmLine.update();
+                        }
                     }
                 }
+                else
+                {
+                    Info(strfmt("@MET:SOPickListForOrderQty", _salesTable.SalesId));
+                }
+
                 salesFormLetter.run();
 
                 METOrderShipmentLoadCreation shipmentLoadCreation =
@@ -289,8 +299,9 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
     /// Create a Purchase order for the food item line.
     /// </summary>
     /// <param name = "_salesTable">Sales Id reference</param>
+    /// <param name = "_pickListOrderedQty">Set to yes if picking list to be generated by ordered qty</param>
     /// <returns>SysQueryRun</returns>
-    private SysQueryRun calcQuery(SalesTable _salesTable)
+    private SysQueryRun calcQuery(SalesTable _salesTable, boolean   _pickListOrderedQty)
     {
         const str               oscCode = 'G-Grocery';
         Query                   qry = new Query(QueryStr(SalesUpdate));
@@ -313,7 +324,7 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
             }
             else
             {
-                if (_salesTable.METAllowBackOrders == false && salesLine.reservedPhysicalInSalesUnit() == 0)
+                if (_salesTable.METAllowBackOrders == false && _pickListOrderedQty == false && salesLine.reservedPhysicalInSalesUnit() == 0)
                 {
                     SalesUpdateRemain::construct().updateDeliverRemainder(salesLine, 0, 0);
 
