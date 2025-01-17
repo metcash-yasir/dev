@@ -25,6 +25,7 @@ abstract class METTMSEngineTransferOrderProccess
 
     METTMSShipmentItemGroupTOHelper             TSIGHelper;
     METTMSEngineTransferOrderProccessLinesTmp   proccessLinesTmp;
+    WMSPickingRouteID pickingRouteId;
 
 }
 ]]></Declaration>
@@ -48,16 +49,23 @@ abstract class METTMSEngineTransferOrderProccess
         switch (_tmsEngineProcess)
         {
             //case (METTMSEngineTransferOrderProcess::Cancellation) :
-            //    if (_sourceRecord is InventTransferTable)
-            //    {
-            //        //process = new METTMSEngineSalesOrderProccess_Cancellation(_sourceRecord);
-            //    }
-            //    else
-            //    {
-            //        error = true;
-            //    }
-            //    break;
-
+            case (METTMSEngineTransferOrderProcess::Pickinglist):
+                if (_sourceRecord is InventTransferTable)
+                {
+                    process = new METTMSEngineTransferOrderProccess_Pickinglist(_sourceRecord, _postingIdentifier);
+                }
+                else if (_sourceRecord is WMSPickingRoute)
+                {
+                    WMSPickingRoute wmsTrans = _sourceRecord;
+                    
+                    InventTransferTable invTransfer = InventTransferTable::find(wmsTrans.TransRefId);
+                    process = new METTMSEngineTransferOrderProccess_Pickinglist(invTransfer, _postingIdentifier);
+                }
+                else
+                {
+                    error = true;
+                }
+                break;
             case (METTMSEngineTransferOrderProcess::Creation) :
                 if (_sourceRecord is InventTransferTable)
                 {
@@ -111,7 +119,7 @@ abstract class METTMSEngineTransferOrderProccess
         {
             tmsEngineTransferOrderProcess = _args.parmEnum();
             common = _args.record();
-            METTMSEngineTransferOrderProccess process = METTMSEngineTransferOrderProccess::construct(tmsEngineTransferOrderProcess, common);
+            METTMSEngineTransferOrderProccess process = METTMSEngineTransferOrderProccess::construct(tmsEngineTransferOrderProcess, common, _args.parm());
 
             process.run();
 
@@ -257,7 +265,7 @@ abstract class METTMSEngineTransferOrderProccess
             {
                 ttsbegin;
 
-                tmsShipmentOrderTable   = this.getTMSShipmentOrderTable(transferTable.TransferId);
+                tmsShipmentOrderTable   = this.getTMSShipmentOrderTable(transferTable.TransferId, pickingRouteId);
                 //Step 2: Check if the order is already on a shipment
                 if (!tmsShipmentOrderTable.RecId)
                 {
@@ -419,7 +427,7 @@ abstract class METTMSEngineTransferOrderProccess
     /// create tms shipment tables
     /// </summary>
     /// <param name = "_isCreateTMSShipment">boolean</param>
-    protected void createShipment(boolean     _isCreateTMSShipment = true)
+    protected void createShipment(boolean  _isCreateTMSShipment = true)
     {
         METTMSShipmentOrderTable    tmsShipmentOrderTable;
 
@@ -673,10 +681,11 @@ abstract class METTMSEngineTransferOrderProccess
     /// <param name = "_tmsShipmentOrderTable"><c>METTMSShipmentOrderTable</c> record</param>
     protected void setTMSShipmentOrderFields(METTMSShipmentOrderTable _tmsShipmentOrderTable)
     {
+        METInventTransferTableExt metTransTableExt = transferTable.metInventTransferTableExt();
         _tmsShipmentOrderTable.initValue();
         _tmsShipmentOrderTable.ShipmentId       = shipmentId;
         _tmsShipmentOrderTable.OrderNumber      = transferTable.TransferId;
-        _tmsShipmentOrderTable.IsCrossDockOrder = NoYes::No;
+        _tmsShipmentOrderTable.IsCrossDockOrder = metTransTableExt.TransferType == METCrossDockTransferType::CrossDock;
 
         METTMSEngineTransferOrderProccessLinesTmp  linesTmp;
         linesTmp.linkPhysicalTableInstance(proccessLinesTmp);
@@ -694,6 +703,7 @@ abstract class METTMSEngineTransferOrderProccess
         _tmsShipmentOrderTable.SSCC                         = '';
         _tmsShipmentOrderTable.XDockWMSUpdateReceived       = NoYes::No;
         _tmsShipmentOrderTable.VendorNumber                 = '';
+        _tmsShipmentOrderTable.PickListId = pickingRouteId;
     }
 
 ]]></Source>
@@ -727,24 +737,31 @@ abstract class METTMSEngineTransferOrderProccess
         METTMSShipmentOrderTable    tmsShipmentOrderTable;
         METTMSShipmentItemGroup     tmsShipmentItemGroup;
 
-        update_recordset tmsShipmentOrderTable
-            setting OrderWeight = tmsShipmentItemGroup.Weight,
-                    OrderVolume = tmsShipmentItemGroup.Cube
-            join sum(Weight), sum(Cube) from tmsShipmentItemGroup
-                where tmsShipmentOrderTable.ShipmentId == shipmentId
+        // was an issue with update_recordset when TSIG for TOT and CSE
+        while select tmsShipmentOrderTable
+               where tmsShipmentOrderTable.ShipmentId == shipmentId
                     && tmsShipmentOrderTable.OrderNumber == transferTable.TransferId
-                    && tmsShipmentItemGroup.TMSShipmentOrderIdentifier == tmsShipmentOrderTable.TMSShipmentOrderIdentifier
+        {
+            tmsShipmentOrderTable.selectForUpdate(true);
+
+            select sum(Weight), sum(Cube) from tmsShipmentItemGroup
+                where tmsShipmentItemGroup.TMSShipmentOrderIdentifier == tmsShipmentOrderTable.TMSShipmentOrderIdentifier
                     && (tmsShipmentItemGroup.QuantityUOM == METConstants::unitCSE
                     || tmsShipmentItemGroup.QuantityUOM like METConstants::KegQtyUOM
                     || tmsShipmentItemGroup.QuantityUOM == METConstants::unitTOT);
 
-        update_recordset tmsShipmentOrderTable
-            setting PalletTotalFootprint = tmsShipmentItemGroup.Quantity
-            join sum(Quantity) from tmsShipmentItemGroup
-                where tmsShipmentOrderTable.ShipmentId == shipmentId
-                    && tmsShipmentOrderTable.OrderNumber == transferTable.TransferId
-                    && tmsShipmentItemGroup.TMSShipmentOrderIdentifier == tmsShipmentOrderTable.TMSShipmentOrderIdentifier
+            tmsShipmentOrderTable.OrderWeight = tmsShipmentItemGroup.Weight;
+            tmsShipmentOrderTable.OrderVolume = tmsShipmentItemGroup.Cube;
+
+            //TSIG PAL record per TSO
+            select sum(Quantity) from tmsShipmentItemGroup
+                where tmsShipmentItemGroup.TMSShipmentOrderIdentifier == tmsShipmentOrderTable.TMSShipmentOrderIdentifier
                     && tmsShipmentItemGroup.QuantityUOM == METConstants::unitPal;
+
+            tmsShipmentOrderTable.PalletTotalFootprint = tmsShipmentItemGroup.Quantity;
+
+            tmsShipmentOrderTable.update();
+        }
     }
 
 ]]></Source>
