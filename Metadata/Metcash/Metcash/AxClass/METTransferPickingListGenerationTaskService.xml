@@ -24,16 +24,16 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
     /// <returns>Yes if the order should be auto received, otherwise false</returns>
     private NoYes shouldAutoReceive(InventTransferId _transferId)
     {
-        METInventTransferTableExt transExt;
-        InventTransferTable trans;
+        METInventTransferTableExt   metInventTransferTableExt;
+        InventTransferTable         inventTransferTable;
         NoYes ret = NoYes::No;
 
-        select TransferType from transExt
-            exists join trans
-            where trans.RecId == transExt.InventTransferTable
-            && trans.TransferId == _transferId;
+        select TransferType from metInventTransferTableExt
+            exists join inventTransferTable
+            where inventTransferTable.RecId == metInventTransferTableExt.InventTransferTable
+            && inventTransferTable.TransferId == _transferId;
         
-        if(transExt.TransferType == METCrossDockTransferType::CrossDock || transExt.TransferType == METCrossDockTransferType::CSD)
+        if (metInventTransferTableExt.TransferType == METCrossDockTransferType::CrossDock || metInventTransferTableExt.TransferType == METCrossDockTransferType::CSD)
         {
             ret = NoYes::Yes;
         }
@@ -51,10 +51,31 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
         InventTransferParmTable         inventTransferParmTable;
         InventTransferParmLine          inventTransferParmLine;
         InventTransferUpd               inventTransferUpd;
+        InventTransferLine              inventTransferLineCancel;
+        METInventTransferLine           metInventTransferLineCancel;              
         
         //CB238 - xDock
         InventTransferTable inventTransferTable = InventTransferTable::find(_dataContract.parmTransferId());
 
+        if (inventTransferTable.metInventTransferTableExt().AllowBackorder == false)
+        {
+            while select forupdate metInventTransferLineCancel
+                join inventTransferLineCancel
+                    where inventTransferLineCancel.RecId == metInventTransferLineCancel.InventTransferLine  &&
+                        inventTransferLineCancel.TransferId == inventTransferTable.TransferId
+            {
+                if (inventTransferLineCancel.displayQtyReservedPhysical() == 0)
+                {
+                    inventTransferLineCancel.selectForUpdate(true);
+                    inventTransferLineCancel.QtyRemainShip = inventTransferLineCancel.QtyTransfer;
+                    inventTransferLineCancel.updateDeliverRemainder(); //std code contains ttsbegin and ttscommit
+
+                    info(strFmt("@MET:NoStockTO", inventTransferLineCancel.TransferId, inventTransferLineCancel.ItemId));
+                    metInventTransferLineCancel.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                    metInventTransferLineCancel.update();
+                }
+            }
+        }
         inventTransferParmTable.TransferId          = _dataContract.parmTransferId();
         inventTransferParmTable.UpdateType          = InventTransferUpdateType::PickingList;
         // CB715_TransferOrderExtract
@@ -72,7 +93,9 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
         // This will populate inventTransferParmLine with only TO lines where extraction status=”Ready for extract” only.
         //inventTransferUpd = InventTransferUpdPick::NewParmBuffer(inventTransferParmTable);
         inventTransferUpd = InventTransferUpdPick::METNewParmBuffer(inventTransferParmTable);
+        
         int linesCount = 0;
+        
         while select forupdate inventTransferParmLine
             where inventTransferParmLine.ParmId     == inventTransferParmTable.ParmId
                 && inventTransferParmLine.TransferId == inventTransferParmTable.TransferId
@@ -86,6 +109,7 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
                 linesCount++;
             }
         }
+
         if(linesCount > 0)
         {
             inventTransferUpd.run();
@@ -159,13 +183,15 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
 
             select firstonly wmsPickingRoute
                 where wmsPickingRoute.parmid == inventTransferParmTable.ParmId;
+            WMSPickingRouteID pickRouteId;
 
             if (wmsPickingRoute)
             {
                 METOrderShipmentLoadCreation metOrderShipmentloadCreation = METOrderShipmentLoadCreation::construct(METOrderTransactionType::TransferOrder,
                                                                                                                             _dataContract.parmTransferId());
                 metOrderShipmentloadCreation.createShippmentLoad(true, false);
-
+                pickRouteId = wmsPickingRoute.pickingRouteID;
+                
                 //CB238 - xDock perform sales reservation once the transfer order picking list is created. 
                 //this.postSalesOrder(_dataContract.parmTransferId());
 
@@ -180,7 +206,8 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
             }
 
             ttscommit;
-
+            //CB628 - Send order to TMS after the pick list is posted.
+            this.createTMSEngineProcess(METTMSEngineTransferOrderProcess::Pickinglist, _dataContract.parmTransferId(), pickRouteId);
         }
         catch
         {
@@ -193,6 +220,35 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
             METInventTransferTableExt::UpdateExtractionStatus(_dataContract.parmTransferId());
         }
 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTMSEngineProcess</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// CB628_TMSEngineProcessingTOCreation
+    /// starts the TMS engine process
+    /// </summary>
+    /// <param name = "_transferTable">InventTransferTable</param>
+    protected void createTMSEngineProcess(METTMSEngineTransferOrderProcess _stage, InventTransferId _transferId, WMSPickingRouteID _pickRouteId)//(InventTransferTable _transferTable)
+    {
+        InventTransferTable transferTable = InventTransferTable::find(_transferId);
+        METInventTransferTableExt       metTransferTable = transferTable.metInventTransferTableExt();
+
+        if(metTransferTable.TransferType != METCrossDockTransferType::None)
+        {
+            Args                                    args = new Args();
+            METTMSEngineTransferOrderProcess        transferOrderProcess;
+
+            args.parmEnumeration(transferOrderProcess);
+            args.parmEnum(_stage);
+            args.record(transferTable);
+            args.parm(_pickRouteId);
+
+            METTMSEngineTransferOrderProccess::main(args);
+        }
     }
 
 ]]></Source>
