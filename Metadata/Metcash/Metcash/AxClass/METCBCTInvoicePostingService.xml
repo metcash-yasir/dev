@@ -232,10 +232,10 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
         SalesTable                  salesTable;
         VendInvoiceInfoTable        vendInvoiceInfoTable;
         boolean                     ret = true;
-
+ 
         int fromInfologLine = infologLine();
         fromInfologLine = fromInfologLine == 0 ? fromInfologLine : fromInfologLine + 1;
-
+ 
         // reset error before new processing
         ttsbegin;
         _cbCTInvoiceHeaderTable.selectForUpdate(true);
@@ -243,39 +243,40 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
         _cbCTInvoiceHeaderTable.Error = NoYes::No;
         _cbCTInvoiceHeaderTable.update();
         ttscommit;
-
+ 
         // Validate
         if (this.validate(_cbCTInvoiceHeaderTable))
         {
             try
             {
-                ttsbegin;                
+                ttsbegin;
                 // Create pending vendor invoice
                 vendInvoiceInfoTable = this.createPendingVendorInvoice(_cbCTInvoiceHeaderTable);
-
+ 
                 // Create sales order
                 salesTable = this.createSalesOrder(_cbCTInvoiceHeaderTable, vendInvoiceInfoTable);
-
+ 
                 // update ref here so we can identify SO created from CT
                 _cbCTInvoiceHeaderTable.selectForUpdate(true);
                 _cbCTInvoiceHeaderTable.RefSalesId = salesTable.SalesId;
                 _cbCTInvoiceHeaderTable.Status = METCBCTInvoiceStatus::Processed;
                 _cbCTInvoiceHeaderTable.update();
-
+ 
                 // post SO
                 this.postSalesOrderInvoice(salesTable);
-
+ 
                 // auto submit pending vendor invoice to workflow
                 this.submitVendorInvoiceWorkflow(vendInvoiceInfoTable);
-        
+
                 ttscommit;
+
                 info(strFmt("@MET:ChargethroughInvoicePosted",cbCTInvoiceHeaderTable.Number));
             }
             catch (Exception::Error)
             {
                 // Save infolog error in the error description field
                 ttsbegin;
-                _cbCTInvoiceHeaderTable.selectForUpdate(true);
+                _cbCTInvoiceHeaderTable = METCBCTInvoiceHeaderTable::find(cbCTInvoiceHeaderTable.Number, true);
                 _cbCTInvoiceHeaderTable.captureFromInfolog(fromInfologLine);
                 ttscommit;
                 ret = false;
@@ -285,7 +286,7 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
         {
             // Save infolog error in the error description field
             ttsbegin;
-            _cbCTInvoiceHeaderTable.selectForUpdate(true);
+            _cbCTInvoiceHeaderTable = METCBCTInvoiceHeaderTable::find(cbCTInvoiceHeaderTable.Number, true);
             _cbCTInvoiceHeaderTable.captureFromInfolog(fromInfologLine);
             ttscommit;
         }
@@ -311,8 +312,9 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
 
         salesTable = this.findOrCreateSalesOrderHeader(_cbCTInvoiceHeaderTable);
 
-        SalesLine   salesLine;
-        METCBCTInvoiceLine      cbCTInvoiceLine;
+        SalesLine           salesLine;
+        METSalesLine        metSalesLine;
+        METCBCTInvoiceLine  cbCTInvoiceLine;
 
         while select cbCTInvoiceLine
             where cbCTInvoiceLine.HeaderNumber == _cbCTInvoiceHeaderTable.Number
@@ -361,6 +363,22 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
 
             salesLine.update();
 
+            //Bug 188467: CB411 - Chargeback / Chargethrough - Code added to exclude charge through order lines
+            metSalesLine = METSalesLine::find(salesLine.RecId);
+
+            if (metSalesLine)
+            {
+                metSalesLine.selectForUpdate(true);
+                metSalesLine.ExcludeFromDualWrite = NoYes::Yes;
+                metSalesLine.update();
+            }
+            else
+            {
+                metSalesLine.salesLine = salesLine.RecId;
+                metSalesLine.ExcludeFromDualWrite = NoYes::Yes;
+                metSalesLine.insert();
+            }
+
             // CB411_412_ChargeThrough customer off remittance
             if (!searchMarkup)
             {
@@ -384,6 +402,7 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
     private SalesTable findOrCreateSalesOrderHeader(METCBCTInvoiceHeaderTable _cbCTInvoiceHeaderTable)
     {
         SalesTable  salesTable;
+        METSalesTable metSalesTable;
         METVendParameters metVendParameters = METVendParameters::find();
         
         // if summary SO invoice posting
@@ -427,6 +446,22 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
             salesTable.ReturnReasonCodeId = _cbCTInvoiceHeaderTable.ClaimReasonCodeId;
         }
         salesTable.insert();
+
+        //Bug 188467: CB411 - Chargeback / Chargethrough - Code added to exclude charge through orders.
+        metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId);
+
+        if (metSalesTable)
+        {
+            metSalesTable.selectForUpdate(true);
+            metSalesTable.ExcludeFromDualWrite = NoYes::Yes;
+            metSalesTable.update();
+        }
+        else
+        {
+            metSalesTable.SalesTable = salesTable.RecId;
+            metSalesTable.ExcludeFromDualWrite = NoYes::Yes;
+            metSalesTable.insert();
+        }
 
         return SalesTable;
     }
@@ -558,7 +593,7 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
 
         // vendor invoice validation
         // Invoice date
-        if (_cbCTInvoiceHeaderTable.DocumentDate > DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()) + metVendParameters.MaxInvoiceDays)
+        if (_cbCTInvoiceHeaderTable.DocumentDate < (DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()) - metVendParameters.MaxInvoiceDays))
         {
             ret = checkFailed("@MET:CBCTInvoiceDateValidation");
         }
@@ -567,9 +602,9 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
         { 
             // Allow CT or cross dock
             METVendTable metVendTable = METVendTable::find(_cbCTInvoiceHeaderTable.VendorAccount);
-
-            if (!metVendTable.AllowChargeThrough && !metVendTable.AllowCrossDock)
-            {
+            if ((_cbCTInvoiceHeaderTable.InvoiceType == METInvoiceType::ChargeThrough && !metVendTable.AllowChargeThrough)
+                    || (_cbCTInvoiceHeaderTable.InvoiceType == METInvoiceType::CrossDock && !metVendTable.AllowCrossDock))
+             {
                 ret = checkFailed("@MET:CBCTVendorAllowedValidation");
             }
         }

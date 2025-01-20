@@ -32,7 +32,7 @@ class MetVendorReturnInvoiceCreationService
             if (purchTable.PurchStatus == PurchStatus::Received)
             {
                 VendPackingSlipJour     vendPackingSlipJour;
-                VendInvoiceInfoTable    vendInvoiceInfoTableLoc;
+                VendInvoiceInfoTable    vendInvoiceInfoTableLoc, vendInvoiceInfoTableExist;
                 VendInvoiceInfoLine     vendInvoiceInfoLine;
                 VendPackingSlipTrans    vendPackingSlipTrans;
                 VendInvoiceInfoSubLine  vendInvoiceInfoSubLine;
@@ -42,6 +42,11 @@ class MetVendorReturnInvoiceCreationService
                     where vendPackingSlipJour.PurchId == purchTable.PurchId
                 {
                     VendInvoicePackingSlipQuantityMatch vendInvoicePkSlipQtyMatch;
+
+                    //Check If Return Invoice already created
+                    select firstonly RecId from vendInvoiceInfoTableExist
+                        where vendInvoiceInfoTableExist.PurchId == vendPackingSlipJour.PurchId
+                        && vendInvoiceInfoTableExist.METReturnInvoice == NoYes::Yes;
 
                     //Validate if a pending vendor invoice jour exists for the PO or one of the product receipt in case of multiple records.
                     select firstonly RecId from vendInvoiceInfoTableLoc where vendInvoiceInfoTableLoc.PurchId == purchTable.PurchId
@@ -58,19 +63,20 @@ class MetVendorReturnInvoiceCreationService
                         where vendPackingSlipTrans.VendPackingSlipJour == vendPackingSlipJour.RecId
                         && vendInvoicePkSlipQtyMatch.PackingSlipSourceDocumentLine == vendPackingSlipTrans.SourceDocumentLine;
 
-                    if (!vendInvoiceInfoTableLoc.RecId && !vendInvoicePkSlipQtyMatch.RecId)
+                    if (!vendInvoiceInfoTableLoc.RecId && !vendInvoicePkSlipQtyMatch.RecId && !vendInvoiceInfoTableExist.RecId)
                     {
                         createInvoice = true;
 
-                        VendInvoiceInfoTable vendInvoiceInfoTable = this.createPendingVendorInvoice(purchTable, vendPackingSlipTrans);
+                        VendInvoiceInfoTable vendInvoiceInfoTable = this.createPendingVendorInvoice(purchTable);
+
+                        if (vendInvoiceInfoTable.RecId)
+                        {
+                            this.createPendingVendorInvoiceLines(purchTable, vendInvoiceInfoTable);
+                        }
             
                         this.submitClaimInvoiceToWorkflow(vendInvoiceInfoTable);
                         this.executePOCPNReport(vendPackingSlipTrans);
                     }
-                }
-                if (!createInvoice)
-                {
-                    checkFailed(strFmt("@MET:PendintInvoiceExistsError", vendInvoiceInfoTableLoc.Num, purchTable.PurchId));
                 }
             }
         }
@@ -88,7 +94,7 @@ class MetVendorReturnInvoiceCreationService
     /// <param name = "_purchTable">PurchTable</param>
     /// <param name = "_invoiceQty">VendPackingSlipTrans</param>
     /// <returns></returns>
-    public VendInvoiceInfoTable createPendingVendorInvoice(PurchTable _purchTable, VendPackingSlipTrans _vendPackingSlipTrans)
+    public VendInvoiceInfoTable createPendingVendorInvoice(PurchTable _purchTable)
     {
         MetImportGST            importGST;
         MetImportAmount         importAmount;
@@ -132,28 +138,8 @@ class MetVendorReturnInvoiceCreationService
 
         if(vendInvoiceInfoTable.validateWrite())
         {
+            VendInvoiceInfoSubTable::createFromVendInvoiceInfoTable(vendInvoiceInfoTable, true);
             vendInvoiceInfoTable.insert();
-
-            VendInvoiceInfoSubTable vendInvoiceInfoSubTable;
-
-            vendInvoiceInfoSubTable.clear();
-            vendInvoiceInfoSubTable.initValue();
-            vendInvoiceInfoSubTable.defaultRow();
- 
-            vendInvoiceInfoSubTable.ParmId              = vendInvoiceInfoTable.ParmId;
-            vendInvoiceInfoSubTable.OrigPurchId         = vendInvoiceInfoTable.PurchId;
-            vendInvoiceInfoSubTable.PurchName           = vendInvoiceInfoTable.PurchName;
-            vendInvoiceInfoSubTable.TableRefId          = vendInvoiceInfoTable.TableRefId;
- 
-            vendInvoiceInfoSubTable.insert();
-        }
-
-        PurchLine purchLine;
-
-        while select purchLine
-            where purchLine.PurchId == _purchTable.PurchId
-        {
-            this.createPendingVendorInvoiceLines(vendInvoiceInfoTable, purchLine, _vendPackingSlipTrans);
         }
 
         return vendInvoiceInfoTable;
@@ -170,47 +156,85 @@ class MetVendorReturnInvoiceCreationService
     /// <param name = "_vendInvoiceInfoTable">VendInvoiceInfoTable</param>
     /// <param name = "_purchLine">PurchLine</param>
     /// <param name = "_invoiceQty">VendPackingSlipTrans</param>
-    public void createPendingVendorInvoiceLines(VendInvoiceInfoTable _vendInvoiceInfoTable, PurchLine _purchLine, VendPackingSlipTrans _vendPackingSlipTrans)
+    public void createPendingVendorInvoiceLines(PurchTable _purchTable, 
+        VendInvoiceInfoTable _vendInvoiceInfoTable)
     {
+        PurchLine               purchLine;
         VendInvoiceInfoLine     vendInvoiceInfoLine;
+
+        while select purchLine
+            where purchLine.PurchId == _purchTable.PurchId
+        {
+            vendInvoiceInfoLine.clear();
+
+            vendInvoiceInfoLine.initValue();
+            vendInvoiceInfoLine.defaultRow(purchLine);
+            vendInvoiceInfoLine.initFromPurchLine(purchLine);
+
+            vendInvoiceInfoLine.ParmId              = _vendInvoiceInfoTable.ParmId;
+            vendInvoiceInfoLine.LineNum             = any2int(purchLine.LineNumber);
+            vendInvoiceInfoLine.OrigPurchId         = purchLine.PurchId;
+            vendInvoiceInfoLine.DeliveryName        = _vendInvoiceInfoTable.DeliveryName;
+            vendInvoiceInfoLine.TableRefId          = _vendInvoiceInfoTable.TableRefId;
+            vendInvoiceInfoLine.currencyCode        = _vendInvoiceInfoTable.CurrencyCode;
+
+            vendInvoiceInfoLine.InvoiceAccount      = _vendInvoiceInfoTable.InvoiceAccount;
+            vendInvoiceInfoLine.InventDimId         = purchLine.InventDimId;
+            vendInvoiceInfoLine.OrderAccount        = _vendInvoiceInfoTable.OrderAccount;
+            vendInvoiceInfoLine.ItemId              = purchLine.ItemId;
+            vendInvoiceInfoLine.InventTransId       = purchLine.InventTransId;
+
+            vendInvoiceInfoLine.DocumentOrigin      = DocumentOrigin::Manual;
+            vendInvoiceInfoLine.ReceiveNow          = purchLine.PurchQty;
+ 
+            vendInvoiceInfoLine.PurchUnit           = purchLine.PurchUnit;
+            vendInvoiceInfoLine.PurchPrice          = purchLine.PurchPrice;
+            vendInvoiceInfoLine.InventNow           = purchLine.PurchQty;
+            vendInvoiceInfoLine.LineAmount          = purchLine.LineAmount;
+            vendInvoiceInfoLine.DefaultDimension    = purchLine.DefaultDimension;
+            vendInvoiceInfoLine.ProcurementCategory = EcoResProductCategory::findByItemIdCategoryHierarchyRole(purchLine.ItemId, EcoResCategoryNamedHierarchyRole::Procurement).Category;
+            
+            //Insert pending invoice lines.
+            vendInvoiceInfoLine.insert();
+            
+            //Insert pending invoice sub-lines.
+            this.createPendingVendorInvoiceInfoSubLines(purchLine.InventTransId, vendInvoiceInfoLine);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPendingVendorInvoiceInfoSubLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create the pending vendor invoice lines of the PO.
+    /// </summary>
+    /// <param name = "_vendInvoiceInfoTable">VendInvoiceInfoTable</param>
+    /// <param name = "_purchLine">PurchLine</param>
+    /// <param name = "_invoiceQty">VendPackingSlipTrans</param>
+    public void createPendingVendorInvoiceInfoSubLines(InventTransId _inventTransId, VendInvoiceInfoLine _vendInvoiceInfoLine)
+    {
+        VendPackingSlipTrans    vendPackingSlipTrans;
         VendInvoiceInfoSubLine  vendInvoiceInfoSubLine;
 
-        vendInvoiceInfoLine.clear();
-        vendInvoiceInfoLine.initValue();
-        vendInvoiceInfoLine.initFromPurchLine(_purchLine);
+        vendInvoiceInfoSubLine.clear();
 
-        vendInvoiceInfoLine.OrigPurchId         = _purchLine.PurchId;
-        vendInvoiceInfoLine.DeliveryName        = _vendInvoiceInfoTable.DeliveryName;
-        vendInvoiceInfoLine.ParmId              = _vendInvoiceInfoTable.ParmId;
-        vendInvoiceInfoLine.TableRefId          = _vendInvoiceInfoTable.TableRefId;
-        vendInvoiceInfoLine.currencyCode        = _vendInvoiceInfoTable.CurrencyCode;
-        vendInvoiceInfoLine.OrderAccount        = _vendInvoiceInfoTable.OrderAccount;
-        vendInvoiceInfoLine.InvoiceAccount      = _vendInvoiceInfoTable.InvoiceAccount;
-        vendInvoiceInfoLine.DocumentOrigin      = DocumentOrigin::Manual;
-        vendInvoiceInfoLine.ReceiveNow          = _vendPackingSlipTrans.Qty;
-        vendInvoiceInfoLine.ItemId              = _purchLine.ItemId;
-        vendInvoiceInfoLine.PurchPrice          = _purchLine.PurchPrice;
-        vendInvoiceInfoLine.PurchUnit           = _purchLine.PurchUnit;
-        vendInvoiceInfoLine.InventNow           = _purchLine.PurchQty;
-        vendInvoiceInfoLine.LineAmount          = _purchLine.LineAmount;
-        vendInvoiceInfoLine.ProcurementCategory = EcoResProductCategory::findByItemIdCategoryHierarchyRole(_purchLine.ItemId, EcoResCategoryNamedHierarchyRole::Procurement).Category;
-        
-        vendInvoiceInfoLine.insert();
-
-        if (vendInvoiceInfoLine.RecId)
+        //Insert the sub line details from the table <c>VendPackingSlipTrans</c>
+        while select InventTransId, PackingSlipId, Qty, RecId, TableId from vendPackingSlipTrans
+            where vendPackingSlipTrans.InventTransId ==_inventTransId
         {
-            vendInvoiceInfoSubLine.clear();
             vendInvoiceInfoSubLine.initValue();
             vendInvoiceInfoSubLine.defaultRow();
 
-            vendInvoiceInfoSubLine.ParmId               = _vendInvoiceInfoTable.ParmId;
-            vendInvoiceInfoSubLine.InventNow            = _vendPackingSlipTrans.Qty;
-            vendInvoiceInfoSubLine.ReceiveNow           = _vendPackingSlipTrans.Qty;
-            vendInvoiceInfoSubLine.DocumentId           = _vendPackingSlipTrans.PackingSlipId;
-            vendInvoiceInfoSubLine.LineRefRecId         = vendInvoiceInfoLine.RecId;
-            vendInvoiceInfoSubLine.JournalRefRecId      = _vendPackingSlipTrans.RecId;
-            vendInvoiceInfoSubLine.JournalRefTableId    = _vendPackingSlipTrans.TableId;
-            
+            vendInvoiceInfoSubLine.ParmId               = _vendInvoiceInfoLine.ParmId;
+            vendInvoiceInfoSubLine.InventNow            = vendPackingSlipTrans.Qty;
+            vendInvoiceInfoSubLine.ReceiveNow           = vendPackingSlipTrans.Qty;
+            vendInvoiceInfoSubLine.DocumentId           = vendPackingSlipTrans.PackingSlipId;
+            vendInvoiceInfoSubLine.LineRefRecId         = _vendInvoiceInfoLine.RecId;
+            vendInvoiceInfoSubLine.JournalRefRecId      = vendPackingSlipTrans.RecId;
+            vendInvoiceInfoSubLine.JournalRefTableId    = vendPackingSlipTrans.TableId;
+
             vendInvoiceInfoSubLine.insert();
         }
     }
