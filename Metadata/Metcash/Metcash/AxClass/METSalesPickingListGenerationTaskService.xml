@@ -13,6 +13,8 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
     SalesTable                                      salesTable, csdSalesTable;
     WMSPickingRoute                                 wmsPickingRoute;
     CompanyInfo                                     companyInfo;
+    InventParameters                                inventParameter;
+    InventLocation                                  inventLocation;
 	//CB123_SalesOrderExtractScreenforCSD -start
     RefRecId                                        salesOrderCount;
 }
@@ -22,7 +24,6 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
 				<Name>isWaveRequired</Name>
 				<Source><![CDATA[
 	//CB123_SalesOrderExtractScreenforCSD -end
-
 	
     /// <summary>
     /// Check if wave details need to be created in the system for the sales order
@@ -54,6 +55,7 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
     /// <param name = "_dataContract">The data contract</param>
     public void process(METSalesPickingListGenerationTaskContract _dataContract)
     {
+        str         actionToPerform;
         boolean     pickListForOrderedQty = false;
         companyInfo  = CompanyInfo::find();
 
@@ -62,15 +64,12 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
         if (salesTable)
         {
 		    //Task 162245-CB123 - SalesOrderExtractScreenforCSD- start
-            InventLocation inventLocation;
-            InventParameters inventParameter = InventParameters::find();
+            
+            inventParameter = InventParameters::find();
 
             select firstonly METWaveRequired, METPickDirector, METCSDWarehouse 
                 from inventLocation
                 where inventLocation.InventLocationId == salesTable.InventLocationId;
-
-            //Task 162245-CB123 - SalesOrderExtractScreenforCSD -end
-            METSalesTable metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId);
 
             //Task 162245-CB123 - SalesOrderExtractScreenforCSD
             if (this.isWaveRequired(salesTable, inventLocation))
@@ -78,6 +77,42 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
                 salesTable.createWaveFromSalesTable(inventLocation.METPickDirector, salesOrderCount);
             }
 
+            actionToPerform = this.getActionToPerform(salesTable);
+
+            if (actionToPerform == METConstants::SOExtractCreateOnlyTO)
+            {
+                // If the supply from transfer option is enabled,
+                // 1. Do not attempt stock reservation on local warehouse.
+                // 2. create TO for the whole sales order quantity from NDC to CSD warehouse.
+                // else, Attempt reservation locally and then create transfer order for any remaining quantity.
+                
+                METCrossDockTransferOrderProcessor::construct().CreateTransferOrder(salesTable);
+            }
+            else if (actionToPerform == METConstants::SOExtractOrderedSOPickOnly)
+            {
+                //Post picking list
+                this.postPickingList(salesTable, true);
+
+                //Post intercompany picking list. Sourcing all lines from a single company
+                this.postIntercompanyPickingList();
+            }
+            else if (actionToPerform == METConstants::SOExtractReservedSOPickOnly)
+            {
+                METStockReservation::construct(salesTable).process();
+                //Post picking list
+                this.postPickingList(salesTable);
+
+                //Post intercompany picking list. Sourcing all lines from a single company
+                this.postIntercompanyPickingList();
+            }
+            else if (actionToPerform == METConstants::SOExtractNoResultSkip)
+            {
+                error(strFmt("@MET:PickListNotGenerate", salesTable.SalesId));
+            }
+
+            /*
+            //Task 162245-CB123 - SalesOrderExtractScreenforCSD -end
+            METSalesTable metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId);
             ///Stock will be reserved only if below condition satisfied, else either system should create picking list with Ordered qty or cancel the delivery reminder for line.
             if (inventLocation.METWaveRequired == NoYes::Yes && inventLocation.METPickDirector == NoYes::No && inventLocation.METCSDWarehouse == NoYes::Yes)
             {
@@ -115,6 +150,7 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
                 Info(strFmt("@MET:PickListNotGenerate", salesTable.SalesId));
             }
             //Task152245-CB123-SalesOrderExtractScreenforCSD -end
+            */
         }
 
     }
@@ -351,6 +387,84 @@ class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
             }
         }
         return new sysQueryRun(qry);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getActionToPerform</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the appropriate action to perform based on the configuration criteria
+    /// Below matrix is attached in BUG - 201881 for reference
+    /// </summary>
+    /// <param name = "_salesTable">SalesTable reference</param>
+    /// <returns>String value</returns>
+    public str getActionToPerform(SalesTable   _salesTable)
+    {
+        str actionToPerfrom;
+        METSalesTable   metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId);
+
+        if (inventParameter.METSupplyFromTransfer == NoYes::Yes) //Food entity
+        {
+            if (metSalesTable.InternalCrossDockOrder == NoYes::Yes  &&
+                inventLocation.METCSDWarehouse == NoYes::No         &&
+                inventLocation.METPickDirector == NoYes::No         &&
+                inventLocation.METWaveRequired == NoYes::No)
+            {
+                actionToPerfrom = METConstants::SOExtractCreateOnlyTO;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                    inventLocation.METPickDirector == NoYes::No         &&
+                    inventLocation.METWaveRequired == NoYes::Yes)
+            {
+                actionToPerfrom = METConstants::SOExtractOrderedSOPickOnly;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                    inventLocation.METPickDirector == NoYes::Yes        &&
+                    inventLocation.METWaveRequired == NoYes::Yes)
+            {
+                actionToPerfrom = METConstants::SOExtractNoResultSkip;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                    inventLocation.METPickDirector == NoYes::No         &&
+                    inventLocation.METWaveRequired == NoYes::No)
+            {
+                actionToPerfrom = METConstants::SOExtractNoResultSkip;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    inventLocation.METCSDWarehouse == NoYes::No         &&
+                    inventLocation.METPickDirector == NoYes::No         &&
+                    inventLocation.METWaveRequired == NoYes::No)
+            {
+                actionToPerfrom = METConstants::SOExtractReservedSOPickOnly;
+            }
+            else
+            {
+                actionToPerfrom = METConstants::SOExtractNoResultSkip;
+            }
+        }
+        else // Liquor entity
+        {
+            if (metSalesTable.InternalCrossDockOrder == NoYes::Yes  &&
+                inventLocation.METCSDWarehouse == NoYes::No         &&
+                inventLocation.METPickDirector == NoYes::No         &&
+                inventLocation.METWaveRequired == NoYes::No)
+            {
+                //TODO - Need to check the scenario
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    inventLocation.METCSDWarehouse == NoYes::No         &&
+                    inventLocation.METPickDirector == NoYes::No         &&
+                    inventLocation.METWaveRequired == NoYes::No)
+            {
+                actionToPerfrom = METConstants::SOExtractReservedSOPickOnly;
+            }
+        }
+        return actionToPerfrom;
     }
 
 ]]></Source>
