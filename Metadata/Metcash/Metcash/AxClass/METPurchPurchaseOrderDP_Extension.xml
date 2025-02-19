@@ -64,11 +64,12 @@ final class METPurchPurchaseOrderDP_Extension
         _purchaseOrderHeader.CompanyLogo            = SysDocuBrandImages::getImage(docuBrandDetails.Image1Name);
         _purchaseOrderHeader.CompanyName            = industryKey.CompanyName;
         PurchaseOrderId docNum                      = _purchaseOrderHeader.PurchOrderDocNum;
-                
+        _purchaseOrderHeader.CompanyCoRegNum        = docuBrandDetails.METTaxRegNumber;
+
         //Import PO report 
         if (VendTable.VendGroup == METConstants::ImportPOVendorGroup && purchTable.PurchPoolId == METConstants::ImportPOPoolId)
         {
-            _purchaseOrderHeader.CompanyCoRegNum            = docuBrandDetails.METTaxRegNumber;
+            
             _purchaseOrderHeader.FormLetterRemarksTxt       = docuBrandDetails.METReportNotes + METConstants::NextLine + docuBrandDetails.NotesLine1 + METConstants::NextLine + docuBrandDetails.NotesLine2;
             LogisticsLocationRoleRecId roleHeadCompanyRecId = LogisticsLocationRole::findByName(METConstants::HeadCompanyRole).RecId;
            
@@ -104,11 +105,12 @@ final class METPurchPurchaseOrderDP_Extension
 
                 smmContactPersonV2Entity contactPersonV2Entity;
 
-                select firstonly PrimaryPhoneNumber, PrimaryPhoneNumberDescription, PrimaryEmailAddress from contactPersonV2Entity
+                select firstonly PrimaryPhoneNumber, ContactPersonName, PrimaryEmailAddress from contactPersonV2Entity
                     order by RecId desc
-                    where contactPersonV2Entity.ContactForParty == vendTable.party;
+                    where contactPersonV2Entity.ContactForParty == freightVendor.party
+                    && contactPersonV2Entity.IsInactive == NoYes::No;
 
-                _purchaseOrderHeader.METFreightContactName   = contactPersonV2Entity.PrimaryPhoneNumberDescription;
+                _purchaseOrderHeader.METFreightContactName   = contactPersonV2Entity.ContactPersonName;
                 _purchaseOrderHeader.METForwarderPhoneNumber = contactPersonV2Entity.PrimaryPhoneNumber;
                 _purchaseOrderHeader.METForwarderEmail       = contactPersonV2Entity.PrimaryEmailAddress;
             }
@@ -119,8 +121,6 @@ final class METPurchPurchaseOrderDP_Extension
         {
             _purchaseOrderHeader.FormLetterRemarksTxt = docuBrandDetails.METReportNotes + METConstants::NextLine + docuBrandDetails.NotesLine1 + METConstants::NextLine + docuBrandDetails.NotesLine2;
   
-            _purchaseOrderHeader.CompanyCoRegNum = industryKey.CoRegNum;
-            
             if (metPurchTable.POSubSource)
             {
                 _purchaseOrderHeader.METOrderToDetails = strFmt("@MET:TradePOSuppilerNumberWithSub",
@@ -258,6 +258,56 @@ final class METPurchPurchaseOrderDP_Extension
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>initializeOrderLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes an order line.
+    /// </summary>
+    /// <param name = "_purchaseOrderHeader">
+    /// A <c>PurchPurchaseOrderHeader</c> record which is the order header.
+    /// </param>
+    /// <param name = "_highlightUpdated">
+    /// A Boolean describing whether an updated order line must be highlighted.
+    /// </param>
+    /// <param name = "_orderLineSelection">
+    /// A <c>PurchPurchaseOrderDPOrderLineQuerySelection</c> object which the order line should be created for.
+    /// </param>
+    /// <returns>
+    /// The initialized <c>PurchPurchaseOrderTmp</c> order line record.
+    /// </returns>
+    protected PurchPurchaseOrderTmp initializeOrderLine(
+        PurchPurchaseOrderHeader                    _purchaseOrderHeader,
+        boolean                                     _highlightUpdated,
+        PurchPurchaseOrderDPOrderLineQuerySelection _orderLineSelection)
+    {
+        PurchPurchaseOrderTmp purchPurchaseOrderTmp = next initializeOrderLine(_purchaseOrderHeader, _highlightUpdated, _orderLineSelection);
+        
+        PurchLineAllVersions purchLineAllVersions = _orderLineSelection.parmPurchLineAllVersions();
+
+        PurchTableVersion purchTableVersion;
+
+        select firstonly purchTableVersion
+            order by purchTableVersion.VersionDateTime desc
+            where purchTableVersion.VersionDateTime < purchLineAllVersions.VersionDateTime
+            && purchTableVersion.VersionDateTime != purchLineAllVersions.VersionDateTime
+            && purchTableVersion.PurchId == purchLineAllVersions.PurchId;
+
+        if (purchTableVersion)
+        {
+            RefRecId versionCount = VendPurchOrderJour::numberOfPurchaseOrderVersions(PurchTable::find(purchLineAllVersions.PurchId));
+
+            if (versionCount > 1)
+            {
+                purchPurchaseOrderTmp.IsUpdated = this.checkIfLineUpdated(purchLineAllVersions, purchTableVersion.VersionDateTime);
+            }
+        }
+
+        return purchPurchaseOrderTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>insertOrderLine</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -282,12 +332,11 @@ final class METPurchPurchaseOrderDP_Extension
         }
         else
         {
-            _purchaseOrderTmp.METUOMPurchaseTxt     = InventTable::find(purchLine.ItemId).inventItemPurchSetup(purchLine.inventdimid).METPurchUnit;
+            _purchaseOrderTmp.METUOMPurchaseTxt = InventTable::find(purchLine.ItemId).inventItemPurchSetup(purchLine.inventdimid).METPurchUnit;
         }
         
         _purchaseOrderTmp.PurchUnitTxt          = purchLine.PurchUnit;
         _purchaseOrderTmp.METName               = inventTable.productName(SystemParameters::getSystemLanguageId());
-        _purchaseOrderTmp.IsUpdated             = METPurchLine::find(purchLine.recId).POAChangeIndicator;
         _purchaseOrderTmp.TaxAmount             = purchLine.PurchPrice;
         
         if (purchLine.PurchUnit == METConstants::unitEach)
@@ -804,6 +853,49 @@ final class METPurchPurchaseOrderDP_Extension
                 && contactLocation.RecId == electronicAddress.Location;
 
         return electronicAddress.Locator;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkIfLineUpdated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if PO line has any changes when compared with historical confirmed lines
+    /// </summary>
+    /// <param name = "_purchLineAllVersions">Purch line version table</param>
+    /// <param name = "_previousVersionDateTime">Version date time</param>
+    /// <returns>true or false</returns>
+    private boolean checkIfLineUpdated(PurchLineAllVersions _purchLineAllVersions, utcdatetime _previousVersionDateTime)
+    {
+        PurchLineAllVersions    purchLineAllVersionsPreviousRec;
+
+        select firstonly purchLineAllVersionsPreviousRec order by RecId desc
+            where  purchLineAllVersionsPreviousRec.InventTransId == _purchLineAllVersions.InventTransId
+            && purchLineAllVersionsPreviousRec.VersionDateTime == _previousVersionDateTime;
+
+        if (purchLineAllVersionsPreviousRec)
+        {
+            Set linesChangedFieldIdSet = PurchLineAllVersions::METLinesChangedFieldIdSet();
+
+            SetEnumerator linesChangedFieldIdsEnumerator = linesChangedFieldIdSet.getEnumerator();
+
+            while (linesChangedFieldIdsEnumerator.moveNext())
+            {
+                FieldId fieldId = linesChangedFieldIdsEnumerator.current();
+
+                if (_purchLineAllVersions.(fieldId) != purchLineAllVersionsPreviousRec.(fieldId))
+                {
+                    return true;
+                }
+            }
+        }
+        else
+        {
+            return true;
+        }
+
+        return false;
     }
 
 ]]></Source>
