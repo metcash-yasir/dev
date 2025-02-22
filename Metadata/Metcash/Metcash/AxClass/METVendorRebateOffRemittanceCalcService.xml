@@ -5,9 +5,10 @@
 		<Declaration><![CDATA[
 public class METVendorRebateOffRemittanceCalcService extends METSysOperationService
 {
-    private METCrossDockSalesOrderAutoExtractTaskContract contract;
+    private METVendorRebateOffRemittanceCalcTaskContract contract;
     private guid queueId;
     Query userQuery;
+    METVendorRebateOffRemittanceCalcContract mainContract;
 }
 ]]></Declaration>
 		<Methods>
@@ -61,13 +62,17 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
     /// </summary>
     /// <param name = "_dataSourceId">Unique data source of the query data source</param>
     /// <returns>Field map</returns>
-    private Map getFieldMap(int _dataSourceId, int _inventDimDS)
+    private Map getFieldMap(int _dataSourceId, int _purchTableDS)
     {
         Map fieldsMap = new Map(Types::String, Types::Container);
         
         fieldsMap.insert(fieldStr(METVendorRebateOffRemittanceCalcStagingTmp, PackingSlipTransRecId), [_dataSourceId, fieldStr(VendPackingSlipTrans, RecId)]);
-        //fieldsMap.insert(fieldStr(METVendorRebateOffRemittanceCalcStagingTmp, InventSiteId), [_inventDimDS, fieldStr(InventDim, InventSiteId)]);
-        //fieldsMap.insert(fieldStr(METVendorRebateOffRemittanceCalcStagingTmp, Department), [_inventDimDS, fieldStr(InventDim, )]);
+        fieldsMap.insert(fieldStr(METVendorRebateOffRemittanceCalcStagingTmp, DefaultDimension), [_dataSourceId, fieldStr(VendPackingSlipTrans, DefaultDimension)]);
+        fieldsMap.insert(fieldStr(METVendorRebateOffRemittanceCalcStagingTmp, InventDimId), [_dataSourceId, fieldStr(VendPackingSlipTrans, InventDimId)]);
+        fieldsMap.insert(fieldStr(METVendorRebateOffRemittanceCalcStagingTmp, LineAmount), [_dataSourceId, fieldStr(VendPackingSlipTrans, ValueMST)]);
+        fieldsMap.insert(fieldStr(METVendorRebateOffRemittanceCalcStagingTmp, PurchId), [_dataSourceId, fieldStr(VendPackingSlipTrans, OrigPurchid)]);
+
+        //fieldsMap.insert(fieldStr(METVendorRebateOffRemittanceCalcStagingTmp, CustomerReference), [_purchTableDS, fieldStr(PurchTable, PurchOrderFormNum)]);
 
         return fieldsMap;
     }
@@ -85,6 +90,8 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
     /// </param>
     public void process(METVendorRebateOffRemittanceCalcContract _contract)
     {
+        mainContract = _contract;
+
         userQuery = new Query(_contract.getQuery());
         QueryBuildDataSource qbdrInventDim = userQuery.dataSourceTable(tableNum(InventDim));
         QueryBuildDataSource qbdrPackJour = userQuery.dataSourceTable(tableNum(VendPackingSlipJour));
@@ -127,14 +134,16 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
     {
         #OCCRetryCount
 
-        contract            = dataContract as METCrossDockSalesOrderAutoExtractTaskContract;
+        contract = dataContract as METVendorRebateOffRemittanceCalcTaskContract;
         queueId = newGuid();
 
         try
         {
             ttsbegin;
 
-            METInternalTransferOrderQueue::cleanUpQueue();
+            METVendorRebateOffRemittanceCalcStaging::cleanUpQueue();
+            METVendorRebateSiteJournalStaging::cleanUpQueue();
+
             this.stageQueue();
 
             ttscommit;
@@ -190,15 +199,76 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
         SalesTable salesTable;
         METSalesTable metSalesTable;
         queryrun qr = new QueryRun(userQuery);
+        DefaultDimensionView defaultDimension;
+        InventDim inventDim;
+        PurchTable PurchTable;
+
         userQuery.clearAllFields();
 
         QueryBuildDataSource qbdsVendPackingSlipTrans = userQuery.dataSourceName(tableStr(VendPackingSlipTrans));
         qbdsVendPackingSlipTrans.addSelectionField(fieldNum(VendPackingSlipTrans, RecId));
-        Query::insert_recordset(metVendorRemittenceStageTmp, this.getFieldMap(qbdsVendPackingSlipTrans.uniqueId(), qbdsVendPackingSlipTrans.uniqueId()), userQuery);
+        qbdsVendPackingSlipTrans.addSelectionField(fieldNum(VendPackingSlipTrans, InventDimId));
+        qbdsVendPackingSlipTrans.addSelectionField(fieldNum(VendPackingSlipTrans, DefaultDimension));
+        qbdsVendPackingSlipTrans.addSelectionField(fieldNum(VendPackingSlipTrans, OrigPurchid));
+        qbdsVendPackingSlipTrans.addSelectionField(fieldNum(VendPackingSlipTrans, ValueMST));
+
+        //QueryBuildDataSource qbdsPurchTable = userQuery.dataSourceName(tableStr(PurchTable));
+        //qbdsPurchTable.addSelectionField(fieldNum(PurchTable, PurchId));
+        //qbdsPurchTable.addSelectionField(fieldNum(PurchTable, PurchOrderFormNum));
+
+        Query::insert_recordset(metVendorRemittenceStageTmp, this.getFieldMap(qbdsVendPackingSlipTrans.uniqueId(), 0), userQuery);
 
         //Transfer the data from tmp table to Process queue with process Id.
-        insert_recordset processQueue(ProcessId, PackingSlipTransRecId)
-            select queueId, PackingSlipTransRecId from metVendorRemittenceStageTmp;
+        insert_recordset processQueue
+            (ProcessId, PackingSlipTransRecId, InventDimId, DefaultDimension, LineAmount, SiteId, Department, CustomerReference, VendAccount)
+            select queueId, PackingSlipTransRecId, InventDimId, DefaultDimension, LineAmount
+            from metVendorRemittenceStageTmp
+            join InventSiteId from inventDim 
+                where inventDim.inventDimId == metVendorRemittenceStageTmp.InventDimId
+            join DisplayValue from defaultDimension 
+                where defaultDimension.DefaultDimension == metVendorRemittenceStageTmp.DefaultDimension
+            && defaultDimension.Name == METConstants::Department
+            join PurchOrderFormNum, InvoiceAccount from PurchTable 
+            where PurchTable.PurchId == metVendorRemittenceStageTmp.PurchId
+            && !(PurchTable.PurchOrderFormNum like 'HD*'
+            || PurchTable.PurchOrderFormNum like 'VO*'
+            || PurchTable.PurchOrderFormNum like 'VR*'
+            || PurchTable.PurchOrderFormNum like 'SR*');
+
+        MarkupAutoLine markupAutoLine;
+        MarkupAutoTable markupAutoTable;
+        METPurchGroup purchGroup;
+
+        update_recordset processQueue
+            setting ChargeCode = markupAutoLine.MarkupCode,
+                ChargePercent = markupAutoLine.Value,
+                ChargeAmount = processQueue.LineAmount * markupAutoLine.Value
+            exists join markupAutoTable
+            where markupAutoTable.ModuleType == MarkupModuleType::Vend
+            && markupAutoTable.AccountCode == TableGroupAll::Table
+            && markupAutoTable.AccountRelation == processQueue.VendAccount
+            && markupAutoTable.ModuleCategory == HeadingLine::Line
+            join markupAutoLine
+            where markupAutoLine.TableRecId == markupAutoTable.RecId
+            && markupAutoLine.TableTableId == markupAutoTable.TableId
+            && markupAutoLine.FromDate >= mainContract.parmAsOfDate()
+            && markupAutoLine.ToDate  <= mainContract.parmAsOfDate()
+            exists join purchGroup
+            where purchGroup.PurchGroupId == markupAutoLine.METPurchGroupId
+            && purchGroup.InvoiceType == METPurchGroupInvoiceType::Warehouse;
+
+        //Remove all packing slips which do not have a charge code mapping for the vendor or the purchase group invoice type is not warehouse.
+
+        delete_from processQueue
+            where processQueue.ChargeCode == ''
+            && processQueue.ProcessId == queueId;
+
+        METVendorRebateSiteJournalStaging siteStaging;
+
+        insert_recordset siteStaging(ProcessId, SiteId)
+            select ProcessId, SiteId from processQueue
+            group by ProcessId, SiteId
+            where processQueue.ProcessId == queueId;
     }
 
 ]]></Source>
@@ -213,8 +283,12 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
     protected void initTaskDataContract(METSysOperationTaskDataContract _taskDataContract)
     {
         super(_taskDataContract);
-        contract = _taskDataContract as METCrossDockSalesOrderAutoExtractTaskContract;
+        contract = _taskDataContract as METVendorRebateOffRemittanceCalcTaskContract;
         contract.parmTopPickingProcessId(queueId);
+        contract.parmAsOnDate(mainContract.parmAsOfDate());
+        contract.parmReversalDate(mainContract.parmReversalDate());
+        contract.parmGroupByChargeCode(mainContract.parmGroupByChargeCode());
+        contract.parmGroupByDepartment(mainContract.parmGroupByDepartment());
     }
 
 ]]></Source>
