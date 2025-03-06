@@ -208,6 +208,7 @@ public class METSalesOrderProcessHelper
         SalesTable      salesTable = SalesTable::find(_salesId);
         METSalesLine    metSalesLine;
 
+        //Loop through the intercompany sales order.
         while select salesLine
             where salesLine.SalesId == salesTable.SalesId
             exists join metSalesLine
@@ -216,8 +217,10 @@ public class METSalesOrderProcessHelper
         {
             WMSOrderTrans wmsOrderTrans;
 
+            //Get the sales line quantity.
             salesQty = salesLine.calcQtyOrdered();
 
+            //Get the picked quantity when the pick list was generated.
             select qty from wmsOrderTrans
                 where wmsOrderTrans.inventTransId == salesLine.InventTransId
                 && wmsOrderTrans.inventTransRefId == salesLine.SalesId;
@@ -231,6 +234,7 @@ public class METSalesOrderProcessHelper
                 continue;
             }
 
+            //Change the company to the original company of the intercompany sales order. 
             changecompany(VendParameters::find().METInterCompanyLegalEntity)
             {
                 SalesTable  origSalesTable          = SalesTable::find(salesTable.InterCompanyOriginalSalesId);
@@ -238,43 +242,135 @@ public class METSalesOrderProcessHelper
             
                 if (purchTable_Reference.RecId)
                 {
+                    //Confirm and receive the purchase order which was created as part of the process in the original legal entity.
                     METPurchaseOrderProcessHelper::confirmPurchaseOrder(purchTable_Reference.PurchId);
                     METPurchaseOrderProcessHelper::postPurchaseOrderProductReceipt(purchTable_Reference, _invoiceId);
                 }
 
                 if (pickedQty)
                 {
-                    const str   oscCode = 'G-Grocery';
-                    SalesLine   origSalesLine;
+                    QueryRun queryRun;
 
-                    while select forupdate origSalesLine
-                        where origSalesLine.SalesId == origSalesTable.SalesId
-                        && origSalesLine.ItemId == salesLine.ItemId
+                    queryRun = METSalesOrderProcessHelper::calcQueryForOriginalSO(origSalesTable.SalesId, salesLine.ItemId, pickedQty);
+                    METSalesOrderProcessHelper::postPickingListForOrigSO(origSalesTable, queryRun);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postPickingListForOrigSO</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Post the pick list for the food item on the original sales order.
+    /// </summary>
+    /// <param name = "_salesTable">SalesTable</param>
+    /// <param name = "_queryRun">QueryRun</param>
+    /// <param name = "_pickListOrderedQty">boolean</param>
+    private static void postPickingListForOrigSO(SalesTable _salesTable, QueryRun _queryRun, boolean _pickListOrderedQty = false)
+    {
+        boolean             isError     = false;
+        SalesTable          salesTable  = SalesTable::find(_salesTable.SalesId);
+        SalesParmLine       salesParmLine;
+        WMSPickingRoute     wmsPickingRoute;
+        SalesFormLetter     salesFormLetter;
+
+        try
+        {
+            ttsbegin;
+            salesFormLetter = SalesFormLetter::construct(DocumentStatus::PickingList);
+            
+            salesFormLetter.chooseLinesQuery(_queryRun);
+            salesFormLetter.salesTable(_salestable);
+            salesFormLetter.initParmSalesTable(salesFormLetter.salesTable());
+            salesFormLetter.transDate(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+            salesFormLetter.specQty(SalesUpdate::All);
+            salesFormLetter.printFormLetter(salesFormLetter.printFormLetter());
+            salesFormLetter.createParmUpdateFromParmUpdateRecord(SalesFormletterParmData::initSalesParmUpdateFormletter(salesFormLetter.documentStatus(), salesFormLetter.pack()));
+            
+            if (_pickListOrderedQty == false)
+            {
+                //For intercompany orders we always pick the reserved quantity
+                if (!InventLocation::find(salesFormLetter.salesTable().InventLocationId).METPickDirector || _salesTable.InterCompanyOrder)
+                {
+                    salesFormLetter.salesParmUpdate().ReduceOnHand  = NoYes::Yes;
+                    salesFormLetter.salesParmUpdate().Reserve       = NoYes::Yes;
+                }
+            }
+            else
+            {
+                salesFormLetter.salesParmUpdate().ReduceOnHand  = NoYes::No;
+                salesFormLetter.salesParmUpdate().Reserve       = NoYes::No;
+            }
+            salesFormLetter.initParameters(salesFormLetter.salesParmUpdate(), Printout::Current);
+            salesFormLetter.initLinesQuery();
+
+            if (_pickListOrderedQty == false)
+            {
+                SalesLine salesLineLoc;
+
+                while select forupdate salesParmLine
+                    where salesParmLine.ParmId == salesFormLetter.parmId()
+                {
+                    salesLineLoc = salesParmLine.salesLine();
+
+                    if (salesLineLoc.metSalesLine().OrderExtractStatus == METOrderExtractStatus::Open ||
+                            salesLineLoc.metSalesLine().OrderExtractStatus == METOrderExtractStatus::ReadyForExtract)
                     {
-                        ttsbegin;
-                        if (InventTable::metGetOSCCode(origSalesLine.ItemId, origSalesLine.inventDim()) == oscCode)
-                        {
-                            origSalesLine.selectForUpdate(true);
-                            
-                            origSalesLine.RemainInventPhysical  = pickedQty;
-                            origSalesLine.RemainSalesPhysical   = pickedQty;
-                            origSalesLine.update();
- 
-                            //This method will update the inventory transactions
-                            InventMovement::bufferSetRemainQty(origSalesLine);
-                        }
-                    
-                        //Post the picking list registration for the original sales order.
-                        QueryRun                    queryRun                    = METSalesOrderProcessHelper::calcQueryForOriginalSO(origSalesTable);
-                        SalesFormLetter_PickingList salesFormLetter_PickingList = SalesFormLetter_PickingList::newPickingList();
-                
-                        salesFormLetter_PickingList.chooseLinesQuery(queryRun);
-
-                        salesFormLetter_PickingList.transDate(systemDateGet());
-                        salesFormLetter_PickingList.update(origSalesTable, systemdateget(), SalesUpdate::All, AccountOrder::None, NoYes::No, NoYes::No);
-                        ttscommit;
+                        salesParmLine.DeliverNow = salesLineLoc.reservedPhysicalInSalesUnit();
+                        
+                        salesParmLine.setQty(DocumentStatus::PickingList, false);
+                        salesParmLine.update();
                     }
                 }
+            }
+            else
+            {
+                Info(strfmt("@MET:SOPickListForOrderQty", _salesTable.SalesId));
+            }
+
+            salesFormLetter.run();
+
+            METOrderShipmentLoadCreation shipmentLoadCreation =
+                    METOrderShipmentLoadCreation::construct(METOrderTransactionType::SalesOrder, _salesTable.SalesId);
+            
+            shipmentLoadCreation.createShippmentLoad(true,false);
+            ttscommit;
+
+            select firstonly wmsPickingRoute
+                    where wmsPickingRoute.parmid == salesFormLetter.parmId();
+
+            if (wmsPickingRoute)
+            {
+                if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METPicklistExtractionBusinessEvent)))
+                {
+                    METPicklistExtractionBusinessEvent::newFromWMSPickingRoute(wmsPickingRoute).send();
+                }
+                else
+                {
+                    error("@MET:PicklistExtractionBusinessEventNotEnabled");
+                }
+            }
+        }
+        catch
+        {
+            error ("@WAX:UpdateCancelled");
+            isError = true;
+        }
+
+        salesTable.reread();
+        salesTable.selectForUpdate(true);
+        salesTable.metUpdateExtractStatus();
+
+        if (!isError)
+        {
+            //CB625_TMSSOPickingListExtraction
+            if (salesTable.METOrderExtractStatus == METOrderExtractStatus::Extracted)
+            {
+                METTMSEngineSalesOrderProccess  metTMSEngineSalesOrderProccess = METTMSEngineSalesOrderProccess::construct(METTMSEngineSalesOrderProcess::PickingList, salesTable, wmsPickingRoute.PickingRouteID);
+                metTMSEngineSalesOrderProccess.run();
             }
         }
     }
@@ -286,67 +382,45 @@ public class METSalesOrderProcessHelper
 				<Source><![CDATA[
     /// <summary>
     /// Created for the CB274 - Intercompany Transfers.
-    /// Exclude the SO  line for extraction if it's a food item.
-    /// Create a Purchase order for the food item line.
+    /// Include the SO line for extraction if it's a food item for pick list processing.
     /// </summary>
-    /// <param name = "_shipmentId">Shipment Id reference</param>
+    /// <param name = "_salesId">Sales ID</param>
+    /// <param name = "_itemId">Item ID</param>
+    /// <param name = "_pickedQty">Picked quantity</param>
     /// <returns>SysQueryRun</returns>
-    private static SysQueryRun calcQueryForOriginalSO(SalesTable _salesTable)
+    private static SysQueryRun calcQueryForOriginalSO(SalesId _salesId, ItemId _itemId, InventQty _pickedQty)
     {
-        Query                   qry = new Query(QueryStr(SalesUpdate));
+        Query                   qry     = new Query(QueryStr(SalesUpdate));
         RefRecId                salesLineRecId;
-        SalesLine               salesLine;
+        SalesLine               origSalesLine;
         METSalesLine            metSalesLine;
         QueryBuildRange         qbrSalesLine;
         QueryBuildDataSource    qbdsSalesLine;
 
         qbdsSalesLine = qry.dataSourceTable(tableNum(SalesLine));
 
-        while select salesLine
-            where salesLine.SalesId == _salesTable.SalesId
-            join metSalesLine
-            where metSalesLine.SalesLine == salesLine.RecId
-            && metSalesLine.OrderExtractStatus == METOrderExtractStatus::Extracted
+        while select origSalesLine
+            where origSalesLine.SalesId == _salesId
+                && origSalesLine.ItemId == _itemId
         {
-            salesLineRecId  = salesLine.RecId;
-            qbrSalesLine    = qbdsSalesLine.addRange(fieldnum(SalesLine, RecId));
+            if (InventTable::metGetOSCCode(origSalesLine.ItemId, origSalesLine.inventDim()) == METConstants::GroceryOscCode)
+            {
+                ttsbegin;
+                origSalesLine.selectForUpdate(true);
+
+                origSalesLine.RemainInventPhysical  = _pickedQty;
+                origSalesLine.RemainSalesPhysical   = _pickedQty;
+                origSalesLine.update();
+
+                //This method will update the inventory transactions
+                InventMovement::bufferSetRemainQty(origSalesLine);
+                ttscommit;
+
+                salesLineRecId  = origSalesLine.RecId;
+                qbrSalesLine    = qbdsSalesLine.addRange(fieldnum(SalesLine, RecId));
                 
-            qbrSalesLine.value(SysQuery::value(salesLineRecId));
-        }
-        return new sysQueryRun(qry);
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>calcQueryFoIntercompanySO</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Query the intercompany sales line.
-    /// </summary>
-    /// <param name = "_salesTable"></param>
-    /// <returns></returns>
-    private SysQueryRun calcQueryFoIntercompanySO(SalesTable _salesTable)
-    {
-        Query                   qry = new Query(QueryStr(SalesUpdate));
-        RefRecId                salesLineRecId;
-        SalesLine               salesLine;
-        METSalesLine            metSalesLine;
-        QueryBuildRange         qbrSalesLine;
-        QueryBuildDataSource    qbdsSalesLine;
-
-        qbdsSalesLine = qry.dataSourceTable(tableNum(SalesLine));
-
-        while select salesLine
-            where salesLine.SalesId == _salesTable.SalesId
-            join metSalesLine
-            where metSalesLine.SalesLine == salesLine.RecId
-            && metSalesLine.OrderExtractStatus == METOrderExtractStatus::Open
-        {
-            salesLineRecId  = salesLine.RecId;
-            qbrSalesLine    = qbdsSalesLine.addRange(fieldnum(SalesLine, RecId));
-                
-            qbrSalesLine.value(SysQuery::value(salesLineRecId));
+                qbrSalesLine.value(SysQuery::value(salesLineRecId));
+            }
         }
         return new sysQueryRun(qry);
     }
