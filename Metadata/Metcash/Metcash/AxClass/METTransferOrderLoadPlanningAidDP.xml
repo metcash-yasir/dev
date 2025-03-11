@@ -10,7 +10,15 @@
 class METTransferOrderLoadPlanningAidDP extends SrsReportDataProviderPreProcessTempDB
 {
     METTransferOrderLoadPlanningAidLinesTmp transferOrderLoadPlanningAidLinesTmp;
-    METTransferOrderLoadPlanningAidContract        contract;
+    METTransferOrderLoadPlanningAidContract contract;
+    InventTransferId                        selectedTransferId;
+    RecordInsertList                        transferOrdLoadPlanningLinesList;
+    CreatedDateTime                         reportGeneratedDateTime;
+    InventLocationId                        inventLocationTo, inventLocationFrom;
+    SalesShippingDateConfirmed              confirmedShipDateFrom;
+    SalesShippingDateRequested              confirmedShipDateTo;
+    METRoute                                routeId;
+    LogisticsLocationRoleRecId              roleDeliveryRecId;
 
 }
 ]]></Declaration>
@@ -34,42 +42,92 @@ class METTransferOrderLoadPlanningAidDP extends SrsReportDataProviderPreProcessT
 			<Method>
 				<Name>processReport</Name>
 				<Source><![CDATA[
+    /// <summary>
+    ///    Parses the report parameters and fills the <c>transferOrderLoadPlanningAidLinesTmp</c> tables with data.
+    /// </summary>
     public void processReport()
     {
         contract = this.parmDataContract() as METTransferOrderLoadPlanningAidContract;
-        METRoute routeId = contract.parmRouteID();
-        SalesShippingDateConfirmed confirmedShipDateFrom = contract.parmConfirmedShipDateFrom();
-        SalesShippingDateRequested confirmedShipDateTo = contract.parmConfirmedShipDateTo();
-        
-        InventLocationId           inventLocationTo = contract.parmInventLocationTo();
-        InventLocationId           inventLocationFrom = contract.parmInventLocationFrom();
-        boolean                    usePrintManagement = contract.parmUsePrintManagement();
+        transferOrdLoadPlanningLinesList = new RecordInsertList(tableNum(METTransferOrderLoadPlanningAidLinesTmp), true, true, true, true, true, transferOrderLoadPlanningAidLinesTmp);
 
+        routeId = contract.parmRouteID();
+        confirmedShipDateFrom = contract.parmConfirmedShipDateFrom();
+        confirmedShipDateTo = contract.parmConfirmedShipDateTo();
+        inventLocationTo = contract.parmInventLocationTo();
+        inventLocationFrom = contract.parmInventLocationFrom();
+        
+        reportGeneratedDateTime = DateTimeUtil::getSystemDateTime();
+        roleDeliveryRecId = LogisticsLocationRole::findByName(METConstants::DeliveryAddress).RecId;
+        str extractOrdersSelected = contract.parmSelectedRecords();
+
+        if (strLen(extractOrdersSelected) > 0)
+        {
+            container transferIdCon = str2con(extractOrdersSelected, ',');
+            int conLen = conLen(transferIdCon);
+            int counter;
+
+            for (counter = 1; counter <= conLen; counter++)
+            {
+                selectedTransferId = conPeek(transferIdCon, counter);
+                this.insertTransferOrders();
+            }
+        }
+        else
+        {
+            this.insertTransferOrders();
+        }
+
+        transferOrdLoadPlanningLinesList.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertTransferOrders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Insert Transfer orders
+    /// </summary>
+    public void insertTransferOrders()
+    {
         InventTransferTable         inventTransferTable;
         InventTransferLine          inventTransferLine;
         METInventTransferTableExt   metInventTransferTableExt;
         METInventTransferLine       metInventTransferLine;
         MetReqItemTable             metReqItemTable;
-        InventLocation              inventLocation;
-        METInventLocation           metInventLocation;
+        InventLocation              inventLocation, toInventLocation;
+        METInventLocation           metInventLocation, toMetInventLocation;
         ReqItemTable                reqItemTable;
         InventDim                   inventDim;
         InventDim                   inventDimReq;
-        boolean                     linesInserted;
-        RecordInsertList            transferOrdLoadPlanningLinesList = new RecordInsertList(tableNum(METTransferOrderLoadPlanningAidLinesTmp), true, true, true, true, true, transferOrderLoadPlanningAidLinesTmp);       
-        CreatedDateTime reportGeneratedDateTime = DateTimeUtil::getSystemDateTime();
+        METIndustryKeyTable         industryKeyTable;
 
         while select InventDimId, ItemId, RecId from inventTransferLine
-            join TransferId, ShipDate from inventTransferTable
+            join TransferId, ShipDate, CreatedDateTime from inventTransferTable
                 where inventTransferTable.TransferId == inventTransferLine.TransferId
+                && (!selectedTransferId || inventTransferTable.TransferId == selectedTransferId)
                 && inventTransferTable.TransferStatus == InventTransferStatus::Created
                 && (!inventLocationFrom  || inventTransferTable.InventLocationIdFrom == inventLocationFrom)
                 && (!inventLocationTo  || inventTransferTable.InventLocationIdTo == inventLocationTo)
-                && (inventTransferTable.ShipDate >= confirmedShipDateFrom && inventTransferTable.ShipDate <= confirmedShipDateTo)
+                && (inventTransferTable.ShipDate >= confirmedShipDateFrom 
+                    && inventTransferTable.ShipDate <= confirmedShipDateTo)
+            join Route, RouteStopNum from metInventTransferTableExt
+                where metInventTransferTableExt.InventTransferTable == inventTransferTable.RecId
+                && (!routeId || metInventTransferTableExt.Route == routeId)
             join Cases, BrokenCase, TotalWeight, TotalVolume from metInventTransferLine
                 where metInventTransferLine.InventTransferLine == inventTransferLine.RecId
             join InventSiteId, InventLocationId from inventDim
                 where inventDim.inventDimId == inventTransferLine.InventDimId
+            join Name, METWHSubEntity, RecId from inventLocation
+                where inventLocation.InventLocationId == inventTransferTable.InventLocationIdFrom
+            join WHSPalletVolume from metInventLocation
+                where metInventLocation.InventLocation == inventLocation.RecId
+            join RecId, InventLocationId, Name from toInventLocation
+                where toInventLocation.InventLocationId == inventTransferTable.InventLocationIdTo
+            join InternalCustomer from toMetInventLocation
+                where toMetInventLocation.InventLocation == toInventLocation.RecId
+            join CompanyName from industryKeyTable
+                where industryKeyTable.IndustryKey == inventLocation.METWHSubEntity
             join RecId, CovInventDimId from reqItemTable
                 where reqItemTable.ItemId == inventTransferLine.ItemId
             join OSCCode from metReqItemTable
@@ -77,19 +135,9 @@ class METTransferOrderLoadPlanningAidDP extends SrsReportDataProviderPreProcessT
             exists join inventDimReq
                 where inventDimReq.InventSiteId == inventDim.InventSiteId
                 && InventDimReq.InventLocationId == inventDim.InventLocationId
-                && inventDimReq.inventDimId == reqItemTable.CovInventDimId
-            join Name, METWHSubEntity, RecId from inventLocation
-                where inventLocation.InventLocationId == inventTransferTable.InventLocationIdFrom
-            join WHSPalletVolume from metInventLocation
-                where metInventLocation.InventLocation == inventLocation.RecId
-            join Route, RouteStopNum from metInventTransferTableExt
-                where metInventTransferTableExt.InventTransferTable == inventTransferTable.RecId
-                && (!routeId || metInventTransferTableExt.Route == routeId)
+                && inventDimReq.inventDimId == reqItemTable.CovInventDimId 
         {
-            if (inventLocation.METWHSubEntity)
-            {
-                transferOrderLoadPlanningAidLinesTmp.CompanyName = METIndustryKeyTable::find(inventLocation.METWHSubEntity).CompanyName;
-            }
+            transferOrderLoadPlanningAidLinesTmp.CompanyName = industryKeyTable.CompanyName;
             transferOrderLoadPlanningAidLinesTmp.FromWareHouseName = inventLocation.Name;
             transferOrderLoadPlanningAidLinesTmp.ReportGeneratedDateTime = reportGeneratedDateTime;
             transferOrderLoadPlanningAidLinesTmp.Route = metInventTransferTableExt.Route;
@@ -101,21 +149,32 @@ class METTransferOrderLoadPlanningAidDP extends SrsReportDataProviderPreProcessT
             transferOrderLoadPlanningAidLinesTmp.Eaches = metInventTransferLine.BrokenCase;
             transferOrderLoadPlanningAidLinesTmp.Weight = metInventTransferLine.TotalWeight;
             transferOrderLoadPlanningAidLinesTmp.Cube = metInventTransferLine.TotalVolume;
-            transferOrderLoadPlanningAidLinesTmp.Pallets = metInventLocation.WHSPalletVolume;
+            
+            if (metInventLocation.WHSPalletVolume > 0)
+            {
+                transferOrderLoadPlanningAidLinesTmp.Pallets = transferOrderLoadPlanningAidLinesTmp.Cube / metInventLocation.WHSPalletVolume;
+            }
+            else
+            {
+                transferOrderLoadPlanningAidLinesTmp.Pallets = transferOrderLoadPlanningAidLinesTmp.Cube;
+            }
+
             transferOrderLoadPlanningAidLinesTmp.OrderCreatedDateTime = inventTransferTable.CreatedDateTime;
             transferOrderLoadPlanningAidLinesTmp.OrderSplitCategoryCode = metReqItemTable.OSCCode;
-            transferOrderLoadPlanningAidLinesTmp.ToWarehouseNumber = transferOrderLoadPlanningAidLinesTmp.ToWarehouseNumber;
-            transferOrderLoadPlanningAidLinesTmp.ToWareHouseName = transferOrderLoadPlanningAidLinesTmp.ToWareHouseName;
+
+            if (!toMetInventLocation.InternalCustomer)
+            {
+                transferOrderLoadPlanningAidLinesTmp.ToWarehouseNumber = toInventLocation.InventLocationId;
+                transferOrderLoadPlanningAidLinesTmp.ToWareHouseName = toInventLocation.Name;
+            }
+            else
+            {
+                transferOrderLoadPlanningAidLinesTmp.ToWarehouseNumber = toMetInventLocation.InternalCustomer;
+                transferOrderLoadPlanningAidLinesTmp.ToWareHouseName = DirPartyTable::getName(CustTable::find(toMetInventLocation.InternalCustomer).Party);
+
+            }
             transferOrdLoadPlanningLinesList.add(transferOrderLoadPlanningAidLinesTmp);
-            linesInserted = true;
-
         }
-        
-        if (linesInserted)
-        {
-            transferOrdLoadPlanningLinesList.insertDatabase();
-        }
-
     }
 
 ]]></Source>

@@ -10,8 +10,14 @@
 class METSalesOrderLoadPlanningDP extends SrsReportDataProviderPreProcessTempDB
 {
     METSalesOrderLoadPlanningLinesTmp salesOrderLoadPlanningLinesTmp;
-    
-    METSalesOrderLoadPlanningContract        contract;
+    METSalesOrderLoadPlanningContract contract;
+    RecordInsertList                  salesOrderLoadPlanningLineslist;
+    SalesId                           selectedSalesId;
+    SalesShippingDateConfirmed        confirmedShipDateFrom;
+    SalesShippingDateRequested        confirmedShipDateTo;
+    InventSiteId                      site;
+    InventLocationId                  inventLocationFrom;
+    LogisticsLocationRoleRecId        roleDeliveryRecId;
 
 }
 ]]></Declaration>
@@ -35,59 +41,112 @@ class METSalesOrderLoadPlanningDP extends SrsReportDataProviderPreProcessTempDB
 			<Method>
 				<Name>processReport</Name>
 				<Source><![CDATA[
+    /// <summary>
+    ///    Parses the report parameters and fills the <c>salesOrderLoadPlanningLinesTmp</c> tables with data.
+    /// </summary>
     public void processReport()
     {
         contract = this.parmDataContract() as METSalesOrderLoadPlanningContract;
-
-        SalesShippingDateConfirmed confirmedShipDateFrom = contract.parmConfirmedShipDateFrom();
-        SalesShippingDateRequested confirmedShipDateTo = contract.parmConfirmedShipDateTo();
+        salesOrderLoadPlanningLineslist = new RecordInsertList(tableNum(METSalesOrderLoadPlanningLinesTmp), false, false, false, false, false, salesOrderLoadPlanningLinesTmp);
         
+        str extractOrdersSelected = contract.parmSelectedRecords();
+        confirmedShipDateFrom = contract.parmConfirmedShipDateFrom();
+        confirmedShipDateTo = contract.parmConfirmedShipDateTo();
+        inventLocationFrom = contract.parmWareHouseId();
+        site = contract.parmInventSiteId();
+
+        roleDeliveryRecId = LogisticsLocationRole::findByName(METConstants::DeliveryAddress).RecId;
+
+        if (strLen(extractOrdersSelected) > 0)
+        {
+            container salesIdCon = str2con(extractOrdersSelected, ',');
+            int conLen = conLen(salesIdCon);
+            int counter;
+
+            for (counter = 1; counter <= conLen; counter++)
+            {
+                selectedSalesId = conPeek(salesIdCon, counter);
+                this.insertSalesOrders();
+            }
+        }
+        else
+        {
+            this.insertSalesOrders();
+
+        }
+
+        salesOrderLoadPlanningLineslist.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertSalesOrders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// insert sales orders in list
+    /// </summary>
+    public void insertSalesOrders()
+    {
         InventDim                   inventDim;
         InventLocation              inventLocation;
-        METSalesLine                metSalesLine;
         METSalesTable               metSalesTable;
         SalesTable                  salesTable;
-        SalesLine                   salesLine;       
-        RecordInsertList            salesOrderLoadPlanningLineslist    = new RecordInsertList(tableNum(METSalesOrderLoadPlanningLinesTmp), false, false, false, false, false, salesOrderLoadPlanningLinesTmp);
-        
+        SalesLine                   salesLine;
+        ReqItemTable                reqItemTable;
+        MetReqItemTable             metReqItemTable;
+        CustTable                   custTable;
+        DirPartyTable               dirPartyTable;
+        InventDim                   inventDimReq;
 
-        while select ItemId, InventDimId, SalesQty, SalesUnit, RecId from salesLine
-            join CustAccount, InventLocationId, SalesName, ShippingDateConfirmed, METRoute, METRouteStopNum, RecId from salesTable
+        while select ItemId, InventDimId, SalesQty, SalesUnit, SalesId, LineNum, RecId from salesLine
+            join CustAccount, InventLocationId, SalesName, ShippingDateConfirmed, METRoute, METRouteStopNum, RecId 
+        from salesTable
         where salesTable.SalesId == salesLine.SalesId
+            && (!selectedSalesId || salesLine.SalesId == selectedSalesId)
             && salesTable.SalesStatus == SalesStatus::Backorder
             && salesTable.DocumentStatus  != DocumentStatus::Cancelled
             && salesTable.SalesType == SalesType::Sales
-            && (salesTable.ShippingDateConfirmed >=  confirmedShipDateFrom
-            && salesTable.ShippingDateConfirmed <=  confirmedShipDateTo)
-        join metSalesLine
-            where metSalesLine.SalesLine == salesLine.RecId
-        join inventDim
-                where inventDim.inventDimId == salesLine.InventDimId
+            && ((!confirmedShipDateFrom ||salesTable.ShippingDateConfirmed >=  confirmedShipDateFrom)
+            && (!confirmedShipDateTo || salesTable.ShippingDateConfirmed <=  confirmedShipDateTo))
+            && (!site || salesTable.InventSiteId == site)
+            && (!inventLocationFrom || salesTable.InventLocationId == inventLocationFrom)
         join StagingLaneId from metSalesTable
             where metSalesTable.SalesTable == salesTable.RecId
         join Name, RecId from inventLocation
             where inventLocation.InventLocationId == salesTable.InventLocationId
-       
+        join Party from custTable
+            where custTable.AccountNum == salesTable.CustAccount
+        join PrimaryAddressLocation from dirPartyTable
+            where dirPartyTable.RecId == custTable.Party
+        join inventDim
+            where inventDim.inventDimId == salesLine.InventDimId
+        join RecId from reqItemTable
+            where reqItemTable.ItemId == salesLine.ItemId
+        join OSCCode from metReqItemTable
+            where metReqItemTable.RefRecId == reqItemTable.RecId
+        exists join inventDimReq
+            where inventDimReq.InventSiteId == inventDim.InventSiteId
+            && InventDimReq.InventLocationId == inventDim.InventLocationId
+            && inventDimReq.inventDimId == reqItemTable.CovInventDimId
         {
             salesOrderLoadPlanningLinesTmp.WareHouseName = inventLocation.Name;
             salesOrderLoadPlanningLinesTmp.Customer = salesTable.CustAccount;
             salesOrderLoadPlanningLinesTmp.CustomerName = salesTable.SalesName;
-            salesOrderLoadPlanningLinesTmp.Suburb = this.getWareHousePrimaryAddress(inventLocation.RecId).County;
-            
+            salesOrderLoadPlanningLinesTmp.Suburb = this.getPrimaryCustDeliveryAddress(custTable.Party, dirPartyTable.PrimaryAddressLocation);            
             salesOrderLoadPlanningLinesTmp.ConfirmedShipDate = salesTable.ShippingDateConfirmed;
             salesOrderLoadPlanningLinesTmp.Route = salesTable.METRoute;
             salesOrderLoadPlanningLinesTmp.RouteStop = salesTable.METRouteStopNum;
             salesOrderLoadPlanningLinesTmp.StagingLane = metSalesTable.StagingLaneId;
-            
-
+            salesOrderLoadPlanningLinesTmp.SalesId = salesLine.SalesId;
+            salesOrderLoadPlanningLinesTmp.LineNum = salesLine.LineNum;
             salesOrderLoadPlanningLinesTmp.BrokenCase = salesLine.SalesUnit == METConstants::unitEach ? salesLine.SalesQty : 0;
             salesOrderLoadPlanningLinesTmp.Cases = salesLine.SalesUnit == METConstants::unitEach ? 0 : salesLine.SalesQty;
-            salesOrderLoadPlanningLinesTmp.TotalVolume = METWHSPhysDimUOMSite::convertVolume(salesLine.ItemId, salesLine.SalesQty, salesLine.SalesUnit, inventDim); 
+            salesOrderLoadPlanningLinesTmp.TotalVolume = METWHSPhysDimUOMSite::convertVolume(salesLine.ItemId, salesLine.SalesQty, salesLine.SalesUnit, inventDim);
             salesOrderLoadPlanningLinesTmp.TotalWeight = METWHSPhysDimUOMSite::convertWeight(salesLine.ItemId, salesLine.SalesQty, salesLine.SalesUnit, inventDim);
+            salesOrderLoadPlanningLinesTmp.OrderSplitGroup = metReqItemTable.OSCCode == METConstants::OSCCodeP ? METConstants::OSCCodePER : METConstants::OSCCodeDRY;
             salesOrderLoadPlanningLineslist.add(salesOrderLoadPlanningLinesTmp);
-        }        
-
-        salesOrderLoadPlanningLineslist.insertDatabase();
+        }
     }
 
 ]]></Source>
@@ -100,7 +159,7 @@ class METSalesOrderLoadPlanningDP extends SrsReportDataProviderPreProcessTempDB
     /// </summary>
     /// <param name = "_inventLocationRecId">Location RecId</param>
     /// <returns>Locator</returns>
-    private LogisticsEntityPostalAddressView getWareHousePrimaryAddress(RefRecId _inventLocationRecId)
+    public LogisticsEntityPostalAddressView getWareHousePrimaryAddress(RefRecId _inventLocationRecId)
     {
         LogisticsEntityPostalAddressView  logisticsEntityPostalAddressView;
         
@@ -112,6 +171,35 @@ class METSalesOrderLoadPlanningDP extends SrsReportDataProviderPreProcessTempDB
             && logisticsEntityPostalAddressView.IsPrimary == NoYes::Yes;
         
         return logisticsEntityPostalAddressView;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getPrimaryCustDeliveryAddress</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get city from customer delivery address
+    /// </summary>
+    /// <param name = "_party">Dirparty RecId</param>
+    /// <param name = "_primaryAddressLocation">PrimaryAddressLocation</param>
+    /// <returns>City Name</returns>
+    public LogisticsAddressCityName getPrimaryCustDeliveryAddress(RefRecId _party, LogisticsLocationRecId _primaryAddressLocation)
+    {
+        DirPartyPostalAddressView   dirPartyPostalAddressView;
+        DirPartyLocationRole        dirPartyLocationRole;
+        
+        select firstonly RecId, City from dirPartyPostalAddressView
+            where dirPartyPostalAddressView.Party == _party
+            && dirPartyPostalAddressView.Location == _primaryAddressLocation
+            && dirPartyPostalAddressView.IsPrimary == NoYes::Yes
+            && dirPartyPostalAddressView.ValidFrom <= DateTimeUtil::getSystemDateTime()
+            && dirPartyPostalAddressView.ValidTo >= DateTimeUtil::getSystemDateTime()
+        exists join dirPartyLocationRole
+            where dirPartyLocationRole.PartyLocation == dirPartyPostalAddressView.RecId
+            && dirPartyLocationRole.LocationRole == roleDeliveryRecId;
+
+        return dirPartyPostalAddressView.City;
     }
 
 ]]></Source>
