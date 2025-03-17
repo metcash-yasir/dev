@@ -19,17 +19,15 @@ namespace CB701_KleberCustAddressIntegrationHelper
         /// </summary>
         /// <param name="oauthToken">OAuth Token</param>
         /// <param name="url">APIM url</param>
-        /// <param name="subscriptionKey">APIM subscription key</param>
         /// <param name="jsonBody">Json body of the request</param>
         /// <param name="addressValidation">is this address validation</param>
         /// <returns>response or error message</returns>
-        public async Task<string> PerformPostRequestAsync(string oauthToken, string url, string subscriptionKey, string jsonBody, bool addressValidation)
+        public async Task<string> PerformPostRequestAsync(string oauthToken, string url, string jsonBody, bool addressValidation)
         {
             HttpRequestMessage requestMessage = new HttpRequestMessage(HttpMethod.Post, url)
             {
                 Content = new StringContent(jsonBody, Encoding.UTF8, "application/json")
             };
-            requestMessage.Headers.Add("Ocp-Apim-Subscription-Key", subscriptionKey);
             requestMessage.Headers.Add("Authorization", $"Bearer {oauthToken}");
 
             try
@@ -79,10 +77,10 @@ namespace CB701_KleberCustAddressIntegrationHelper
         /// <param name="jsonBody">Json body of the request</param>
         /// <param name="addressValidation">is this address validation</param>
         /// <returns>response or error message</returns>
-        public string PerformPostRequestSync(string oauthToken, string url, string subscriptionKey, string jsonBody, bool addressValidation)
+        public string PerformPostRequestSync(string oauthToken, string url, string jsonBody, bool addressValidation)
         {
             // Call the async method and wait for the result synchronously
-            return PerformPostRequestAsync(oauthToken, url, subscriptionKey, jsonBody, addressValidation).GetAwaiter().GetResult();
+            return PerformPostRequestAsync(oauthToken, url, jsonBody, addressValidation).GetAwaiter().GetResult();
         }
 
         public class AddressValidationResponse
