@@ -109,8 +109,6 @@ public class METCrossDockSalesFinalizationFacade
         METInventTransferTableExt metTransferTable;
         SalesTable salesTable;
         InventLocation inventLocation;
-
-        CompanyInfo companyInfo = CompanyInfo::find();
         
         select firstonly salesTable
             where salesTable.METOrderExtractStatus == METOrderExtractStatus::Extracted
@@ -132,8 +130,13 @@ public class METCrossDockSalesFinalizationFacade
 
         if(salesTable && metTransferTable.TransferType != METCrossDockTransferType::None)
         {
+            // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+            // In TO finalisation, before the SO picking list, the SO reservation qty needs to be initalised from the TO received qty
+            this.reservePhysicalQty(salesTable, _transferId);
+            
             //Post picking list
-            WMSShipmentId wmsShipmentId = this.postPickingList(salesTable);
+            this.postPickingList(salesTable);                       
+
             //Post intercompany picking list. Sourcing all lines from a single company
             this.postIntercompanyPickingList(salesTable);
 
@@ -142,12 +145,15 @@ public class METCrossDockSalesFinalizationFacade
             //                                                                                                        salesTable.SalesId);
             //WMSShipmentId wmsShipmentId = shipmentLoadCreation.createShippmentLoad(true,false);
 
-            if(wmsShipmentId != '')
+            // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+            // Not required anymore, only the Picking list, load/shipment creation/update
+            // The TO finalisation was triggered with the wrong parameter anyway wmsShipmentId instead of MetShipmentId
+            /*if (metShipmentId != '')
             {
                 //Initialize and run the sales order finalization process. 
                 METOrderShipmentConfirmation orderShipmentConfirmation = METOrderShipmentConfirmation::construct(wmsShipmentId);
                 orderShipmentConfirmation.run();
-            }
+            }*/
         }
     }
 
@@ -212,113 +218,21 @@ public class METCrossDockSalesFinalizationFacade
     /// Post picking list
     /// </summary>
     /// <param name = "_salesTable">SalesTable buffer.</param>
-    private WMSShipmentId postPickingList(SalesTable _salesTable)
+    private void postPickingList(SalesTable _salesTable)
     {
-        boolean             isError;
-        QueryRun            queryRun;
-        SalesParmLine       salesParmLine;
-        SalesFormLetter     salesFormLetter;
+        // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+        // Refactoring to use the existing code from METSalesPickingListGenerationTaskService instead of having a separate method for xDock
+        METSalesPickingListGenerationTaskService_CrossDock salesPickingListGenerationTaskService_CrossDock = new METSalesPickingListGenerationTaskService_CrossDock();
+        salesPickingListGenerationTaskService_CrossDock.postPickingList(_salesTable);
+        WMSPickingRoute wmsPickingRoute = salesPickingListGenerationTaskService_CrossDock.getWMSPickingRoute();
 
-        WMSShipmentId wmsShipmentId = '';
-
-        try
+        // Moved the picking list registration after postPickingList
+        if (wmsPickingRoute)
         {
-            ttsbegin;
-
-            //NS-Created for CB274 - Intercompany Transfers.
-            queryRun = this.calcQuery(_salesTable);
-            //NE-Created for CB274 - Intercompany Transfers.
-
-            salesFormLetter = SalesFormLetter::construct(DocumentStatus::PickingList);
-            
-            salesFormLetter.chooseLinesQuery(queryRun);
-            salesFormLetter.salesTable(_salestable);
-            salesFormLetter.initParmSalesTable(salesFormLetter.salesTable());
-            salesFormLetter.transDate(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
-            salesFormLetter.specQty(SalesUpdate::All);
-            salesFormLetter.printFormLetter(salesFormLetter.printFormLetter());
-            salesFormLetter.createParmUpdateFromParmUpdateRecord(SalesFormletterParmData::initSalesParmUpdateFormletter(salesFormLetter.documentStatus(), salesFormLetter.pack()));
-            
-            //For intercompany orders we always pick the reserved quantity
-            if (!InventLocation::find(salesFormLetter.salesTable().InventLocationId).METPickDirector || _salesTable.InterCompanyOrder)
-            {
-                salesFormLetter.salesParmUpdate().ReduceOnHand  = NoYes::Yes;
-                salesFormLetter.salesParmUpdate().Reserve       = NoYes::Yes;
-            }
-           
-            salesFormLetter.initParameters(salesFormLetter.salesParmUpdate(), Printout::Current);
-            salesFormLetter.initLinesQuery();
-
-            SalesLine salesLineLoc;
-            
-            while select forupdate salesParmLine
-                where salesParmLine.ParmId == salesFormLetter.parmId()
-            {
-                salesLineLoc = salesParmLine.salesLine();
-                
-                salesParmLine.DeliverNow = salesLineLoc.reservedPhysical();
-                InventDim inventDimLoc = salesLineLoc.inventDim();
-
-                if(InventDimLoc.wMSLocationId == '')
-                {
-                    inventDimLoc.wMSLocationId = inventDimLoc.inventLocation().DefaultFinalShipmentLocation;
-                    salesParmLine.InventDimId = InventDim::findOrCreate(inventDimLoc).inventDimId;
-                }
-
-                salesParmLine.setQty(DocumentStatus::PickingList, false);
-                salesParmLine.update();
-            }
-
-            salesFormLetter.run();
-
-            METOrderShipmentLoadCreation shipmentLoadCreation =
-                METOrderShipmentLoadCreation::construct(METOrderTransactionType::SalesOrder, _salesTable.SalesId);
-            
-            shipmentLoadCreation.createShippmentLoad(true,false);
-            
-            WMSPickingRoute wmsPickingRoute;
-            
-            select firstonly wmsPickingRoute
-                where wmsPickingRoute.parmid == salesFormLetter.parmId();
-
-            if (wmsPickingRoute)
-            {
-                wmsPickingRoute.selectForUpdate(true);
-                wmsPickingRoute.METTransferOrderPickingRouteId = this.getTransferPickListReference(wmsPickingRoute);
-                wmsPickingRoute.doUpdate();
-
-                //If the default wmsLocation is not set at the Sales order level, update the same before pick list registration.
-                this.updateWMSPickLocation(wmsPickingRoute);
-
-                this.postPickingListRegistration(wmsPickingRoute.pickingRouteID);
-                
-                wmsShipmentId = wmsPickingRoute.shipmentId;
-
-                if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METPicklistExtractionBusinessEvent)))
-                {
-                    METPicklistExtractionBusinessEvent::newFromWMSPickingRoute(wmsPickingRoute).send();
-                }
-                else
-                {
-                    throw error("@MET:PicklistExtractionBusinessEventNotEnabled");
-                }
-            }
-            ttscommit;
+            //If the default wmsLocation is not set at the Sales order level, update the same before pick list registration.
+            this.updateWMSPickLocation(wmsPickingRoute);
+            this.postPickingListRegistration(wmsPickingRoute.pickingRouteID);
         }
-        catch
-        {
-            error ("@WAX:UpdateCancelled");
-            isError = true;
-        }
-
-        if (isError)
-        {
-            // If picking list generation failed with error revert extract status back to Open
-            _salesTable.selectForUpdate(true);
-            _salesTable.metUpdateExtractStatus();
-        }
-        
-        return wmsShipmentId;
     }
 
 ]]></Source>
@@ -386,6 +300,41 @@ public class METCrossDockSalesFinalizationFacade
         }
 
         return new sysQueryRun(qry);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reservePhysicalQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+    /// Method to reserve SO physical qty straight after TO receipt
+    /// </summary>
+    /// <param name = "_salesTable">Sales order to reserve physical qty after TO receipt</param>
+    /// <param name = "_transferId">TO received</param>
+    private void reservePhysicalQty(SalesTable _salesTable, InventTransferId _transferId)
+    {
+        InventTransferLine      inventTransferLine;
+        METInventTransferLine   metInventTransferLine;
+        SalesLine               salesLine;
+
+        // For each TO line originating from SO line (xDock)
+        while select QtyReceived from inventTransferLine
+               where inventTransferLine.TransferId == _transferId
+                join metInventTransferLine
+               where metInventTransferLine.InventTransferLine == inventTransferLine.RecId
+                join InventTransId, QtyOrdered from salesLine
+               where salesLine.InventTransId == metInventTransferLine.SalesLineTransId
+        {
+            METInventTransReserveService reserveService;
+            boolean                      partialReserve;
+
+            reserveService = METInventTransReserveService::construct(salesLine.InventTransId, salesLine.QtyOrdered);
+            reserveService.parmPickPartialReservedLine(true);
+            // reserve the TO receipt qty against the corresponding SO line
+            reserveService.reserve(inventTransferLine.QtyReceived);
+        }
     }
 
 ]]></Source>
