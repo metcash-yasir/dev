@@ -86,6 +86,9 @@ public class METCrossDockTransferOrderProcessor
             && metTransferTable.UnderBond == underBond
             join transferTable
             where transferTable.RecId == metTransferTable.InventTransferTable
+            // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+            // For allow backorders scenario, the previous TO will be received so need to create a new TO as per scenario
+            && transferTable.TransferStatus == InventTransferStatus::Created
             && transferTable.InventLocationIdFrom == fromWh
             && transferTable.InventLocationIdTo == toWh;
 
@@ -150,32 +153,19 @@ public class METCrossDockTransferOrderProcessor
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>getUnitConversionFactor</Name>
-				<Source><![CDATA[
-    private UnitOfMeasureConversionFactor getUnitConversionFactor(ItemId _itemId, SalesUnit _fromUnit)
-    {
-        InventUnitId inventUnit = InventTableModule::find(_itemId, ModuleInventPurchSales::Invent).UnitId;
-                
-        UnitOfMeasureConversionFactor convFact = 1;
-
-        if(inventUnit != _fromUnit)
-        {
-            convFact = UnitOfMeasureConversion::findByConversion(UnitOfMeasure::findBySymbol(_fromUnit).RecId, UnitOfMeasure::findBySymbol(inventUnit).RecId).Factor;
-        }
-
-        return convFact;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
 				<Name>CreateTransferOrderLine</Name>
 				<Source><![CDATA[
     private void CreateTransferOrderLine(SalesLine _salesLine, METSalesLine _metSalesLine, SalesTable _salesTable, METSalesTable _metSalesTable)
     {
-        SalesQty qtyReserved = _salesLine.mcrSalesQtyReserved();
+        // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+        // get qtyReserved in inventory unit instead of sales unit then no conversion required
+        //SalesQty qtyReserved = _salesLine.mcrSalesQtyReserved();
+        InventQty qtyReserved = _salesLine.reservedPhysical();
 
-        if (qtyReserved < _salesLine.QtyOrdered)
+        // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+        // Need to look at deliver remainder for back orders
+        //if (qtyReserved < _salesLine.QtyOrdered)
+        if (qtyReserved < _salesLine.RemainInventPhysical)
         {
             InventTransferLine transferLine;
             METInventTransferLine metTransferLine;
@@ -188,15 +178,14 @@ public class METCrossDockTransferOrderProcessor
                 {
                     transferLine.initFromSalesLine(_salesLine);
                     transferLine.initFromInventTransferTable(transferTable, true);
-
-                    UnitOfMeasureConversionFactor convFact = this.getUnitConversionFactor(_salesLine.ItemId, _salesLine.SalesUnit);
-
-                    //Create transfer order for the remaining quantity of sales order line and it should be converted to the inventory unit.
-                    transferLine.QtyTransfer = (_salesLine.QtyOrdered - qtyReserved) * convFact;
-                        
+                     
+                    // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+                    // Need to look at deliver remainder for backorders scenario
+                    transferLine.QtyTransfer = (_salesLine.RemainInventPhysical - qtyReserved);
+   
                     if(_salesLine.PdsCWQty)
                     {
-                        transferLine.PdsCWQtyTransfer = _salesLine.pdsCWQtyActivateRemainder() * convFact;
+                        transferLine.PdsCWQtyTransfer = _salesLine.pdsCWQtyActivateRemainder();
                         transferLine.modifiedField(fieldNum(InventTransferLine, PdsCWQtyTransfer));
                     }
 
@@ -211,7 +200,7 @@ public class METCrossDockTransferOrderProcessor
                     inventDimTO.InventLocationId = inventDimTOOrig.InventLocationId;
 
                     inventDimTO.wMSLocationId = InventLocation::find(inventDimTO.InventLocationId).DefaultFinalShipmentLocation;
-
+                    
                     transferLine.LineNum = _salesLine.LineNum;
                     transferLine.InventDimId = inventDim::findOrCreate(inventDimTO).inventDimId;
 
@@ -220,8 +209,10 @@ public class METCrossDockTransferOrderProcessor
                         transferLine.insert();
                     }
 
-                    this.insertSupplyRelation(_salesLine, transferLine);
-                    this.checkAndUpdateMarking(_salesLine, transferLine);
+                    // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+                    // Commented FC confirmed not to use preview feature
+                    //this.insertSupplyRelation(_salesLine, transferLine);                    
+                    //this.checkAndUpdateMarking(_salesLine, transferLine);
 
                     metTransferLine.clear();
                     metTransferLine.initValue();
@@ -327,77 +318,6 @@ public class METCrossDockTransferOrderProcessor
             _salesTable.METOrderExtractDateTime = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
             _salesTable.update();
         }
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>checkAndUpdateMarking</Name>
-				<Source><![CDATA[
-    private void checkAndUpdateMarking(SalesLine _salesLine, InventTransferLine _transferLine)
-    {
-        //&& this.shouldAutoMarking(_salesLine.ItemId) - check if this needs to be enabled later.
-        if (!PdsGlobal::pdsIsCWItem(_salesLine.ItemId))
-        {
-            InventTransOriginId salesLineTransOriginId    = InventTransOrigin::findByInventTransId(_salesLine.InventTransId).RecId;
-            InventTransOriginId transferLineTransOriginId = InventTransOrigin::findByInventTransId(_transferLine.InventTransIdReceive).RecId;
-
-            InventDimParm inventDimParm;
-            InventDim     inventDim = _salesLine.inventDim();
-            inventDimParm.initFromInventDim(inventDim);
-
-            this.updateMarking(salesLineTransOriginId, transferLineTransOriginId, -_transferLine.QtyTransfer, -_transferLine.PdsCWQtyTransfer, inventDim, inventDimParm);
-        }
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>updateMarking</Name>
-				<Source><![CDATA[
-    private void updateMarking(
-        InventTransOriginId     _inventTransOriginId,           // Issue
-        InventTransOriginId     _markingRefInventTransOriginId, // Receipt
-        InventQty               _markQty,
-        PdsCWInventQty          _cwMarkQty,
-        InventDim               _inventDimCriteria = null,
-        InventDimParm           _inventDimParm = null)
-    {
-        PmfQtyDataCarrier outQuantities = new PmfQtyDataCarrier();
-
-        // mark sales line
-        InventQty markedQty = InventTransOrigin::updateMarking(_inventTransOriginId, _markingRefInventTransOriginId, _markQty, '', SortOrder::Descending, true, _inventDimCriteria, _inventDimParm, _cwMarkQty, outQuantities);
-
-        if (!markedQty)
-        {
-            return;
-        }
-
-        // mark transfer line receive
-        InventQty markedReverseQty = InventTransOrigin::updateMarking(_markingRefInventTransOriginId, _inventTransOriginId, markedQty, '', SortOrder::Descending, true, _inventDimCriteria, _inventDimParm, outQuantities.parmCwQty());
-
-        if (markedReverseQty)
-        {
-            // update reservation for the issue.
-            InventUpd_Reservation::updateReserveRefTransId(InventTransOrigin::find(_inventTransOriginId).inventMovement(InventDirection::Issue), true);
-        }
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>insertSupplyRelation</Name>
-				<Source><![CDATA[
-    private void insertSupplyRelation(SalesLine _salesLine, InventTransferLine _inventTransferLine)
-    {
-        ttsbegin;
-        InventTransferOrderSalesLineSupplyRelation relation;
-        relation.SalesId                         = _salesLine.SalesId;
-        relation.SalesLineCreationSequenceNumber = _salesLine.LineCreationSequenceNumber;
-        relation.TransferId                      = _inventTransferLine.TransferId;
-        relation.TransferLineNum                 = _inventTransferLine.LineNum;
-        relation.insert();
-        ttscommit;
     }
 
 ]]></Source>

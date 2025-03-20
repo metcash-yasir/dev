@@ -6,568 +6,93 @@
 /// <summary>
 /// Service class for sales picking list generation service task
 /// </summary>
-class METSalesPickingListGenerationTaskService extends SysOperationServiceBase
-{
-    boolean                                         processExtraction = false;
-    METSalesPickingListGenerationTaskContract       dataContract;
-    SalesTable                                      salesTable, csdSalesTable;
-    WMSPickingRoute                                 wmsPickingRoute;
-    CompanyInfo                                     companyInfo;
-    InventParameters                                inventParameter;
-    InventLocation                                  inventLocation;
-	//CB123_SalesOrderExtractScreenforCSD -start
-    RefRecId                                        salesOrderCount;
+class METSalesPickingListGenerationTaskService extends METSalesPickingListGenerationTaskServiceBase
+{  
 }
 ]]></Declaration>
 		<Methods>
 			<Method>
-				<Name>isWaveRequired</Name>
-				<Source><![CDATA[
-	//CB123_SalesOrderExtractScreenforCSD -end
-	
-    /// <summary>
-    /// Check if wave details need to be created in the system for the sales order
-    /// </summary>
-    /// <param name = "_salesTable">Table buffer of of <t>SalesTable</t></param>
-    /// <param name = "_inventLocation">Table buffer of type <t>InventLocation</t></param>
-    /// <returns>true if wave is required, otherwise false</returns>
-    private boolean isWaveRequired(SalesTable _salesTable, InventLocation _inventLocation)
-    {
-        boolean ret = false;
-
-        if (_salesTable.salesid && DateTimeUtil::minValue() != _salesTable.METOrderExtractDateTime
-                && _inventLocation.METWaveRequired == NoYes::Yes) //Bug 189021: CB123 - METCSDWarehouse = Yes & METPickDirector = yes conditions are removed.
-        {
-            ret = true;
-        }
-
-        return ret;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
 				<Name>process</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// processing logic
+    /// Required for METSalesPickingListGenerationTaskController\new
     /// </summary>
-    /// <param name = "_dataContract">The data contract</param>
+    /// <param name = "_dataContract"><c>METSalesPickingListGenerationTaskContract</c> data contract object</param>
     public void process(METSalesPickingListGenerationTaskContract _dataContract)
     {
-        #OCCRetryCount
-        try
-        {
-            ttsbegin;
-
-            this.processPickingList(_dataContract);
-
-            ttscommit;
-        }
-        catch (Exception::Deadlock)
-        {
-            retry;
-        }
-        catch (Exception::UpdateConflict)
-        {
-            if (appl.ttsLevel() == 0)
-            {
-                if (xSession::currentRetryCount() >= #RetryNum)
-                {
-                    throw Exception::UpdateConflictNotRecovered;
-                }
-                else
-                {
-                    retry;
-                }
-            }
-            else
-            {
-                throw Exception::UpdateConflict;
-            }
-        }
-        catch(Exception::DuplicateKeyException)
-        {
-            if (appl.ttsLevel() == 0)
-            {
-                if (xSession::currentRetryCount() >= #RetryNum)
-                {
-                    throw Exception::DuplicateKeyExceptionNotRecovered;
-                }
-                else
-                {
-                    retry;
-                }
-            }
-            else
-            {
-                throw Exception::DuplicateKeyException;
-            }
-        }
-        catch
-        {
-            exceptionTextFallThrough();
-        }
+        super(_dataContract);
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>processPickingList</Name>
+				<Name>updateSalesParmLineCondition</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Process the picking list operations
+    /// Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+    /// Moving existing logic in method so it can be adjusted when SO extract is called from TO finalisation
     /// </summary>
-    /// <param name = "_dataContract">Data contract reference</param>
-    public void processPickingList(METSalesPickingListGenerationTaskContract _dataContract)
+    /// <param name = "_salesLine"><c>SalesLine</c> record</param>
+    /// <returns>True if the extract status is Open or ReadyForExtract; otherwise, false.</returns>
+    protected boolean updateSalesParmLineCondition(SalesLine _salesLine)
     {
-        str         actionToPerform;
-        boolean     pickListForOrderedQty = false;
-        companyInfo  = CompanyInfo::find();
-
-        this.initParms(_dataContract);
-
-        if (salesTable)
-        {
-            //Task 162245-CB123 - SalesOrderExtractScreenforCSD- start
-            
-            inventParameter = InventParameters::find();
-
-            select firstonly METWaveRequired, METPickDirector, METCSDWarehouse
-                    from inventLocation
-                    where inventLocation.InventLocationId == salesTable.InventLocationId;
-
-            //Task 162245-CB123 - SalesOrderExtractScreenforCSD
-            if (this.isWaveRequired(salesTable, inventLocation))
-            {
-                salesTable.createWaveFromSalesTable(inventLocation.METPickDirector, salesOrderCount);
-            }
-
-            actionToPerform = this.getActionToPerform(salesTable);
-
-            if (actionToPerform == METConstants::SOExtractCreateOnlyTO)
-            {
-                // If the supply from transfer option is enabled,
-                // 1. Do not attempt stock reservation on local warehouse.
-                // 2. create TO for the whole sales order quantity from NDC to CSD warehouse.
-                
-                METCrossDockTransferOrderProcessor::construct().CreateTransferOrder(salesTable);
-
-                info(strFmt("@MET:TOCreatedForSO", salesTable.SalesId));
-            }
-            else if (actionToPerform == METConstants::SOExtractReservedSOPickAndTO)
-            {
-                METStockReservation::construct(salesTable).process();
-
-                METCrossDockTransferOrderProcessor::construct().CreateTransferOrder(salesTable);
-                
-                this.postPickingList(salesTable);
-
-                info(strFmt("@MET:PickListReservedQty", salesTable.SalesId));
-
-                this.postIntercompanyPickingList();
-            }
-            else if (actionToPerform == METConstants::SOExtractOrderedSOPickOnly)
-            {
-                //Post picking list
-                this.postPickingList(salesTable, true);
-
-                info(strFmt("@MET:PickListForOrderedQty", salesTable.SalesId));
-                //Post intercompany picking list. Sourcing all lines from a single company
-                this.postIntercompanyPickingList();
-            }
-            else if (actionToPerform == METConstants::SOExtractReservedSOPickOnly)
-            {
-                METStockReservation::construct(salesTable).process();
-                //Post picking list
-                this.postPickingList(salesTable);
-
-                info(strFmt("@MET:PickListForReservedQty", salesTable.SalesId));
-                //Post intercompany picking list. Sourcing all lines from a single company
-                this.postIntercompanyPickingList();
-            }
-            else if (actionToPerform == METConstants::SOExtractUpdateStatusOnly)
-            {
-                METSalesLine    metSalesLine;
-                SalesLine       salesLineUpdate;
-                
-                ttsbegin;
-                salesTable.selectForUpdate(true);
-                salesTable.SkipUpdate = true;
-                salesTable.SkipLineUpdate = true;
-                salesTable.METOrderExtractStatus = METOrderExtractStatus::Extracted;
-                salesTable.METOrderExtractDateTime = DateTimeUtil::getSystemDateTime();
-                salesTable.update();
-
-                update_recordset metSalesLine
-                    setting OrderExtractStatus = METOrderExtractStatus::Extracted
-                        exists join salesLineUpdate
-                            where salesLineUpdate.RecId == metSalesLine.RecId   &&
-                                salesLineUpdate.SalesId == salesTable.SalesId;
-
-                ttscommit;
-
-                info(strFmt("@MET:SOExtractionUpdate", salesTable.SalesId));
-            }
-            else if (actionToPerform == METConstants::SOExtractSkip)
-            {
-                warning(strFmt("@MET:NoActionSOExtract", salesTable.SalesId));
-            }
-        }
+        METOrderExtractStatus orderExtractStatus = _salesLine.metSalesLine().OrderExtractStatus;
+        
+        return (orderExtractStatus == METOrderExtractStatus::Open 
+             || orderExtractStatus == METOrderExtractStatus::ReadyForExtract);
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>initParms</Name>
+				<Name>setSalesParmLineFields</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Initialize parameters requried for processing picking lists
+    /// Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+    /// Moving existing logic in method so it can be adjusted when SO extract is called from TO finalisation
     /// </summary>
-    /// <param name = "_dataContract">The data contract</param>
-    public void initParms(METSalesPickingListGenerationTaskContract _dataContract)
+    /// <param name = "_salesParmLine"><c>SalesParmLine</c> record</param>
+    /// <param name = "_salesLine"><c>SalesLine</c> record</param>
+    protected void setSalesParmLineFields(SalesParmLine _salesParmLine, SalesLine _salesLine)
     {
-        dataContract    =   _dataContract;
-        salesTable      =   salesTable::find(_dataContract.parmSalesId());
-        salesOrderCount =   dataContract.parmCSDSalesOrderCount();
+        _salesParmLine.DeliverNow = _salesLine.reservedPhysicalInSalesUnit();        
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>postIntercompanyPickingList</Name>
+				<Name>updateWmsPickingRoute</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Post intercompany picking list
+    /// Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+    /// Moving existing logic in method so it can be adjusted when SO extract is called from TO finalisation
     /// </summary>
-    private void postIntercompanyPickingList()
+    /// <param name = "_wmsPickingRoute"><c>WMSPickingRoute</c> record</param>
+    protected void updateWmsPickingRoute(WMSPickingRoute _wmsPickingRoute)
     {
-        PurchTable                      purchTable_Reference    = salesTable.referencePurchTable();
-
-        if ((!purchTable_Reference.RecId && !purchTable_Reference.InterCompanySalesId) || !TradeInterCompany::checkDataAreaAccess(purchTable_Reference.InterCompanyCompanyId))
-        {
-            return;
-        }
-        else if (purchTable_Reference.RecId)
-        {
-            changeCompany(purchTable_Reference.InterCompanyCompanyId)
-            {
-                METStockReservation::construct(purchTable_Reference.interCompanySalesTable()).process();
-                this.postPickingList(purchTable_Reference.interCompanySalesTable());
-            }
-        }
-
+        
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>postPickingList</Name>
+				<Name>triggerBusinessEvent</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Post picking list
+    /// Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+    /// Moving existing logic in method so it can be adjusted when SO extract is called from TO finalisation
     /// </summary>
-    /// <param name = "_salesTable">SalesTable buffer.</param>
-    /// <param name = "_pickListOrderedQty">boolean buffer.</param>
-    private void postPickingList(SalesTable _salesTable, boolean _pickListOrderedQty = false)
+    /// <param name = "_wmsPickingRoute"><c>WMSPickingRoute</c> record</param>
+    protected void triggerBusinessEvent(WMSPickingRoute _wmsPickingRoute)
     {
-        boolean             isError;
-        QueryRun            queryRun;
-        SalesTable          salesTableCurr = SalesTable::find(_salesTable.SalesId);
-        SalesParmLine       salesParmLine;
-        SalesFormLetter     salesFormLetter;
-
-        try
+        if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METPicklistExtractionBusinessEvent)))
         {
-            //NS-Created for CB274 - Intercompany Transfers.
-            queryRun = this.calcQuery(_salesTable, _pickListOrderedQty);
-            //NE-Created for CB274 - Intercompany Transfers.
-
-            if (processExtraction == true)
-            {
-                ttsbegin;
-                salesFormLetter = SalesFormLetter::construct(DocumentStatus::PickingList);
-            
-                salesFormLetter.chooseLinesQuery(queryRun);
-                salesFormLetter.salesTable(_salestable);
-                salesFormLetter.initParmSalesTable(salesFormLetter.salesTable());
-                salesFormLetter.transDate(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
-                salesFormLetter.specQty(SalesUpdate::All);
-                salesFormLetter.printFormLetter(salesFormLetter.printFormLetter());
-                salesFormLetter.createParmUpdateFromParmUpdateRecord(SalesFormletterParmData::initSalesParmUpdateFormletter(salesFormLetter.documentStatus(), salesFormLetter.pack()));
-            
-                if (_pickListOrderedQty == false)
-                {
-                    //For intercompany orders we always pick the reserved quantity
-                    if (!InventLocation::find(salesFormLetter.salesTable().InventLocationId).METPickDirector || _salesTable.InterCompanyOrder)
-                    {
-                        salesFormLetter.salesParmUpdate().ReduceOnHand  = NoYes::Yes;
-                        salesFormLetter.salesParmUpdate().Reserve       = NoYes::Yes;
-                    }
-                }
-                else
-                {
-                    salesFormLetter.salesParmUpdate().ReduceOnHand  = NoYes::No;
-                    salesFormLetter.salesParmUpdate().Reserve       = NoYes::No;
-                }
-                // CB123 - SalesOrderExtractScreenforCSD -start
-                if (dataContract.parmCSDSalesId() == dataContract.parmSalesId())
-                {
-                    salesFormLetter.initParameters(salesFormLetter.salesParmUpdate(), Printout::Current, NoYes::Yes, NoYes::No, NoYes::No ,NoYes::Yes);
-                }
-                else
-                {
-                    salesFormLetter.initParameters(salesFormLetter.salesParmUpdate(), Printout::Current);
-                }
-                // CB123 - SalesOrderExtractScreenforCSD -end
-                salesFormLetter.initLinesQuery();
-
-
-                if (_pickListOrderedQty == false)
-                {
-                    SalesLine salesLineLoc;
-
-                    while select forupdate salesParmLine
-                        where salesParmLine.ParmId == salesFormLetter.parmId()
-                    {
-                        salesLineLoc = salesParmLine.salesLine();
-
-                        if (salesLineLoc.metSalesLine().OrderExtractStatus == METOrderExtractStatus::Open ||
-                            salesLineLoc.metSalesLine().OrderExtractStatus == METOrderExtractStatus::ReadyForExtract)
-                        {
-                            salesParmLine.DeliverNow = salesLineLoc.reservedPhysicalInSalesUnit();
-                        
-                            salesParmLine.setQty(DocumentStatus::PickingList, false);
-                            salesParmLine.update();
-                        }
-                    }
-                }
-                else
-                {
-                    Info(strfmt("@MET:SOPickListForOrderQty", _salesTable.SalesId));
-                }
-
-                salesFormLetter.run();
-
-                METOrderShipmentLoadCreation shipmentLoadCreation =
-                    METOrderShipmentLoadCreation::construct(METOrderTransactionType::SalesOrder, _salesTable.SalesId);
-            
-                shipmentLoadCreation.createShippmentLoad(true,false);
-                ttscommit;
-
-                select firstonly wmsPickingRoute
-                    where wmsPickingRoute.parmid == salesFormLetter.parmId();
-
-                if (wmsPickingRoute)
-                {
-                    if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METPicklistExtractionBusinessEvent)))
-                    {
-                        METPicklistExtractionBusinessEvent::newFromWMSPickingRoute(wmsPickingRoute).send();
-                    }
-                    else
-                    {
-                        error("@MET:PicklistExtractionBusinessEventNotEnabled");
-                    }
-                }
-            }
-
+            METPicklistExtractionBusinessEvent::newFromWMSPickingRoute(_wmsPickingRoute).send();
         }
-        catch
+        else
         {
-            error ("@WAX:UpdateCancelled");
-            isError = true;
+            error("@MET:PicklistExtractionBusinessEventNotEnabled");
         }
-
-        salesTableCurr.reread();
-        salesTableCurr.selectForUpdate(true);
-        salesTableCurr.metUpdateExtractStatus();
-
-        if (!isError)
-        {
-            //CB625_TMSSOPickingListExtraction
-            if (salesTableCurr.METOrderExtractStatus == METOrderExtractStatus::Extracted)
-            {
-                METTMSEngineSalesOrderProccess  metTMSEngineSalesOrderProccess = METTMSEngineSalesOrderProccess::construct(METTMSEngineSalesOrderProcess::PickingList, salesTableCurr, wmsPickingRoute.PickingRouteID);
-                metTMSEngineSalesOrderProccess.run();
-            }           
-        }
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>calcQuery</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Created for the CB274 - Intercompany Transfers.
-    /// Exclude the SO  line for extraction if it's a food item.
-    /// Create a Purchase order for the food item line.
-    /// </summary>
-    /// <param name = "_salesTable">Sales Id reference</param>
-    /// <param name = "_pickListOrderedQty">Set to yes if picking list to be generated by ordered qty</param>
-    /// <returns>SysQueryRun</returns>
-    private SysQueryRun calcQuery(SalesTable _salesTable, boolean   _pickListOrderedQty)
-    {
-        const str               oscCode = 'G-Grocery';
-        Query                   qry = new Query(QueryStr(SalesUpdate));
-        RefRecId                salesLineRecId;
-        SalesLine               salesLine;
-        METSalesLine            metSalesLine;
-        QueryBuildRange         qbrSalesLine;
-        QueryBuildDataSource    qbdsSalesLine;
-
-        qbdsSalesLine = qry.dataSourceTable(tableNum(SalesLine));
-
-        while select forupdate salesLine
-            where salesLine.SalesId == _salesTable.SalesId
-        {
-            PurchTable purchTable_Reference = salesTable.referencePurchTable();
-
-            if (!purchTable_Reference && InventTable::metGetOSCCode(salesLine.ItemId, salesLine.inventDim()) == oscCode && 
-                _salesTable.METIntercompanyTransferFulfillment == NoYes::Yes
-                && _salesTable.InterCompanyOrigin != InterCompanyOrigin::Derived)
-            {
-                METSalesOrderProcessHelper::createPOForIntercompanyFulfillment(_salesTable, salesLine);
-            }
-            else
-            {
-                if (_salesTable.METAllowBackOrders == false && _pickListOrderedQty == false && salesLine.reservedPhysicalInSalesUnit() == 0)
-                {
-                    SalesUpdateRemain::construct().updateDeliverRemainder(salesLine, 0, 0);
-
-                    info(strFmt("@MET:NoStock", salesLine.SalesId, salesLine.ItemId));
-
-                    update_recordset metSalesLine
-                        setting OrderExtractStatus = METOrderExtractStatus::Extracted
-                            where metSalesLine.SalesLine == salesLine.RecId;
-                }
-                else
-                {
-                    if (_pickListOrderedQty == false && salesLine.reservedPhysicalInSalesUnit() == 0)
-                    {
-                        continue;
-                    }
-                    processExtraction   = true;
-                    salesLineRecId      = salesLine.RecId;
-                    qbrSalesLine        = qbdsSalesLine.addRange(fieldnum(SalesLine, RecId));
-                
-                    qbrSalesLine.value(SysQuery::value(salesLineRecId));
-                }
-            }
-        }
-        return new sysQueryRun(qry);
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>getActionToPerform</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Get the appropriate action to perform based on the configuration criteria
-    /// Below matrix is attached in BUG - 201881 for reference
-    /// </summary>
-    /// <param name = "_salesTable">SalesTable reference</param>
-    /// <returns>String value</returns>
-    public str getActionToPerform(SalesTable   _salesTable)
-    {
-        str actionToPerfrom;
-        METSalesTable   metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId);
-
-        if (inventParameter.METSupplyFromTransfer == NoYes::Yes) //Food entity
-        {
-            if (metSalesTable.InternalCrossDockOrder == NoYes::Yes  &&
-                inventLocation.METCSDWarehouse == NoYes::No         &&
-                inventLocation.METPickDirector == NoYes::No         &&
-                inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractCreateOnlyTO;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    _salesTable.METAllowBackOrders == NoYes::No         &&
-                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
-                    inventLocation.METPickDirector == NoYes::No         &&
-                    inventLocation.METWaveRequired == NoYes::Yes)
-            {
-                actionToPerfrom = METConstants::SOExtractOrderedSOPickOnly;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    _salesTable.METAllowBackOrders == NoYes::No         &&
-                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
-                    inventLocation.METPickDirector == NoYes::Yes        &&
-                    inventLocation.METWaveRequired == NoYes::Yes)
-            {
-                actionToPerfrom = METConstants::SOExtractUpdateStatusOnly;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    _salesTable.METAllowBackOrders == NoYes::No         &&
-                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
-                    inventLocation.METPickDirector == NoYes::No         &&
-                    inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractUpdateStatusOnly;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    _salesTable.METAllowBackOrders == NoYes::No         &&
-                    inventLocation.METCSDWarehouse == NoYes::No         &&
-                    inventLocation.METPickDirector == NoYes::No         &&
-                    inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractReservedSOPickOnly;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    _salesTable.METAllowBackOrders == NoYes::Yes        &&
-                    inventLocation.METCSDWarehouse == NoYes::No         &&
-                    inventLocation.METPickDirector == NoYes::No         &&
-                    inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractReservedSOPickOnly;
-            }
-            else
-            {
-                actionToPerfrom = METConstants::SOExtractSkip;
-            }
-        }
-        else // Liquor entity
-        {
-            if (metSalesTable.InternalCrossDockOrder == NoYes::Yes  &&
-                _salesTable.METAllowBackOrders == NoYes::Yes        &&
-                inventLocation.METCSDWarehouse == NoYes::No         &&
-                inventLocation.METPickDirector == NoYes::No         &&
-                inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractReservedSOPickAndTO;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::Yes     &&
-                _salesTable.METAllowBackOrders == NoYes::No                 &&
-                inventLocation.METCSDWarehouse == NoYes::No                 &&
-                inventLocation.METPickDirector == NoYes::No                 &&
-                inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractReservedSOPickAndTO;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    _salesTable.METAllowBackOrders == NoYes::No         &&
-                    inventLocation.METCSDWarehouse == NoYes::No         &&
-                    inventLocation.METPickDirector == NoYes::No         &&
-                    inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractReservedSOPickOnly;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    _salesTable.METAllowBackOrders == NoYes::Yes        &&
-                    inventLocation.METCSDWarehouse == NoYes::No         &&
-                    inventLocation.METPickDirector == NoYes::No         &&
-                    inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractReservedSOPickOnly;
-            }
-            else
-            {
-                actionToPerfrom = METConstants::SOExtractSkip;
-            }
-        }
-        return actionToPerfrom;
     }
 
 ]]></Source>
