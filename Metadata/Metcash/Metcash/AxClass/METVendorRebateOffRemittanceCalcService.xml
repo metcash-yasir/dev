@@ -71,8 +71,8 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
         fieldsMap.insert(fieldStr(METVendorRebateOffRemittanceCalcStagingTmp, InventDimId), [_dataSourceId, fieldStr(VendPackingSlipTrans, InventDimId)]);
         fieldsMap.insert(fieldStr(METVendorRebateOffRemittanceCalcStagingTmp, LineAmount), [_dataSourceId, fieldStr(VendPackingSlipTrans, ValueMST)]);
         fieldsMap.insert(fieldStr(METVendorRebateOffRemittanceCalcStagingTmp, PurchId), [_dataSourceId, fieldStr(VendPackingSlipTrans, OrigPurchid)]);
-
-        //fieldsMap.insert(fieldStr(METVendorRebateOffRemittanceCalcStagingTmp, CustomerReference), [_purchTableDS, fieldStr(PurchTable, PurchOrderFormNum)]);
+        fieldsMap.insert(fieldStr(METVendorRebateOffRemittanceCalcStagingTmp, ItemId), [_dataSourceId, fieldStr(VendPackingSlipTrans, ItemId)]);
+        fieldsMap.insert(fieldStr(METVendorRebateOffRemittanceCalcStagingTmp, DlvMode), [_dataSourceId, fieldStr(VendPackingSlipTrans, DlvMode)]);
 
         return fieldsMap;
     }
@@ -103,7 +103,7 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
         
         qbdrPackJour.addRange(fieldNum(VendPackingSlipJour, DeliveryDate)).value('< ' + SysQuery::value(_contract.parmAsOfDate()));
 
-        //this.initialise();
+        this.initialise();
         this.processInternal(_contract);
     }
 
@@ -138,7 +138,7 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
         queueId = newGuid();
 
         try
-    {
+        {
             ttsbegin;
 
             METVendorRebateOffRemittanceCalcStaging::cleanUpQueue();
@@ -211,19 +211,17 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
         qbdsVendPackingSlipTrans.addSelectionField(fieldNum(VendPackingSlipTrans, DefaultDimension));
         qbdsVendPackingSlipTrans.addSelectionField(fieldNum(VendPackingSlipTrans, OrigPurchid));
         qbdsVendPackingSlipTrans.addSelectionField(fieldNum(VendPackingSlipTrans, ValueMST));
-
-        //QueryBuildDataSource qbdsPurchTable = userQuery.dataSourceName(tableStr(PurchTable));
-        //qbdsPurchTable.addSelectionField(fieldNum(PurchTable, PurchId));
-        //qbdsPurchTable.addSelectionField(fieldNum(PurchTable, PurchOrderFormNum));
+        qbdsVendPackingSlipTrans.addSelectionField(fieldNum(VendPackingslipTrans, ItemId));
+        qbdsVendPackingSlipTrans.addSelectionField(fieldNum(VendPackingSlipTrans, DlvMode));
 
         Query::insert_recordset(metVendorRemittenceStageTmp, this.getFieldMap(qbdsVendPackingSlipTrans.uniqueId(), 0), userQuery);
 
         //Transfer the data from tmp table to Process queue with process Id.
         insert_recordset processQueue
-            (ProcessId, PackingSlipTransRecId, InventDimId, DefaultDimension, LineAmount, SiteId, Department, CustomerReference, VendAccount)
-            select queueId, PackingSlipTransRecId, InventDimId, DefaultDimension, LineAmount
+            (ProcessId, PackingSlipTransRecId, InventDimId, DefaultDimension, LineAmount, ItemId, DlvMode, SiteId, wMSLocationId, Department, CustomerReference, VendAccount)
+            select queueId, PackingSlipTransRecId, InventDimId, DefaultDimension, LineAmount, ItemId, DlvMode
             from metVendorRemittenceStageTmp
-            join InventSiteId from inventDim 
+            join InventSiteId, wMSLocationId from inventDim 
                 where inventDim.inventDimId == metVendorRemittenceStageTmp.InventDimId
             join DisplayValue from defaultDimension 
                 where defaultDimension.DefaultDimension == metVendorRemittenceStageTmp.DefaultDimension
@@ -243,12 +241,9 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
         update_recordset processQueue
             setting ChargeCode = markupAutoLine.MarkupCode,
                 ChargePercent = markupAutoLine.Value
-                //ChargeAmount = processQueue.LineAmount * markupAutoLine.Value
             join markupAutoLine
             where markupAutoLine.TableRecId == markupAutoTable.RecId
             && markupAutoLine.TableTableId == markupAutoTable.TableId
-            //&& markupAutoLine.FromDate <= mainContract.parmAsOfDate()
-            //&& markupAutoLine.ToDate  >= mainContract.parmAsOfDate()
             join markupAutoTable
             where markupAutoTable.ModuleType == MarkupModuleType::Vend
             && markupAutoTable.AccountCode == TableGroupAll::Table
@@ -258,8 +253,9 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
             where purchGroup.PurchGroupId == markupAutoLine.METPurchGroupId
             && purchGroup.InvoiceType == METPurchGroupInvoiceType::Warehouse;
 
-        //Remove all packing slips which do not have a charge code mapping for the vendor or the purchase group invoice type is not warehouse.
+        this.updateChargeDetails();
 
+        //Remove all packing slips which do not have a charge code mapping for the vendor or the purchase group invoice type is not warehouse.
         delete_from processQueue
             where processQueue.ChargeCode == ''
             && processQueue.ProcessId == queueId;
@@ -270,6 +266,139 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
             select ProcessId, SiteId from processQueue
             group by ProcessId, SiteId
             where processQueue.ProcessId == queueId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateChargeDetails</Name>
+				<Source><![CDATA[
+    private void updateChargeDetails()
+    {
+        METVendorRebateOffRemittanceCalcStaging processQueue;
+        MarkupCode chargeCode;
+        MarkupValue chargePer;
+
+        while select VendAccount, ItemId, DlvMode, SiteId, wmsLocationId from processQueue
+            group by VendAccount, ItemId, DlvMode, SiteId, wmsLocationId
+            where processQueue.ProcessId == queueId
+            && processQueue.ChargeCode == ''
+        {
+            [chargeCode, chargePer] = this.findChargeDetails(processQueue);
+            if (chargeCode)
+            {
+                METVendorRebateOffRemittanceCalcStaging processQueueUpd;
+
+                update_recordset processQueueUpd
+                    setting ChargeCode = chargeCode,
+                    ChargePercent = chargePer,
+                    ChargeAmount = processQueueUpd.LineAmount * (chargePer/100)
+                    where processQueueUpd.VendAccount == processQueue.VendAccount
+                    && processQueueUpd.ItemId == processQueue.ItemId
+                    && processQueueUpd.DlvMode == processQueue.DlvMode
+                    && processQueueUpd.SiteId == processQueue.SiteId
+                    && processQueueUpd.wMSLocationId == processqueue.wMSLocationId;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findChargeDetails</Name>
+				<Source><![CDATA[
+    private container findChargeDetails(METVendorRebateOffRemittanceCalcStaging _record)
+    {
+        MarkupAutoTable markupAutoTable;
+        MarkupAutoLine markupAutoLine;
+
+        select firstonly markupAutoTable
+            where markupAutoTable.AccountRelation == _record.VendAccount
+            && markupAutoTable.AccountCode == TableGroupAll::Table
+            && markupAutoTable.ModuleCategory == HeadingLine::Line
+            && markupAutoTable.ModuleType == MarkupModuleType::Vend
+            && markupAutoTable.ItemCode == TableGroupAll::Table
+            && markupAutoTable.ItemRelation == _record.ItemId;
+
+        if (!markupAutoTable)
+        {
+            select firstonly markupAutoTable
+                where markupAutoTable.AccountRelation == _record.VendAccount
+                && markupAutoTable.AccountCode == TableGroupAll::Table
+                && markupAutoTable.ModuleCategory == HeadingLine::Line
+                && markupAutoTable.ModuleType == MarkupModuleType::Vend
+                && markupAutoTable.ItemCode == TableGroupAll::All;
+
+            markupAutoLine = this.findMarkupLine(markupAutoTable, _record);
+        }
+        else
+        {
+            markupAutoLine = this.findMarkupLine(markupAutoTable, _record);
+
+            if (!markupAutoLine)
+            {
+                select firstonly markupAutoTable
+                    where markupAutoTable.AccountRelation == _record.VendAccount
+                    && markupAutoTable.AccountCode == TableGroupAll::Table
+                    && markupAutoTable.ModuleCategory == HeadingLine::Line
+                    && markupAutoTable.ModuleType == MarkupModuleType::Vend;
+
+                markupAutoLine = this.findMarkupLine(markupAutoTable, _record);
+            }
+        }
+
+        return [markupAutoLine.MarkupCode, markupAutoLine.Value];
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findMarkupLine</Name>
+				<Source><![CDATA[
+    private MarkupAutoLine findMarkupLine(MarkupAutoTable _markupTable, METVendorRebateOffRemittanceCalcStaging _record)
+    {
+        MarkupAutoLine markupAutoLine;
+        MarkupAutoTable markupAutoTable = _markupTable;
+        METPurchGroup purchGroup;
+
+        select markupAutoLine
+                where markupAutoLine.TableTableId == tableNum(MarkupAutoTable)
+                && markupAutoLine.TableRecId == markupAutoTable.RecId
+                && markupAutoLine.FromDate <= mainContract.parmAsOfDate()
+                && markupAutoLine.ToDate >= mainContract.parmAsOfDate()
+                && markupAutoLine.InventSiteId == _record.SiteId
+                && markupAutoLine.InventLocationId == _record.wMSLocationId
+            exists join purchGroup
+                where purchGroup.PurchGroupId == markupAutoLine.METPurchGroupId
+                && purchGroup.InvoiceType == METPurchGroupInvoiceType::Warehouse;
+
+        if (!markupAutoLine)
+        {
+            select markupAutoLine
+                    where markupAutoLine.TableTableId == tableNum(MarkupAutoTable)
+                    && markupAutoLine.TableRecId == markupAutoTable.RecId
+                    && markupAutoLine.FromDate <= mainContract.parmAsOfDate()
+                    && markupAutoLine.ToDate >= mainContract.parmAsOfDate()
+                    && markupAutoLine.InventSiteId == _record.SiteId
+                exists join purchGroup
+                    where purchGroup.PurchGroupId == markupAutoLine.METPurchGroupId
+                    && purchGroup.InvoiceType == METPurchGroupInvoiceType::Warehouse;
+
+            if (!markupAutoLine)
+            {
+                select markupAutoLine
+                        where markupAutoLine.TableTableId == tableNum(MarkupAutoTable)
+                        && markupAutoLine.TableRecId == markupAutoTable.RecId
+                        && markupAutoLine.FromDate <= mainContract.parmAsOfDate()
+                        && markupAutoLine.ToDate >= mainContract.parmAsOfDate()
+                    exists join purchGroup
+                        where purchGroup.PurchGroupId == markupAutoLine.METPurchGroupId
+                        && purchGroup.InvoiceType == METPurchGroupInvoiceType::Warehouse;
+            }
+        }
+
+        return markupAutoLine;
     }
 
 ]]></Source>
