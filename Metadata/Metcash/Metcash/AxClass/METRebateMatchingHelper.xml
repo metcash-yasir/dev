@@ -5,7 +5,13 @@
 		<Declaration><![CDATA[
 internal final class METRebateMatchingHelper
 {
-    /*
+    static Map purchTableMap = new Map(Types::Container, Types::Record);
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>checkIfPricingAttributesAreMatched</Name>
+				<Source><![CDATA[
     static internal boolean checkIfPricingAttributesAreMatched(
         Common _journalTransaction,
         TAMRebateQueryBuilder _rebateQueryBuilder,
@@ -19,63 +25,168 @@ internal final class METRebateMatchingHelper
         {
             if (_journalTransaction is PurchTable)
             {
-                salesTable = _journalTransaction as PurchTable;
+                purchTable = _journalTransaction as PurchTable;
             }
             else
             {
                 tableName = tableId2Name(_rebateQueryBuilder.transTable());
-                SalesId salesId = _journalTransaction.(fieldName2Id(tableName2Id(tableName), 'SalesId'));
-                container key = [salesId, _rebateTable.RebateCompanyId];
+                PurchId purchId = _journalTransaction.(fieldName2Id(tableName2Id(tableName), 'PurchId'));
+                container key = [purchId, _rebateTable.RebateCompanyId];
 
-                if (salesTableMap.exists(key))
+                if (purchTableMap.exists(key))
                 {
-                    salesTable = salesTableMap.lookup(key);
+                    purchTable = purchTableMap.lookup(key);
                 }
                 else
                 {
-                    salesTable = PurchTable::find(salesId);
-                    salesTableMap.add(key, salesTable);
+                    purchTable = PurchTable::find(purchId);
+                    purchTableMap.add(key, purchTable);
                 }
             }
         }
         else
         {
             tableName = tableId2Name(_rebateQueryBuilder.transTable());
-            salesTable = PurchTable::find(_journalTransaction.(fieldName2Id(tableName2Id(tableName), 'SalesId')));
+            purchTable = PurchTable::find(_journalTransaction.(fieldName2Id(tableName2Id(tableName), 'PurchId')));
         }
 
-        if (salesTable.RecId)
+        if (purchTable.RecId)
         {
-            if (hashFeatureEnabled)
-            {
-                return GUPRebateMatchingHelper::checkIfPricingAttributesAreMatchedForSalesByHash(salesTable, _journalTransaction, tableName, _rebateTable);
-            }
-            else
-            {
-                CLRObject rebateEntities = GUPRebateMatchingHelper::buildRebateEntities(_journalTransaction.(_rebateQueryBuilder.dateFieldId()), _rebateDate, _rebateTable);
-                return GUPRebateMatchingHelper::checkIfPricingAttributesAreMatchedForSales(salesTable, _journalTransaction, tableName, _rebateDate, rebateEntities);
-            }
-        }
-        else if (_journalTransaction is CustInvoiceTrans)
-        {
-            if (hashFeatureEnabled)
-            {
-                return GUPRebateMatchingHelper::checkIfPricingAttributesAreMatchedForFreeTextInvoiceByHash(_journalTransaction, _rebateTable);
-            }
-            else
-            {
-                CLRObject rebateEntities = GUPRebateMatchingHelper::buildRebateEntities(_journalTransaction.(_rebateQueryBuilder.dateFieldId()), _rebateDate, _rebateTable);
-                return GUPRebateMatchingHelper::checkIfPricingAttributesAreMatchedForFreeTextInvoice(_journalTransaction, tableName, _rebateDate, _rebateTable, rebateEntities);
-            }
+            return METRebateMatchingHelper::checkIfPricingAttributesAreMatchedForPurchByHash(purchTable, _journalTransaction, tableName, _rebateTable);
         }
         else
         {
             return false;
         }
     }
-*/
-}
-]]></Declaration>
-		<Methods />
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkIfPricingAttributesAreMatchedForPurchByHash</Name>
+				<Source><![CDATA[
+    static internal boolean checkIfPricingAttributesAreMatchedForPurchByHash(
+        PurchTable _purchTable,
+        Common _journalTransaction,
+        str _tableName,
+        TAMRebateTable _rebateTable)
+    {
+        if (_rebateTable.PricingRuleHeader == 0 && _rebateTable.PricingRuleLine == 0)
+        {
+            return true;
+        }
+
+        PurchLine purchLine = _journalTransaction is PurchLine ?
+                              _journalTransaction as PurchLine :
+                              PurchLine::findInventTransId(_journalTransaction.(fieldName2Id(tableName2Id(_tableName), 'InventTransId')));
+
+        boolean matchPriceTree = purchLine.LineAmount != 0
+                             && (!_rebateTable.PriceComponentCombination
+                             || !GUPParameters::find().EnablePriceTree
+                             || GUPPricingTree::getComponentCodeNamesLinkedWithPriceTreeFromSalesId(_purchTable.PurchId).in(_rebateTable.getPriceComponentCodeName()));
+
+        if (!matchPriceTree)
+        {
+            return false;
+        }
+
+        boolean headerMatched;
+        container headerRuleMatchedkey = [tableNum(PurchTable), _purchTable.RecId, _rebateTable.PricingRuleHeader];
+
+        if (gupRebatePerfFlightEnabled)
+        {
+            // only match the salestable and salesline attribute
+            headerMatched = ruleMatchedCache.exists(headerRuleMatchedkey) ?
+                            ruleMatchedCache.lookup(headerRuleMatchedkey) :
+                            GUPHashHelper::checkRuleMatchedWithTableOrLineAttribute(_rebateTable.PricingRuleHeader, _purchTable)
+                            && !GUPHashHelper::checkRuleMatchedWithExclusion(_rebateTable.PricingRuleHeader, _purchTable);
+
+            if (!ruleMatchedCache.exists(headerRuleMatchedkey))
+            {
+                ruleMatchedCache.add(headerRuleMatchedkey, headerMatched);
+            }
+
+            return headerMatched
+                && GUPHashHelper::checkRuleMatchedWithTableOrLineAttribute(_rebateTable.PricingRuleLine, purchLine)
+                && !GUPHashHelper::checkRuleMatchedWithExclusion(_rebateTable.PricingRuleLine, purchLine);
+        }
+
+        if (ruleMatchedCache.exists(headerRuleMatchedkey))
+        {
+            headerMatched = ruleMatchedCache.lookup(headerRuleMatchedkey);
+        }
+        else
+        {
+            container key = [_purchTable.SalesId, _purchTable.DataAreaId];
+            Set headerHashSet = salesTableHashCache.exists(key) ?
+                                salesTableHashCache.lookup(key) :
+                                GUPHashHelper::calculateHashValueForHashKeySet(GUPHashHelper::getPropertyHashKeySetForPricingObject(_salesTable, GUPPricingAttributeSourceLevel::Header));
+
+            if (!salesTableHashCache.exists(key))
+            {
+                salesTableHashCache.add(key, headerHashSet);
+            }
+
+            headerMatched = GUPHashHelper::checkRuleMatchedWithHashSet(headerHashSet, _rebateTable.PricingRuleHeader, _purchTable);
+            ruleMatchedCache.add(headerRuleMatchedkey, headerMatched);
+        }
+
+        if (!headerMatched)
+        {
+            return false;
+        }
+
+        container productAttributekey = [purchLine.ItemId, purchLine.DataAreaId];
+        Map productAttributeValues = productAttributeCache.exists(productAttributekey) ? productAttributeCache.lookup(productAttributekey) : new Map(Types::String, Types::AnyType);
+        Set lineHashSet = GUPHashHelper::calculateHashValueForHashKeySet(GUPHashHelper::getPropertyHashKeySetForPricingObject(purchLine, GUPPricingAttributeSourceLevel::Line, productAttributeValues));
+
+        if (productAttributeCache.exists(productAttributekey))
+        {
+            productAttributeCache.remove(productAttributekey);
+        }
+        productAttributeCache.add(productAttributekey, productAttributeValues);
+
+        return headerMatched && GUPHashHelper::checkRuleMatchedWithHashSet(lineHashSet, _rebateTable.PricingRuleLine, purchLine);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkIfRecordLinkedWithPriceTree</Name>
+				<Source><![CDATA[
+    static internal boolean checkIfRecordLinkedWithPriceTree(
+        Common _journalTransaction,
+        TAMRebateQueryBuilder _rebateQueryBuilder,
+        TAMRebateTable _rebateTable)
+    {
+        if (GUPParameters::find().EnablePriceTree)
+        {
+            str tableName = tableId2Name(_rebateQueryBuilder.transTable());
+            PurchTable purchTable = PurchTable::find(_journalTransaction.(fieldName2Id(tableName2Id(tableName), 'PurchId')));
+
+            if (purchTable.RecId)
+            {
+                GUPPricingAttributeGroupCombinationName name = _rebateTable.getPriceComponentCodeName();
+                SetEnumerator enumerator = METGUPPricingTree_extension::METGetComponentCodeNamesLinkedWithPriceTreeFromPurchId(purchTable.PurchId).getEnumerator();
+
+                while (enumerator.moveNext())
+                {
+                    if (strCmp(name, enumerator.current()) == 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        else
+        {
+            return true;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
 	</SourceCode>
 </AxClass>
