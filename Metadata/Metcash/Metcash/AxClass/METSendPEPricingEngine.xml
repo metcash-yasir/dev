@@ -1,0 +1,557 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSendPEPricingEngine</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// CB 797 send PE pricing The service class for update sales order pricing from PE
+/// </summary>
+class METSendPEPricingEngine extends SysOperationServiceBase
+{
+
+    RecordInsertList      salesLinePriceComList = new RecordInsertList(tableNum(METSalesLinePriceComponent));
+    RecordInsertList      insertCompDetailList = new RecordInsertList(tableNum(METSalesLinePriceComponentDetail), true);
+    RecordInsertList      insertMarkupList = new RecordInsertList(tableNum(MarkupTrans), true);
+   
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>sendPEPricingMessage</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PE Pricing update for salesorder
+    /// </summary>
+    /// <param name="_sendPEPricingRequest">
+    /// The contract instance
+    /// </param>
+    /// <returns>
+    /// The response <c>sendPEPricingRequest</c>
+    /// </returns>
+    public void sendPEPricingMessage(METSendPEPricingRequest _sendPEPricingRequest)
+    {
+        METProcessingStatus result;
+        Description255      message = "@MET:NoRecordsUpdated"; //default message
+
+        this.processPESalesPricingUpdate(_sendPEPricingRequest);
+       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processPESalesPricingUpdate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the PE Pricing for sales lines
+    /// </summary>
+    /// <param name="_sendPEPricingRequest">List of contracts</param>
+    /// <returns>Container of Results</returns>
+    public void processPESalesPricingUpdate(METSendPEPricingRequest _sendPEPricingRequest)
+    {
+        METProcessingStatus result;
+        Description255      message = "@MET:NoRecordsUpdated";
+        container           resultCon;
+
+       
+        ttsbegin;
+        resultCon = this.sendPEHeaderPricing(_sendPEPricingRequest.parmSendPricingHeaderContract(), _sendPEPricingRequest);
+        result = conPeek(resultCon, 1);
+        message = conPeek(resultCon, 2);
+
+        // Throw the error if any node is fail and catupre in MES message log to fail
+        if (result == METProcessingStatus::Error)
+        {
+            throw Error (message);
+        }
+        
+        ttscommit;
+       
+       
+       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sendPEHeaderPricing</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// PE sales order header details
+    /// </summary>
+    /// <param name = "_metSendPricingHeader">Contract class reference</param>
+    /// <param name="_sendPEPricingRequest">List of contracts</param>
+    /// <returns>Container</returns>
+    public container sendPEHeaderPricing(METSendPricingHeaderContract _metSendPricingHeader,
+                                            METSendPEPricingRequest _sendPEPricingRequest)
+    {
+        SalesTable                              salesTable;
+        METProcessingStatus                     result;
+        Description255                          messageLoc;
+        SalesId                                 salesId;
+        METExternalOrderNumber                  externalPEorderId;
+        List                                    lines;
+        ListEnumerator                          lineEnumerator;
+        container                               resultCon;
+        METSalesTable                           metSalesTable;
+       
+        salesId = _metSendPricingHeader.parmSalesId();
+        externalPEorderId = _metSendPricingHeader.parmExternalOrderId();
+        
+        select firstonly salesTable where salesTable.SalesId == salesId;
+
+        // Verify sales order is valid or not if no return.
+        if (salesTable.SalesId == '')
+        {
+            throw error ("@MET:METOrderNotFound");
+        }
+   
+        // Update the PE External orderId as a refrence from upstream
+        select firstonly forupdate metSalesTable 
+            where metSalesTable.SalesTable == salesTable.RecId;
+
+        //Create update salesLine
+        lines = _sendPEPricingRequest.parmsendPEPricingLineClassArray();
+       
+        // To check Sales order is not invoiced primary check ready to update the salesline or not
+        if (lines &&  salesTable.checkUpdate(true))
+        { 
+            METSendPricingLineContract              sendPricingLineContract;
+
+            lineEnumerator = lines.getEnumerator();
+            while (lineEnumerator.moveNext())
+            {
+                sendPricingLineContract = lineEnumerator.current();
+                resultCon = this.createUpdateSalesLine(_sendPEPricingRequest, sendPricingLineContract, salesTable);
+                result = conPeek(resultCon, 1);
+                messageLoc = conPeek(resultCon, 2);
+                if (result == METProcessingStatus::Error)
+                {
+                    return [result, messageLoc];
+                }
+            }
+
+            //Bulk insert records
+            salesLinePriceComList.insertDatabase(); // Bulk insert priceComponent
+            insertCompDetailList.insertDatabase(); // Bulk insert compDetailRecords
+            insertMarkupList.insertDatabase(); // Bulk insert Markup records
+
+            if (metSalesTable.RecId != 0)
+            {
+                metSalesTable.ExternalOrderNumber = externalPEorderId;
+                metSalesTable.OrderProcessingStatus = METSalesOrderProcessingStatus::PricingCompleted;
+                metSalesTable.update();
+            }
+
+            // All lines sucessfully inserted and update send the pass message
+            result      = METProcessingStatus::Success;
+            messageLoc  = "@MET:METPricingSucessfullyProcessed";
+ 
+        }
+        else
+        {
+            result      = METProcessingStatus::Error;
+            messageLoc  = "@MET:METInvalidSalesLineRecord";
+        }
+
+        return [result, messageLoc];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createUpdateSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update insert sales line records.
+    ////</summary>
+    /// <param name = "_sendPEPricingRequest">Contract class reference</param>
+    /// <param name="_sendPEPricingLineClass">List of contracts</param>
+    /// <param name="_salesTable">SalesTable</param>
+    /// <returns>Container</returns>
+    public container createUpdateSalesLine(METSendPEPricingRequest _sendPEPricingRequest,
+                                            METSendPricingLineContract _sendPEPricingLineClass,
+                                             SalesTable _salesTable)
+    {
+        List                             priceComponents, markupTransRecords;
+        ListEnumerator                   priceComponentEnumerator, markupTransEnumerator;
+        SalesLine                        salesLine, salesLineBuf;
+        InventDim                        inventDim;
+        METPriceComponentContract 	     priceComponentContract;
+        METSendPricingMarkupDetailContract  markupTransContract;
+        METProcessingStatus              result;
+        Description255                   message;
+        METSendPricingHeaderContract     sendPEPricingHeaderClass = _sendPEPricingRequest.parmSendPricingHeaderContract();
+        SalesTable                       salesTable = SalesTable::find(_sendPEPricingLineClass.parmSalesId());
+        container                        resultCon;
+        InventTransId                    preInventTransId;
+        #OCCRetryCount
+
+        salesLineBuf =  SalesLine::findInventTransId(_sendPEPricingLineClass.parmInventTransId(), true);
+        
+        if (salesLineBuf.RecId == 0)
+        {
+            salesLineBuf.clear();
+            salesLineBuf.SalesId = sendPEPricingHeaderClass.parmSalesId();
+            salesLineBuf.ItemId = _sendPEPricingLineClass.parmItemId();
+
+            //Initializing the sales line from inventory
+            salesLineBuf.initFromInventTable(InventTable::find(salesLineBuf.ItemId));
+
+            //Setting and creating inventory dimensions
+            inventdim.InventSiteId = _salesTable.InventSiteId;
+            inventdim.InventLocationId = _salesTable.InventLocationId;
+            salesLineBuf.InventDimId = InventdIm::findOrCreate(inventDim).inventDimId;
+
+               
+            salesLineBuf.createLine(NoYes::Yes, // Validate
+            NoYes::Yes, // initFromSalesTable
+            NoYes::No, // initFromInventTable
+            NoYes::Yes, // calcInventQty
+            NoYes::Yes, // searchMarkup
+            NoYes::Yes); //
+
+            //Set the values as per message 
+            salesLineBuf.SalesPrice = _sendPEPricingLineClass.parmSalesPrice();
+            salesLineBuf.SalesQty = _sendPEPricingLineClass.parmSalesQty();
+            salesLineBuf.LineDisc = _sendPEPricingLineClass.parmSalesLineDisc();
+            salesLineBuf.SalesUnit = _sendPEPricingLineClass.parmSalesUnit() != '' ? _sendPEPricingLineClass.parmSalesUnit() : InventItemSalesSetup::find(salesLine.ItemId, salesLine.InventDimId).METSalesUnit;
+            salesLineBuf.LineAmount  = salesLineBuf.calcLineAmount();
+            salesLineBuf.update();
+
+        }
+        else
+        {   
+            //Set the values as per message
+            salesLineBuf.SalesPrice = _sendPEPricingLineClass.parmSalesPrice();
+            salesLineBuf.SalesQty = _sendPEPricingLineClass.parmSalesQty();
+            salesLineBuf.LineDisc = _sendPEPricingLineClass.parmSalesLineDisc();
+            //salesLineBuf.SalesUnit = _sendPEPricingLineClass.parmSalesUnit() != '' ? _sendPEPricingLineClass.parmSalesUnit() : InventItemSalesSetup::find(salesLine.ItemId, salesLine.InventDimId).METSalesUnit;
+            salesLineBuf.LineAmount = salesLineBuf.calcLineAmount();
+            salesLineBuf.update();
+        }
+
+        // price component insert or update
+        priceComponents = _sendPEPricingLineClass.parmsendPEPriceComponetClassArray();
+            
+        if (priceComponents)
+        {
+            priceComponentEnumerator = priceComponents.getEnumerator();
+            while (priceComponentEnumerator.moveNext())
+            {
+                priceComponentContract = priceComponentEnumerator.current();
+                resultCon = this.createUpdatePriceComponent(priceComponentContract, salesLineBuf);
+                result = conPeek(resultCon, 1);
+                message = conPeek(resultCon, 2);
+
+                if (result == METProcessingStatus::Error)
+                {
+                    return [result, message];
+                }
+            }  
+        }
+            
+        // Markuptrans record update insert based on salesline level
+        markupTransRecords = _sendPEPricingLineClass.parmsendPEMarkupTransClassArray();
+ 
+        if (markupTransRecords)
+        { 
+            markupTransEnumerator = markupTransRecords.getEnumerator();
+            while (markupTransEnumerator.moveNext())
+            {
+                markupTransContract = markupTransEnumerator.current();
+                resultCon = this.createUpdateMarkupTrans(markupTransContract, salesLineBuf, salesTable);
+                result = conPeek(resultCon, 1);
+                message = conPeek(resultCon, 2);
+                if (result == METProcessingStatus::Error)
+                {
+                    return [result, message];
+                }
+            }  
+        }
+       
+        return [result, message];
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createUpdatePriceComponent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update insert price component
+    /// </summary>
+    /// <param name="_priceComponentContract">PE pricingRquest</param>
+    /// <param name="_salesline">salesline</param>
+    /// <returns>Container</returns>    
+    public container createUpdatePriceComponent(METPriceComponentContract _priceComponentContract, SalesLine _salesline)
+    { 
+        METSalesLinePriceComponent      salesLinePriceComponent, salesLinePriceComInsert;
+        List                            salesLinePriceComDetail;
+        ListEnumerator                  priceCompDetailEnumerator;
+        METPriceComponentDetailContract priceCompDetailContract;
+        METProcessingStatus              result;
+        Description255                   message;
+        container                        resultCon;
+       
+        #OCCRetryCount
+       
+        salesLinePriceComponent = METSalesLinePriceComponent::find(_salesline.InventTransId,
+                                                                  _priceComponentContract.parmComponent(), 
+                                                                  _priceComponentContract.parmPriceCodeRef(), true);
+        
+        if (salesLinePriceComponent.RecId == 0)
+        {
+            salesLinePriceComInsert.clear();
+            salesLinePriceComInsert.InventTransId = _salesline.InventTransId;
+            salesLinePriceComInsert.Component     = _priceComponentContract.parmComponent();
+            salesLinePriceComInsert.PriceCodeRef  = _priceComponentContract.parmPriceCodeRef();
+            salesLinePriceComInsert.Value         = _priceComponentContract.parmAmountValue();
+            // Validate the write operation before inserting
+            message = salesLinePriceComInsert.validateValue();
+
+            if (message == '')
+            {
+                salesLinePriceComList.add(salesLinePriceComInsert);
+            }
+                
+        }
+        else
+        {
+            salesLinePriceComponent.PriceCodeRef  = _priceComponentContract.parmPriceCodeRef();
+            salesLinePriceComponent.Value         = _priceComponentContract.parmAmountValue();
+            // Validate the write operation before updating
+            message = salesLinePriceComponent.validateValue();
+
+            if (message == '')
+            {
+                salesLinePriceComponent.update();
+            }  
+        }
+
+        // Pass the error message to AIS
+        if (message != '')
+        {  
+            throw error (message);
+        }
+           
+        // price component insert or update
+        salesLinePriceComDetail = _priceComponentContract.parmsendPEPriceComponetDetailClassArray();
+ 
+        if (salesLinePriceComDetail)
+        {
+            priceCompDetailEnumerator = salesLinePriceComDetail.getEnumerator();
+
+            while (priceCompDetailEnumerator.moveNext())
+            {
+                priceCompDetailContract = priceCompDetailEnumerator.current();
+                resultCon = this.createUpdatePriceComponentDetail(priceCompDetailContract, _salesline.InventTransId, _priceComponentContract.parmPriceCodeRef());
+                result = conPeek(resultCon, 1);
+                message = conPeek(resultCon, 2);
+            }  
+        }
+
+        return [result, message];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createUpdatePriceComponentDetail</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update insert price component
+    /// </summary>
+    /// <param name="_priceComponentDetailContract">PE pricing Detail Contract</param>
+    /// <param name="_salesLineInventTransId">PE pricing Detail Contract</param>
+    /// <param name="_priceCodeRef">PE pricing Detail Contract</param>
+    /// <returns>Container</returns>
+    public container createUpdatePriceComponentDetail(METPriceComponentDetailContract _priceComponentDetailContract, 
+                                                        InventTransId _salesLineInventTransId,
+                                                        METPriceCodeRef    _priceCodeRef)
+    {
+
+        METSalesLinePriceComponentDetail    salesLinePriceComDetail, salesLinePriceCompDetailInsert;
+        METProcessingStatus                 result;
+        Description255                      message;
+        #OCCRetryCount
+
+        salesLinePriceComDetail  = METSalesLinePriceComponentDetail::find(_salesLineInventTransId,
+                                                _priceComponentDetailContract.parmComponent(),
+                                                _priceComponentDetailContract.parmCodeId(),
+                                                _priceCodeRef, true);
+
+        if (salesLinePriceComDetail.RecId == 0)
+        {
+            salesLinePriceCompDetailInsert.clear();
+            salesLinePriceCompDetailInsert.InventTransId   = _salesLineInventTransId;
+            salesLinePriceCompDetailInsert.Component       = _priceComponentDetailContract.parmComponent();
+            salesLinePriceCompDetailInsert.Code            = _priceComponentDetailContract.parmCodeId();
+            salesLinePriceCompDetailInsert.Reference       = _priceComponentDetailContract.parmReference();
+            salesLinePriceCompDetailInsert.ToDate          = _priceComponentDetailContract.parmToDate();
+            salesLinePriceCompDetailInsert.FromDate        = _priceComponentDetailContract.parmFromDate();
+            salesLinePriceCompDetailInsert.Value           = _priceComponentDetailContract.parmCustomerAllowance();
+            salesLinePriceCompDetailInsert.VendorValue     = _priceComponentDetailContract.parmVendorAllowance();
+            salesLinePriceCompDetailInsert.priceCodeRef    = _priceCodeRef;
+            // Validate the write operation before inserting
+            message = salesLinePriceCompDetailInsert.validateValue();
+
+            if (message == '')
+            {
+                insertCompDetailList.add(salesLinePriceCompDetailInsert);
+            }
+              
+        }
+        else
+        {  
+            salesLinePriceComDetail.Reference       = _priceComponentDetailContract.parmReference();
+            salesLinePriceComDetail.ToDate          = _priceComponentDetailContract.parmToDate();
+            salesLinePriceComDetail.FromDate        = _priceComponentDetailContract.parmFromDate();
+            salesLinePriceComDetail.Value           = _priceComponentDetailContract.parmCustomerAllowance();
+            salesLinePriceComDetail.VendorValue     = _priceComponentDetailContract.parmVendorAllowance();
+            // Validate the write operation before updating
+            message = salesLinePriceComDetail.validateValue();
+
+            if (message == '')
+            {
+                salesLinePriceComDetail.update();
+            }
+        }
+      
+        // Pass the error message to AIS
+        if (message != '')
+        {
+            throw error (message);
+        }
+
+        return [result, message];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createUpdateMarkupTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update insert markupTrans value
+    /// </summary>
+    /// <param name="_markupTransDetail">PE markupTrans records</param>
+    /// <param name="_salesline">InventTransId</param>
+    /// <param name="_salesTable">salesTable</param>
+    /// <returns>Container</returns>
+    public container createUpdateMarkupTrans(METSendPricingMarkupDetailContract _markupTransDetail,Salesline _salesline, SalesTable _salesTable)
+    {
+        METProcessingStatus     result;
+        Description255          message;
+        MarkupTrans             markupTrans;
+        InventTransId           inventTransId;
+        InventTableModule       inventModule;
+        #define.AUD('AUD')
+        #define.GST('GST')
+        #define.WEG('WEG')
+        #OCCRetryCount
+
+      
+        select firstonly forupdate markupTrans 
+                    where markupTrans.TransRecId == _salesline.RecId &&
+                            markupTrans.LineNum == _markupTransDetail.parmLineNum() &&
+                            markupTrans.TransTableId == tableNum(SalesLine);
+
+        select firstonly TaxItemGroupId  from inventModule
+            where inventModule.ItemId == _salesline.ItemId &&
+            inventModule.ModuleType == ModuleInventPurchSales::Sales;
+
+        // Write function did not work out used insert update 
+        if (markupTrans.RecId !=0 )
+        {
+            markupTrans.MarkupCode       = _markupTransDetail.parmMarkupCode();
+            markupTrans.MarkupCategory   = _markupTransDetail.parmMarkupCategory();
+            markupTrans.METChargesMethod = _markupTransDetail.parmMETChargesMethod();
+            markupTrans.Value            = _markupTransDetail.parmChargeValue();
+            markupTrans.CurrencyCode     = #AUD;
+            markupTrans.TaxGroup         = #GST;
+            markupTrans.TaxItemGroup     = inventModule.TaxItemGroupId != #WEG ? inventModule.TaxItemGroupId : #GST;
+            if (markupTrans.validateWrite())
+            {
+                markupTrans.update();
+            }
+            else
+            {
+                throw error("@SYS104318");
+            }
+
+        }
+        else
+        {
+            markUpTrans.initFromSalesTable(_salesTable);
+            markupTrans.TransRecId       = _salesline.RecId;
+            markupTrans.TransTableId     = tableNum(SalesLine);
+            markupTrans.LineNum          = _markupTransDetail.parmLineNum();
+            markupTrans.MarkupCode       = _markupTransDetail.parmMarkupCode();
+            markupTrans.MarkupCategory   = _markupTransDetail.parmMarkupCategory();
+            markupTrans.METChargesMethod = _markupTransDetail.parmMETChargesMethod();
+            markupTrans.Value            = _markupTransDetail.parmChargeValue();
+            markupTrans.CurrencyCode     = #AUD;
+            markupTrans.TaxGroup         = #GST;
+            markupTrans.TaxItemGroup     = inventModule.TaxItemGroupId != #WEG ? inventModule.TaxItemGroupId : #GST;
+            markupTrans.validateWrite();
+            if (markupTrans.validateWrite())
+            {
+                insertMarkupList.add(markupTrans);
+            }
+            else
+            {
+                throw error("@SYS104318");
+            }
+
+        }
+
+        return [result, message];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getErrorStr</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Capture the Error Log message
+    /// </summary>
+    /// <returns>errorLog</returns>
+    private str getErrorStr()
+    {
+        SysInfologEnumerator enumerator;
+        SysInfologMessageStruct msgStruct;
+        Exception exception;
+        str error;
+        enumerator = SysInfologEnumerator::newData(infolog.cut());
+        while (enumerator.moveNext())
+        {
+            msgStruct = new SysInfologMessageStruct(enumerator.currentMessage());
+            exception = enumerator.currentException();
+            error = strfmt("%1", error, msgStruct.message());
+        }
+        return error;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct method to create new instance
+    /// </summary>
+    /// <returns>METSendPEPricingEngine</returns>
+    Public static METSendPEPricingEngine construct()
+    {
+        return new METSendPEPricingEngine();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
