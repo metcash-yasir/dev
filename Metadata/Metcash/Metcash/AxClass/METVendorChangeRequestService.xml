@@ -14,14 +14,18 @@ class METVendorChangeRequestService
     private VendAccount vendAccountNumber;
     private List coverageWareHouseIdList = new List(Types::String);
     private ItemId itemNumber;
+    //Task110346_CB409-D365ToPIM-Supplier change request- end
+
+    InventParameters inventParameters = InventParameters::find();
+
+    MetChangeReqEffectiveDate currentDate;
+
 }
 ]]></Declaration>
 		<Methods>
 			<Method>
 				<Name>processOperation</Name>
 				<Source><![CDATA[
-    //Task110346_CB409-D365ToPIM-Supplier change request- end
-
     /// <summary>
     /// This process method initiates the business flow orchestration for vendor change requests.
     /// </summary>
@@ -37,7 +41,7 @@ class METVendorChangeRequestService
             InventSiteId inventSiteId;
             inventSiteId = _data.parmInventSiteId();
             vendorChangerequestsProcessed = new Set(Types::Int64);
-            MetChangeReqEffectiveDate currentDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), DateTimeUtil::getUserPreferredTimeZone()));
+            currentDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), DateTimeUtil::getUserPreferredTimeZone()));
             //Task110346_CB409-D365ToPIM-Supplier change request- start
             boolean validateVendorChangeRequests = true;
             //Task110346_CB409-D365ToPIM-Supplier change request- end
@@ -135,8 +139,39 @@ class METVendorChangeRequestService
             this.updateItemSubrangeAndPOTORecords(reqItemTable, _metVendorChangeRequest);
         }
         else if (reqItemTable.RecId && reqItemTable.ReqPOType == ReqPOType::Purch && reqItemTable.METInterCompanySourced == NoYes::Yes)
-        {
-            // TODO Need to take care inter company scenario once when CB 230 FSD Changes done.
+        {            
+            //CB886_IntercompanyFulfilmentProcess
+            ReqItemTable    reqItemTableInterComp;
+            InventDim       invDimInterComp;         
+
+            select firstOnly reqItemTableInterComp
+                where reqItemTableInterComp.ItemId == _metVendorChangeRequest.ItemId
+                join RecId from invDimInterComp
+                where invDimInterComp.InventDimId == reqItemTableInterComp.CovInventDimId
+                && invDimInterComp.InventSiteId == _metVendorChangeRequest.SiteId
+                && invDimInterComp.InventLocationId == _metVendorChangeRequest.InventLocationId
+                && reqItemTableInterComp.ReqPOType == ReqPOType::Purch
+                && reqItemTableInterComp.METInterCompanySourced == NoYes::Yes;
+
+            if (reqItemTableInterComp.RecId)
+            {
+                if (this.validateInterCompanyVendorChangeRequest(inventParameters.METInterCompanyPurchaseLegalEntity, _metVendorChangeRequest.ItemId, _metVendorChangeRequest.SiteId, _metVendorChangeRequest.InventLocationId))
+                {
+                    this.updateChangeReqForParentChildItemInterCompPO(_metVendorChangeRequest);
+                    this.processItemSubRange(_metVendorChangeRequest, reqItemTableInterComp);
+                    return ret; 
+                }
+            }
+
+            if (!reqItemTableInterComp.RecId && !vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
+            {
+                _metVendorChangeRequest.selectForUpdate(true);
+                _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
+                _metVendorChangeRequest.ChangeRequestLog += "@MET:NoItemCoverageError";
+                _metVendorChangeRequest.update();
+                vendorChangerequestsProcessed.add(_metVendorChangeRequest.RecId);
+                ret = false;
+            }                       
         }
         else if (reqItemTable.ReqPOType == ReqPOType::Transfer)
         {
@@ -214,6 +249,176 @@ class METVendorChangeRequestService
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>validateInterCompanyVendorChangeRequest</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate the vendor change request data
+    /// </summary>
+    /// <param name = "_legalEntity">Legal entity</param>
+    /// <param name = "_itemId">Item Id</param>
+    /// <param name = "_siteId">Site</param>
+    /// <param name = "_locationId">Warehouse</param>
+    /// <returns>If retuen true means record exist; otherwise false</returns>
+    public boolean validateInterCompanyVendorChangeRequest(DataAreaId _legalEntity, 
+                                                        ItemId _itemId, 
+                                                        InventSiteId _siteId, 
+                                                        InventLocationId _locationId)
+    {
+        boolean ret = false;
+
+        changecompany(_legalEntity)
+        {
+            MetVendorChangeRequest metVendorChangeRequestPO;
+            MetVendorChangeRequest metVendorChangeRequestPOLoc;
+
+            select firstonly metVendorChangeRequestPO
+                where metVendorChangeRequestPO.Status == METVendChangeReqStatus::Completed
+                    && metVendorChangeRequestPO.InventLocationId == _locationId
+                    && metVendorChangeRequestPO.SiteId == _siteId
+                    && metVendorChangeRequestPO.ItemId == _itemId;
+            
+            if (metVendorChangeRequestPO.RecId)
+            {
+                ret = true;
+            }
+            else
+            {
+                select firstonly metVendorChangeRequestPOLoc
+                    where metVendorChangeRequestPOLoc.InventLocationId == _locationId
+                        && metVendorChangeRequestPOLoc.SiteId == _siteId
+                        && metVendorChangeRequestPOLoc.ItemId == _itemId;
+
+                if (!metVendorChangeRequestPOLoc.RecId)
+                {
+                    ret = true;
+                }
+            }
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processItemSubRange</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the item subrange basis
+    /// </summary>
+    /// <param name = "_metVendorChangeRequest">MetVendorChangeRequest</param>
+    /// <param name = "_reqItemTable">ReqItemTable</param>
+    public void processItemSubRange(MetVendorChangeRequest _metVendorChangeRequest, ReqItemTable _reqItemTable)
+    {
+        METSubrangeId   subRangeValue;
+         
+        //Check the subrange value
+        subRangeValue = this.getSubRangeValue(_metVendorChangeRequest.ItemId, _metVendorChangeRequest.SiteId);
+
+        if (subRangeValue)
+        {
+            this.processVendChangeReqInterCompData(_metVendorChangeRequest, _reqItemTable); //Current item
+            this.processItemSubRangeChilds(_metVendorChangeRequest, subRangeValue); //Current item subrange
+        }
+        else
+        {
+            this.processVendChangeReqInterCompData(_metVendorChangeRequest, _reqItemTable);            
+        }        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processItemSubRangeChilds</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// All the same subrange items will be processed for vendor change request.
+    /// </summary>
+    /// <param name = "_metVendorChangeRequest">MetVendorChangeRequest</param>
+    /// <param name = "_subRangeValue">METSubrangeId</param>
+    public void processItemSubRangeChilds(MetVendorChangeRequest _metVendorChangeRequest, METSubrangeId   _subRangeValue)
+    {
+        METInventItemOrderSetup metInventItemOrderSetup;  
+        MetVendorChangeRequest  MetVendorChangeRequestItemSub;
+
+        while select metInventItemOrderSetup
+            where metInventItemOrderSetup.ItemId != _metVendorChangeRequest.ItemId
+                && metInventItemOrderSetup.SiteId == _metVendorChangeRequest.SiteId
+                && metInventItemOrderSetup.SubrangeId == _subRangeValue
+        {            
+            this.validateVendorChangeRequestsInterComp(metInventItemOrderSetup.ItemId, metInventItemOrderSetup.SiteId);
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateVendorChangeRequestsInterComp</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method is to validate the change request agaist item and Site.
+    /// </summary>
+    /// <param name = "_itemId">ItemId</param>
+    /// <param name = "_siteId">InventSiteId</param>
+    /// <returns></returns>
+    public boolean validateVendorChangeRequestsInterComp(ItemId _itemId, InventSiteId _siteId)
+    {
+        boolean                 ret = true;
+        METVendorChangeRequest  vendorChangeRequest;
+        ReqItemTable            reqItemTable;
+        InventDim               inventDim;
+
+        select firstonly vendorChangeRequest
+            where vendorChangeRequest.ItemId == _itemId
+                && vendorChangeRequest.SiteId == _siteId
+                && vendorChangeRequest.Status != METVendChangeReqStatus::Completed
+                && vendorChangeRequest.ChangeReqEffectiveDate <= currentDate;
+
+        select firstonly reqItemTable
+            exists join inventDim
+                where inventDim.inventDimId == reqItemTable.CovInventDimId
+                && reqItemTable.ItemId == _itemId
+                && inventDim.InventLocationId == vendorChangeRequest.InventLocationId
+                && inventDim.InventSiteId == _siteId;
+        
+        if (reqItemTable.RecId && reqItemTable.ReqPOType == ReqPOType::Purch && reqItemTable.METInterCompanySourced == NoYes::Yes)
+        {
+            ReqItemTable    reqItemTableInterComp;
+            InventDim       invDimInterComp;
+
+            select firstOnly reqItemTableInterComp
+                where reqItemTableInterComp.ItemId == vendorChangeRequest.ItemId
+                join RecId from invDimInterComp
+                where invDimInterComp.InventDimId == reqItemTableInterComp.CovInventDimId
+                && invDimInterComp.InventSiteId == vendorChangeRequest.SiteId
+                && invDimInterComp.InventLocationId == vendorChangeRequest.InventLocationId
+                && reqItemTableInterComp.ReqPOType == ReqPOType::Purch
+                && reqItemTableInterComp.METInterCompanySourced == NoYes::Yes;
+
+            if (reqItemTableInterComp.RecId)
+            {
+                if (this.validateInterCompanyVendorChangeRequest(inventParameters.METInterCompanyPurchaseLegalEntity, vendorChangeRequest.ItemId, vendorChangeRequest.SiteId, vendorChangeRequest.InventLocationId))
+                {
+                    this.processVendChangeReqInterCompData(vendorChangeRequest, reqItemTable);
+                }
+            }
+
+            if (!reqItemTableInterComp.RecId && !vendorChangerequestsProcessed.in(vendorChangeRequest.RecId))
+            {
+                vendorChangeRequest.selectForUpdate(true);
+                vendorChangeRequest.Status = METVendChangeReqStatus::Error;
+                vendorChangeRequest.ChangeRequestLog += "@MET:NoItemCoverageError";
+                vendorChangeRequest.update();
+                vendorChangerequestsProcessed.add(vendorChangeRequest.RecId);
+                ret = false;
+            }
+        }
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>updateWaitingStatusForRecords</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -222,7 +427,7 @@ class METVendorChangeRequestService
     /// <param name = "_metVendorChangeRequest">Vendor change request record.</param>
     private void updateWaitingStatusForRecords(MetVendorChangeRequest _metVendorChangeRequest)
     {
-        MetChangeReqEffectiveDate currentDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), DateTimeUtil::getUserPreferredTimeZone()));
+        currentDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), DateTimeUtil::getUserPreferredTimeZone()));
 
         MetVendorChangeRequest metVendorChangeRequest;
 
@@ -312,6 +517,84 @@ class METVendorChangeRequestService
                 gupPriceTermJournalTrans.update();
             }
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processVendChangeReqInterCompData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This is where all successfully completed records are processed.
+    /// </summary>
+    /// <param name = "_metVendorChangeRequest">Vendor change request record</param>
+    /// <param name = "_reqItemTable">Item coverage record</param>
+    /// <param name = "_itemId">Item number</param>
+    public void processVendChangeReqInterCompData(MetVendorChangeRequest _metVendorChangeRequest, ReqItemTable _reqItemTable, ItemId _itemId = '')
+    {
+        ItemId itemId;
+
+        if (!_itemId)
+        {
+            itemId = _metVendorChangeRequest.ItemId;
+        }
+
+        // Update the item coverage vendor with the pending vendor number.
+        VendAccount vendAccount = _reqItemTable.VendId;
+        VendAccount pendingVendAccount = METReqItemTable::find(_reqItemTable.RecId).PendingVendAccountNumber;
+
+        if (_reqItemTable.RecId)
+        {
+            _reqItemTable.selectForUpdate(true);
+            _reqItemTable.VendId = pendingVendAccount;
+            _reqItemTable.update();
+        }
+
+        if (vendAccountNumber != pendingVendAccount)
+        {
+            vendAccountNumber = pendingVendAccount;
+        }
+
+        //set item number
+        if (itemNumber != _reqItemTable.ItemId)
+        {
+            itemNumber = _reqItemTable.ItemId;
+        }
+
+        // Clear the pending vendor number and date when there is no error.
+        this.clearPendingVendorAccountFields(_reqItemTable.RecId);
+
+        // Pricelist of vendor to close
+        GUPVendPriceAdmTable gupVendPriceAdmTable;
+        GUPVendPriceAdmTrans gupVendPriceAdmTrans;
+
+        update_recordset gupVendPriceAdmTrans
+        setting ToDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone())
+        exists join gupVendPriceAdmTable
+            where gupVendPriceAdmTable.JournalNum == gupVendPriceAdmTrans.JournalNum
+            && gupVendPriceAdmTable.InventSiteId == _metVendorChangeRequest.SiteId
+            && gupVendPriceAdmTable.AccountRelation == vendAccount
+            && gupVendPriceAdmTrans.ItemNum == itemId;
+
+        // Vendor Price term agreements to close.
+        GUPPriceTermJournalTable gupPriceTermJournalTable;
+        GUPPriceTermJournalTrans gupPriceTermJournalTrans;
+
+        while select forupdate gupPriceTermJournalTrans
+            exists join gupPriceTermJournalTable
+           where gupPriceTermJournalTable.AgreementId == gupPriceTermJournalTrans.AgreementId
+            && gupPriceTermJournalTable.InventSiteId == _metVendorChangeRequest.SiteId
+            && gupPriceTermJournalTable.AccountRelation == vendAccount
+        {
+            str priceDetails = gupPriceTermJournalTrans.displayPricingAttributeDescription();
+
+            if (strScan(priceDetails, itemId, 1, strLen(priceDetails)))
+            {
+                gupPriceTermJournalTrans.ValidTo = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+                gupPriceTermJournalTrans.update();
+            }
+        }
+        this.updateVendorChangeRequestStatus(_metVendorChangeRequest); 
     }
 
 ]]></Source>
@@ -411,6 +694,25 @@ class METVendorChangeRequestService
         }
 
         return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSubRangeValue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get subrange value for vendor change request process.
+    /// </summary>
+    /// <param name = "_itemId">Item ID</param>
+    /// <param name = "_siteId">Site ID</param>
+    /// <returns>A Subrange value</returns>
+    private METSubrangeId getSubRangeValue(ItemId _itemId, InventSiteId _siteId)
+    {        
+        METInventItemOrderSetup metInventItemOrderSetup = METInventItemOrderSetup::findByItemAndSite(_itemId, _siteId);
+        METSubrangeId           subRangeValue           = metInventItemOrderSetup.SubrangeId;
+        
+        return subRangeValue;
     }
 
 ]]></Source>
@@ -549,6 +851,27 @@ class METVendorChangeRequestService
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>updateChangeReqForParentChildItemInterCompPO</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inter company PO updates the vendor change requests for all the child items based on parent item.
+    /// </summary>
+    /// <param name = "_metVendorChangeRequest">_metVendorChangeRequest</param>
+    private void updateChangeReqForParentChildItemInterCompPO(METVendorChangeRequest _metVendorChangeRequest)
+    {
+        METSalesItemSubstitutionParentChild parent;
+
+        while select parent
+            where parent.ParentItemID == _metVendorChangeRequest.ItemId
+                && parent.InventSiteId == _metVendorChangeRequest.SiteId
+        {
+            this.validateVendorChangeRequestsInterComp(parent.ChildItemID, parent.InventSiteId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>updateTemporaryItemPackChangeRecords</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -594,6 +917,20 @@ class METVendorChangeRequestService
         this.updateTemporaryItemPackChangeRecords(_metVendorChangeRequest);
         this.updateChangeReqForParentChildItem(_metVendorChangeRequest);
         this.updateTransferOrderRelatedToPO(_metVendorChangeRequest);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateRelatedChildsInterCompPO</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inter company PO Update all the linked child records 
+    /// </summary>
+    /// <param name = "_metVendorChangeRequest">_metVendorChangeRequest</param>
+    private void updateRelatedChildsInterCompPO(MetVendorChangeRequest _metVendorChangeRequest)
+    {
+        this.updateChangeReqForParentChildItemInterCompPO(_metVendorChangeRequest);
     }
 
 ]]></Source>
