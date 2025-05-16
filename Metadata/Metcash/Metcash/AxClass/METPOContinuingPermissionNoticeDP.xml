@@ -94,8 +94,8 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
         List metBondList = strSplit(site.METBondNumber, ' ');
         Container metBondCon = list2con(metBondList);
 
-        header.SenderBranchExciseNumber = conpeek(metBondCon, 1);
-        header.SenderBranchBondNumber = conpeek(metBondCon, 2);
+        header.SenderBranchExciseNumber = conpeek(metBondCon, 2);
+        header.SenderBranchBondNumber = conpeek(metBondCon, 1);
         header.ReceivingBranchExciseNumber = vendTable.ExciseNumber;
         header.ReceivingBranchBondNumber = vendTable.BondNumber;
         header.ReturnPurchaseOrder = purchTable.PurchId;
@@ -141,6 +141,7 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
         InventTable inventTable;
         InventDim inventDim;
         METInventTable metInventTable;
+        METPurchLine metPurchLine;
         
         METExciseRegisterEntry exciseRegister;
         METExciseInformationTable metExciseInformationTable;
@@ -155,35 +156,31 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
             where metInventTable.ItemId == inventTable.ItemId
         outer join TariffItem from tariffCodeBase
             where tariffCodeBase.RecId == metInventTable.METTariffItemCodeBaseRecid
-        outer join RecId from inventDim
+        outer join RecId, InventSiteId from inventDim
             where inventDim.inventDimId == purchLine.InventDimId
-        outer join forupdate metExciseInformationTable
-            where metExciseInformationTable.InventTransType == InventTransType::Purch  &&
-            metExciseInformationTable.ReferenceNumber == purchLine.PurchId &&
-            metExciseInformationTable.ItemId == purchLine.ItemId &&
-            metExciseInformationTable.SiteId == inventDim.InventSiteId &&
-            metExciseInformationTable.Lodgement == ''
+        outer join RecId, Lodgement from metPurchLine
+            where metPurchLine.PurchLine == purchLine.RecId
         {
             METLodgement lodgement;
 
-            if (metExciseInformationTable.RecId)
+            if (metPurchLine.Lodgement)
             {
-                lodgement = this.getMetLodgement(metExciseInformationTable);
+                lodgement = metPurchLine.Lodgement;
+            }
+            else
+            {
+                lodgement = this.getMetLodgement(purchLine.ItemId, inventDim.InventSiteId, purchLine.QtyOrdered);
+            }
 
-                if (lodgement)
+            if (lodgement)
+            {
+                List lodgementList = strSplit(lodgement, ';');
+                ListEnumerator enum = lodgementList.getEnumerator();
+
+                while (enum.moveNext())
                 {
-                    List lodgementList = strSplit(lodgement, ';');
-                    ListEnumerator enum = lodgementList.getEnumerator();
+                    line.BondMark = any2Str(enum.current());
 
-                    while (enum.moveNext())
-                    {
-                        line.BondMark = any2Str(enum.current());
-
-                        this.prepareRecordListTmp(purchLine, inventTable, metInventTable, tariffCodeBase, lodgement);
-                    }
-                }
-                else
-                {
                     this.prepareRecordListTmp(purchLine, inventTable, metInventTable, tariffCodeBase, lodgement);
                 }
             }
@@ -325,8 +322,10 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
         }
 
         select TIUV, DutyRateReceived from exciseRegister
-                where exciseRegister.OrderNumber == purchTable.PurchId
-                && exciseRegister.ItemId == _purchLine.ItemId;
+                where exciseRegister.SiteId == _purchLine.inventDim().InventSiteId
+                && exciseRegister.ItemId == _purchLine.ItemId
+                && exciseRegister.OriginType == InventTransType::Purch
+                && exciseRegister.Lodgement == line.BondMark;
 
         METPurchaseWMSFactor purchaseWMSFactor = UnitOfMeasureConversion::findByConversion(UnitOfMeasure::findBySymbol(_purchLine.PurchUnit).RecId, UnitOfMeasure::findBySymbol(defaultUOM).RecId, EcoResProduct::findByProductNumber(_purchLine.ItemId).RecId).Factor;
         line.BottlesSupplied = abs(purchaseWMSFactor * _purchLine.PurchQty);
@@ -337,7 +336,7 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
         line.Strength = _metInventTable.AlcoholContent;
         line.PurchUoM = _purchLine.PurchUnit;
         line.Quantity = _purchLine.PurchQty;
-        line.LitresOfAlcoholCalculated = abs(_metInventTable.BottleSize * line.BottlesSupplied * _metInventTable.AlcoholContent);
+        line.LitresOfAlcoholCalculated = abs(_metInventTable.BottleSize * line.BottlesSupplied * (_metInventTable.AlcoholContent/100));
         line.ValueTIU = exciseRegister.TIUV;
         line.TariffItem = _tariffCodeBase.TariffItem;
         line.CountryOfOrigin = _metInventTable.CountryCode;
@@ -354,104 +353,44 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
 				<Name>getMetLodgement</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Gets the lodgement details for the updated excise information table.
+    /// Concatenated lodgement details.
     /// </summary>
-    /// <param name = "_metExciseInformationTable">_metExciseInformationTable buffer</param>
-    /// <returns>Returns the concatenated lodgement details.</returns>
-    private METLodgement getMetLodgement(METExciseInformationTable _metExciseInformationTable)
+    /// <param name = "_itemId">Item Id</param>
+    /// <param name = "_siteId">Site Id</param>
+    /// <param name = "_purchLineQty">Purchase order line quantity</param>
+    /// <returns></returns>
+    private METLodgement getMetLodgement(ItemId _itemId, InventSiteId _siteId, Qty _purchLineQty)
     {
-        METExciseInformationTable       metExciseInformationTablePO;
-        METAvailableQty                 purchAvailableQty;
-        METAvailableQty                 purchAvailableQtyOrig;
-        METLodgement                    metLodgement;
+        METExciseInformationTable metExciseInformationTablePO;
+        METLodgement              metLodgement;
+        real                      remainingQty = abs(_purchLineQty);
 
-        try
-        {
-            ttsbegin;
-
-            container                       lodgementQtyCon;
-
-            select forupdate metExciseInformationTablePO
-            order by CreatedDateTime
+        while select forupdate metExciseInformationTablePO
+            order by CreatedDateTime desc
                 where metExciseInformationTablePO.InventTransType == InventTransType::Purch &&
-                    metExciseInformationTablePO.ItemId == _metExciseInformationTable.ItemId &&
-                    metExciseInformationTablePO.SiteId == _metExciseInformationTable.SiteId &&
-                    metExciseInformationTablePO.LodgementClosed == NoYes::No;
-
-            if (metExciseInformationTablePO.RecId != 0)
+                metExciseInformationTablePO.ItemId == _itemId &&
+                metExciseInformationTablePO.SiteId == _siteId &&
+                metExciseInformationTablePO.LodgementClosed == NoYes::No
+        {
+            if (remainingQty > 0)
             {
-                purchAvailableQty  =  metExciseInformationTablePO.AvailableQty -  abs(_metExciseInformationTable.InventoryQty);
-                metLodgement = metExciseInformationTablePO.Lodgement;
+                // Subtract the available quantity from the remaining
+                remainingQty -= metExciseInformationTablePO.AvailableQty;
 
-                if (purchAvailableQty > 0)
+                // Append Lodgement to result string
+                if (!metLodgement)
                 {
-                    lodgementQtyCon += [metExciseInformationTablePO.Lodgement, abs(_metExciseInformationTable.InventoryQty)];
-
-                    metExciseInformationTablePO.AvailableQty = purchAvailableQty;
-                    metExciseInformationTablePO.update();
-
-                    _metExciseInformationTable.Lodgement = metExciseInformationTablePO.Lodgement;
-                    _metExciseInformationTable.LodgementAndQtyCon = lodgementQtyCon;
-                    _metExciseInformationTable.update();
+                    metLodgement = metExciseInformationTablePO.Lodgement;
                 }
                 else
                 {
-                    lodgementQtyCon += [metExciseInformationTablePO.Lodgement, abs(metExciseInformationTablePO.AvailableQty)];
-
-                    metExciseInformationTablePO.AvailableQty = 0;
-                    metExciseInformationTablePO.LodgementClosed = NoYes::Yes;
-                    metExciseInformationTablePO.update();
-
-                    do
-                    {
-                        next metExciseInformationTablePO;
-
-                        if (metExciseInformationTablePO.RecId == 0)
-                        {
-                            Error(strFmt("@MET:LodgementValidation", _metExciseInformationTable.ItemId, _metExciseInformationTable.SiteId));
-                            break;
-                        }
-                        purchAvailableQtyOrig = abs(purchAvailableQty);
-                        purchAvailableQty  =  metExciseInformationTablePO.AvailableQty - abs(purchAvailableQty);
-
-                        metLodgement = metLodgement + ','+  metExciseInformationTablePO.Lodgement;
-
-                        if (purchAvailableQty > 0)
-                        {
-                            lodgementQtyCon += [metExciseInformationTablePO.Lodgement, purchAvailableQtyOrig];
-
-                            metExciseInformationTablePO.AvailableQty = purchAvailableQty;
-                            metExciseInformationTablePO.update();
-
-                            break;
-                        }
-                        else
-                        {
-                            lodgementQtyCon += [metExciseInformationTablePO.Lodgement, metExciseInformationTablePO.AvailableQty];
-
-                            metExciseInformationTablePO.AvailableQty = 0;
-                            metExciseInformationTablePO.LodgementClosed = NoYes::Yes;
-                            metExciseInformationTablePO.update();
-                        }
-                    }
-                    while (purchAvailableQty < 0);
-
-                    _metExciseInformationTable.Lodgement = metLodgement;
-                    _metExciseInformationTable.LodgementAndQtyCon = lodgementQtyCon;
-                    _metExciseInformationTable.update();
+                    metLodgement += ";" + metExciseInformationTablePO.Lodgement;
                 }
-
-                info(strFmt("@MET:LodgmentUpdate", _metExciseInformationTable.ItemId, _metExciseInformationTable.SiteId));
             }
             else
             {
-                Error(strFmt("@MET:LodgementValidation", _metExciseInformationTable.ItemId, _metExciseInformationTable.SiteId));
+                break; // Exit if no more quantity is needed
             }
-            ttscommit;
-        }
-        catch
-        {
-            exceptionTextFallThrough();
         }
 
         return metLodgement;
