@@ -16,7 +16,11 @@ class METTransferOrderLoadPlanningDP extends SrsReportDataProviderPreProcessTemp
     InventTransferShipDate               confirmedShipDateFrom, confirmedShipDateTo;
     RecordInsertList                     transferOrderLoadPlanningAidLineslist;
     LogisticsLocationRoleRecId           roleDeliveryRecId;
-
+    InventLocationId                     fromWarehouse;
+    InventLocationId                     toWarehouse;
+    METRoute                             routeID;
+    METOrderExtractStatus                extractStatus;
+    METOrderSplitGroup                   orderSplitGroup;
 
 }
 ]]></Declaration>
@@ -49,8 +53,12 @@ class METTransferOrderLoadPlanningDP extends SrsReportDataProviderPreProcessTemp
 
         confirmedShipDateFrom = contract.parmConfirmedShipDateFrom();
         confirmedShipDateTo = contract.parmConfirmedShipDateTo();
+        orderSplitGroup     = contract.parmOrderSplitGroup();
+        extractStatus       = contract.parmExtractStatus();
+        fromWarehouse       = contract.parmFromWarehouse();
+        toWarehouse         = contract.parmToWarehouse();
+        routeId             = contract.parmRouteID();
 
-        
         transferOrderLoadPlanningAidLineslist = new RecordInsertList(tableNum(METTransferOrderLoadPlanningLinesTmp), false, false, false, false, false, transferOrderLoadPlanningLinesTmp);
         
         str extractOrdersSelected = contract.parmSelectedRecords();
@@ -96,35 +104,31 @@ class METTransferOrderLoadPlanningDP extends SrsReportDataProviderPreProcessTemp
         METInventLocation           metInventLocation;
         ReqItemTable                reqItemTable;
         MetReqItemTable             metReqItemTable;
-        InventDim                   inventDimReq, inventDim;
+        InventDim                   inventDim;
 
-        while select RecId, TransferId, LineNum from inventTransferLine
-            join ShipDate, RecId from inventTransferTable
-                where inventTransferTable.TransferId == inventTransferLine.TransferId
+        while select RecId, TransferId, ItemId, InventDimId, LineNum from inventTransferLine
+            join ShipDate, RecId, InventLocationIdFrom, InventLocationIdTo from inventTransferTable
+                where inventTransferTable.TransferId == inventTransferLine.TransferId               
                 && (!selectedTransferId || inventTransferTable.TransferId == selectedTransferId)
-                && inventTransferTable.TransferStatus == InventTransferStatus::Created
+                && (!fromWarehouse  || inventTransferTable.InventLocationIdFrom == fromWarehouse)
+                && (!toWarehouse  || inventTransferTable.InventLocationIdTo == toWarehouse)
                 && (inventTransferTable.ShipDate >= confirmedShipDateFrom
                 && inventTransferTable.ShipDate <= confirmedShipDateTo)
-            join InventSiteId, InventLocationId from inventDim
+                && inventTransferTable.TransferStatus == InventTransferStatus::Created
+            join Route, RouteStopNum, StagingLane, OrderSplitGroup from metInventTransferTableExt
+                where metInventTransferTableExt.InventTransferTable == inventTransferTable.RecId
+                && (!extractStatus || metInventTransferTableExt.OrderExtractStatus == extractStatus)
+                && (!routeId  || metInventTransferTableExt.Route == routeId)
+            join BrokenCase, Cases, TotalVolume, TotalWeight  from metInventTransferLine
+                where metInventTransferLine.InventTransferLine == inventTransferLine.RecId
+            join InventSiteId, InventLocationId, inventDimId from inventDim
                 where inventDim.inventDimId == inventTransferLine.InventDimId
             join Name from inventLocationFrom
                 where inventLocationFrom.InventLocationId == inventTransferTable.InventLocationIdFrom
             join Name, InventLocationId, RecId from inventLocationTo
                 where inventLocationTo.InventLocationId == inventTransferTable.InventLocationIdTo
             join InternalCustomer from metInventLocation
-                where metInventLocation.InventLocation == inventLocationTo.RecId          
-            join Route, RouteStopNum, StagingLane from metInventTransferTableExt
-                where metInventTransferTableExt.InventTransferTable == inventTransferTable.RecId
-            join BrokenCase, Cases, TotalVolume, TotalWeight  from metInventTransferLine
-                where metInventTransferLine.InventTransferLine == inventTransferLine.RecId
-            join RecId from reqItemTable
-                where reqItemTable.ItemId == inventTransferLine.ItemId
-            join OSCCode from metReqItemTable
-                where metReqItemTable.RefRecId == reqItemTable.RecId
-            exists join inventDimReq
-                where inventDimReq.InventSiteId == inventDim.InventSiteId
-                && InventDimReq.InventLocationId == inventDim.InventLocationId
-                && inventDimReq.inventDimId == reqItemTable.CovInventDimId            
+                where metInventLocation.InventLocation == inventLocationTo.RecId             
         {
             transferOrderLoadPlanningLinesTmp.FromWareHouseName = inventLocationFrom.Name;
             transferOrderLoadPlanningLinesTmp.ConfirmedShipDate = inventTransferTable.ShipDate;
@@ -140,30 +144,28 @@ class METTransferOrderLoadPlanningDP extends SrsReportDataProviderPreProcessTemp
             {
                 transferOrderLoadPlanningLinesTmp.InternalCustomer = metInventLocation.InternalCustomer;
                 
-                if (CustTable::exist(metInventLocation.InternalCustomer))
+                RefRecId party = CustTable::find(metInventLocation.InternalCustomer).Party;
+
+                if (party != 0)
                 {
-                    RefRecId party = CustTable::find(metInventLocation.InternalCustomer).Party;
-                    
                     transferOrderLoadPlanningLinesTmp.ToWareHouseName =  DirPartyTable::getName(CustTable::find(metInventLocation.InternalCustomer).Party);
 
                     transferOrderLoadPlanningLinesTmp.Suburb = this.getPrimaryCustDeliveryAddress(party, DirPartyTable::findRec(party).PrimaryAddressLocation);
                 }
-                else
-                {
-                    transferOrderLoadPlanningLinesTmp.ToWareHouseName = '';
-                    transferOrderLoadPlanningLinesTmp.Suburb = '';
-                }
             }
-            else
-            {
-                transferOrderLoadPlanningLinesTmp.InternalCustomer = inventLocationTo.InventLocationId;
-                transferOrderLoadPlanningLinesTmp.ToWareHouseName = inventLocationTo.Name;
-                transferOrderLoadPlanningLinesTmp.Suburb = this.getWareHousePrimaryAddress(inventLocationTo.RecId).City;
-            }
+            
             transferOrderLoadPlanningLinesTmp.TransferId = inventTransferLine.TransferId;
             transferOrderLoadPlanningLinesTmp.LineNum = inventTransferLine.LineNum;
 
-            transferOrderLoadPlanningLinesTmp.OrderSplitCategoryCode = metReqItemTable.OSCCode == METConstants::OSCCodeP ? METConstants::OSCCodePER : METConstants::OSCCodeDRY;
+            if (metInventTransferTableExt.OrderSplitGroup == METConstants::OSCCodeP)
+            {
+                transferOrderLoadPlanningLinesTmp.OrderSplitCategoryCode = METConstants::OSCCodePER;
+            }
+            else
+            {
+                transferOrderLoadPlanningLinesTmp.OrderSplitCategoryCode = METConstants::OSCCodeDRY;
+            }
+
             transferOrderLoadPlanningAidLineslist.add(transferOrderLoadPlanningLinesTmp);
         }
     }
@@ -216,7 +218,7 @@ class METTransferOrderLoadPlanningDP extends SrsReportDataProviderPreProcessTemp
             && dirPartyPostalAddressView.ValidTo >= DateTimeUtil::getSystemDateTime()
         exists join dirPartyLocationRole
             where dirPartyLocationRole.PartyLocation == dirPartyPostalAddressView.RecId
-            && dirPartyLocationRole.LocationRole == roleDeliveryRecId;
+            && dirPartyLocationRole.LocationRole == LogisticsLocationRole::findByName(METConstants::DeliveryAddress).RecId;
 
         return dirPartyPostalAddressView.City;
     }
