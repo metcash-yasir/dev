@@ -144,7 +144,7 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
             headerTmp.RunNumber             = strFmt("%1/%2", shipmentHeader.Route, shipmentHeader.RouteStopNum);//shipmentHeader.Route + '/' + any2Str(shipmentHeader.RouteStopNum);
             
             headerTmp.Text                  = 'KEGs';
-            headerTmp.ReportDateTime        = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+            headerTmp.ReportDateTime        = DateTimeUtil::getSystemDateTime();
             headerTmp.ReportUser            = XUserInfo::find(false, curUserId()).name;
 
             headerTmp.WarehouseName         = inventLocation.Name;
@@ -201,7 +201,7 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
                 salesOrdersTmp.CoverNotesHeaderGuidStr      = headerReportGuid;
                 salesOrdersTmp.insert();
 
-                this.addProductTypesSalesOrder(shipmentLines.OrderNum, shipmentLines.ShipmentId);
+                this.addProductTypesSalesOrder(shipmentLines.OrderNum, shipmentLines.ShipmentId, shipmentLines.Quantity);
                 this.addTotes(shipmentLines.OrderNum);
             }
             else if (_transactionType == METOrderTransactionType::TransferOrder)
@@ -312,7 +312,7 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
     /// </summary>
     /// <param name = "_salesId">Sales order number</param>
     /// <param name = "_shipmentId">Shipment number</param>
-    public void addProductTypesSalesOrder(SalesId _salesId, MetShipmentId _shipmentId)
+    public void addProductTypesSalesOrder(SalesId _salesId, MetShipmentId _shipmentId, Qty _deliveryNoteQty)
     {
         WHSFilters                  whsFilters;
         SalesLine                   salesLine;
@@ -320,6 +320,7 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
         InventDim                   inventDim;
         MetContainerTable           containerTable;
         METInventItemOrderSetup     metInventItemOrderSetup;
+        UnitOfMeasureFromRecId      fromUnit,toUnit;
 
         while select salesLine where salesLine.SalesId == _salesId
             join metSalesLine
@@ -333,24 +334,27 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
                 where whsFilters.FilterTitle == WHSFilterTitle::Code1
                 && whsFilters.FilterNum == metInventItemOrderSetup.FilterCode
         {
-            productTypesTmp.clear();
+            Factor                  factor;
+            InventDim               inventDimDefaultSetting;
+            InventItemSalesSetup    inventItemSalesSetup;
 
-            productTypesTmp.ProductType                 = metInventItemOrderSetup.ItemType;
-            productTypesTmp.GrossWeight                 = salesLine.displayMETGrossWeight();
-            productTypesTmp.ProductTotalWeight          = salesLine.displayMETGrossWeight();
-            productTypesTmp.METCase                     = salesLine.displayMETcases();
-            productTypesTmp.BrokenCase                  = salesLine.displayMETBrokenCase();
+            select firstonly METSalesUnit from inventItemSalesSetup
+                join inventDimDefaultSetting
+                    where inventDimDefaultSetting.inventDimId == inventItemSalesSetup.InventDimId
+                    && inventItemSalesSetup.ItemId == salesLine.ItemId
+                    && inventDimDefaultSetting.InventSiteId == inventDim.InventSiteId;
 
-            while select ContainerTypeCode, ContainerQty from containerTable
-                where containerTable.ShipmentId == _shipmentId
-            {
-                productTypesTmp.PalletContainerTotalWeight += salesLine.displayMETGrossWeight() * containerTable.ContainerQty;    
-            }
+            toUnit      = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(salesLine.SalesUnit);
+            fromUnit    = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(inventItemSalesSetup.METSalesUnit);
 
-            productTypesTmp.TotalWeight                 = productTypesTmp.ProductTotalWeight + productTypesTmp.PalletContainerTotalWeight;
-            productTypesTmp.BundleReportHeaderGuidStr   = bundleHeaderReportGuid;
-            productTypesTmp.CoverNotesHeaderGuidStr     = headerReportGuid;
-            productTypesTmp.insert();
+            factor      = EcoResProductUnitConverter::convertForReleasedProduct(
+                                    salesLine.ItemId,
+                                    salesLine.inventDimId,
+                                    1,
+                                    fromUnit,
+                                    toUnit,
+                                    NoYes::No,
+                                    NoYes::No);
         }
     }
 
@@ -366,25 +370,27 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
     /// <param name = "_shipmentId">Shipment number</param>
     public void addProductTypesTransferOrder(InventTransferId _transferId, MetShipmentId _shipmentId)
     {
+        Map                         consolidatedWeightMap;
+        METGrossWeight              totatWeight = 0;
+        MapEnumerator               consolidatedWeightMapEnum;
         WHSFilters                  whsFilters;
         InventTransferLine          transferLine;
         METInventTransferLine       metTransferLine;
         InventDim                   inventDim;
         MetContainerTable           containerTable;
         METInventItemOrderSetup     metInventItemOrderSetup;
-        UnitOfMeasureFromRecId      fromUnit,toUnit;
 
         while select transferLine where transferLine.TransferId == _transferId
             join metTransferLine
-                where metTransferLine.InventTransferLine == transferLine.RecId
-            join inventDimId, InventSiteId from inventDim
+            where metTransferLine.InventTransferLine == transferLine.RecId
+                join inventDimId, InventSiteId from inventDim
                 where inventDim.inventDimId == transferLine.InventDimId
-            join ItemType, FilterCode from metInventItemOrderSetup
-                where metInventItemOrderSetup.ItemId == transferLine.ItemId
-                && metInventItemOrderSetup.SiteId == inventDim.InventSiteId
-            join whsFilters
-                where whsFilters.FilterTitle == WHSFilterTitle::Code1
-                && whsFilters.FilterNum == metInventItemOrderSetup.FilterCode
+                    join ItemType, FilterCode from metInventItemOrderSetup
+                    where metInventItemOrderSetup.ItemId == transferLine.ItemId
+                    && metInventItemOrderSetup.SiteId == inventDim.InventSiteId
+                        join whsFilters
+                        where whsFilters.FilterTitle == WHSFilterTitle::Code1
+                        && whsFilters.FilterNum == metInventItemOrderSetup.FilterCode
         {
             Factor                  factor;
             InventDim               inventDimDefaultSetting;
@@ -396,40 +402,145 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
                     && inventItemSalesSetup.ItemId == transferLine.ItemId
                     && inventDimDefaultSetting.InventSiteId == inventDim.InventSiteId;
 
-            toUnit      = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(transferLine.UnitId);
-            fromUnit    = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(inventItemSalesSetup.METSalesUnit);
+            factor                      = this.getUnitConversionFactor(inventItemSalesSetup.METSalesUnit, transferLine);
+            consolidatedWeightMap       = this.getConsolidatedWeight(transferLine.TransferId);
+            consolidatedWeightMapEnum   = consolidatedWeightMap.getEnumerator();
 
-            factor      = EcoResProductUnitConverter::convertForReleasedProduct(
-                                    transferLine.ItemId,
-                                    transferLine.inventDimId,
-                                    1,
-                                    fromUnit,
-                                    toUnit,
-                                    NoYes::No,
-                                    NoYes::No);
-
-            if (factor)
+            if (consolidatedWeightMap.exists(whsFilters.Description))
             {
-                productTypesTmp.clear();
-
-                productTypesTmp.METCase             = real2int(transferLine.QtyShipped / factor);
-                productTypesTmp.BrokenCase          = real2int(transferLine.QtyShipped - (productTypesTmp.METCase * factor));
+                totatWeight = consolidatedWeightMap.lookup(whsFilters.Description);
             }
 
-            while select ContainerTypeCode, ContainerQty from containerTable
-                where containerTable.ShipmentId == _shipmentId
-            {
-                productTypesTmp.PalletContainerTotalWeight += productTypesTmp.ProductTotalWeight * containerTable.ContainerQty;
-            }
+            productTypesTmp.clear();
 
             productTypesTmp.ProductType                 = whsFilters.Description;
-            productTypesTmp.GrossWeight                 = metTransferLine.TOUnitWeight * transferLine.QtyShipped;
-            productTypesTmp.ProductTotalWeight          = transferLine.displayMETGrossWeight();
-            productTypesTmp.TotalWeight                 = productTypesTmp.ProductTotalWeight + productTypesTmp.PalletContainerTotalWeight;
+            productTypesTmp.METCase                     = this.getCases(factor, transferLine.QtyShipped);
+            productTypesTmp.BrokenCase                  = real2int(transferLine.QtyShipped - (productTypesTmp.METCase * factor));
+            
             productTypesTmp.BundleReportHeaderGuidStr   = bundleHeaderReportGuid;
-            productTypesTmp.CoverNotesHeaderGuidStr     = headerReportGuid;;
+            productTypesTmp.CoverNotesHeaderGuidStr     = headerReportGuid;
+
             productTypesTmp.insert();
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getUnitConversionFactor</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the factor based on from and to unit id.
+    /// </summary>
+    /// <param name = "_fromUnit">From unit</param>
+    /// <param name = "_toUnit">To unit</param>
+    /// <returns></returns>
+    public Factor getUnitConversionFactor(UnitOfMeasureSymbol _fromUnitID, InventTransferLine _transferLine)
+    {
+        Factor                  factor;
+        UnitOfMeasureFromRecId  fromUnit,toUnit;
+
+        fromUnit    = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(_fromUnitID);
+        toUnit      = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(_transferLine.UnitId);
+
+        factor = EcoResProductUnitConverter::convertForReleasedProduct(
+                    _transferLine.ItemId,
+                    _transferLine.inventDimId,
+                    1,
+                    fromUnit,
+                    toUnit,
+                    NoYes::No,
+                    NoYes::No);
+
+        return factor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getConsolidatedWeight</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the consolidated weight of the line.
+    /// </summary>
+    /// <param name = "_transferId">Transfer order id</param>
+    /// <returns></returns>
+    public Map getConsolidatedWeight(InventTransferId _transferId)
+    {
+        Map                     weightByCategoryMap = new Map(Types::String, Types::Real);
+        InventDim               inventDim;
+        WHSFilters              whsFilters;
+        METUnitWeight           shippedWeight, existingWeight;;
+        METFilterCodeone        filterCode;
+        METGrossWeight          weight              = 0;
+        METGrossWeight          totatWeight         = 0;
+        InventTransferLine      transferLine;
+        METInventTransferLine   metTransferLine;
+        METInventItemOrderSetup metInventItemOrderSetup;
+
+        while select transferLine where transferLine.TransferId == _transferId
+            join metTransferLine
+            where metTransferLine.InventTransferLine == transferLine.RecId
+                exists join inventDim
+                where inventDim.inventDimId == transferLine.InventDimId
+                    join FilterCode from metInventItemOrderSetup
+                    where metInventItemOrderSetup.ItemId == transferLine.ItemId
+                    && metInventItemOrderSetup.SiteId == inventDim.InventSiteId
+                        exists join whsFilters
+                        where whsFilters.FilterTitle == WHSFilterTitle::Code1
+                        && whsFilters.FilterNum == metInventItemOrderSetup.FilterCode
+        {
+            filterCode      = metInventItemOrderSetup.FilterCode;
+            shippedWeight   = metTransferLine.TOUnitWeight * transferLine.QtyShipped;
+
+            if (weightByCategoryMap.exists(filterCode))
+            {
+                existingWeight = weightByCategoryMap.lookup(filterCode);
+                weightByCategoryMap.insert(filterCode, existingWeight + shippedWeight);
+            }
+            else
+            {
+                weightByCategoryMap.insert(filterCode, shippedWeight);
+            }
+        }
+
+        return weightByCategoryMap;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCases</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the case value of each shipped qty on the line.
+    /// </summary>
+    /// <param name = "_factor">Factor</param>
+    /// <param name = "_qtyShipped">Quantity</param>
+    /// <returns></returns>
+    public METCase getCases(Factor _factor, InventTransferQtyShipped _qtyShipped)
+    {
+        int     value = 0;
+        METCase cases = 0;
+
+        if (_factor == 0)
+        {
+            cases = 0;
+        }
+        else
+        {
+            value = _qtyShipped / _factor;
+
+            if (value < 1)
+            {
+                cases = any2Int(round(_qtyShipped / _factor, 1));
+            }
+            else
+            {
+                cases = any2Int(_qtyShipped / _factor);
+            }
+        }
+        return cases;
     }
 
 ]]></Source>
