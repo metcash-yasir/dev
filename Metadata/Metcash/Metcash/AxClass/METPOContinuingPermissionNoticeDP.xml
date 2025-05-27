@@ -4,8 +4,9 @@
 	<SourceCode>
 		<Declaration><![CDATA[
 [SRSReportParameterAttribute(classstr(METPOContinuingPermissionNoticeContract))]
-class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
+class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessTempDB
 {
+    RecordInsertList insertList;
     METPOContinuingPermissionNoticeHeaderTmp header;
     METPOContinuingPermissionNoticeLineTmp line;
     PurchTable purchTable;
@@ -24,28 +25,19 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
         METPOContinuingPermissionNoticeContract contract = this.parmDataContract() as METPOContinuingPermissionNoticeContract;
        
         PurchId purchId = contract.parmPurchId();
-        purchTable =  PurchTable::find(purchId);
+        purchTable = PurchTable::find(purchId);
 
-        if (!contract.parmIsRePrint())
+        PurchLine purchLineNegative;
+
+        select firstonly RecId from purchLineNegative
+            where purchLineNegative.PurchId == purchTable.PurchId
+            && purchLineNegative.PurchQty < 0;
+
+        METPurchTable metPurchTable = METPurchTable::find(purchTable.PurchId);
+
+        if (purchTable.RecId && metPurchTable.UnderBond && purchLineNegative.RecId && metPurchTable.VendorReturn)
         {
-            delete_from header
-                where header.ReturnPurchaseOrder == purchId;
-
-            delete_from line
-                where line.PurchId == purchId;
-
-            PurchLine purchLineNegative;
-
-            select firstonly RecId from purchLineNegative
-                where purchLineNegative.PurchId == purchTable.PurchId
-                && purchLineNegative.PurchQty < 0;
-
-            METPurchTable metPurchTable = METPurchTable::find(purchTable.PurchId);
-            // TODO vendor Return field to include
-            if (purchTable.RecId && metPurchTable.UnderBond && purchLineNegative.RecId && metPurchTable.VendorReturn)
-            {
-                this.insertHeaderData();
-            }
+            this.insertHeaderData();
         }
     }
 
@@ -61,15 +53,21 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
     {
         METVendTable vendTable = METVendTable::find(purchTable.OrderAccount);
 
-        NumberSequenceReference numberSequenceReference;
+        METCPNumber cpNumber = purchTable.metPurchTable().ContinuingPermissionNoticeNumber;
 
-        numberSequenceReference = NumberSeqReference::findReference(extendedTypeNum(METCPNumber));
-
-        if (numberSequenceReference.RecId)
+        if (!cpNumber)
         {
-            METCPNumber num = NumberSeq::newGetNum(numberSequenceReference).num();
-            header.ContinuingPermissionNoticeNumber = num;
+            NumberSequenceReference numberSequenceReference;
+
+            numberSequenceReference = NumberSeqReference::findReference(extendedTypeNum(METCPNumber));
+
+            if (numberSequenceReference.RecId)
+            {
+                cpNumber = NumberSeq::newGetNum(numberSequenceReference).num();
+            }
         }
+
+        header.ContinuingPermissionNoticeNumber = cpNumber;
 
         CompanyInfo companyInfo = CompanyInfo::find();
         InventSite site;
@@ -85,19 +83,23 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
         header.CompanyLogo = this.getCompanyLogo(companyInfo.METLegalEntityType, inventLocation.METWHSubEntity);
         LogisticsEntityPostalAddressView postalAddressView = this.getWareHousePrimaryAddress(inventLocation.RecId);
 
+        METIndustryKeyTable industryKey = METIndustryKeyTable::find(inventLocation.METWHSubEntity);
+       
+        header.IndustryKey = industryKey.IndustryKey;
+
         header.SendingBranchAddress = postalAddressView.Address;
         header.SendingBranchName = inventLocation.Name;
         header.ReceivingBranchAddress = VendTable::find(purchTable.OrderAccount).postalAddress().Address;
         header.ReceivingBranchName = VendTable::find(purchTable.OrderAccount).name();
         header.NoticeDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::getSystemDateTime(), DateTimeUtil::getUserPreferredTimeZone()));
         header.NoticeTimeString = int2Str(DateTimeUtil::time(DateTimeUtil::utcNow()));
-        header.CompanyName = companyInfo.Name;
+        header.CompanyName = industryKey.CompanyName;
 
         List metBondList = strSplit(site.METBondNumber, ' ');
         Container metBondCon = list2con(metBondList);
 
-        header.SenderBranchExciseNumber = conpeek(metBondCon, 1);
-        header.SenderBranchBondNumber = conpeek(metBondCon, 2);
+        header.SenderBranchExciseNumber = conpeek(metBondCon, 2);
+        header.SenderBranchBondNumber = conpeek(metBondCon, 1);
         header.ReceivingBranchExciseNumber = vendTable.ExciseNumber;
         header.ReceivingBranchBondNumber = vendTable.BondNumber;
         header.ReturnPurchaseOrder = purchTable.PurchId;
@@ -143,11 +145,12 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
         InventTable inventTable;
         InventDim inventDim;
         METInventTable metInventTable;
+        METPurchLine metPurchLine;
         
         METExciseRegisterEntry exciseRegister;
         METExciseInformationTable metExciseInformationTable;
         METTariffItemCodeBase tariffCodeBase;
-        RecordInsertList insertList = new RecordInsertList(tableNum(METPOContinuingPermissionNoticeLineTmp));
+        insertList = new RecordInsertList(tableNum(METPOContinuingPermissionNoticeLineTmp), false, false, false, false, false, line);
 
         while select purchLine
             where purchLine.PurchId == purchTable.PurchId
@@ -157,30 +160,37 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
             where metInventTable.ItemId == inventTable.ItemId
         outer join TariffItem from tariffCodeBase
             where tariffCodeBase.RecId == metInventTable.METTariffItemCodeBaseRecid
-        outer join RecId from inventDim
+        outer join RecId, InventSiteId from inventDim
             where inventDim.inventDimId == purchLine.InventDimId
-        outer join forupdate metExciseInformationTable
-            where metExciseInformationTable.InventTransType == InventTransType::Purch  &&
-            metExciseInformationTable.ItemId == purchLine.ItemId &&
-            metExciseInformationTable.SiteId == inventDim.InventSiteId &&
-            metExciseInformationTable.Lodgement == ''
+        outer join RecId, Lodgement from metPurchLine
+            where metPurchLine.PurchLine == purchLine.RecId
         {
-            METLodgement lodgement = this.getMetLodgement(metExciseInformationTable);
-            List lodgementList = strSplit(lodgement, ';');
-            ListEnumerator enum = lodgementList.getEnumerator();
+            METLodgement lodgement;
+
+            if (metPurchLine.Lodgement)
+            {
+                lodgement = metPurchLine.Lodgement;
+            }
+            else
+            {
+                lodgement = this.getMetLodgement(purchLine.ItemId, inventDim.InventSiteId, purchLine.QtyOrdered);
+            }
 
             if (lodgement)
             {
+                List lodgementList = strSplit(lodgement, ';');
+                ListEnumerator enum = lodgementList.getEnumerator();
+
                 while (enum.moveNext())
                 {
                     line.BondMark = any2Str(enum.current());
 
-                    insertList = this.prepareRecordListTmp(purchLine, inventTable, metInventTable, tariffCodeBase, lodgement);
+                    this.prepareRecordListTmp(purchLine, inventTable, metInventTable, tariffCodeBase, lodgement);
                 }
             }
             else
             {
-                insertList = this.prepareRecordListTmp(purchLine, inventTable, metInventTable, tariffCodeBase, lodgement);
+                this.prepareRecordListTmp(purchLine, inventTable, metInventTable, tariffCodeBase, lodgement);
             }
         }
             
@@ -199,8 +209,7 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
     [SRSReportDataSetAttribute(tableStr(METPOContinuingPermissionNoticeHeaderTmp))]
     public METPOContinuingPermissionNoticeHeaderTmp dsHeader()
     {
-        select header
-            where header.ReturnPurchaseOrder == purchTable.PurchId;
+        select header;
 
         return header;
     }
@@ -217,8 +226,7 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
     [SRSReportDataSetAttribute(tableStr(METPOContinuingPermissionNoticeLineTmp))]
     public METPOContinuingPermissionNoticeLineTmp dsLines()
     {
-        select line
-            where line.PurchId == purchTable.PurchId;
+        select line;
 
         return line;
     }
@@ -286,20 +294,18 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
 			<Method>
 				<Name>prepareRecordListTmp</Name>
 				<Source><![CDATA[
-    private RecordInsertList prepareRecordListTmp(PurchLine _purchLine, InventTable _inventTable, METInventTable _metInventTable, METTariffItemCodeBase _tariffCodeBase, METLodgement _lodgement)
+    private void prepareRecordListTmp(PurchLine _purchLine, InventTable _inventTable, METInventTable _metInventTable, METTariffItemCodeBase _tariffCodeBase, METLodgement _lodgement)
     {
         const str defaultUOM = 'EA';
-        RecordInsertList insertList = new RecordInsertList(tableNum(METPOContinuingPermissionNoticeLineTmp), false, false, false, false, false, line);
- 
+
         METExciseRegisterEntry exciseRegister;
-        PurchLine purchLine;
         METPurchLine metPurchLine;
 
         if (_lodgement)
         {
             // Find the matching purch line
             select firstonly metPurchLine
-           where metPurchLine.PurchLine == _purchLine.RecId;
+                where metPurchLine.PurchLine == _purchLine.RecId;
 
             if (metPurchLine.RecId)
             {
@@ -313,26 +319,28 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
             else
             {
                 // Insert new record
-                metPurchLine.PurchLine = purchLine.RecId;
+                metPurchLine.PurchLine = _purchLine.RecId;
                 metPurchLine.Lodgement = _lodgement;
                 metPurchLine.insert();
             }
         }
 
         select TIUV, DutyRateReceived from exciseRegister
-                where exciseRegister.OrderNumber == purchTable.PurchId
-                && exciseRegister.ItemId == purchLine.ItemId;
+                where exciseRegister.SiteId == _purchLine.inventDim().InventSiteId
+                && exciseRegister.ItemId == _purchLine.ItemId
+                && exciseRegister.OriginType == InventTransType::Purch
+                && exciseRegister.Lodgement == line.BondMark;
 
-        METPurchaseWMSFactor purchaseWMSFactor = UnitOfMeasureConversion::findByConversion(UnitOfMeasure::findBySymbol(purchLine.PurchUnit).RecId, UnitOfMeasure::findBySymbol(defaultUOM).RecId, EcoResProduct::findByProductNumber(purchLine.ItemId).RecId).Factor;
-        line.BottlesSupplied = purchaseWMSFactor * purchLine.PurchQty;
-        line.ItemId = purchLine.ItemId;
+        METPurchaseWMSFactor purchaseWMSFactor = UnitOfMeasureConversion::findByConversion(UnitOfMeasure::findBySymbol(_purchLine.PurchUnit).RecId, UnitOfMeasure::findBySymbol(defaultUOM).RecId, EcoResProduct::findByProductNumber(_purchLine.ItemId).RecId).Factor;
+        line.BottlesSupplied = abs(purchaseWMSFactor * _purchLine.PurchQty);
+        line.ItemId = _purchLine.ItemId;
         line.ItemDescription = _inventTable.productName(SystemParameters::getSystemLanguageId());
         line.BottleSize = _metInventTable.BottleSize;
         line.PackQty = _metInventTable.ItemPack;
         line.Strength = _metInventTable.AlcoholContent;
-        line.PurchUoM = purchLine.PurchUnit;
-        line.Quantity = purchLine.PurchQty;
-        line.LitresOfAlcoholCalculated = _metInventTable.BottleSize * line.BottlesSupplied * _metInventTable.AlcoholContent;
+        line.PurchUoM = _purchLine.PurchUnit;
+        line.Quantity = _purchLine.PurchQty;
+        line.LitresOfAlcoholCalculated = abs(_metInventTable.BottleSize * line.BottlesSupplied * (_metInventTable.AlcoholContent/100));
         line.ValueTIU = exciseRegister.TIUV;
         line.TariffItem = _tariffCodeBase.TariffItem;
         line.CountryOfOrigin = _metInventTable.CountryCode;
@@ -341,8 +349,6 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
         line.InvoiceAccount = purchTable.InvoiceAccount;
         line.PurchId = purchTable.PurchId;
         insertList.add(line);
-
-        return insertList;
     }
 
 ]]></Source>
@@ -351,104 +357,44 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
 				<Name>getMetLodgement</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Gets the lodgement details for the updated excise information table.
+    /// Concatenated lodgement details.
     /// </summary>
-    /// <param name = "_metExciseInformationTable">_metExciseInformationTable buffer</param>
-    /// <returns>Returns the concatenated lodgement details.</returns>
-    private METLodgement getMetLodgement(METExciseInformationTable _metExciseInformationTable)
+    /// <param name = "_itemId">Item Id</param>
+    /// <param name = "_siteId">Site Id</param>
+    /// <param name = "_purchLineQty">Purchase order line quantity</param>
+    /// <returns></returns>
+    private METLodgement getMetLodgement(ItemId _itemId, InventSiteId _siteId, Qty _purchLineQty)
     {
-        METExciseInformationTable       metExciseInformationTablePO;
-        METAvailableQty                 purchAvailableQty;
-        METAvailableQty                 purchAvailableQtyOrig;
-        METLodgement                    metLodgement;
+        METExciseInformationTable metExciseInformationTablePO;
+        METLodgement              metLodgement;
+        real                      remainingQty = abs(_purchLineQty);
 
-        try
-        {
-            ttsbegin;
-
-            container                       lodgementQtyCon;
-
-            select forupdate metExciseInformationTablePO
-            order by CreatedDateTime
+        while select forupdate metExciseInformationTablePO
+            order by CreatedDateTime desc
                 where metExciseInformationTablePO.InventTransType == InventTransType::Purch &&
-                    metExciseInformationTablePO.ItemId == _metExciseInformationTable.ItemId &&
-                    metExciseInformationTablePO.SiteId == _metExciseInformationTable.SiteId &&
-                    metExciseInformationTablePO.LodgementClosed == NoYes::No;
-
-            if (metExciseInformationTablePO.RecId != 0)
+                metExciseInformationTablePO.ItemId == _itemId &&
+                metExciseInformationTablePO.SiteId == _siteId &&
+                metExciseInformationTablePO.LodgementClosed == NoYes::No
+        {
+            if (remainingQty > 0)
             {
-                purchAvailableQty  =  metExciseInformationTablePO.AvailableQty -  abs(_metExciseInformationTable.InventoryQty);
-                metLodgement = metExciseInformationTablePO.Lodgement;
+                // Subtract the available quantity from the remaining
+                remainingQty -= metExciseInformationTablePO.AvailableQty;
 
-                if (purchAvailableQty > 0)
+                // Append Lodgement to result string
+                if (!metLodgement)
                 {
-                    lodgementQtyCon += [metExciseInformationTablePO.Lodgement, abs(_metExciseInformationTable.InventoryQty)];
-
-                    metExciseInformationTablePO.AvailableQty = purchAvailableQty;
-                    metExciseInformationTablePO.update();
-
-                    _metExciseInformationTable.Lodgement = metExciseInformationTablePO.Lodgement;
-                    _metExciseInformationTable.LodgementAndQtyCon = lodgementQtyCon;
-                    _metExciseInformationTable.update();
+                    metLodgement = metExciseInformationTablePO.Lodgement;
                 }
                 else
                 {
-                    lodgementQtyCon += [metExciseInformationTablePO.Lodgement, abs(metExciseInformationTablePO.AvailableQty)];
-
-                    metExciseInformationTablePO.AvailableQty = 0;
-                    metExciseInformationTablePO.LodgementClosed = NoYes::Yes;
-                    metExciseInformationTablePO.update();
-
-                    do
-                    {
-                        next metExciseInformationTablePO;
-
-                        if (metExciseInformationTablePO.RecId == 0)
-                        {
-                            Error(strFmt("@MET:LodgementValidation", _metExciseInformationTable.ItemId, _metExciseInformationTable.SiteId));
-                            break;
-                        }
-                        purchAvailableQtyOrig = abs(purchAvailableQty);
-                        purchAvailableQty  =  metExciseInformationTablePO.AvailableQty - abs(purchAvailableQty);
-
-                        metLodgement = metLodgement + ','+  metExciseInformationTablePO.Lodgement;
-
-                        if (purchAvailableQty > 0)
-                        {
-                            lodgementQtyCon += [metExciseInformationTablePO.Lodgement, purchAvailableQtyOrig];
-
-                            metExciseInformationTablePO.AvailableQty = purchAvailableQty;
-                            metExciseInformationTablePO.update();
-
-                            break;
-                        }
-                        else
-                        {
-                            lodgementQtyCon += [metExciseInformationTablePO.Lodgement, metExciseInformationTablePO.AvailableQty];
-
-                            metExciseInformationTablePO.AvailableQty = 0;
-                            metExciseInformationTablePO.LodgementClosed = NoYes::Yes;
-                            metExciseInformationTablePO.update();
-                        }
-                    }
-                    while (purchAvailableQty < 0);
-
-                    _metExciseInformationTable.Lodgement = metLodgement;
-                    _metExciseInformationTable.LodgementAndQtyCon = lodgementQtyCon;
-                    _metExciseInformationTable.update();
+                    metLodgement += ";" + metExciseInformationTablePO.Lodgement;
                 }
-
-                info(strFmt("@MET:LodgmentUpdate", _metExciseInformationTable.ItemId, _metExciseInformationTable.SiteId));
             }
             else
             {
-                Error(strFmt("@MET:LodgementValidation", _metExciseInformationTable.ItemId, _metExciseInformationTable.SiteId));
+                break; // Exit if no more quantity is needed
             }
-            ttscommit;
-        }
-        catch
-        {
-            exceptionTextFallThrough();
         }
 
         return metLodgement;

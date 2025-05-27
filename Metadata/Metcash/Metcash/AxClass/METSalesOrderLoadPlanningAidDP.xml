@@ -19,8 +19,10 @@ class METSalesOrderLoadPlanningAidDP extends SrsReportDataProviderPreProcessTemp
     custAccount                 customerAccount;
     InventLocationId            inventLocationFrom;
     InventSiteId                site;
-
-
+    METOrderExtractStatus       extractStatus;
+    METOrderSplitGroup          orderSplitGroup;
+    METSalesOrderTypeID         salesOrderTypeID;
+    NoYes                       exclCreditMgmt;
 
 }
 ]]></Declaration>
@@ -58,6 +60,10 @@ class METSalesOrderLoadPlanningAidDP extends SrsReportDataProviderPreProcessTemp
         customerAccount = contract.parmCustAccount();
         inventLocationFrom = contract.parmWareHouseId();
         site = contract.parmInventSiteId();
+        extractStatus = contract.parmExtractStatus();
+        orderSplitGroup = contract.parmOrderSplitGroup();
+        salesOrderTypeID = contract.parmSalesOrderTypeID();
+        exclCreditMgmt = contract.parmExclCreditMgmt();
 
         str extractOrdersSelected = contract.parmSelectedRecords();
 
@@ -99,34 +105,48 @@ class METSalesOrderLoadPlanningAidDP extends SrsReportDataProviderPreProcessTemp
         METIndustryKeyTable         industryKeyTable;
         SalesTable                  salesTable;
         SalesLine                   salesLine;
+        METSalesTable               metSalesTable;
         ReqItemTable                reqItemTable;
-
+        MetInventItemOrderSetup     metInventItemOrderSetup;
+        boolean                     extractConfirmedOrder = WHSParameters::find().METExtractConfirmedOrders;
         CreatedDateTime             reportGeneratedDateTime = DateTimeUtil::getSystemDateTime();
+        NoYes exclCredit = exclCreditMgmt ? NoYes::No : NoYes::Yes;
 
         while select SalesId, LineNum, ItemId, InventDimId, SalesUnit, SalesQty, RecId from salesLine
             join SalesId, CreatedDateTime, CustAccount, InventLocationId,
                  METRoute, METSalesOrderType, SalesName,
                  ShippingDateConfirmed, METRouteStopNum, RecId
             from salesTable
-        where salesTable.SalesId == salesLine.SalesId
-            && (!selectedSalesId || salesLine.SalesId == selectedSalesId)
-            && salesTable.SalesStatus == SalesStatus::Backorder
-            && salesTable.DocumentStatus  != DocumentStatus::Cancelled
-            && salesTable.SalesType == SalesType::Sales
-            && (!routeId  || salesTable.METRoute == routeId)
-            && (salesTable.ShippingDateConfirmed >=  confirmedShipDateFrom
-            && salesTable.ShippingDateConfirmed <=  confirmedShipDateTo)
-            && (!customerAccount || salesTable.CustAccount == customerAccount)
-            && (!site || salesTable.InventSiteId  == site)
-            && (!inventLocationFrom || salesTable.InventLocationId == inventLocationFrom)
-        join inventDim
-             where inventDim.inventDimId == salesLine.InventDimId
-        join Name, METWHSubEntity, RecId from inventLocation
-            where inventLocation.InventLocationId == salesTable.InventLocationId
-        join WHSPalletVolume from metInventLocation
-                where metInventLocation.InventLocation == inventLocation.RecId
-        join CompanyName from industryKeyTable
-            where industryKeyTable.IndustryKey == inventLocation.METWHSubEntity
+                where salesLine.SalesId == salesTable.SalesId
+                && (!selectedSalesId || salesLine.SalesId == selectedSalesId)
+                && salesTable.SalesStatus == SalesStatus::Backorder
+                && ((!extractConfirmedOrder || salesTable.DocumentStatus  != DocumentStatus::None)
+                && salesTable.DocumentStatus             != DocumentStatus::Cancelled)
+                && salesTable.SalesType                  == SalesType::Sales
+                && salesTable.METOrderExtractStatus      == extractStatus
+                && (!routeId  || salesTable.METRoute     == routeId)
+                && (salesTable.ShippingDateConfirmed >=  confirmedShipDateFrom
+                && salesTable.ShippingDateConfirmed <=  confirmedShipDateTo)
+                && (!customerAccount || salesTable.CustAccount == customerAccount)
+                && (!site || salesTable.InventSiteId  == site)
+                && (!inventLocationFrom || salesTable.InventLocationId == inventLocationFrom)
+                && (!salesTable.InterCompanyOriginalSalesId)
+                && (!salesOrderTypeID || salesTable.METSalesOrderType == salesOrderTypeID)
+                && salesTable.CredManInCreditControl == exclCredit
+            join OrderSplitGroup from metSalesTable
+                where metSalesTable.SalesTable == salesTable.RecId
+                &&  metSalesTable.OrderProcessingStatus == METSalesOrderProcessingStatus::OptimisationCompleted
+            join inventDim
+                where inventDim.inventDimId == salesLine.InventDimId
+            join Name, METWHSubEntity, RecId from inventLocation
+                where inventLocation.InventLocationId == salesTable.InventLocationId
+            join WHSPalletVolume from metInventLocation
+                    where metInventLocation.InventLocation == inventLocation.RecId
+            join CompanyName from industryKeyTable
+                where industryKeyTable.IndustryKey == inventLocation.METWHSubEntity
+            exists join metInventItemOrderSetup
+                where metInventItemOrderSetup.ItemId == salesLine.ItemId
+                && metInventItemOrderSetup.SiteId == site 
         {
             salesOrderLoadPlanningAidLinesTmp.CompanyName = industryKeyTable.CompanyName;
             salesOrderLoadPlanningAidLinesTmp.WareHouse = inventLocation.Name;
@@ -136,8 +156,8 @@ class METSalesOrderLoadPlanningAidDP extends SrsReportDataProviderPreProcessTemp
             salesOrderLoadPlanningAidLinesTmp.StopNumber = salesTable.METRouteStopNum;
             salesOrderLoadPlanningAidLinesTmp.SalesId = salesLine.SalesId;
             salesOrderLoadPlanningAidLinesTmp.LineNum = salesLine.LineNum;
-            salesOrderLoadPlanningAidLinesTmp.Cases = salesLine.SalesUnit == METConstants::unitEach ? 0 : salesLine.SalesQty;
-            salesOrderLoadPlanningAidLinesTmp.Eaches = salesLine.SalesUnit == METConstants::unitEach ? salesLine.SalesQty : 0;
+            salesOrderLoadPlanningAidLinesTmp.Cases = salesLine.displayMETCases();
+            salesOrderLoadPlanningAidLinesTmp.Eaches = salesLine.displayMETBrokenCase();
             salesOrderLoadPlanningAidLinesTmp.Weight = METWHSPhysDimUOMSite::convertWeight(salesLine.ItemId, salesLine.SalesQty, salesLine.SalesUnit, inventDim);
             salesOrderLoadPlanningAidLinesTmp.Volume = METWHSPhysDimUOMSite::convertVolume(salesLine.ItemId, salesLine.SalesQty, salesLine.SalesUnit, inventDim);
 
@@ -151,8 +171,7 @@ class METSalesOrderLoadPlanningAidDP extends SrsReportDataProviderPreProcessTemp
             }
             salesOrderLoadPlanningAidLinesTmp.OrderCreatedDateTime = salesTable.CreatedDateTime;
             salesOrderLoadPlanningAidLinesTmp.OrderType = salesTable.METSalesOrderType;
-            METOSCCode oscCode = MetReqItemTable::find(ReqItemTable::find(salesLine.ItemId,inventDim.inventDimId).RecId).OSCCode;
-            salesOrderLoadPlanningAidLinesTmp.OrderSplitGroup = oscCode;
+            salesOrderLoadPlanningAidLinesTmp.OrderSplitGroup = metSalesTable.OrderSplitGroup;
             salesOrderLoadPlanningAidLinesTmp.CustAccount = salesTable.CustAccount;
             salesOrderLoadPlanningAidLinesTmp.CustomerName = salesTable.SalesName;
             salesOrderLoadPlanningAidLineslist.add(salesOrderLoadPlanningAidLinesTmp);
