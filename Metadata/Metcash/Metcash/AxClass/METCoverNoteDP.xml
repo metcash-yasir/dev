@@ -16,12 +16,14 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
     METCoverNoteProductTypesTmp     productTypesTmp;
     METCoverNoteTrasnferOrderTmp    transferOrderTmp;
 
+
     METBundleGuid   bundleHeaderReportGuid;
     METBundleGuid   headerReportGuid;
 
     Map consolidatedWeightMap               = new Map(Types::String, Types::Real);
     Map consolidatedCasesMap                = new Map(Types::String, Types::Real);
     Map consolidatedBrokenCasesMap          = new Map(Types::String, Types::Real);
+    Map consolidatedQuantityOutMap          = new Map(Types::String, Types::Real);
     Map consolidatedProductWeightTotalMap   = new Map(Types::String, Types::Real);
 
     const str containerTypeCodeCHP = 'CHP';
@@ -30,6 +32,7 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
     const str containerTypeCodeBLT = 'BLT';
     const str containerTypeCodePLN = 'PLN';
     const str containerTypeCodeTOT = 'TOT';
+    const str containerTypeCodeKEG = 'KEG';
 
 }
 ]]></Declaration>
@@ -72,6 +75,39 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>isKegItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// If the item on the sales line has a Product attribute listed in the new setup table, set IsKegItem = Yes
+    /// </summary>
+    /// <param name = "_itemId">Item Id</param>
+    /// <returns><c>boolean</c> object</returns>
+    protected boolean isKegItem(ItemId    _itemId)
+    {
+        InventTable                             inventTable;
+        METAttributeIdentifiers                 attributeIdentifiers;
+        EcoResProductInstanceValue              ecoResProductInstanceValue;
+        RetailEcoResInstanceAttributeValuesView attributeValuesTable;
+
+        select firstonly crosscompany RecId from inventTable
+            where inventTable.ItemId == _itemId
+            join  RecId from ecoResProductInstanceValue
+            where   ecoResProductInstanceValue.Product == inventTable.Product
+            join InstanceRecId from attributeValuesTable
+                where   attributeValuesTable.InstanceRecId == ecoResProductInstanceValue.RecId
+                exists join attributeIdentifiers
+                    where   attributeIdentifiers.Attribute == attributeValuesTable.AttributeDefinitionRecId
+                        &&  attributeIdentifiers.AttributeValueText == attributeValuesTable.TextValue
+                        &&  attributeIdentifiers.AttributeValueText != ''
+                        &&  attributeIdentifiers.AttributeSource == METAttributeSource::Product
+                        &&  attributeIdentifiers.AttributeIdentifier == METAttributeIdentifier::Keg;
+
+        return inventTable.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>processReport</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -93,6 +129,8 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
         METSalesOrderShipmentLoadHeader     shipmentHeader;
         METWarehouseCarrierCustomerView     whsCustomerCarrier;
         
+        headerTmp.clear();
+
         contract = this.parmDataContract();
 
         //Fetch the record from the <c>METSalesOrderShipmentLoadHeader</c>
@@ -120,8 +158,6 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
 
             docuBrandingDetails = this.getDocuBrandDetails(industryKeyTable.IndustryKey);
 
-            headerTmp.clear();
-
             headerTmp.IndustryKey           = industryKeyTable.IndustryKey;
             headerTmp.CompanyName           = industryKeyTable.CompanyName;
 
@@ -139,7 +175,6 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
             headerTmp.CustomerInstruction   = whsCustomerCarrier.CustomerInstruction;
 
             headerTmp.RunNumber             = strFmt("%1/%2", shipmentHeader.Route, shipmentHeader.RouteStopNum);
-            headerTmp.Text                  = 'KEGs';
             headerTmp.ReportDateTime        = DateTimeUtil::getSystemDateTime();
             headerTmp.ReportUser            = XUserInfo::find(false, curUserId()).name;
 
@@ -168,15 +203,13 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
     /// <param name = "_shipmentID">Shipment ID</param>
     public void insertLineData(MetShipmentId _shipmentID, METOrderTransactionType _transactionType)
     {
-        int                             conValue            = 0;
-        container                       con;
-        METCase                         cases               = 0;
-        METBrokenCase                   brokenCases         = 0;
-        METGrossWeight                  weight              = 0;
-        METGrossWeight                  totalProducttWeight = 0;
-        METGrossWeight                  totalWeight         = 0;
+        int                             conValueOrderNum    = 0;
+        int                             conValueProductType = 0;
+        container                       conOrderNum;
+        container                       conProductType;
+        SalesLine                       salesLine;
+        METSalesLine                    metSalesLine;
         WHSFilters                      whsFilters;
-        MapEnumerator                   totalProductWeightMapEnumerator;
         InventTransferLine              transferLine;
         METInventTransferLine           metTransferLine;
         InventDim                       inventDim;
@@ -185,86 +218,78 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
         METSalesOrderShipmentLoadLines  shipmentLines, shipmentLinesLoc;
 
         productTypesTmp.clear();
+        salesOrdersTmp.clear();
         transferOrderTmp.clear();
 
-        while select OrderNum from shipmentLines
+        while select OrderNum from shipmentLines group by OrderNum
             where shipmentLines.ShipmentId == contract.parmShipmentId()
-            join transferLine where transferLine.TransferId == shipmentLines.OrderNum
-            join metTransferLine where metTransferLine.InventTransferLine == transferLine.RecId
-            join whsFilters where whsFilters.FilterTitle == WHSFilterTitle::Code1
-                && whsFilters.FilterNum == metTransferLine.WarehouseCategory
         {
-            if (!conFind(con, metTransferLine.WarehouseCategory))
+            headerTmp.OrderNumber = shipmentLines.OrderNum;
+
+            this.addTotes(shipmentLines.OrderNum);
+
+            if (_transactionType == METOrderTransactionType::SalesOrder)
             {
-                conValue++;
+                salesOrdersTmp.SalesId                      = shipmentLines.OrderNum;
+                salesOrdersTmp.BundleReportHeaderGuidStr    = bundleHeaderReportGuid;
+                salesOrdersTmp.CoverNotesHeaderGuidStr      = headerReportGuid;
+                salesOrdersTmp.insert();
 
-                con = conIns(con, conValue, metTransferLine.WarehouseCategory);
-
-                if (_transactionType == METOrderTransactionType::SalesOrder)
+                while select salesLine
+                    where salesLine.SalesId == shipmentLines.OrderNum
+                    join metSalesLine where metSalesLine.SalesLine == salesLine.RecId
+                    join inventDim where inventDim.inventDimId == salesLine.InventDimId
+                    join FilterCode from metInventItemOrderSetup
+                    where metInventItemOrderSetup.ItemId == salesLine.ItemId
+                        && metInventItemOrderSetup.SiteId == inventDim.InventSiteId
+                    join whsFilters
+                    where whsFilters.FilterTitle == WHSFilterTitle::Code1
+                        && whsFilters.FilterNum == metInventItemOrderSetup.FilterCode
                 {
-                    //Insert sales order id into <c>METCoverNoteSalesOrdersTmp<c/>
-                    salesOrdersTmp.clear();
+                    if (!conFind(conProductType, metInventItemOrderSetup.FilterCode))
+                    {
+                        conValueProductType++;
 
-                    salesOrdersTmp.SalesId                      = shipmentLines.OrderNum;
-                    salesOrdersTmp.BundleReportHeaderGuidStr    = bundleHeaderReportGuid;
-                    salesOrdersTmp.CoverNotesHeaderGuidStr      = headerReportGuid;
-                    salesOrdersTmp.insert();
+                        conProductType = conIns(conProductType, conValueProductType, metInventItemOrderSetup.FilterCode);
 
-                    this.addTotes(shipmentLines.OrderNum);
+                        if (consolidatedCasesMap.elements() == 0 && consolidatedBrokenCasesMap.elements() == 0 && consolidatedWeightMap.elements() == 0)
+                        {
+                            this.getProductTypesDetailsSO(shipmentLines.OrderNum, contract.parmShipmentId());
+                        }
+
+                        this.insertProductTypesData(contract.parmShipmentId(), metInventItemOrderSetup.FilterCode, whsFilters.Description);
+                    }
                 }
-                else if (_transactionType == METOrderTransactionType::TransferOrder)
+            }
+            else if (_transactionType == METOrderTransactionType::TransferOrder)
+            {
+                transferOrderTmp.TransferId                 = shipmentLines.OrderNum;
+                transferOrderTmp.BundleReportHeaderGuidStr  = bundleHeaderReportGuid;
+                transferOrderTmp.CoverNotesHeaderGuidStr    = headerReportGuid;
+                transferOrderTmp.insert();
+
+                while select transferLine where transferLine.TransferId == shipmentLines.OrderNum
+                    join metTransferLine where metTransferLine.InventTransferLine == transferLine.RecId
+                    join whsFilters where whsFilters.FilterTitle == WHSFilterTitle::Code1
+                    && whsFilters.FilterNum == metTransferLine.WarehouseCategory
                 {
-                    totalWeight         = 0;
-                    totalProducttWeight = 0;
-
-                    //Insert sales order id into <c>METCoverNoteTrasnferOrderTmp<c/>
-                    transferOrderTmp.TransferId                 = shipmentLines.OrderNum;
-                    transferOrderTmp.BundleReportHeaderGuidStr  = bundleHeaderReportGuid;
-                    transferOrderTmp.CoverNotesHeaderGuidStr    = headerReportGuid;
-                    transferOrderTmp.insert();
-
-                    transferTableExt = METInventTransferTableExt::findByTransferId(shipmentLines.OrderNum);
-
-                    this.addCustomerDetails(transferTableExt.InternalCustomer);
-                    headerTmp.OrderNumber = shipmentLines.OrderNum;
-
-                    if (consolidatedCasesMap.elements() == 0 && consolidatedBrokenCasesMap.elements() == 0 && consolidatedWeightMap.elements() == 0)
+                    if (!conFind(conProductType, metTransferLine.WarehouseCategory))
                     {
-                        this.getProductTypesDetailsTO(shipmentLines.OrderNum, contract.parmShipmentId());
+                        conValueProductType++;
+
+                        conProductType      = conIns(conProductType, conValueProductType, metTransferLine.WarehouseCategory);
+                        transferTableExt    = METInventTransferTableExt::findByTransferId(shipmentLines.OrderNum);
+
+                        this.addCustomerDetails(transferTableExt.InternalCustomer);
+                        headerTmp.OrderNumber   = shipmentLines.OrderNum;
+
+                        if (consolidatedCasesMap.elements() == 0 && consolidatedBrokenCasesMap.elements() == 0 && consolidatedWeightMap.elements() == 0)
+                        {
+                            this.getProductTypesDetailsTO(shipmentLines.OrderNum, contract.parmShipmentId());
+                        }
+
+                        this.insertProductTypesData(contract.parmShipmentId(), metTransferLine.WarehouseCategory, whsFilters.Description);
                     }
-
-                    if (consolidatedCasesMap.exists(metTransferLine.WarehouseCategory))
-                    {
-                        cases = consolidatedCasesMap.lookup(metTransferLine.WarehouseCategory);
-                    }
-                    if (consolidatedWeightMap.exists(metTransferLine.WarehouseCategory))
-                    {
-                        weight = consolidatedWeightMap.lookup(metTransferLine.WarehouseCategory);
-                    }
-                    if (consolidatedBrokenCasesMap.exists(metTransferLine.WarehouseCategory))
-                    {
-                        brokenCases = consolidatedBrokenCasesMap.lookup(metTransferLine.WarehouseCategory);
-                    }
-
-                    totalProductWeightMapEnumerator = consolidatedWeightMap.getEnumerator();
-
-                    while (totalProductWeightMapEnumerator.moveNext())
-                    {
-                        totalProducttWeight += totalProductWeightMapEnumerator.currentValue();
-                    }
-
-                    productTypesTmp.ProductType                 = whsFilters.Description;
-                    productTypesTmp.METCase                     = cases;
-                    productTypesTmp.BrokenCase                  = brokenCases;
-                    productTypesTmp.GrossWeight                 = weight;
-                    productTypesTmp.ProductTotalWeight          = totalProducttWeight;
-                    productTypesTmp.PalletContainerTotalWeight  = this.palletContainerWeight(_shipmentId);
-                    productTypesTmp.TotalWeight                 = productTypesTmp.ProductTotalWeight + productTypesTmp.PalletContainerTotalWeight;
-
-                    productTypesTmp.BundleReportHeaderGuidStr   = bundleHeaderReportGuid;
-                    productTypesTmp.CoverNotesHeaderGuidStr     = headerReportGuid;
-
-                    productTypesTmp.insert();
                 }
             }
         }
@@ -273,46 +298,52 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>addCustomerDetails</Name>
+				<Name>insertProductTypesData</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Get customer details
+    /// Insert product type details into tmp table.
     /// </summary>
-    /// <param name = "_custAccount">Customer account number</param>
-    public void addCustomerDetails(AccountNum _custAccount)
+    /// <param name = "_shipmentId">Shipment id</param>
+    /// <param name = "_whsCategory">Warehouse category</param>
+    /// <param name = "_productType">Description</param>
+    public void insertProductTypesData(MetShipmentId _shipmentId, METFilterCodeone _whsCategory, Description _productType)
     {
-        CustTable custTable = CustTable::find(_custAccount);
+        METCase         cases               = 0;
+        METBrokenCase   brokenCases         = 0;
+        METGrossWeight  weight              = 0;
+        METGrossWeight  totalProducttWeight = 0;
+        METGrossWeight  totalWeight         = 0;
+        MapEnumerator   totalProductWeightMapEnumerator;
 
-        headerTmp.CustomerAccountNumber = custTable.AccountNum;
-        headerTmp.CustomerName          = custTable.name();
-        headerTmp.CustomerAddress       = custTable.address();
-        headerTmp.CustomerPhone         = custTable.phone();
-    }
+        totalWeight         = 0;
+        totalProducttWeight = 0;
 
-]]></Source>
-			</Method>
-			<Method>
-				<Name>addContainerTable</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Get the container table and insert into header tmp table.
-    /// </summary>
-    /// <param name = "_shipmentId"></param>
-    public void addContainerTable(MetShipmentId _shipmentId)
-    {
-        MetContainerTable               containerTable;
-        METContainerTypeTable           containerTypeTable;
-        METSalesOrderShipmentLoadHeader shipmentHeader = METSalesOrderShipmentLoadHeader::findByShipmentId(_shipmentId);
-
-        while select containerTable
-            where containerTable.ShipmentId == _shipmentId
-            join containerTypeTable
-                where containerTypeTable.ContainerTypeCode == containerTable.ContainerTypeCode
-                && containerTypeTable.InventLocationId == shipmentHeader.Warehouse
+        if (consolidatedCasesMap.exists(_whsCategory))
         {
-            headerTmp.SecurityCartons   += containerTypeTable.TobaccoRepackQty;
-            headerTmp.RepackCartons     += containerTypeTable.GroceryRepackQty; 
+            cases       = consolidatedCasesMap.lookup(_whsCategory);
+            weight      = consolidatedWeightMap.lookup(_whsCategory);
+            brokenCases = consolidatedBrokenCasesMap.lookup(_whsCategory);
         }
+
+        totalProductWeightMapEnumerator = consolidatedWeightMap.getEnumerator();
+
+        while (totalProductWeightMapEnumerator.moveNext())
+        {
+            totalProducttWeight += totalProductWeightMapEnumerator.currentValue();
+        }
+
+        productTypesTmp.ProductType                 = _productType;
+        productTypesTmp.METCase                     = cases;
+        productTypesTmp.BrokenCase                  = brokenCases;
+        productTypesTmp.GrossWeight                 = weight;
+        productTypesTmp.ProductTotalWeight          = totalProducttWeight;
+        productTypesTmp.PalletContainerTotalWeight  = this.palletContainerWeight(_shipmentId);
+        productTypesTmp.TotalWeight                 = productTypesTmp.ProductTotalWeight + productTypesTmp.PalletContainerTotalWeight;
+
+        productTypesTmp.BundleReportHeaderGuidStr   = bundleHeaderReportGuid;
+        productTypesTmp.CoverNotesHeaderGuidStr     = headerReportGuid;
+
+        productTypesTmp.insert();
     }
 
 ]]></Source>
@@ -327,19 +358,21 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
     /// <param name = "_shipmentId">Shipment number</param>
     public void getProductTypesDetailsTO(InventTransferId _transferId, MetShipmentId _shipmentId)
     {
-        Map                             transferLineByWhsCategoryMap    = new Map(Types::String, Types::Int64);
         Factor                          factor;
-        METCase                         cases, existingCases, totalCases;
-        METBrokenCase                   brokenCases, existingBrokenCases, totalBrokenCases;
+        METCase                         cases,          existingCases,          totalCases;
+        InventQty                       quantityOut,    existingQuantityOut,    totalQuantityOut;
+        METUnitWeight                   shippedWeight,  existingWeight,         totalWeight;
+        METUnitWeight                   productWeight,  existingProductWeight,  totalProductWeight;
+        METBrokenCase                   brokenCases,    existingBrokenCases,    totalBrokenCases;
         METFilterCodeone                filterCode;
+        METLegalEntityType              legalEntityType = CompanyInfo::find().METLegalEntityType;
+
+        Map                             transferLineByWhsCategoryMap = new Map(Types::String, Types::Int64);
         InventDim                       inventDim, inventDimDefaultSetting;
         InventTransferLine              transferLine;
         InventItemSalesSetup            inventItemSalesSetup;
         METInventTransferLine           metTransferLine;
         UnitOfMeasureFromRecId          fromUnit,toUnit;
-        METUnitWeight                   shippedWeight, existingWeight, totalWeight;
-        METUnitWeight                   productWeight, existingProductWeight, totalProductWeight;
-        METSalesOrderShipmentLoadHeader shipmentLoadHeader = METSalesOrderShipmentLoadHeader::findByShipmentId(_shipmentId);
 
         while select transferLine
             where transferLine.TransferId == _transferId
@@ -351,6 +384,15 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
                 && inventItemSalesSetup.ItemId == transferLine.ItemId
                 && inventDimDefaultSetting.InventSiteId == inventDim.InventSiteId
         {
+
+            if (legalEntityType == METLegalEntityType::Liquor)
+            {
+                if (this.isKegItem(transferLine.ItemId))
+                {
+                    headerTmp.KegCount += transferLine.QtyShipped;
+                }
+            }
+
             //Get the unit conversion rule and factor.
             fromUnit    = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(inventItemSalesSetup.METSalesUnit);
             toUnit      = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(transferLine.UnitId);
@@ -401,7 +443,192 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
             {
                 consolidatedBrokenCasesMap.insert(filterCode, brokenCases);
             }
+        }
+    }
 
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getProductTypesDetailsSO</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Add product types for the sales order.
+    /// </summary>
+    /// <param name = "_transferId">Transfer order number</param>
+    /// <param name = "_shipmentId">Shipment number</param>
+    public void getProductTypesDetailsSO(InventTransferId _salesId, MetShipmentId _shipmentId)
+    {
+        Factor                          factor;
+        METCase                         cases,          existingCases,          totalCases;
+        InventQty                       quantityOut,    existingQuantityOut,    totalQuantityOut;
+        METUnitWeight                   shippedWeight,  existingWeight,         totalWeight;
+        METUnitWeight                   productWeight,  existingProductWeight,  totalProductWeight;
+        METBrokenCase                   brokenCases,    existingBrokenCases,    totalBrokenCases;
+        METFilterCodeone                filterCode;
+        UnitOfMeasureFromRecId          fromUnit,toUnit;
+
+        Map                             salesLineByWhsCategoryMap = new Map(Types::String, Types::Int64);
+        InventDim                       inventDim, inventDimDefaultSetting;
+        SalesLine                       salesLine;
+        METSalesLine                    metSalesLine;
+        InventItemSalesSetup            inventItemSalesSetup;
+        METInventItemOrderSetup         metInventItemOrderSetup;
+        METSalesOrderShipmentLoadLines  shipmentLines;
+
+        while select salesLine
+            where salesLine.SalesId == _salesId
+            join metSalesLine where metSalesLine.SalesLine == salesLine.RecId
+            join inventDim where inventDim.inventDimId == salesLine.InventDimId
+            join shipmentLines
+            where shipmentLines.OrderNum == salesLine.SalesId
+                && shipmentLines.LineNum == salesLine.LineNum
+            join FilterCode from metInventItemOrderSetup
+                where metInventItemOrderSetup.ItemId == salesLine.ItemId
+                && metInventItemOrderSetup.SiteId == inventDim.InventSiteId
+        {
+            select firstonly METSalesUnit from inventItemSalesSetup
+                join inventDimDefaultSetting
+                where inventDimDefaultSetting.inventDimId == inventItemSalesSetup.InventDimId
+                    && inventItemSalesSetup.ItemId == salesLine.ItemId
+                    && inventDimDefaultSetting.InventSiteId == inventDim.InventSiteId;
+
+            if (curExt() == '2000')
+            {
+                if (this.isKegItem(salesLine.ItemId))
+                {
+                    headerTmp.KegCount += shipmentLines.Quantity;
+                }
+            }
+
+            //Get the unit conversion rule and factor.
+            fromUnit    = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(inventItemSalesSetup.METSalesUnit);
+            toUnit      = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(salesLine.SalesUnit);
+            factor      = EcoResProductUnitConverter::convertForReleasedProduct(
+                                    salesLine.ItemId,
+                                    salesLine.inventDimId,
+                                    1,
+                                    fromUnit,
+                                    toUnit,
+                                    NoYes::No,
+                                    NoYes::No);
+
+            filterCode      = metInventItemOrderSetup.FilterCode;
+            shippedWeight   = metSalesLine.SalesUnitWeight * shipmentLines.Quantity;
+            cases           = this.getCases(factor, shipmentLines.Quantity);
+            brokenCases     = real2int(shipmentLines.Quantity - (cases * factor));
+            productWeight   = metSalesLine.SalesUnitWeight;
+
+            //Weight
+            if (consolidatedWeightMap.exists(filterCode))
+            {
+                existingWeight = consolidatedWeightMap.lookup(filterCode);
+                consolidatedWeightMap.insert(filterCode, existingWeight + shippedWeight);
+            }
+            else
+            {
+                consolidatedWeightMap.insert(filterCode, shippedWeight);
+            }
+
+            //Cases
+            if (consolidatedCasesMap.exists(filterCode))
+            {
+                existingCases = consolidatedCasesMap.lookup(filterCode);
+                consolidatedCasesMap.insert(filterCode, existingCases + cases);
+            }
+            else
+            {
+                consolidatedCasesMap.insert(filterCode, cases);
+            }
+
+            //Broken case
+            if (consolidatedBrokenCasesMap.exists(filterCode))
+            {
+                existingBrokenCases = consolidatedBrokenCasesMap.lookup(filterCode);
+                consolidatedBrokenCasesMap.insert(filterCode, existingBrokenCases + brokenCases);
+            }
+            else
+            {
+                consolidatedBrokenCasesMap.insert(filterCode, brokenCases);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addCustomerDetails</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get customer details
+    /// </summary>
+    /// <param name = "_custAccount">Customer account number</param>
+    public void addCustomerDetails(AccountNum _custAccount)
+    {
+        CustTable                   custTable = CustTable::find(_custAccount);
+        DirPartyLocation            dirPartyLocation;
+        LogisticsElectronicAddress  logisticsElectronicAddress;
+
+        select firstonly Locator from  logisticsElectronicAddress
+            exists join dirPartyLocation
+             where logisticsElectronicAddress.location == dirPartyLocation.Location
+            && dirPartyLocation.Party == custTable.Party
+            && logisticsElectronicAddress.type == LogisticsElectronicAddressMethodType::Phone
+            && logisticsElectronicAddress.IsPrimary == NoYes::Yes;
+
+        headerTmp.CustomerAccountNumber = custTable.AccountNum;
+        headerTmp.CustomerName          = custTable.name();
+        headerTmp.CustomerAddress       = custTable.address();
+        headerTmp.CustomerPhone         = logisticsElectronicAddress.Locator;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addContainerTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the container table and insert into header tmp table.
+    /// </summary>
+    /// <param name = "_shipmentId"></param>
+    public void addContainerTable(MetShipmentId _shipmentId)
+    {
+        MetContainerTable               containerTable;
+        METContainerTypeTable           containerTypeTable;
+        METSalesOrderShipmentLoadHeader shipmentHeader = METSalesOrderShipmentLoadHeader::findByShipmentId(_shipmentId);
+
+        while select containerTable
+            where containerTable.ShipmentId == _shipmentId
+            join containerTypeTable
+                where containerTypeTable.ContainerTypeCode == containerTable.ContainerTypeCode
+                && containerTypeTable.InventLocationId == shipmentHeader.Warehouse
+        {
+            headerTmp.SecurityCartons   += containerTypeTable.TobaccoRepackQty;
+            headerTmp.RepackCartons     += containerTypeTable.GroceryRepackQty;
+
+            if (containerTable.ContainerTypeCode == containerTypeCodeCHP)
+            {
+                headerTmp.ChepPalletCount += containerTable.ContainerQty;
+            }
+            else if (containerTable.ContainerTypeCode == containerTypeCodeLOS)
+            {
+                headerTmp.LoscamPalletCount += containerTable.ContainerQty;
+            }
+            else if (containerTable.ContainerTypeCode == containerTypeCodeLFT)
+            {
+                headerTmp.PalletLiftCount += containerTable.ContainerQty;
+            }
+            else if (containerTable.ContainerTypeCode == containerTypeCodeBLT)
+            {
+                headerTmp.CoolerBlanketCount += containerTable.ContainerQty;
+            }
+            else if (containerTable.ContainerTypeCode == containerTypeCodePLN)
+            {
+                headerTmp.PlainPalletCount += containerTable.ContainerQty;
+            }
+            else if (containerTable.ContainerTypeCode == containerTypeCodeTOT)
+            {
+                headerTmp.ToteCount += containerTable.ContainerQty;
+            }
         }
     }
 
