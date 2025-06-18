@@ -1,0 +1,373 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METUpdateStockAvailabilityService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// 
+/// </summary>
+internal final class METUpdateStockAvailabilityService extends SysOperationServiceBase
+{
+    InventSiteId inventSiteId;
+    ItemId itemId;
+    METStockAvailDate stockAvailabilityDate;
+    EcoResProductLifecycleStateId productLifeCycleStateId;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    public void process(METUpdateStockAvailabilityContract _contract)
+    {
+        inventSiteId            = _contract.parmInventSiteId();
+        itemId                  = _contract.parmItemId();
+        stockAvailabilityDate   = _contract.parmMETStockAvailDate();
+        productLifeCycleStateId = _contract.parmProductLifecycleStateId();
+
+        this.updateDOSInArgs();
+        
+        if (METVendParameters::find().UpdateFromParentToTransferSites)
+        {
+            try
+            {
+                ttsbegin;
+            
+                this.processDefaultOrderSettings(itemId, inventSiteId);
+                this.processIntercompanyDefaultOrderSettings(itemId,inventSiteId);
+
+                ttscommit;
+            }
+            catch(Exception::Error)
+            {
+                throw  error(strFmt("Unexpected error while executing update stock availability details for Item: %1 | Site: %2", itemId, inventSiteId));
+            }
+           
+        }
+        else
+        {
+            Info("Metcash Accounts Payable parameter 'Update dates and states from parent to transfer sites' is not enabled to continue with Update stock availability details.");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDOSInArgs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method updates the selected or the current record of Default order setting for the Item, with 'Stock availability date' and 'Product lifecycle state'.
+    /// </summary>
+    private void updateDOSInArgs()//METUpdateStockAvailabilityContract _contract
+    {
+        //Note: Not getting the args record directly from contract as this will be called in an intercompany call and RecId wont be usefull then.
+        if (itemId && inventSiteId)
+        {
+            //InventItemPurchSetup inventItemPurchSetupUpdate;
+            //InventDim inventDim;
+
+            //select forupdate firstOnly inventItemPurchSetupUpdate
+            //    where inventItemPurchSetupUpdate.ItemId == itemId
+            //join firstOnly inventDim
+            //    where inventDim.InventDimId == inventItemPurchSetupUpdate.InventDimId
+            //        && inventDim.InventSiteId == inventSiteId;
+
+            METInventItemOrderSetup metInventItemDOSUpd = METInventItemOrderSetup::findByItemAndSite(itemId, inventSiteId, true);
+            if (metInventItemDOSUpd.RecId)
+            {
+                ttsBegin;
+                metInventItemDOSUpd.StockAvailDate = stockAvailabilityDate;
+                metInventItemDOSUpd.ProductLifecycleStateId = productLifeCycleStateId;
+                metInventItemDOSUpd.doUpdate();
+                ttsCommit;
+                Info(Strfmt("Default order setting for Item = %1 | Site = %2 is updated with 'Stock availability date and 'Product lifecycle state'.", itemId, inventSiteId));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>classifyWarehousesForItemAndSite</Name>
+				<Source><![CDATA[
+    public container classifyWarehousesForItemAndSite(ItemId _itemId, InventSiteId _siteId) //Set ndcSet, Set nonNdcSet
+    {
+        ReqItemTable reItemTable;
+        InventLocation inventLocation;
+        InventDim inventDim;
+        InventSite inventSite;
+
+        container ndcYesContainer;
+        container ndcNoContainer;
+        container combinedContainer;
+
+        while select reItemTable
+            where reItemTable.ItemId == _itemId &&
+                  reItemTable.CovInventDimId != ''
+        join inventDim
+            where inventDim.InventDimId == reItemTable.CovInventDimId
+        exists join inventSite
+            where inventSite.SiteId == inventDim.InventSiteId &&
+                  inventSite.SiteId == _siteId
+        exists join inventLocation
+            where inventLocation.InventLocationId == inventDim.InventLocationId
+        {
+            container recCon = [_itemId, _siteId, inventDim.InventLocationId];
+
+            if (inventLocation.METNDCWarehouse == NoYes::Yes)
+            {
+                //ndcYesContainer.add(recCon);
+                ndcYesContainer += recCon;
+            }
+            else
+            {
+               //ndcNoContainer.add(recCon);
+                ndcNoContainer += recCon;
+            }
+        }
+
+        // Combine both containers
+        combinedContainer = ndcYesContainer + ndcNoContainer;
+
+        return combinedContainer;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processDefaultOrderSettings</Name>
+				<Source><![CDATA[
+    public void processDefaultOrderSettings(ItemId _itemId, InventSiteId _inventSiteId)
+    {
+        container conClassifiedWarehousesForItemAndSite = this.classifyWarehousesForItemAndSite(_itemId, _inventSiteId);
+        container newSiteItemPair = this.performUpdateStockAvailability(_itemId, _inventSiteId);
+
+        for (int i = 1; i <= conLen(newSiteItemPair); i++)
+        {
+            container entry = conPeek(newSiteItemPair, i);
+            ItemId newItemId = conPeek(entry, 1);
+            InventSiteId newSiteId = conPeek(entry, 2);
+            this.processDefaultOrderSettings(newItemId, newSiteId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>performUpdateStockAvailability</Name>
+				<Source><![CDATA[
+    public container performUpdateStockAvailability(ItemId _itemId, InventSiteId _inventSiteId)
+    {
+        ReqItemTable reqItemTable;
+        InventLocation inventLocation;
+        InventDim inventDim;
+        InventSite inventSite;
+
+        InventItemPurchSetup inventItemDOSUpd; //Item Default Order settings
+
+        //container allCoverage;
+        //container finalCoverage;
+
+        int i;
+        container record;
+        container newCombos;
+        METItemStatusWarehouses metItemStatusWarehousesExcluded;
+
+        while select reqItemTable
+            where reqItemTable.ItemId == _itemId
+                && reqItemTable.ReqPOType == ReqPOType::Transfer
+                && reqItemTable.CovInventDimId != ''
+        join inventDim
+            where inventDim.InventDimId == reqItemTable.CovInventDimId
+        exists join inventLocation
+            where inventLocation.InventLocationId == inventDim.InventLocationId
+        notexists join metItemStatusWarehousesExcluded
+            where metItemStatusWarehousesExcluded.InventLocationId == inventDim.InventLocationId
+        {
+            //allCoverage += [[_itemId, inventDim.InventSiteId, inventDim.InventLocationId]];
+
+            //_inventSiteId is the main Site from where the triggere for update stock availability has started. Subsequentely its the site for the newSiteItemPair combinations if any.
+            if (inventDim.InventSiteId == _inventSiteId)
+                continue;
+
+            // Checking if the Main warehouse is available or not for the Item coverage.
+            if (!reqItemTable.InventLocationIdReqMain)
+            {
+                Info(strFmt("Item coverage for Item: %1 | Site: %2 | Warehouse: %3 is not set with Main warehouse.", _itemId, inventDim.InventSiteId, inventDim.InventLocationId));
+                continue;
+            }
+            //else //should use continue above or use else block
+            //{
+                this.updateDefaultOrderSettingsForItemSite(_itemId, reqItemTable.CovInventDimId); // Should I collect all the records and update at once.mostly outside this loop.
+            
+            newCombos += [_itemId, inventDim.InventSiteId];
+            //} //should use continue above or use else block
+
+        }//while
+
+        return newCombos;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDefaultOrderSettingsForItemSite</Name>
+				<Source><![CDATA[
+    public void updateDefaultOrderSettingsForItemSite(ItemId _itemId, InventSiteId _inventSideId, str _currentLegalEnity = curExt(), InventDimId _covInventDimId = null)
+    {
+        #OCCRetryCount
+        //if (_covInventDimId != null && _itemId)
+        //{
+        //    InventItemPurchSetup inventItemDOSUpd = InventItemPurchSetup::find(_itemId, _covInventDimId, true);
+        //}
+
+        if (_itemId && _inventSideId)
+        {
+            try
+            {
+                METInventItemOrderSetup inventItemDOSUpd = METInventItemOrderSetup::findByItemAndSite(_itemId, _inventSideId, true);
+
+                if (inventItemDOSUpd.RecId)
+                {
+                    ttsBegin;
+                    inventItemDOSUpd.StockAvailDate = stockAvailabilityDate;
+                    inventItemDOSUpd.ProductLifecycleStateId = productLifeCycleStateId;
+                    inventItemDOSUpd.doUpdate();
+                    ttsCommit;
+
+                    if (_currentLegalEnity == curExt())
+                    {
+                        Info(strFmt("Default order settings for Item: %1 | Site: %2 is updated with 'Stock availability date' and 'Process lifecycle state'.", _itemId, _inventSideId));
+                    }
+                    else
+                    {
+                        Info(strFmt("Default order settings Legal entity: %3, for Item: %1 | Site: %2 is updated with 'Stock availability date' and 'Process lifecycle state'.", _itemId, _inventSideId, _currentLegalEnity));
+                    }
+                    //infoLog.add(
+                    //    strFmt("Updated InventItemPurchSetup for Item: %1 | Site: %2 | Stock Date: %3 | Lifecycle: %4",
+                    //        inventItemDOSUpd.ItemId,
+                    //        inventItemDOSUpd.InventSiteId,
+                    //        inventItemDOSUpd.StockAvailabilityDate,
+                    //        inventItemDOSUpd.ProcessLifecycleState)
+                    //    ,LogSeverity::Info );
+
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch(Exception::Error)
+            {
+                throw error(strFmt("Unexpected error while executing update stock availability details for Item: %1 | Site: %2", _itemId, _inventSideId));
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processIntercompanyDefaultOrderSettings</Name>
+				<Source><![CDATA[
+    public void processIntercompanyDefaultOrderSettings(ItemId _itemId, InventSiteId _inventSiteId)
+    {
+        DataAreaId metInterCompanyPurchaseLegalEntity = InventParameters::find().METInterCompanyPurchaseLegalEntity;
+        if (metInterCompanyPurchaseLegalEntity)
+        {
+            changecompany(metInterCompanyPurchaseLegalEntity)
+            {
+                container newSiteItemPairIntercompany = this.performIntercompanyUpdStkAvailability(_itemId, _inventSiteId, metInterCompanyPurchaseLegalEntity);
+
+                for (int i = 1; i <= conLen(newSiteItemPairIntercompany); i++)
+                {
+                    container entry = conPeek(newSiteItemPairIntercompany, i);
+                    ItemId newItemId = conPeek(entry, 1);
+                    InventSiteId newSiteId = conPeek(entry, 2);
+                    //this.processIntercompanyDefaultOrderSettings(newItemId, newSiteId);
+                    this.performIntercompanyUpdStkAvailability(_itemId, _inventSiteId, metInterCompanyPurchaseLegalEntity);
+                }
+            }
+        }
+        else
+        {
+            Info(strFmt("Cannot proceed with update stock availbility for intercompany. Metcash intercompany purchaes legal entity is not set in legal entity: %1. ", curExt()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>performIntercompanyUpdStkAvailability</Name>
+				<Source><![CDATA[
+    public container performIntercompanyUpdStkAvailability(ItemId _itemId, InventSiteId _inventSiteId,  DataAreaId _metInterCompanyPurchaseLegalEntity)
+    {
+        ReqItemTable reqItemTable;
+        InventLocation inventLocation;
+        InventDim inventDim;
+        InventSite inventSite;
+        METItemStatusWarehouses metItemStatusWarehousesExcluded;
+
+        container newCombosUnderInterCompanyLE;
+
+        while select reqItemTable
+            where reqItemTable.ItemId == _itemId
+                && reqItemTable.ReqPOType == ReqPOType::Purch
+                && reqItemTable.METInterCompanySourced == NoYes::Yes
+                && reqItemTable.CovInventDimId != ''
+        join inventDim
+            where inventDim.InventDimId == reqItemTable.CovInventDimId
+        exists join inventLocation
+            where inventLocation.InventLocationId == inventDim.InventLocationId
+        notexists join metItemStatusWarehousesExcluded
+            where metItemStatusWarehousesExcluded.InventLocationId == inventDim.InventLocationId
+        {
+            if (!reqItemTable.METIntercompanySourcedWarehouse)
+            {
+                Info(strFmt("Legal Entity: %4 | Item coverage for Item: %1 | Site: %2 | Warehouse: %3 is not set with Intercompany warehouse.", _itemId, inventDim.InventSiteId, inventDim.InventLocationId, curExt()));
+                continue;
+            }
+            //else
+            //{
+            this.updateDefaultOrderSettingsForItemSite(_itemId, reqItemTable.CovInventDimId, _metInterCompanyPurchaseLegalEntity);
+            //}
+
+            newCombosUnderInterCompanyLE += [_itemId, inventDim.InventSiteId];
+        }
+
+        return newCombosUnderInterCompanyLE;
+
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
