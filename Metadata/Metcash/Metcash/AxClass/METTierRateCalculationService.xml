@@ -64,6 +64,7 @@
             TAMRebateDate rebateDate;
             CustInvoiceTrans custInvoiceTrans;
             CustInvoiceJour custInvoiceJour;
+            CustTable custTable;
 
             select firstonly Deal,RecId from rebateDeal
             where rebateDeal.Deal == _contract.parmRebateDealRecId();
@@ -88,6 +89,15 @@
             {
                 int i = 2;
 
+                GUPPricingRuleCopy pricingRuleCopyCustHeader;
+                Query custQuery;
+                
+                if (rebateTable.PricingRuleHeader)
+                {
+                    pricingRuleCopyCustHeader.initFromPricingRule(GUPPricingRule::find(rebateTable.PricingRuleHeader));
+                    custQuery = GUPPricingObjectQueryBuilder::constructFromPricingRuleCopy(pricingRuleCopyCustHeader).build();
+                }
+
                 while select custInvoiceTrans join custInvoiceJour
                 where custInvoiceJour.SalesId == custInvoiceTrans.SalesId
                 && custInvoiceJour.InvoiceId == custInvoiceTrans.InvoiceId
@@ -95,8 +105,24 @@
                 && custInvoiceJour.numberSequenceGroup == custInvoiceTrans.numberSequenceGroup
                 && custInvoiceTrans.InvoiceDate >= _contract.parmFromDate()
                 && custInvoiceTrans.InvoiceDate <= _contract.parmToDate()
+                join RecId from custTable
+                    where custTable.AccountNum == custInvoiceJour.OrderAccount
                 {
-                    i = 2;
+                    if (custQuery)
+                    {
+                        
+                        SysQuery::findOrCreateRange(custQuery.dataSourceTable(tableNum(CustTable)), fieldNum(CustTable, RecId)).value(queryValue(custTable.RecId));
+                        QueryRun queryRun = new QueryRun(custQuery);
+
+                        custQuery.firstOnly1(true);
+
+                        if (!queryRun.next())
+                        {
+                            continue;
+                        }
+                    }
+                    
+                    i = 2 ;
 
                     while (i > 0)
                     {
@@ -150,39 +176,53 @@
 
                 if (rebateDate.RebateFromDate <= _contract.parmFromDate() && _contract.parmToDate() <= rebateDate.RebateToDate)
                 {
-                    tierRateTrans.clear();
-                    tierRateTrans.FromDate = _contract.parmFromDate();
-                    tierRateTrans.ToDate = _contract.parmToDate();
-                    tierRateTrans.TAMRebateDealId = rebateDeal.Deal;
-                    tierRateTrans.RebateTransactionType = TAMRebateTransactionType::Rebate;
-                    tierRateTrans.RebateId = rebateTable.RebateId;
-                    tierRateTrans.insert();
+                    while select StartDate, EndDate from fiscalCalendarPeriod
+                        exists join fiscalCalYear
+                            where fiscalCalendarPeriod.FiscalCalendarYear == fiscalCalYear.RecId
+                        exists join fiscalCal
+                            where fiscalCal.RecId == fiscalCalYear.FiscalCalendar
+                                && fiscalCal.CalendarId == calendarId
+                                && fiscalCalendarPeriod.Type == FiscalPeriodType::Operating
+                                && ((fiscalCalendarPeriod.StartDate >= _contract.parmFromDate() && fiscalCalendarPeriod.StartDate <= _contract.parmToDate()) ||
+                                   (fiscalCalendarPeriod.EndDate >= _contract.parmFromDate() && fiscalCalendarPeriod.EndDate <= _contract.parmToDate()) ||
+                                   (fiscalCalendarPeriod.startDate <= _contract.parmFromDate() && fiscalCalendarPeriod.endDate >= _contract.parmToDate()))
+                    {
+                        tierRateTrans.clear();
+                        tierRateTrans.FromDate = fiscalCalendarPeriod.StartDate;
+                        tierRateTrans.ToDate = fiscalCalendarPeriod.EndDate;
+                        tierRateTrans.TAMRebateDealId = rebateDeal.Deal;
+                        tierRateTrans.RebateTransactionType = TAMRebateTransactionType::Rebate;
+                        tierRateTrans.RebateId = rebateTable.RebateId;
+                        tierRateTrans.insert();
 
-                    update_recordSet tierRebateTrans
-                setting METTierRateTransRecID = tierRateTrans.RecId
-                    where tierRebateTrans.RebateRefDate >= tierRateTrans.FromDate
-                    && tierRebateTrans.RebateRefDate <= tierRateTrans.ToDate
-                    && tierRebateTrans.RebateId == rebateTable.RebateId
-                    && tierRebateTrans.TAMRebateDealId == tierRateTrans.TAMRebateDealId
-                    && tierRebateTrans.RebateTransactionType == TAMRebateTransactionType::Rebate;
+                        update_recordSet tierRebateTrans
+                            setting METTierRateTransRecID = tierRateTrans.RecId
+                                where tierRebateTrans.RebateRefDate >= tierRateTrans.FromDate
+                                    && tierRebateTrans.RebateRefDate <= tierRateTrans.ToDate
+                                    && tierRebateTrans.RebateId == rebateTable.RebateId
+                                    && tierRebateTrans.TAMRebateDealId == tierRateTrans.TAMRebateDealId
+                                    && tierRebateTrans.RebateTransactionType == TAMRebateTransactionType::Rebate;
+                        
+                        select sum(RebateRefAmount) from tierRebateTrans
+                            where tierRebateTrans.METTierRateTransRecID == tierRateTrans.RecId
+                            && tierRebateTrans.RebateTransactionType == TAMRebateTransactionType::Rebate
+                            && tierRebateTrans.RebateRefDate >= tierRateTrans.FromDate
+                            && tierRebateTrans.RebateRefDate <= tierRateTrans.ToDate;
 
-                    select sum(RebateRefAmount) from tierRebateTrans
-                    where tierRebateTrans.METTierRateTransRecID == tierRateTrans.RecId
-                    && tierRebateTrans.RebateTransactionType == TAMRebateTransactionType::Rebate;
+                        ttsbegin;
+                        tierRateTrans.selectForUpdate(true);
+                        tierRateTrans.AgEligibleTransAmount = tierRebateTrans.RebateRefAmount;
+                        tierRateTrans.WeeklyAverage = tierRateTrans.AgEligibleTransAmount/calendarMonth;
 
-                    ttsbegin;
-                    tierRateTrans.selectForUpdate(true);
-                    tierRateTrans.AgEligibleTransAmount = tierRebateTrans.RebateRefAmount;
-                    tierRateTrans.WeeklyAverage = tierRateTrans.AgEligibleTransAmount/calendarMonth;
+                        select firstonly rebateLine
+                            where rebateLine.RebateFrom <= tierRateTrans.WeeklyAverage
+                            && rebateLine.RebateLimit >= tierRateTrans.WeeklyAverage
+                            && rebateLine.RebateId == rebateTable.RebateId;
 
-                    select firstonly rebateLine
-                    where rebateLine.RebateFrom <= tierRateTrans.WeeklyAverage
-                    && rebateLine.RebateLimit >= tierRateTrans.WeeklyAverage
-                    && rebateLine.RebateId == rebateTable.RebateId;
-
-                    tierRateTrans.EligibleRebate = rebateLine.RebateAmount;
-                    tierRateTrans.doUpdate();
-                    ttscommit;
+                        tierRateTrans.EligibleRebate = rebateLine.RebateAmount;
+                        tierRateTrans.doUpdate();
+                        ttscommit;
+                    }
 
                     while (calendarMonth > weekPeriod)
                     {
