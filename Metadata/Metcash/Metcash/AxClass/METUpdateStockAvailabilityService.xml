@@ -13,6 +13,8 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
     METStockAvailDate stockAvailabilityDate;
     EcoResProductLifecycleStateId productLifeCycleStateId;
 
+    Set processedItemSitePairs = new Set(Types::Container);
+
 }
 ]]></Declaration>
 		<Methods>
@@ -141,8 +143,25 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
 				<Source><![CDATA[
     public void processDefaultOrderSettings(ItemId _itemId, InventSiteId _inventSiteId)
     {
+        if (this.isItemSitePairAlreadyProcessed(_itemId, _inventSiteId))
+        {
+            return;
+        }
+
+        container newSiteItemPair;
         container conClassifiedWarehousesForItemAndSite = this.classifyWarehousesForItemAndSite(_itemId, _inventSiteId);
-        container newSiteItemPair = this.performUpdateStockAvailability(_itemId, _inventSiteId);
+        
+        for (int i = 1; i <= conLen(conClassifiedWarehousesForItemAndSite); i++)
+        {
+            container itemSiteWarehousePair        = conPeek(conClassifiedWarehousesForItemAndSite, i);
+            //ItemId itemCoverageItem                = conPeek(itemSiteWarehousePair, 1);
+            //InventSiteId itemCoverageSite          = conPeek(itemSiteWarehousePair, 2);
+            InventLocationId itemCoverageWarehouses = conPeek(itemSiteWarehousePair, 3);
+
+            //container newSiteItemPair = this.performUpdateStockAvailability(itemCoverageItem, itemCoverageSite, itemCoverageWarehouse); //_itemId, _inventSiteId,
+        
+            newSiteItemPair += this.performUpdateStockAvailability(_itemId, _inventSiteId, itemCoverageWarehouses);
+        }
 
         for (int i = 1; i <= conLen(newSiteItemPair); i++)
         {
@@ -158,7 +177,7 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
 			<Method>
 				<Name>performUpdateStockAvailability</Name>
 				<Source><![CDATA[
-    public container performUpdateStockAvailability(ItemId _itemId, InventSiteId _inventSiteId)
+    public container performUpdateStockAvailability(ItemId _itemId, InventSiteId _inventSiteId, InventLocationId _covInventLocationId)
     {
         ReqItemTable reqItemTable;
         InventLocation inventLocation;
@@ -167,18 +186,16 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
 
         InventItemPurchSetup inventItemDOSUpd; //Item Default Order settings
 
-        //container allCoverage;
-        //container finalCoverage;
-
         int i;
         container record;
         container newCombos;
         METItemStatusWarehouses metItemStatusWarehousesExcluded;
 
         while select reqItemTable
-            where reqItemTable.ItemId == _itemId
-                && reqItemTable.ReqPOType == ReqPOType::Transfer
-                && reqItemTable.CovInventDimId != ''
+            where reqItemTable.ItemId                   == _itemId
+                && reqItemTable.InventLocationIdReqMain == _covInventLocationId
+                && reqItemTable.ReqPOType               == ReqPOType::Transfer
+                && reqItemTable.CovInventDimId          != ''
         join inventDim
             where inventDim.InventDimId == reqItemTable.CovInventDimId
         exists join inventLocation
@@ -186,24 +203,11 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
         notexists join metItemStatusWarehousesExcluded
             where metItemStatusWarehousesExcluded.InventLocationId == inventDim.InventLocationId
         {
-            //allCoverage += [[_itemId, inventDim.InventSiteId, inventDim.InventLocationId]];
 
-            //_inventSiteId is the main Site from where the triggere for update stock availability has started. Subsequentely its the site for the newSiteItemPair combinations if any.
-            if (inventDim.InventSiteId == _inventSiteId)
-                continue;
-
-            // Checking if the Main warehouse is available or not for the Item coverage.
-            if (!reqItemTable.InventLocationIdReqMain)
-            {
-                Info(strFmt("Item coverage for Item: %1 | Site: %2 | Warehouse: %3 is not set with Main warehouse.", _itemId, inventDim.InventSiteId, inventDim.InventLocationId));
-                continue;
-            }
-            //else //should use continue above or use else block
-            //{
-                this.updateDefaultOrderSettingsForItemSite(_itemId, reqItemTable.CovInventDimId); // Should I collect all the records and update at once.mostly outside this loop.
+            this.updateDefaultOrderSettingsForItemSite(_itemId, reqItemTable.CovInventDimId); // Should I collect all the records and update at once.mostly outside this loop.
             
             newCombos += [_itemId, inventDim.InventSiteId];
-            //} //should use continue above or use else block
+
 
         }//while
 
@@ -227,14 +231,18 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
         {
             try
             {
-                METInventItemOrderSetup inventItemDOSUpd = METInventItemOrderSetup::findByItemAndSite(_itemId, _inventSideId, true);
+                METInventItemOrderSetup metInventItemDOSUpd = METInventItemOrderSetup::findByItemAndSite(_itemId, _inventSideId, true);
 
-                if (inventItemDOSUpd.RecId)
+                if (metInventItemDOSUpd.RecId 
+                    && (metInventItemDOSUpd.ItemStatus == enum2Str(METItemsStatus::Active) ||
+                        metInventItemDOSUpd.ItemStatus == enum2Str(METItemsStatus::Discontinued) ||
+                        metInventItemDOSUpd.ItemStatus == enum2Str(METItemsStatus::PackChange))
+                    )
                 {
                     ttsBegin;
-                    inventItemDOSUpd.StockAvailDate = stockAvailabilityDate;
-                    inventItemDOSUpd.ProductLifecycleStateId = productLifeCycleStateId;
-                    inventItemDOSUpd.doUpdate();
+                    metInventItemDOSUpd.StockAvailDate = stockAvailabilityDate;
+                    metInventItemDOSUpd.ProductLifecycleStateId = productLifeCycleStateId;
+                    metInventItemDOSUpd.doUpdate();
                     ttsCommit;
 
                     if (_currentLegalEnity == curExt())
@@ -247,12 +255,16 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
                     }
                     //infoLog.add(
                     //    strFmt("Updated InventItemPurchSetup for Item: %1 | Site: %2 | Stock Date: %3 | Lifecycle: %4",
-                    //        inventItemDOSUpd.ItemId,
-                    //        inventItemDOSUpd.InventSiteId,
-                    //        inventItemDOSUpd.StockAvailabilityDate,
-                    //        inventItemDOSUpd.ProcessLifecycleState)
+                    //        metInventItemDOSUpd.ItemId,
+                    //        metInventItemDOSUpd.InventSiteId,
+                    //        metInventItemDOSUpd.StockAvailabilityDate,
+                    //        metInventItemDOSUpd.ProcessLifecycleState)
                     //    ,LogSeverity::Info );
 
+                }
+                else
+                {
+                    Info(strFmt("Default order settings for Item: %1 | Site: %2 could not be updated as Item status is either 'Deleted' or 'New'.", _itemId, _inventSideId));
                 }
             }
             catch (Exception::UpdateConflict)
@@ -338,10 +350,10 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
         container newCombosUnderInterCompanyLE;
 
         while select reqItemTable
-            where reqItemTable.ItemId == _itemId
-                && reqItemTable.ReqPOType == ReqPOType::Purch
+            where reqItemTable.ItemId                  == _itemId
+                && reqItemTable.ReqPOType              == ReqPOType::Purch
                 && reqItemTable.METInterCompanySourced == NoYes::Yes
-                && reqItemTable.CovInventDimId != ''
+                && reqItemTable.CovInventDimId         != ''
         join inventDim
             where inventDim.InventDimId == reqItemTable.CovInventDimId
         exists join inventLocation
@@ -354,6 +366,8 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
                 Info(strFmt("Legal Entity: %4 | Item coverage for Item: %1 | Site: %2 | Warehouse: %3 is not set with Intercompany warehouse.", _itemId, inventDim.InventSiteId, inventDim.InventLocationId, curExt()));
                 continue;
             }
+
+
             //else
             //{
             this.updateDefaultOrderSettingsForItemSite(_itemId, reqItemTable.CovInventDimId, _metInterCompanyPurchaseLegalEntity);
@@ -363,7 +377,22 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
         }
 
         return newCombosUnderInterCompanyLE;
+    }
 
+]]></Source>
+			</Method>
+			<Method>
+				<Name>IsItemSitePairAlreadyProcessed</Name>
+				<Source><![CDATA[
+    private boolean IsItemSitePairAlreadyProcessed(ItemId _itemId, InventSiteId _siteId)
+    {
+        container itemSitePairKey = [_itemId, _siteId];
+        if (!processedItemSitePairs.in(itemSitePairKey))
+        {
+            processedItemSitePairs.add(itemSitePairKey);
+            return true;
+        }
+        return false;
     }
 
 ]]></Source>
