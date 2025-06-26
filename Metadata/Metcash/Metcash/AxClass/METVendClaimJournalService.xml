@@ -16,7 +16,11 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
     MetVendClaimType        claimType;
     InvoiceDate             invoiceDate;
     InventSiteId            siteId;
+    InventLocationId        inventLovcationId;
     METVendorClaimTable     vendorClaimTable;
+    InventLocationId        warehouse;
+    Description255          itemDescription;
+    ItemId                  itemId;
 
     #OCCRetryCount
 
@@ -74,17 +78,17 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
             throw error(strfmt("@GLS111556", new DictType(extendedtypenum(METVendClaimInvoiceNumberSequenceTable)).label(), "@GlobalUnifiedPricing:GUPParameters"));
         }
 
-        InventSite inventSite;
+        InventLocation inventLocation;  
         QueryRun qr = new QueryRun(contract.getQuery());
         
         while (qr.next())
         {
-            inventSite = qr.get(tableNum(InventSite));
+            inventLocation = qr.get(tableNum(InventLocation)); 
             try
             {
                 ttsbegin;
                 journalTable = null;
-                this.createClaimJournalForSite(inventSite.SiteId);
+                this.createClaimJournalForWarehouse(inventLocation.InventLocationId);
                 ttscommit;
                 //Split transaction blocks to separate journal creation and posting. In case posting fails, journal will remain in system and manual posting can be done
                 ttsbegin;
@@ -152,23 +156,23 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>createClaimJournalForSite</Name>
+				<Name>createClaimJournalForWarehouse</Name>
 				<Source><![CDATA[
     /// <summary>
     /// Create journal header and lines
     /// </summary>
     /// <param name = "_siteId"></param>
-    private void createClaimJournalForSite(InventSiteId _siteId)
+    private void createClaimJournalForWarehouse(InventLocationId _InventLocationId)
     {
-        siteId = _siteId;
+        inventLovcationId = _InventLocationId;
         
-        if(!METVendorClaimTable::existClaimLinesToProcess(claimType, _siteId))
+        if(!METVendorClaimTable::existClaimLinesToProcess(claimType, _InventLocationId))
             return;
 
-        while select sum(ClaimAmount), VendAccount
+        while select sum(ClaimAmount), VendAccount, InventLocationId, ItemId
             from vendorClaimTable
-            group by vendorClaimTable.ClaimType, vendorClaimTable.VendAccount, vendorClaimTable.SiteId, vendorClaimTable.ItemId
-            where vendorClaimTable.SiteId == _siteId
+            group by vendorClaimTable.ClaimType, vendorClaimTable.VendAccount, vendorClaimTable.InventLocationId, vendorClaimTable.ItemId 
+            where vendorClaimTable.InventLocationId == _InventLocationId
             &&      vendorClaimTable.ClaimType == MetVendClaimType::StandardCost
             &&      vendorClaimTable.Claimed == NoYes::No
             &&      vendorClaimTable.ClaimStatus == METVendorClaimStatus::Approved
@@ -178,6 +182,9 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
                 this.createLedgerJournalTable();
             }
             claimAmount = vendorClaimTable.ClaimAmount;
+            warehouse   = vendorClaimTable.InventLocationId;
+            itemDescription = InventTable ::find(vendorClaimTable.ItemId).itemDescriptionOrName();
+            itemId = vendorClaimTable.ItemId;
             this.createLedgerJournalTrans();
         }
     }
@@ -225,7 +232,37 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
         ledgerJournalTrans.AccountType           = LedgerJournalACType::Vend;
         ledgerJournalTrans.parmAccount(vendorClaimTable.VendAccount);
         ledgerJournalTrans.OffsetAccountType = LedgerJournalACType::Ledger;
-        ledgerJournalTrans.OffsetLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(journalName.OffsetLedgerDimension);
+
+        InventItemGroupItem  inventItemGroupItem;
+        InventTable          inventTable;
+
+        select firstonly ItemId,DataAreaId from inventTable
+                    where inventTable.ItemId == itemId
+                    join ItemGroupId from inventItemGroupItem
+                    where inventItemGroupItem.ItemId == inventTable.ItemId &&
+                    inventItemGroupItem.ItemDataAreaId == inventTable.DataAreaId;
+
+        // Tobacco
+
+        if (gupParameters.METTobaccoItemGroup == inventItemGroupItem.ItemGroupId)
+        {
+            ledgerJournalTrans.OffsetLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(gupParameters.METTobaccoOffsetAccount);
+        }
+        else
+        {
+            ledgerJournalTrans.OffsetLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(gupParameters.METNonTobaccoOffsetAccount);
+        }
+        
+        InventLocation inventLOcation;
+
+        select firstonly METDefaultDimension from inventLOcation
+            where inventLOcation.InventLocationId == warehouse;
+        ledgerJournalTrans.DefaultDimension      = this.getToDefaultDimension(ledgerJournalTrans.DefaultDimension, inventLOcation.METDefaultDimension);
+        ledgerJournalTrans.OffsetDefaultDimension      = this.getToDefaultDimension(ledgerJournalTrans.OffsetDefaultDimension, inventLOcation.METDefaultDimension);
+        ledgerJournalTrans.Txt                         = this.getClaimInvoiceNumberSeq().num() + itemDescription;
+        ledgerJournalTrans.TaxGroup              = VendTable::find(vendorClaimTable.VendAccount).TaxGroup;
+        ledgerJournalTrans.TaxItemGroup          = InventTableModule::find(itemId, ModuleInventPurchSales::Sales).TaxItemGroupId;
+
         ledgerJournalTrans.insert();
 
         if((LedgerjournalTrans.RecId != 0))
@@ -321,6 +358,28 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
     public boolean isRetryable()
     {
         return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getToDefaultDimension</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to find the  to default dimension.
+    /// </summary>
+    /// <param name = "_fromDefaultDimension">From Default Dimension</param>
+    /// <param name = "_costCentreDefaultDimension">Cost Centre</param>
+    /// <returns>Default dimension.</returns>
+    public DimensionDefault getToDefaultDimension(
+      DimensionDefault                    _fromDefaultDimension,
+      DimensionDefault                    _costCentreDefaultDimension)
+    {
+        DimensionDefault    toDefaultDimension;
+      
+        toDefaultDimension = DimensionDefaultFacade::serviceMergeDefaultDimensions(_costCentreDefaultDimension, _fromDefaultDimension);
+
+        return toDefaultDimension;
     }
 
 ]]></Source>
