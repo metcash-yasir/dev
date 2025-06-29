@@ -15,6 +15,7 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
     boolean             runForExcise;
     RecordInsertList    recordInsertList;
     TransDate           startDate;
+    boolean             immediateChange;
 
 
 }
@@ -29,26 +30,25 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
     /// <param name = "_dataContract">Contract</param>
     public void processOperation(METDutyRollMonthlyContract _dataContract)
     {
-        BatchHeader batchHeader;
-
         try
         {
-            batchHeader     = this.getCurrentBatchHeader();
-            
-            if (batchHeader == null)
-            {
-                batchHeader = batchHeader::construct();
-            }
-            batchHeader.parmCaption("@MET:MonthlyDutyRoll");
-
+            ttsbegin;
             itemList        = _dataContract.parmItemList();
             siteList        = _dataContract.parmSiteList();
             adHoc           = _dataContract.parmAdHoc();
             runForExcise    = _dataContract.parmRunForExcise();
+            immediateChange = _dataContract.parmImmediateChange();
 
             recordInsertList    = new RecordInsertList(tableNum(METDutyRollValuesLine));
 
-            startDate   = this.getFstMonday();
+            if (immediateChange)
+            {
+                startDate    = DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone());
+            }
+            else
+            {
+                startDate    = this.getNextMonday();
+            }
 
             this.processSites();
  
@@ -59,14 +59,68 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
             }
             else
             {
-                throw error("@MET:DutyRollExtBusinessEventNotEnabled");
+                error("@MET:DutyRollExtBusinessEventNotEnabled");
             }
+            ttscommit;
         }
         catch
         {
             error ("@WAX:UpdateCancelled");
         }
         //NE - Created for the CB799 - to provide the extract of duty per case value after the batch job is finished.
+
+        //Call Generate Ad Valorum Claim Batch
+        if (adHoc)
+        {
+            this.processGenerateAdValorumClaimBatch(siteList, itemList);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processGenerateAdValorumClaimBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Call Generate Ad Valorum Claim Batch
+    /// </summary>
+    /// <param name = "_siteList">SiteList</param>
+    /// <param name = "_itemList">ItemList</param>
+    public void processGenerateAdValorumClaimBatch(List _siteList, List _itemList)
+    {
+        try
+        {
+            ttsbegin;
+            BatchHeader     batchHeader;
+                
+            batchHeader = this.getCurrentBatchHeader(); 
+
+            SysOperationServiceController controller = new SysOperationServiceController(classStr(METDutyAdValorumClaimGenerateService), methodStr(METDutyAdValorumClaimGenerateService, processOperation), SysOperationExecutionMode::ScheduledBatch);
+            controller.parmExecutionMode(SysOperationExecutionMode::ScheduledBatch);
+            controller.parmShowDialog(false);
+            controller.parmLoadFromSysLastValue(false);
+            controller.parmDialogCaption("@MET:GenerateAdValorumClaim");
+ 
+            // Set contract parameters
+            METDutyAdValorumClaimGenerateContract contract = new METDutyAdValorumClaimGenerateContract();
+            contract = controller.getDataContractObject();
+            contract.parmDutyValuesBySite(true);
+            contract.parmGenerateClaims(false);
+            contract.parmFilterItemSite(true);
+            contract.parmSiteList(_siteList);
+            contract.parmItemList(_itemList);
+
+            //add the batch tasks to the batch header
+            batchHeader.addTask(controller);
+
+            //save the batch
+            batchHeader.save();
+            ttscommit;
+        }
+        catch
+        {
+            error ('Generate Ad valorum claim batch scheduled is failed.');
+        }
     }
 
 ]]></Source>
@@ -113,29 +167,15 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
     /// <param name = "_siteId">InventSiteId</param>
     private void processSite(InventSiteId   _siteId)
     {
-        METDutyRollValuesTable  dutyRollValuesTable, dutyRollValuesTableTo;
+        METDutyRollValuesTable  dutyRollValuesTable;
+        METDutyRollValuesLine   dutyRollValuesLineLoc;
+
         dutyRollValuesTable = METDutyRollValuesTable::findActive(_siteId);
+
         try
         {
-            if (dutyRollValuesTable.RecId)
+            if (adHoc & dutyRollValuesTable.RecId)
             {
-                ttsbegin;
-                dutyRollValuesTable.selectForUpdate(true);
-                dutyRollValuesTable.inactivateRecord();
-                dutyRollValuesTable.update();
-                ttscommit;
-            }
-
-            if (adHoc)
-            {
-                dutyRollValuesTableTo.clear();
-                dutyRollValuesTableTo.Site = _siteId;
-                dutyRollValuesTableTo.StartDate = startDate;
-                dutyRollValuesTableTo.Status = METDutyRollStatus::Active;
-                dutyRollValuesTableTo.insert();
-
-                this.copyDutyRollValueLines(dutyRollValuesTable, dutyRollValuesTableTo);
-
                 METDutyRollValuesLine dutyRollValuesLine;
 
                 ItemId itemId;
@@ -148,12 +188,14 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
                     {
                         itemId  = iter.current();
 
-                        delete_from dutyRollValuesLine
-                            where dutyRollValuesLine.Site == _siteId
-                            && dutyRollValuesLine.ItemId == itemId
-                            && dutyRollValuesLine.RefRecId == dutyRollValuesTableTo.RecId;
+                        update_recordset dutyRollValuesLine
+                            setting EndDate = DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone())
+                                where dutyRollValuesLine.Site == _siteId
+                                    && dutyRollValuesLine.ItemId == itemId
+                                    && dutyRollValuesLine.RefRecId == dutyRollValuesTable.RecId
+                                    && dutyRollValuesLine.EndDate == dateNull();
 
-                        this.processItem(_siteId, itemId, dutyRollValuesTableTo.RecId);
+                        this.processItem(_siteId, itemId, dutyRollValuesTable.RecId);
                     }
                 }
 
@@ -162,9 +204,21 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
             }
             else
             {
+                if (dutyRollValuesTable.RecId)
+                {
+                    dutyRollValuesTable.selectForUpdate(true);
+                    dutyRollValuesTable.Status  = METDutyRollStatus::Inactive;
+                    dutyRollValuesTable.update();
+
+                    update_recordset dutyRollValuesLineLoc
+                        setting EndDate = DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone())
+                            where dutyRollValuesLineLoc.Site == _siteId
+                                && dutyRollValuesLineLoc.RefRecId == dutyRollValuesTable.RecId
+                                && dutyRollValuesLineLoc.EndDate == dateNull();
+                }
+
                 dutyRollValuesTable.clear();
                 dutyRollValuesTable.Site = _siteId;
-                dutyRollValuesTable.StartDate = startDate;
                 dutyRollValuesTable.Status = METDutyRollStatus::Active;
                 dutyRollValuesTable.insert();
 
@@ -256,17 +310,17 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
         METTariffItemCode           tariffItemCode;
         METExciseSiteDutySetup      exciseSiteDutySetup;
         Qty                         lalqty;
-        Qty                         averageQty;
         container                   con;
 
         dutyRollValuesLine.clear();
         dutyRollValuesLine.CalcDate     = DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone());
+        dutyRollValuesLine.StartDate    = startDate;        
         dutyRollValuesLine.RefRecId     = _refRecId;
         dutyRollValuesLine.Site         = _siteId;
         dutyRollValuesLine.ItemId       = _itemId;
         dutyRollValuesLine.ItemName     = inventTable.NameAlias;
         dutyRollValuesLine.Unit         = inventTable.salesUnitId();
-        [dutyRollValuesLine.AverageVFD,averageQty] = this.calcAvgDutyCase(_itemId, _siteId);
+        dutyRollValuesLine.AverageVFD   = this.calcAvgDutyCase(_itemId, _siteId);
         tariffItemCode                  = METTariffItemCode::findRecId(metInventTable.METTariffItemCodeBaseRecid);
         //Duty amount = (pack size * Bottlesize * (AlcStrn/100) * Duty-LAL) + (VFD * (Adval Rate/100))
         dutyRollValuesLine.TotalDutyPerCase = metInventTable.ItemPack * metInventTable.BottleSize * (metInventTable.AlcoholContent/100) * tariffItemCode.DutyLAL + (dutyRollValuesLine.AverageVFD * tariffItemCode.AdValoremOrBeerSubsidyRate/100);
@@ -277,7 +331,7 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
             if (exciseSiteDutySetup.RecId)
             {
                 // LAL = Alcohol Content (%) x Bottle Size (L) x Quantity (each)
-                lalqty = (metInventTable.AlcoholContent / 100) * metInventTable.BottleSize * averageQty;
+                lalqty = (metInventTable.AlcoholContent / 100) * metInventTable.BottleSize * metInventTable.ItemPack;
                 exciseSiteDutySetup.ExcisePerCase   = tariffItemCode.DutyLAL * lalqty;
                 exciseSiteDutySetup.ValidFrom       = startDate;
                 exciseSiteDutySetup.update();
@@ -318,6 +372,32 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>getNextMonday</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// calculate date for the next monday of the current date
+    /// </summary>
+    /// <returns>TransDate</returns>
+    private TransDate getNextMonday()
+    {
+        TransDate   transDate;
+        int         day;
+        int         daysToAdd;
+        const int   valEight = 8;
+
+        transDate   = DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone());
+
+        day         = dayOfWk(transDate);
+        daysToAdd   = valEight - day;
+        
+        transDate   = transDate + daysToAdd;
+
+        return transDate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>calcAvgDutyCase</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -325,8 +405,8 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
     /// </summary>
     /// <param name = "_itemId">ItemId</param>
     /// <param name = "_siteId">InventSiteId</param>
-    /// <returns>container</returns>
-    private container calcAvgDutyCase(ItemId   _itemId, InventSiteId   _siteId)
+    /// <returns>METValueForDuty</returns>
+    private METValueForDuty calcAvgDutyCase(ItemId   _itemId, InventSiteId   _siteId)
     {
         METValueForDuty avgDuty;
         METExciseInformationTable   exciseInformationTable;
@@ -336,8 +416,6 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
         TransDateTime               endDateTime;
         TransDate                   transDate;
         int                         countRecords;
-        Qty                         qty;
-        Qty                         inventQty = 0;
         Amount                      dutyRateReceived = 0;
 
         transDate = DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone());
@@ -349,12 +427,12 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
             order by CreatedDateTime desc
             where  exciseRegisterEntry.ItemId == _itemId
                 && exciseRegisterEntry.SiteId == _siteId
-            join InventoryQty from exciseInformationTable
+            exists join exciseInformationTable
             where exciseInformationTable.InventTransType == InventTransType::Purch
                 && exciseInformationTable.ItemId == _itemId
                 && exciseInformationTable.SiteId == _siteId
                 && exciseInformationTable.ReferenceNumber == exciseRegisterEntry.OrderNumber
-            join PurchId from purchLine
+            exists join purchLine
             where purchLine.InventTransId == exciseInformationTable.InventTransId
                 && purchLine.CreatedDateTime >= startDateTime
                 && purchLine.CreatedDateTime <= endDateTime
@@ -364,7 +442,6 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
                 break;
             }
 
-            inventQty        += exciseInformationTable.InventoryQty;
             dutyRateReceived += exciseRegisterEntry.DutyRateReceived;
             countRecords++;
         }
@@ -372,10 +449,9 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
         if (countRecords)
         {
             avgDuty = dutyRateReceived / (countRecords);
-            qty = inventQty / (countRecords);
         }
             
-        return [avgDuty, qty];
+        return avgDuty;
     }
 
 ]]></Source>
@@ -393,7 +469,6 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
         METDutyRollValuesLine dutyRollValuesLineFrom;
         METDutyRollValuesLine dutyRollValuesLineTo;
 
-        ttsBegin; 
         while select dutyRollValuesLineFrom
             where dutyRollValuesLineFrom.RefRecId == _dutyRollValueFrom.RecId
         {
@@ -402,7 +477,6 @@ class METDutyRollMonthlyService extends SysOperationServiceBase
             dutyRollValuesLineTo.RefRecId = _dutyRollValueTo.RecId;
             dutyRollValuesLineTo.insert();
         }
-        ttsCommit;
     }
 
 ]]></Source>
