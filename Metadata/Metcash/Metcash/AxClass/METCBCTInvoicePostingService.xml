@@ -9,6 +9,8 @@
 public class METCBCTInvoicePostingService extends SysOperationServiceBase
 {
     boolean isExecutionModeSynchronous;
+    METVendParameters metVendParameters;
+    
 
 }
 ]]></Declaration>
@@ -231,6 +233,8 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
         METCBCTInvoiceHeaderTable   cbCTInvoiceHeaderTable = _cbCTInvoiceHeaderTable;
         SalesTable                  salesTable;
         VendInvoiceInfoTable        vendInvoiceInfoTable;
+        LedgerJournalTable          VendInvoiceJournal;
+        CustInvoiceTable            custInvoiceTable;
         boolean                     ret = true;
  
         int fromInfologLine = infologLine();
@@ -250,25 +254,67 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
             try
             {
                 ttsbegin;
-                // Create pending vendor invoice
-                vendInvoiceInfoTable = this.createPendingVendorInvoice(_cbCTInvoiceHeaderTable);
- 
-                // Create sales order
-                salesTable = this.createSalesOrder(_cbCTInvoiceHeaderTable, vendInvoiceInfoTable);
- 
+
+                if (_cbCTInvoiceHeaderTable.InvoiceType == METInvoiceType::ChargeThrough
+                    || _cbCTInvoiceHeaderTable.InvoiceType == METInvoiceType::Claim
+                    || _cbCTInvoiceHeaderTable.InvoiceType == METInvoiceType::CrossDock
+                    || _cbCTInvoiceHeaderTable.InvoiceType == METInvoiceType::RDA)
+                {
+                    // Create pending vendor invoice
+                    vendInvoiceInfoTable = this.createPendingVendorInvoice(_cbCTInvoiceHeaderTable);
+                        
+                    if (_cbCTInvoiceHeaderTable.InvoiceType == METInvoiceType::RDA)
+                    {
+                        CustInvoiceTable = this.createCustFreeTextInvoice(_cbCTInvoiceHeaderTable);
+                    }
+                    else
+                    {
+                        // Create sales order
+                        salesTable = this.createSalesOrder(_cbCTInvoiceHeaderTable, vendInvoiceInfoTable);
+                    }
+                }
+
+                if (_cbCTInvoiceHeaderTable.InvoiceType == METInvoiceType::SVR)
+                {
+                    VendInvoiceJournal = this.createVendInvoiceJournal(_cbCTInvoiceHeaderTable);
+
+                    CustInvoiceTable = this.createCustFreeTextInvoice(_cbCTInvoiceHeaderTable);
+                }
+                
                 // update ref here so we can identify SO created from CT
                 _cbCTInvoiceHeaderTable.selectForUpdate(true);
                 _cbCTInvoiceHeaderTable.RefSalesId = salesTable.SalesId;
+                _cbCTInvoiceHeaderTable.RefVendTaxInvoiceJournalId = VendInvoiceJournal.JournalNum;
+                //_cbCTInvoiceHeaderTable.RefVendTaxInvoiceJournal = vendInvoiceInfoTable.Num;
+                _cbCTInvoiceHeaderTable.RefFTIInvoiceId = custInvoiceTable.InvoiceId;
+                _cbCTInvoiceHeaderTable.RefFTIRecId = custInvoiceTable.RecId;
                 _cbCTInvoiceHeaderTable.Status = METCBCTInvoiceStatus::Processed;
                 _cbCTInvoiceHeaderTable.update();
- 
-                // post SO
-                this.postSalesOrderInvoice(salesTable);
- 
-                // auto submit pending vendor invoice to workflow
-                this.submitVendorInvoiceWorkflow(vendInvoiceInfoTable);
 
                 ttscommit;
+
+                if (VendInvoiceJournal)
+                {
+                    this.postVendInvoiceJournal(VendInvoiceJournal);
+                }
+
+                if (vendInvoiceInfoTable)
+                {
+                    // auto submit pending vendor invoice to workflow
+                    this.submitVendorInvoiceWorkflow(vendInvoiceInfoTable);
+                }
+
+                if (custInvoiceTable)
+                {
+                    //Post the FreeText Invoice
+                    this.postCustFreeTextInvoice(custInvoiceTable);
+                }
+
+                if (salesTable)
+                {
+                    // post SO
+                    this.postSalesOrderInvoice(salesTable);
+                }
 
                 info(strFmt("@MET:ChargethroughInvoicePosted",cbCTInvoiceHeaderTable.Number));
             }
@@ -309,6 +355,7 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
     private SalesTable createSalesOrder(METCBCTInvoiceHeaderTable  _cbCTInvoiceHeaderTable, VendInvoiceInfoTable _vendInvoiceInfoTable)
     {        
         SalesTable  salesTable;
+        boolean     addChargesToSalesHeader = true;
 
         salesTable = this.findOrCreateSalesOrderHeader(_cbCTInvoiceHeaderTable);
 
@@ -335,14 +382,23 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
 
             // All lines that have a ‘negative’ amount must be copied with a negative quantity of ‘-1’ to the pending vendor invoice and sales order line
             salesLine.SalesQty = cbCTInvoiceLine.Qty >= 0 ? cbCTInvoiceLine.Qty : -cbCTInvoiceLine.Qty;
-
+            salesLine.SalesUnit = METConstants::unitEach;
             salesLine.QtyOrdered = salesLine.calcQtyOrdered();
             salesLine.LineDisc = 0; 
           
             // CB411_412_ChargeThrough
             // If a site is not specified in the METCBCTCustomerSiteOffRemitCostCentreLink, 
             // then standard sales order charges will apply as setup in auto charges
-            boolean searchMarkup = !METCBCTCustomerSiteOffRemitCostCentreLink::find(cbCTInvoiceLine.InventSiteId).CustomerOffRemittance;
+            boolean searchMarkup;
+
+            if (_cbCTInvoiceHeaderTable.InvoiceType == METInvoiceType::SVR)
+            {
+                searchMarkup = false;
+            }
+            else
+            {
+                searchMarkup = METCBCTCustomerSiteOffRemitCostCentreLink::find(cbCTInvoiceLine.InventSiteId).CustomerOffRemittance; 
+            }
 
             salesLine.createLine(true, // Validate
                                 true,  // initFromSalesTable
@@ -381,10 +437,17 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
             }
 
             // CB411_412_ChargeThrough customer off remittance
-            if (!searchMarkup)
+            if (searchMarkup)
             {
                 // copy charges from vendor invoice to SO line
-                this.copyChargesFromPendingVendorInvoice(salesLine, _vendInvoiceInfoTable);
+                this.copyChargesFromPendingVendorInvoice(_vendInvoiceInfoTable, salesLine);
+
+                if (addChargesToSalesHeader)
+                {
+                    //copy charge from vendor invoice header to SO header
+                    this.copyChargesFromPendingVendorInvoice(_vendInvoiceInfoTable, null, salesTable);
+                    addChargesToSalesHeader = false;
+                }
             }
 
             // line document note attachment
@@ -404,8 +467,7 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
     {
         SalesTable  salesTable;
         METSalesTable metSalesTable;
-        METVendParameters metVendParameters = METVendParameters::find();
-        
+              
         // if summary SO invoice posting
         if (metVendParameters.CustInvoicePostingType)
         {
@@ -432,14 +494,14 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
         salesTable.initFromCustTable();
         salesTable.SalesId      = numberSeq.num();
         salesTable.TaxGroup     = custTable.TaxGroup;
-        salesTable.CashDisc     = _cbCTInvoiceHeaderTable.CustCashDisc;
+        salesTable.CashDisc     = custTable.CashDisc;
         salesTable.CustomerRef  = _cbCTInvoiceHeaderTable.TaxInvoiceNum + ' '+
                                   _cbCTInvoiceHeaderTable.VendorAccount + ' '+
                                   _cbCTInvoiceHeaderTable.vendTable().name();
         salesTable.GUPSkipPricingCalculation = NoYes::Yes;
         salesTable.METSalesOrderType = metVendParameters.SalesOrderType;
         salesTable.DefaultDimension = _cbCTInvoiceHeaderTable.FinancialDimension;
-
+        salesTable.FixedDueDate = _cbCTInvoiceHeaderTable.CustDueDate;
         // CB194_ChargeThroughClaims
         // When the Sales Order is created, if there is a value present in the below field, copy it onto the respective field on the new Sales order header
         if (_cbCTInvoiceHeaderTable.ClaimReasonCodeId)
@@ -507,8 +569,7 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
         VendInvoiceInfoTable    vendInvoiceInfoTable;
         VendTable               vendTable = VendTable::find(_cbCTInvoiceHeaderTable.VendorAccount);
         METVendTable            metVendTable = METVendTable::find(_cbCTInvoiceHeaderTable.VendorAccount);
-        METVendParameters       metVendParameters = METVendParameters::find();
-
+        
         vendInvoiceInfoTable.TableRefId             = formletterParmData::getNewTableRefId();
 
         vendInvoiceInfoTable.ParmJobStatus          = ParmJobStatus::Waiting;
@@ -566,7 +627,7 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
             vendInvoiceLine.TableRefId          = _vendInvoiceInfoTable.TableRefid;
             vendInvoiceLine.OrderAccount        = _vendInvoiceInfoTable.OrderAccount;
             vendInvoiceLine.currencyCode        = _vendInvoiceInfoTable.CurrencyCode;
-
+            
             vendInvoiceLine.METInitFromCBCTInvoiceLine(cbCTInvoiceLine);
 
             vendInvoiceLine.PurchUnit           = METConstants::unitEach;
@@ -590,7 +651,7 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
     boolean validate(METCBCTInvoiceHeaderTable  _cbCTInvoiceHeaderTable)
     {        
         boolean ret = true;
-        METVendParameters metVendParameters = METVendParameters::find();
+        metVendParameters = METVendParameters::find();
 
         // vendor invoice validation
         // Invoice date
@@ -599,13 +660,15 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
             ret = checkFailed("@MET:CBCTInvoiceDateValidation");
         }
 
+        METVendTable metVendTable = METVendTable::find(_cbCTInvoiceHeaderTable.VendorAccount);
+        
         if (_cbCTInvoiceHeaderTable.ManuallyCreated)
         { 
             // Allow CT or cross dock
-            METVendTable metVendTable = METVendTable::find(_cbCTInvoiceHeaderTable.VendorAccount);
+            
             if ((_cbCTInvoiceHeaderTable.InvoiceType == METInvoiceType::ChargeThrough && !metVendTable.AllowChargeThrough)
                     || (_cbCTInvoiceHeaderTable.InvoiceType == METInvoiceType::CrossDock && !metVendTable.AllowCrossDock))
-             {
+            {
                 ret = checkFailed("@MET:CBCTVendorAllowedValidation");
             }
         }
@@ -648,8 +711,7 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
     /// <param name = "_salesTable">Sales order header</param>
     void postSalesOrderInvoice(SalesTable _salesTable)
     {
-        METVendParameters metVendParameters = METVendParameters::find();
-
+        
         // if detailed SO invoice posting
         if (!metVendParameters.CustInvoicePostingType)
         {
@@ -683,41 +745,78 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
 				<Source><![CDATA[
     /// <summary>
     /// CB411_412_ChargeThrough Copy pending vendor invoice line charges to sales order line charges.
-    /// </summary>
-    /// <param name = "_salesLine">Sales order line</param>
+    /// </summary>    
     /// <param name = "_vendInvoiceInfoTable">Pending vendor invoice header</param>
-    void copyChargesFromPendingVendorInvoice(SalesLine _salesLine, VendInvoiceInfoTable _vendInvoiceInfoTable)
+    /// <param name = "_salesLine">Sales order line</param>
+    /// <param name = "_salestable">Sales table buffer</param>
+    void copyChargesFromPendingVendorInvoice(VendInvoiceInfoTable _vendInvoiceInfoTable, SalesLine _salesLine = null, SalesTable _salestable = null)
     {
         VendInvoiceInfoLine vendInvoiceInfoLine;
-        MarkupTrans       markUpTransVendInvoiceInfoLine, markUpTransSalesLine;
-        LineNum           markUpTransSalesLineLineNum;
+        MarkupTrans       markUpTransVendInvoiceInfoLine, markUpTransVendInvoiceInfoTable, markUpTransSalesLine, markupTransSalesTable;
+        LineNum           markUpTransSalesLineLineNum, markUpTransSalesTableLineNum;
         RecordInsertList  markUpTransSalesLineRecordInsertList = new RecordInsertList(tableNum(MarkupTrans));
-        
-        select firstonly vendInvoiceInfoLine
+
+        if ((metVendParameters.DefaultARChargeCode1 || metVendParameters.DefaultARChargeCode2))
+        {                
+            if (_salestable)
+            {
+                markUpTransSalesTableLineNum = MarkupTrans::lastLineNum(_salestable.TableId, _salestable.RecId);
+
+                VendInvoiceInfoSubTable VendInvoiceInfoSubTable = VendInvoiceInfoSubTable::find(_vendInvoiceInfoTable.ParmId, _vendInvoiceInfoTable.TableRefId, '');
+
+                while select markUpTransVendInvoiceInfoTable
+                    where markUpTransVendInvoiceInfoTable.TransTableId == VendInvoiceInfoSubTable.TableId
+                    && markUpTransVendInvoiceInfoTable.TransRecId == VendInvoiceInfoSubTable.RecId
+                    && (markUpTransVendInvoiceInfoTable.MarkupCode == metVendParameters.DefaultARChargeCode1
+                        || markUpTransVendInvoiceInfoTable.MarkupCode == metVendParameters.DefaultARChargeCode2)
+                {
+                    markUpTransSalesTableLineNum++;
+          
+                    markupTransSalesTable.clear();
+                    markupTransSalesTable.data(markUpTransVendInvoiceInfoTable);
+                    markupTransSalesTable.TransTableId   = _salestable.TableId;
+                    markupTransSalesTable.TransRecId     = _salestable.RecId;
+                    markupTransSalesTable.LineNum        = markUpTransSalesTableLineNum;
+                    //Bug 208271: CB411 - ChargeThrough offremit automatic charge and not applied correctly
+                    // Reverse the sign so it shows correctly in SO totals
+                    markupTransSalesTable.Value          = -markUpTransVendInvoiceInfoTable.Value;
+                    markUpTransSalesLineRecordInsertList.add(markupTransSalesTable);
+                }
+            }
+            else
+            {
+                select firstonly vendInvoiceInfoLine
                    where vendInvoiceInfoLine.ParmId     == _vendInvoiceInfoTable.ParmId
                       && vendInvoiceInfoLine.TableRefId == _vendInvoiceInfoTable.TableRefId
                       && vendInvoiceInfoLine.ItemId     == _salesLine.ItemId
                       && vendInvoiceInfoLine.TaxGroup   == _salesLine.TaxGroup;
+                
+                if (vendInvoiceInfoLine)
+                {
+                    markUpTransSalesLineLineNum = MarkupTrans::lastLineNum(_salesLine.TableId, _salesLine.RecId);
 
-        if (vendInvoiceInfoLine)
-        {                
-            markUpTransSalesLineLineNum = MarkupTrans::lastLineNum(_salesLine.TableId, _salesLine.RecId);
+                    while select markUpTransVendInvoiceInfoLine
+                    where markUpTransVendInvoiceInfoLine.TransTableId == vendInvoiceInfoLine.TableId
+                        && markUpTransVendInvoiceInfoLine.TransRecId == vendInvoiceInfoLine.RecId
+                        && (markUpTransVendInvoiceInfoLine.MarkupCode == metVendParameters.DefaultARChargeCode1
+                            || markUpTransVendInvoiceInfoLine.MarkupCode == metVendParameters.DefaultARChargeCode2)
 
-            while select markUpTransVendInvoiceInfoLine
-                   where markUpTransVendInvoiceInfoLine.TransTableId == vendInvoiceInfoLine.TableId
-                      && markUpTransVendInvoiceInfoLine.TransRecId == vendInvoiceInfoLine.RecId
-            {
-                markUpTransSalesLineLineNum++;
-                markUpTransSalesLine.clear();
-                markUpTransSalesLine.data(markUpTransVendInvoiceInfoLine);
-                markUpTransSalesLine.TransTableId   = _salesLine.TableId;
-                markUpTransSalesLine.TransRecId     = _salesLine.RecId;
-                markUpTransSalesLine.LineNum        = markUpTransSalesLineLineNum;
-                //Bug 208271: CB411 - ChargeThrough offremit automatic charge and not applied correctly
-                // Reverse the sign so it shows correctly in SO totals
-                markUpTransSalesLine.Value          = -markUpTransVendInvoiceInfoLine.Value;
-                markUpTransSalesLineRecordInsertList.add(markUpTransSalesLine);
-            }                
+                    {
+                        markUpTransSalesLineLineNum++;
+          
+                        markUpTransSalesLine.clear();
+                        markUpTransSalesLine.data(markUpTransVendInvoiceInfoLine);
+                        markUpTransSalesLine.TransTableId   = _salesLine.TableId;
+                        markUpTransSalesLine.TransRecId     = _salesLine.RecId;
+                        markUpTransSalesLine.LineNum        = markUpTransSalesLineLineNum;
+                        //Bug 208271: CB411 - ChargeThrough offremit automatic charge and not applied correctly
+                        // Reverse the sign so it shows correctly in SO totals
+                        markUpTransSalesLine.Value          = -markUpTransVendInvoiceInfoLine.Value;
+                        markUpTransSalesLineRecordInsertList.add(markUpTransSalesLine);
+                    }
+                }
+            }
+                            
         }
         
         markUpTransSalesLineRecordInsertList.insertDatabase();
@@ -741,6 +840,388 @@ public class METCBCTInvoicePostingService extends SysOperationServiceBase
         QueryRun qr = new QueryRun(_query);
 
         return SysQuery::countTotal(qr);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postVendInvoiceJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Posts a Vendor invoice Journal 
+    /// </summary>
+    /// <param name = "_vendInvJourTable">LedgerJournalTable buffer</param>
+    public void postVendInvoiceJournal(LedgerJournalTable  _vendInvJourTable)
+    {
+        try
+        {
+            LedgerJournalCheckPost jourCheckPost;
+
+            // Post Vendor Innvoice Journal
+            jourCheckPost = LedgerJournalCheckPost::newLedgerJournalTable(_vendInvJourTable, NoYes::Yes);
+            jourCheckPost.runOperation();
+        }
+        catch
+        {
+            error(this.getInfologMessage());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createVendInvoiceJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates Vendor invoice Journal
+    /// </summary>
+    /// <param name = "_cbCTInvoiceHeaderTable">Charge through header table</param>
+    /// <returns>LedgerJournalTable</returns>
+    public LedgerJournalTable createVendInvoiceJournal(METCBCTInvoiceHeaderTable  _cbCTInvoiceHeaderTable)
+    {        
+        LedgerJournalTrans vendInvJourTrans;
+        LedgerJournalTable vendInvJourTable;
+        Voucher voucher;              
+        METCBCTInvoiceLine vendLine;
+        RecordInsertList vendInvoiceJourLineList;
+        
+        VendTable               vendTable = VendTable::find(_cbCTInvoiceHeaderTable.VendorAccount);
+        
+        try
+        {
+            // create journal header
+            vendInvJourTable.clear();
+            vendInvJourTable.initValue();
+            vendInvJourTable.initFromLedgerJournalName(VendParameters::find().METLedgerJournalNameIdVendInvoice);
+            
+            vendInvJourTable.CurrencyCode = vendTable.Currency;
+            vendInvJourTable.modifiedField(fieldNum(LedgerJournalTable, CurrencyCode));
+            vendInvJourTable.DefaultDimension = _cbCTInvoiceHeaderTable.FinancialDimension;
+            vendInvJourTable.JournalNum = JournalTableData::newTable(vendInvJourTable).nextJournalId();
+            vendInvJourTable.insert();
+        
+            vendInvoiceJourLineList = new RecordInsertList(tableNum(LedgerJournalTrans));
+           
+            // create vendor line
+            this.createJournalLine(_cbCTInvoiceHeaderTable, vendInvJourTrans,
+                vendInvJourTable.JournalNum,
+                voucher,
+                LedgerJournalACType::Vend,
+                LedgerDynamicAccountHelper::getDynamicAccountFromAccountNumber(vendTable.AccountNum, LedgerJournalACType::Vend),
+                _cbCTInvoiceHeaderTable.Reference,
+                0,
+                METALMSupplierVolumetricRebateLine::totalVendAmount(_cbCTInvoiceHeaderTable.Number),
+                _cbCTInvoiceHeaderTable.FinancialDimension);
+
+            vendInvoiceJourLineList.add(vendInvJourTrans);
+
+            voucher = vendInvJourTrans.Voucher;
+
+            // create ledger lines
+            while select vendLine
+                where vendLine.HeaderNumber == _cbCTInvoiceHeaderTable.Number
+                && vendLine.VendCustType == METCBCTVendCust::Vend
+            {
+                this.createJournalLine(_cbCTInvoiceHeaderTable, vendInvJourTrans,
+                    vendInvJourTable.JournalNum,
+                    voucher,
+                    LedgerJournalACType::Ledger,
+                    vendLine.LedgerDimension,
+                    vendLine.Description,
+                    vendLine.Amount,
+                    0,
+                    vendLine.FinancialDimension,
+                    vendLine.TaxGroup,
+                    vendLine.TaxItemGroup);
+          
+                vendInvoiceJourLineList.add(vendInvJourTrans);
+            }
+
+            // Insert VendInvoiceJourLines in DB;
+            vendInvoiceJourLineList.insertDatabase();
+           
+            // Attach note
+            this.createAttachedNote(vendInvJourTable.RecId,
+                vendInvJourTable.TableId,
+                strFmtLB(strFmt("@MET:FTICustomerNotes", _cbCTInvoiceHeaderTable.Number, _cbCTInvoiceHeaderTable.VendorAccount,
+                                vendTable.name())),
+                vendInvJourTable.DataAreaId);
+
+        }
+        catch
+        {
+            error(this.getInfologMessage());
+            throw error("@MET:VendorInvoiceJournalError");
+        }
+
+        return vendInvJourTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournalLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create Vend Invoice Journal line
+    /// </summary>
+    /// <param name = "_cbCTInvoiceHeaderTable">Charge through invoice header table</param>
+    /// <param name = "_journalLine">Journa Line</param>
+    /// <param name = "_journalNum">Journal batch number</param>
+    /// <param name = "_voucher">voucher info</param>
+    /// <param name = "_type">Ledger journal account type</param>
+    /// <param name = "_ledgerDimension">Ledger dimension</param>
+    /// <param name = "_txt">Description</param>
+    /// <param name = "_creditAmount">Credit amount</param>
+    /// <param name = "_debitAmount">Debit Amount</param>
+    /// <param name = "_defaultDimension">Default Dimension</param>
+    /// <param name = "_taxGroup">Tax group </param>
+    /// <param name = "_itemTaxGroup"> item sales tax group</param>
+    private void createJournalLine(METCBCTInvoiceHeaderTable  _cbCTInvoiceHeaderTable,
+                                    LedgerJournalTrans _journalLine,
+                                    LedgerJournalId _journalNum,
+                                    Voucher         _voucher,
+                                    LedgerJournalACType _type,
+                                    DimensionDynamicAccount _ledgerDimension,
+                                    LedgerJournalTransTxt _txt,
+                                    AmountCurCredit _creditAmount,
+                                    AmountCurDebit  _debitAmount,
+                                    LedgerDimensionValueSet _defaultDimension,
+                                    TaxGroupJournal _taxGroup = '',
+                                    TaxGroupJournal _itemTaxGroup = '')
+    {
+        LedgerJournalEngine engine = new LedgerJournalEngine();
+
+        _journalLine.clear();
+        _journalLine.initValue();
+      
+        if ( System.String::IsNullOrEmpty(_voucher) )
+        {
+            engine.ledgerJournalTable(LedgerJournalTable::find(_journalNum));
+            engine.initValue(_journalLine);
+        }
+        else
+        {
+            _journalLine.JournalNum = _journalNum;
+            _journalLine.Voucher = _voucher;
+        }
+
+        if ( _cbCTInvoiceHeaderTable.TransactionDate != _journalLine.TransDate )
+        {
+            _journalLine.TransDate = _cbCTInvoiceHeaderTable.TransactionDate;
+            _journalLine.modifiedField(fieldNum(LedgerJournalTrans, TransDate));
+        }
+
+        if ( _type != _journalLine.AccountType )
+        {
+            _journalLine.AccountType = _type;
+            _journalLine.modifiedField(fieldNum(LedgerJournalTrans, AccountType));
+        }
+        _journalLine.DocumentNum = _journalNum;
+        _journalLine.LedgerDimension = _ledgerDimension;
+        _journalLine.modifiedField(fieldNum(LedgerJournalTrans, LedgerDimension));
+        engine.accountModified(_journalLine);
+        _journalLine.DocumentDate = _cbCTInvoiceHeaderTable.DocumentDate;
+        _journalLine.Invoice = _cbCTInvoiceHeaderTable.TaxInvoiceNum;
+        _journalLine.modifiedField(fieldNum(LedgerJournalTrans, Invoice));
+        _journalLine.Txt = strfmt('%1-%2',_cbCTInvoiceHeaderTable.TaxInvoiceNum, _journalNum);
+        _journalLine.AmountCurCredit = _creditAmount;
+        _journalLine.modifiedField(fieldNum(LedgerJournalTrans, AmountCurCredit));
+        _journalLine.AmountCurDebit = _debitAmount;
+        _journalLine.modifiedField(fieldNum(LedgerJournalTrans, AmountCurDebit));
+        _journalLine.DefaultDimension = _defaultDimension;
+        _journalLine.Approver = HcmWorkerLookup::currentWorker();
+        _journalLine.Approved = NoYes::Yes;
+        _journalLine.Due = _cbCTInvoiceHeaderTable.VendDueDate;
+
+        if ( _cbCTInvoiceHeaderTable.CurrencyCode != _journalLine.CurrencyCode)
+        {
+            _journalLine.CurrencyCode = _cbCTInvoiceHeaderTable.CurrencyCode;
+            _journalLine.modifiedField(fieldNum(LedgerJournalTrans, CurrencyCode));
+        }
+
+        if ( _taxGroup && _taxGroup != _journalLine.TaxGroup )
+        {
+            _journalLine.TaxGroup = _taxGroup;
+            _journalLine.modifiedField(fieldNum(LedgerJournalTrans, TaxGroup));
+        }
+
+        if ( _itemTaxGroup && _itemTaxGroup != _journalLine.TaxItemGroup )
+        {
+            _journalLine.TaxItemGroup = _itemTaxGroup;
+            _journalLine.modifiedField(fieldNum(LedgerJournalTrans, TaxItemGroup));
+        }
+
+        _journalLine.METALMSupplierVolumetricRebateNumber = _cbCTInvoiceHeaderTable.Number;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postCustFreeTextInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Post Free Text Invoice 
+    /// </summary>
+    /// <param name = "_custInvoiceTable">CustInvoiceTable</param>
+    public void postCustFreeTextInvoice(CustInvoiceTable _custInvoiceTable)
+    {
+        try
+        {
+            CustPostInvoice     custPostInvoice;
+            //Post the FreeText Invoice
+            custPostInvoice = new CustPostInvoice(_custInvoiceTable);
+            custPostInvoice.run();
+        }
+        catch
+        {
+            error(this.getInfologMessage());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCustFreeTextInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates Customer free text invoice
+    /// </summary>
+    /// <param name = "_cbCTInvoiceHeaderTable">Charge through header table</param>
+    /// <returns>CustInvoiceTable</returns>
+    public CustInvoiceTable createCustFreeTextInvoice(METCBCTInvoiceHeaderTable  _cbCTInvoiceHeaderTable)
+    {
+        CustInvoiceTable                    custInvoiceTable;
+        CustInvoiceLine                     custInvoiceLine;
+        CustTable                           custTable = CustTable::find(_cbCTInvoiceHeaderTable.CustomerAccount);
+        RecordInsertList                    custInvoiceLineList;
+        METCBCTInvoiceLine                  custLine;
+
+        try
+        {
+            changecompany(_cbCTInvoiceHeaderTable.DataAreaId)
+            {   
+                //create header
+                custInvoiceTable.clear();
+                custInvoiceTable.initValue();
+                custInvoiceTable.OrderAccount = _cbCTInvoiceHeaderTable.CustomerAccount;
+                custInvoiceTable.InvoiceId = _cbCTInvoiceHeaderTable.TaxInvoiceNum;
+                custInvoiceTable.modifiedField(fieldNum(CustInvoiceTable, OrderAccount));
+                custInvoiceTable.DocumentDate = _cbCTInvoiceHeaderTable.DocumentDate;
+                custInvoiceTable.InvoiceDate = _cbCTInvoiceHeaderTable.TransactionDate;
+                custInvoiceTable.modifiedField(fieldNum(CustInvoiceTable, InvoiceDate));
+                custInvoiceTable.CurrencyCode = _cbCTInvoiceHeaderTable.CurrencyCode;
+                custInvoiceTable.Payment = _cbCTInvoiceHeaderTable.CustPaymTermId;                
+                custInvoiceTable.DefaultDimension = _cbCTInvoiceHeaderTable.FinancialDimension;
+                custInvoiceTable.CustomerRef = strFmt("@MET:PlaceHolder", _cbCTInvoiceHeaderTable.VendorAccount, _cbCTInvoiceHeaderTable.TaxInvoiceNum);
+                custInvoiceTable.PurchOrderFormNum = _cbCTInvoiceHeaderTable.Number;
+                custInvoiceTable.DueDate = _cbCTInvoiceHeaderTable.CustDueDate;
+               
+                custInvoiceTable.insert();
+
+                custInvoiceLineList = new RecordInsertList(tableNum(CustInvoiceLine));
+            }
+            LineNum  linenum = 0;
+            // create lines
+            while select custLine
+                where custLine.HeaderNumber == _cbCTInvoiceHeaderTable.Number
+                && custLine.VendCustType == METCBCTVendCust::Cust
+            {
+                linenum++;
+                changecompany(_cbCTInvoiceHeaderTable.DataAreaId)
+                {
+                    
+                    custInvoiceLine.clear();
+                    custInvoiceLine.initValue();
+                    custInvoiceLine.LineNum = linenum;
+                    custInvoiceLine.ParentRecId = custInvoiceTable.RecId;
+                    custInvoiceLine.initFromCustInvoiceTable(custInvoiceTable);
+                    custInvoiceLine.Description = custLine.Description;
+                    custInvoiceLine.modifiedField(fieldNum(CustInvoiceLine, Description));
+                    custInvoiceLine.LedgerDimension     = custLine.LedgerDimension;
+                    custInvoiceLine.DefaultDimension    = custLine.FinancialDimension;
+                    custInvoiceLine.TaxGroup = custLine.TaxGroup;
+                    custInvoiceLine.TaxItemGroup = custLine.TaxItemGroup;                    
+                    custInvoiceLine.Quantity = 1;
+                    custInvoiceLine.modifiedField(fieldNum(CustInvoiceLine, Quantity));
+                    custInvoiceLine.UnitPrice = custLine.Amount;
+                    custInvoiceLine.modifiedField(fieldNum(CustInvoiceLine, UnitPrice));
+                    custInvoiceLine.AmountCur = custLine.Amount;
+                    
+                    custInvoiceLineList.add(custInvoiceLine);
+                }
+            }
+            changecompany(_cbCTInvoiceHeaderTable.DataAreaId)
+            {
+                //Insert CustInvoiceLines in DB;
+                custInvoiceLineList.insertDatabase();
+            }
+            // Attach note
+            this.createAttachedNote(custInvoiceTable.RecId,
+                custInvoiceTable.TableId,
+                strFmtLB(strFmt("@MET:FTIVendorNotes", _cbCTInvoiceHeaderTable.Number, _cbCTInvoiceHeaderTable.CustomerAccount, custTable.name())),
+                custInvoiceTable.DataAreaId);
+                                              
+        }
+        catch
+        {
+            error(this.getInfologMessage());
+            throw error("@MET:CustomerFreeTextInvoiceError");
+        }
+
+        return custInvoiceTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAttachedNote</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create attachment notes
+    /// </summary>
+    /// <param name = "_refRecId">Source table recid</param>
+    /// <param name = "_refTableId">Source tableId</param>
+    /// <param name = "_note">Notes to be attached</param>
+    /// <param name = "_legalEntity">Company</param>
+    private void createAttachedNote(RefRecId _refRecId, RefTableId _refTableId, Notes _note, DataAreaId _legalEntity)
+    {
+        DocuRef docuRef;
+        changecompany(_legalEntity)
+        {
+            docuRef.clear();
+            docuRef.initValue();
+            docuRef.TypeId = 'Note';
+            docuRef.RefCompanyId = _legalEntity;
+            docuRef.RefRecId = _refRecId;
+            docuRef.RefTableId = _refTableId;
+            docuRef.Name = "@MET:ALMSupplierVolumetricRebate";
+            docuRef.Notes = _note;
+            docuRef.Restriction = DocuRestriction::External;
+            DocuRef.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInfologMessage</Name>
+				<Source><![CDATA[
+    private str getInfologMessage()
+    {
+        SysInfologEnumerator sysInfologEnumerator;
+        SysInfologMessageStruct sysInfologMessageStruct;
+        str infologMessage;
+        sysInfologEnumerator = SysInfologEnumerator::newData(infolog.infologData());
+
+        while (sysInfologEnumerator.moveNext())
+        {
+            sysInfologMessageStruct = new SysInfologMessageStruct(sysInfologEnumerator.currentMessage());
+            infologMessage += strfmt(sysInfologMessageStruct.message());
+        }
+
+        return infologMessage;
     }
 
 ]]></Source>
