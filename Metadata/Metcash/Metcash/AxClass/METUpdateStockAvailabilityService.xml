@@ -1,0 +1,464 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METUpdateStockAvailabilityService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// This class handles the main processing to perform the Update stock availlability details on Item default order settings.
+/// </summary>
+internal final class METUpdateStockAvailabilityService extends SysOperationServiceBase
+{
+    InventSiteId inventSiteId;
+    ItemId itemId;
+    METStockAvailDate stockAvailabilityDate;
+    EcoResProductLifecycleStateId productLifeCycleStateId;
+
+    Set processedItemSitePairs = new Set(Types::Container);
+    Set porcessedItemSitePairsUnderIntercompany = new Set(Types::Container);
+
+    boolean haveIdentifiedClassifiedInitialWarehouses;
+    Set identifiedClassifiedIntialWarehouseSet = new Set(Types::Container);
+
+
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method begins or triggeres the process the Update stock availlability details on Item default order settings.
+    /// </summary>
+    /// <param name = "_contract">METUpdateStockAvailabilityContract contract class object</param>
+    public void process(METUpdateStockAvailabilityContract _contract)
+    {
+        inventSiteId            = _contract.parmInventSiteId();
+        itemId                  = _contract.parmItemId();
+        stockAvailabilityDate   = _contract.parmMETStockAvailDate();
+        productLifeCycleStateId = _contract.parmProductLifecycleStateId();
+
+        this.updateDOSInArgs();
+        
+        if (METVendParameters::find().UpdateFromParentToTransferSites)
+        {
+            try
+            {
+                ttsbegin;
+                
+                this.processDefaultOrderSettings(itemId, inventSiteId);
+                this.processIntercompanyDefaultOrderSettings(itemId,inventSiteId);
+
+                ttscommit;
+            }
+            catch(Exception::Error)
+            {
+                throw  error(strFmt("@MET:UnexpectedErrorWhileUpdateStockAvailabilityDetails", itemId, inventSiteId));
+            }
+           
+        }
+        else
+        {
+            Info("@MET:UpdateFromParentToTransferSitesParameterNoSet");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDOSInArgs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method updates the selected or the current record of Default order setting for the Item, with 'Stock availability date' and 'Product lifecycle state'.
+    /// </summary>
+    private void updateDOSInArgs()
+    {
+        //Note: Not getting the args record directly from contract as this will be called in an intercompany call and RecId wont be usefull then.
+        if (itemId && inventSiteId)
+        {
+            METInventItemOrderSetup metInventItemDOSUpd = METInventItemOrderSetup::findByItemAndSite(itemId, inventSiteId, true);
+            if (metInventItemDOSUpd.RecId)
+            {
+                ttsBegin;
+                metInventItemDOSUpd.StockAvailDate = stockAvailabilityDate;
+                metInventItemDOSUpd.ProductLifecycleStateId = productLifeCycleStateId;
+                metInventItemDOSUpd.doUpdate();
+                ttsCommit;
+                Info(Strfmt("@MET:DefaultOrderSettingIsUpdatedWithStockAvailability", itemId, inventSiteId, stockAvailabilityDate, productLifeCycleStateId));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>classifyWarehousesForItemAndSite</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method is used to classify the coverage warehouses for the Item and Site combinations under Item coverages for item.
+    /// </summary>
+    /// <param name = "_itemId">Unique Item Id</param>
+    /// <param name = "_siteId">Unique Site Id</param>
+    /// <returns>A container with the combinations of ItemId, coverage site and coverage warehouse</returns>
+    public container classifyWarehousesForItemAndSite(ItemId _itemId, InventSiteId _siteId)
+    {
+        ReqItemTable reItemTable;
+        InventLocation inventLocation;
+        InventDim inventDim;
+        InventSite inventSite;
+        container ndcYesNoCombinedContainer;
+
+        while select reItemTable
+            where reItemTable.ItemId == _itemId &&
+                  reItemTable.CovInventDimId != ''
+        join inventDim
+            where inventDim.InventDimId == reItemTable.CovInventDimId
+        exists join inventSite
+            where inventSite.SiteId == inventDim.InventSiteId &&
+                  inventSite.SiteId == _siteId
+        exists join inventLocation
+            where inventLocation.InventLocationId == inventDim.InventLocationId
+        {
+            container recCon = [_itemId, _siteId, inventDim.InventLocationId];
+
+            ndcYesNoCombinedContainer = conIns(ndcYesNoCombinedContainer, conLen(ndcYesNoCombinedContainer) + 1, recCon);
+        }
+
+        return ndcYesNoCombinedContainer;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processDefaultOrderSettings</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Recursively identifies the unique combination of replinishment sites with unique combination of Item and Site.
+    /// </summary>
+    /// <param name = "_itemId">Unique ItemId</param>
+    /// <param name = "_inventSiteId">Unique SiteId</param>
+    public void processDefaultOrderSettings(ItemId _itemId, InventSiteId _inventSiteId)
+    {
+        if (!this.isItemSitePairAlreadyProcessed(_itemId, _inventSiteId))
+        {
+            return;
+        }
+
+        Set newSiteItemPairSet = new Set(Types::Container);
+
+        container conClassifiedWarehousesForItemAndSite = this.classifyWarehousesForItemAndSite(_itemId, _inventSiteId);
+        
+        for (int i = 1; i <= conLen(conClassifiedWarehousesForItemAndSite); i++)
+        {
+            container itemSiteWarehousePair = conPeek(conClassifiedWarehousesForItemAndSite, i);
+            ItemId itemCoverageItem = conPeek(itemSiteWarehousePair, 1);
+            InventSiteId itemCoverageSite = conPeek(itemSiteWarehousePair, 2);
+            InventLocationId itemCoverageWarehouses = conPeek(itemSiteWarehousePair, 3);
+        
+            Set updatedItemSiteCombos = this.performUpdateStockAvailability(itemCoverageItem, itemCoverageSite, itemCoverageWarehouses);
+        
+            SetEnumerator setEnumerator = updatedItemSiteCombos.getEnumerator();
+            while(setEnumerator.moveNext())
+            {
+                container conSiteItempair = setEnumerator.current();
+                newSiteItemPairSet.add(conSiteItempair);
+            }
+        }
+
+        SetEnumerator setEnumerator = newSiteItemPairSet.getEnumerator();
+        while(setEnumerator.moveNext())
+        {
+            container newEntryPair = setEnumerator.current();
+            ItemId newItemId = conPeek(newEntryPair, 1);
+            InventSiteId newSiteId = conPeek(newEntryPair, 2);
+
+            this.processDefaultOrderSettings(newItemId, newSiteId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>performUpdateStockAvailability</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Identifies and updates the unique combination of replinishment sites with unique combination of Item and Site.
+    /// </summary>
+    /// <param name = "_itemId">Unique ItemId</param>
+    /// <param name = "_inventSiteId">Unique SiteId</param>
+    /// <param name = "_covInventLocationId">Unique WarehouseId</param>
+    /// <returns>Returns a unique combination of Item and Site to further check for the replenishment sites </returns>
+    public Set performUpdateStockAvailability(ItemId _itemId, InventSiteId _inventSiteId, InventLocationId _covInventLocationId)
+    {
+        ReqItemTable reqItemTable;
+        InventLocation inventLocation;
+        InventDim inventDim;
+        InventSite inventSite;
+
+        InventItemPurchSetup inventItemDOSUpd; //Item Default Order settings
+
+        Set newCombos = new Set(Types::Container);
+
+        while select ItemId, InventLocationIdReqMain, ReqPOType, CovInventDimId, RecId from reqItemTable
+            where reqItemTable.ItemId                   == _itemId
+                && reqItemTable.InventLocationIdReqMain == _covInventLocationId
+                && reqItemTable.ReqPOType               == ReqPOType::Transfer
+                && reqItemTable.CovInventDimId          != ''
+        join inventDimId, InventSiteId, InventLocationId from inventDim
+            where inventDim.InventDimId == reqItemTable.CovInventDimId
+        {
+            this.updateDefaultOrderSettingsForItemSite(_itemId, inventDim.InventSiteId);
+
+            newCombos.add([_itemId, inventDim.InventSiteId]);
+
+        }
+
+        return newCombos;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDefaultOrderSettingsForItemSite</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to perform update of the Defult order settings identified as replnishment sites
+    /// </summary>
+    /// <param name = "_itemId">Unique ItemId</param>
+    /// <param name = "_inventSideId">Unique SiteId</param>
+    /// <param name = "_isMetInterCompanyPurchaseLegalEntity">Boolean value to determine the legal entity under which the update of replenishment is carreid out.Default value false for current legal entity</param>
+    public void updateDefaultOrderSettingsForItemSite(ItemId _itemId, InventSiteId _inventSideId, boolean _isMetInterCompanyPurchaseLegalEntity = false)
+    {
+        #OCCRetryCount
+
+        if (_itemId && _inventSideId)
+        {
+            try
+            {
+                METInventItemOrderSetup metInventItemDOSUpd = METInventItemOrderSetup::findByItemAndSite(_itemId, _inventSideId, true);
+
+                if (metInventItemDOSUpd.RecId 
+                    && (metInventItemDOSUpd.ItemStatus == enum2Str(METItemsStatus::Active) ||
+                        metInventItemDOSUpd.ItemStatus == enum2Str(METItemsStatus::Discontinued) ||
+                        metInventItemDOSUpd.ItemStatus == enum2Str(METItemsStatus::PackChange))
+                    )
+                {
+                    ttsBegin;
+                    metInventItemDOSUpd.StockAvailDate = stockAvailabilityDate;
+                    metInventItemDOSUpd.ProductLifecycleStateId = productLifeCycleStateId;
+                    metInventItemDOSUpd.doUpdate();
+                    ttsCommit;
+
+                    if (!_isMetInterCompanyPurchaseLegalEntity)
+                    {
+                        Info(strFmt("@MET:DefaultOrderSettingIsUpdatedWithStockAvailability", _itemId, _inventSideId, stockAvailabilityDate, productLifeCycleStateId));
+                    }
+                    else
+                    {
+                        Info(strFmt("@MET:DefaultOrderSettingForLegalEntityIsUpdatedWithStockAvailability", _itemId, _inventSideId, curExt()));
+                    }
+                }
+                else if(metInventItemDOSUpd.RecId)
+                {
+                    Info(strFmt("@MET:DefaultOrderSettingsCouldNotBeUpdatedDueToCurrentItemStatus", _itemId, _inventSideId));
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch(Exception::Error)
+            {
+                throw error(strFmt("@MET:UnexpectedErrorWhileUpdateStockAvailabilityDetails", _itemId, _inventSideId));
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processIntercompanyDefaultOrderSettings</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method processes or perform update stock availablility for the intercompany Sites 
+    /// </summary>
+    /// <param name = "_itemId">Unique ItemId</param>
+    /// <param name = "_inventSiteId">Unique SiteId</param>
+    public void processIntercompanyDefaultOrderSettings(ItemId _itemId, InventSiteId _inventSiteId)
+    {
+        DataAreaId metInterCompanyPurchaseLegalEntity = InventParameters::find().METInterCompanyPurchaseLegalEntity;
+        if (metInterCompanyPurchaseLegalEntity)
+        {
+            changecompany(metInterCompanyPurchaseLegalEntity)
+            {
+                Set processDOSNewSiteItemPairUnderInterCompanySet = new Set(Types::Container);
+
+                Set newSiteItemPairIntercompany = this.performIntercompanyUpdStkAvailability(_itemId, _inventSiteId, true);
+
+                SetEnumerator setEnumerator = newSiteItemPairIntercompany.getEnumerator();
+                while(setEnumerator.moveNext())
+                {
+                    container entry = setEnumerator.current();
+                    ItemId newItemId = conPeek(entry, 1);
+                    InventSiteId newSiteId = conPeek(entry, 2);
+                    //this.processIntercompanyDefaultOrderSettings(newItemId, newSiteId);
+                    this.performIntercompanyUpdStkAvailability(newItemId, newSiteId, true);
+
+                    processDOSNewSiteItemPairUnderInterCompanySet.add([newItemId, newSiteId]);
+                }
+
+                setEnumerator = processDOSNewSiteItemPairUnderInterCompanySet.getEnumerator();
+                while(setEnumerator.moveNext())
+                {
+                    container entry = setEnumerator.current();
+                    ItemId newItemId = conPeek(entry, 1);
+                    InventSiteId newSiteId = conPeek(entry, 2);
+
+                    this.processDefaultOrderSettingsUnderInterCompany(newItemId, newSiteId);
+                }
+            }
+        }
+        else
+        {
+            Info(strFmt("@MET:CannotProceedWithUpdateStockAvailbilityForIntercompany", curExt()));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>performIntercompanyUpdStkAvailability</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method processes or perform update stock availablility for the intercompany (purchase) sites.
+    /// </summary>
+    /// <param name = "_itemId">Unique ItemId</param>
+    /// <param name = "_inventSiteId">Unique SiteId</param>
+    /// <param name = "_isMetInterCompanyPurchaseLegalEntity">Boolean value to determine the legal entity under which the update of replenishment is carreid out.</param>
+    /// <returns></returns>
+    public Set performIntercompanyUpdStkAvailability(ItemId _itemId, InventSiteId _inventSiteId, boolean _isMetInterCompanyPurchaseLegalEntity)
+    {
+        ReqItemTable reqItemTable;
+        InventLocation inventLocation;
+        InventDim inventDim;
+        InventSite inventSite;
+
+        Set newCombosUnderInterCompanyLE = new Set(Types::Container);
+        if (!this.IsItemSitePairAlreadyProcessedUnderIntercompany(_itemId, _inventSiteId))
+        {
+            return newCombosUnderInterCompanyLE;
+        }
+
+        while select ItemId, InventLocationIdReqMain, ReqPOType, CovInventDimId, RecId, METIntercompanySourcedWarehouse, METInterCompanySourced from reqItemTable
+            where reqItemTable.ItemId                  == _itemId
+                && reqItemTable.ReqPOType              == ReqPOType::Purch
+                && reqItemTable.METInterCompanySourced == NoYes::Yes
+                && reqItemTable.CovInventDimId         != ''
+        join inventDim
+            where inventDim.InventDimId == reqItemTable.CovInventDimId
+        {
+            if (!reqItemTable.METIntercompanySourcedWarehouse)
+            {
+                Info(strFmt("@MET:LegalEnityIsNotSetForIntercompanyWarehouse", _itemId, inventDim.InventSiteId, inventDim.InventLocationId, curExt()));
+                continue;
+            }
+
+            this.updateDefaultOrderSettingsForItemSite(_itemId, inventDim.InventSiteId, _isMetInterCompanyPurchaseLegalEntity);
+
+            newCombosUnderInterCompanyLE.add([_itemId, inventDim.InventSiteId]);
+        }
+
+        return newCombosUnderInterCompanyLE;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>IsItemSitePairAlreadyProcessed</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if the update stock availability action is already performed for the Item and Site pair.
+    /// </summary>
+    /// <param name = "_itemId">Unique ItemId</param>
+    /// <param name = "_siteId">Unique SiteId</param>
+    /// <returns></returns>
+    private boolean IsItemSitePairAlreadyProcessed(ItemId _itemId, InventSiteId _siteId)
+    {
+        container itemSitePairKey = [_itemId, _siteId];
+        if (!processedItemSitePairs.in(itemSitePairKey))
+        {
+            processedItemSitePairs.add(itemSitePairKey);
+            return true;
+        }
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processDefaultOrderSettingsUnderInterCompany</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method is used to trigger the update of replenishment sites under the Intercompany process
+    /// </summary>
+    /// <param name = "_itemId">Unique ItemId</param>
+    /// <param name = "_inventSiteId">Unique SiteId</param>
+    public void processDefaultOrderSettingsUnderInterCompany(ItemId _itemId, InventSiteId _inventSiteId)
+    {
+        this.processDefaultOrderSettings(_itemId, _inventSiteId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>IsItemSitePairAlreadyProcessedUnderIntercompany</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if the update stock availability action is already performed for the Item and Site pair.
+    /// </summary>
+    /// <param name = "_itemId">Unique ItemId</param>
+    /// <param name = "_siteId">Unique SiteId</param>
+    /// <returns>Boolean value, false if the combination is yet to be processsed to update,else return true</returns>
+    private boolean IsItemSitePairAlreadyProcessedUnderIntercompany(ItemId _itemId, InventSiteId _siteId)
+    {
+        container itemSitePairKey = [_itemId, _siteId];
+        if (!porcessedItemSitePairsUnderIntercompany.in(itemSitePairKey))
+        {
+            porcessedItemSitePairsUnderIntercompany.add(itemSitePairKey);
+            return true;
+        }
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
