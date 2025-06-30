@@ -11,9 +11,11 @@ class METVendorChangeRequestService
     Set vendorChangerequestsProcessed;
     
     //Task110346_CB409-D365ToPIM-Supplier change request- start
+    private List        vendAccountNumberList               = new List(Types::String); //C - Task 259910: CB409 - PE-128: D365 to PIM
+    private List        coverageWareHouseIdList             = new List(Types::String);
+    private List        coverageWhsIdVendAccountNumberList  = new List(Types::String); //C - Task 259910: CB409 - PE-128: D365 to PIM
+    private ItemId      itemNumber;
     private VendAccount vendAccountNumber;
-    private List coverageWareHouseIdList = new List(Types::String);
-    private ItemId itemNumber;
     //Task110346_CB409-D365ToPIM-Supplier change request- end
 
     InventParameters inventParameters = InventParameters::find();
@@ -59,9 +61,22 @@ class METVendorChangeRequestService
                 }
 
                 //Task110346_CB409-D365ToPIM-Supplier change request- start
-                if (validateVendorChangeRequests && !coverageWareHouseIdList.empty())
+                if (validateVendorChangeRequests && !coverageWareHouseIdList.empty() && !vendAccountNumberList.empty())
                 {
-                    this.triggerSupplierChangeCompleteBusinessEvent(itemNumber, vendAccountNumber, coverageWareHouseIdList);
+                    //NS - Task 259910: CB409 - PE-128: D365 to PIM
+                    ListIterator coverageWhsIdItr       = new ListIterator(coverageWareHouseIdList);
+                    ListIterator vendAccountNumberItr   = new ListIterator(vendAccountNumberList);
+
+                    while (coverageWhsIdItr.more() && vendAccountNumberItr.more())
+                    {
+                        coverageWhsIdVendAccountNumberList.addEnd(strFmt("%1-%2", coverageWhsIdItr.value(), vendAccountNumberItr.value()));
+                        
+                        coverageWhsIdItr.next();
+                        vendAccountNumberItr.next();
+                    }
+                    //NE - Task 259910: CB409 - PE-128: D365 to PIM
+                    
+                    this.triggerSupplierChangeCompleteBusinessEvent(itemNumber, coverageWhsIdVendAccountNumberList);
                     coverageWareHouseIdList = new List(Types::String);
                 }
                 //Task110346_CB409-D365ToPIM-Supplier change request- end
@@ -155,11 +170,21 @@ class METVendorChangeRequestService
 
             if (reqItemTableInterComp.RecId)
             {
-                if (this.validateInterCompanyVendorChangeRequest(inventParameters.METInterCompanyPurchaseLegalEntity, _metVendorChangeRequest.ItemId, _metVendorChangeRequest.SiteId, _metVendorChangeRequest.InventLocationId))
+                ret = this.validateInterCompanyVendorChangeRequest(inventParameters.METInterCompanyPurchaseLegalEntity, _metVendorChangeRequest.ItemId, _metVendorChangeRequest.SiteId, reqItemTableInterComp.METIntercompanySourcedWarehouse);
+                if (ret)
                 {
                     this.updateChangeReqForParentChildItemInterCompPO(_metVendorChangeRequest);
                     this.processItemSubRange(_metVendorChangeRequest, reqItemTableInterComp);
                     return ret; 
+                }
+                else
+                {
+                    _metVendorChangeRequest.selectForUpdate(true);
+                    _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
+                    _metVendorChangeRequest.ChangeRequestLog += strFmt("@MET:PendingVCRInIntComp", inventParameters.METInterCompanyPurchaseLegalEntity, _metVendorChangeRequest.ItemId, reqItemTableInterComp.METIntercompanySourcedWarehouse);
+                    _metVendorChangeRequest.update();
+                    vendorChangerequestsProcessed.add(_metVendorChangeRequest.RecId);
+                    ret = false;
                 }
             }
 
@@ -268,6 +293,8 @@ class METVendorChangeRequestService
 
         changecompany(_legalEntity)
         {
+            _siteId = InventLocation::find(_locationId).InventSiteId;
+
             MetVendorChangeRequest metVendorChangeRequestPO;
             MetVendorChangeRequest metVendorChangeRequestPOLoc;
 
@@ -472,6 +499,7 @@ class METVendorChangeRequestService
         if (vendAccountNumber != pendingVendAccount)
         {
             vendAccountNumber = pendingVendAccount;
+            vendAccountNumberList.addEnd(vendAccountNumber);
         }
 
         //set item number
@@ -553,6 +581,7 @@ class METVendorChangeRequestService
         if (vendAccountNumber != pendingVendAccount)
         {
             vendAccountNumber = pendingVendAccount;
+            vendAccountNumberList.addEnd(vendAccountNumber);
         }
 
         //set item number
@@ -672,6 +701,41 @@ class METVendorChangeRequestService
         {
             errorLog += strFmt("@MET:ErrorPendingPackChanges", _metVendorChangeRequest.ItemId);
             ret = false;
+        }
+
+        if (inventParameters.METInterCompanyPurchaseLegalEntity)
+        {
+            changecompany(inventParameters.METInterCompanyPurchaseLegalEntity)
+            {
+                MetVendorChangeRequest metVendorChangeRequestPO;
+                ReqItemTable reqItemTableIntCom;
+
+                select firstonly covInventDimId from reqItemTableIntCom
+                    where reqItemTableIntCom.ItemId == _metVendorChangeRequest.ItemId
+                    && reqItemTableIntCom.METInterCompanySourced == NoYes::Yes
+                    && reqItemTableIntCom.METIntercompanySourcedWarehouse == _metVendorChangeRequest.InventLocationId;
+                
+                if (reqItemTableIntCom.covInventDimId)
+                {
+                    InventDim inventDimIntCom = InventDim::find(reqItemTableIntCom.covInventDimId);
+
+                    select firstonly RecId from metVendorChangeRequestPO
+                        where metVendorChangeRequestPO.Status == METVendChangeReqStatus::Completed
+                        && metVendorChangeRequestPO.InventLocationId == inventDimIntCom.InventLocationId
+                        && metVendorChangeRequestPO.SiteId == inventDimIntCom.InventSiteId
+                        && metVendorChangeRequestPO.ItemId == _metVendorChangeRequest.ItemId;
+    
+                    if (metVendorChangeRequestPO.RecId)
+                    {
+                        ret = true;
+                    }
+                    else
+                    {
+                        errorLog += strFmt("@MET:PendingVCRInIntComp", inventParameters.METInterCompanyPurchaseLegalEntity, _metVendorChangeRequest.ItemId, inventDimIntCom.InventLocationId);
+                        ret = false;
+                    }
+                }
+            }
         }
 
         if (ret && !vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
@@ -973,11 +1037,11 @@ class METVendorChangeRequestService
     /// <param name = "_itemId">ItemId from the vendor change request </param>
     /// <param name = "_vendAccount">Pending vendor account</param>
     /// <param name = "_coverageWareHouseIdList">Item coverage parent and child warehouses for supplier change</param>
-    private void triggerSupplierChangeCompleteBusinessEvent(ItemId _itemId,VendAccount _vendAccount, list _coverageWareHouseIdList)
+    private void triggerSupplierChangeCompleteBusinessEvent(ItemId _itemId, List _coverageWhsIdVendAccountNumberList)
     {
         if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METSupplierChangeCompletedBusinessEvent)))
         {
-            METSupplierChangeCompletedBusinessEvent::newFromSupplierChangeCompleted(_itemId, _vendAccount, _coverageWareHouseIdList).send();
+            METSupplierChangeCompletedBusinessEvent::newFromSupplierChangeCompleted(_itemId, _coverageWhsIdVendAccountNumberList).send();
         }
     }
 

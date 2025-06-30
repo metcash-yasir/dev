@@ -33,7 +33,6 @@ class METPurchaseOrderService extends SysOperationServiceBase
     METPurchaseOrderServiceLinesContract        linesContract;
     METVersioningPurchaseOrder                  versioningPurchaseOrder;
 
-      
 
 }
 ]]></Declaration>
@@ -63,6 +62,8 @@ class METPurchaseOrderService extends SysOperationServiceBase
 
             try
             {
+                ttsbegin;
+
                 metPurchTable = purchTable.metPurchTable();
                 //Create <c>MetPurchTable</c> record if not exists.
                 if(!metPurchTable)
@@ -72,23 +73,20 @@ class METPurchaseOrderService extends SysOperationServiceBase
 
                 this.updatePurchaseOrderHeader();
 
-                if (this.type == enum2int(METPurchActions::Cancel))
+                if (poeDIPOAMsg == POEDIPOAMsg::Rejected)
                 {
-                    //Requestchange is handled inside PurchCancel
                     this.cancelPurchaseOrder();
                 }
-                else
+                else if (poeDIPOAMsg == POEDIPOAMsg::AcceptedWithChanges)
                 {
-                    ttsbegin;
 
                     this.processPurchaseOrderLines();
 
-                    this.confirmChanges();
-
-                    ttscommit;
                 }
-
-                this.checkUpdateProcessingStatus();
+                this.confirmChanges();
+                METPurchPurchaseOrderHeaderV2Entity::poSubmitToWorkflow(purchTable);
+                this.checkUpdateProcessingStatus();//success or failure
+                ttscommit;
                
             }
 
@@ -131,8 +129,7 @@ class METPurchaseOrderService extends SysOperationServiceBase
             catch
             {
                 purchTable.reread();
-                if (this.type == enum2int(METPurchActions::Cancel)
-                    && !purchTable.isCanceled())
+                if (poeDIPOAMsg == POEDIPOAMsg::Rejected && !purchTable.isCanceled())
                 {
                     processingMessage = "@MET:PurchaseOrderNotCancelled";
                 }
@@ -173,27 +170,29 @@ class METPurchaseOrderService extends SysOperationServiceBase
             select firstonly1 forupdate purchLine
                 where purchLine.PurchId == purchaseOrderNumber
                 && purchLine.LineNumber == linesContract.parmLineNumber();
+
+            select firstonly1 forupdate metpurchline
+                where purchLine.RecId == metpurchline.PurchLine;
+
             if(purchLine && purchLine.validateWrite())
             {
                 ttsbegin;
-                boolean isCWItem = PdsGlobal::pdsIsCWItem(purchLine.ItemId);
-                if (isCWItem && linesContract.parmCWQuantity()!= 0)
+                if(metpurchline)
                 {
-                    purchLine.PdsCWQty      = linesContract.parmCWQuantity();
-                    purchLine.pdsCWQtyConversion();
-                    this.updateQuantities(purchLine);
-                    purchLine.update();
+                    metpurchline.POAChangeIndicator = true;
+                    metpurchline.ChangeReasonCode = METVendParameters::find().POChangeReasonCode;
+                    metpurchline.update();
                 }
-                else if(!isCWItem && linesContract.parmPurchaseQty() != 0)
+                if (linesContract.parmLineAction() == METConstants::LineRejected)
+                {
+                    this.cancelLine(purchLine);
+                }
+                else if (linesContract.parmPurchaseQty() != 0)
                 {
                     purchLine.PurchQty    = linesContract.parmPurchaseQty();
                     this.updateQuantities(purchLine);
+                    purchLine.ConfirmedDlv = linesContract.parmConfirmedDeliveryDate();
                     purchLine.update();
-                }
-                else if (linesContract.parmCWQuantity() == 0
-                    || linesContract.parmPurchaseQty() == 0)
-                {
-                    this.cancelLine(purchLine);
                 }
                 ttscommit;
             }
@@ -242,8 +241,17 @@ class METPurchaseOrderService extends SysOperationServiceBase
     /// <param name = "_purchLine">purchline buffer</param>
     protected void cancelLine(PurchLine     _purchLine)
     {
+        /*
         PurchCancel         purchCancel = purchCancel::METconstruct();  
-        purchCancel.metCancelPurchLine(_purchLine);
+        purchCancel.metCancelPurchLine(_purchLine);//org   commented for Original code */
+
+        _purchLine.RemainInventPhysical = 0;
+        _purchLine.RemainPurchPhysical = 0;
+        _purchLine.PurchStatus = PurchStatus::Canceled;
+        _purchLine.update();
+        // This method will update the inventory transactions
+
+        InventMovement::bufferSetRemainQty(_purchLine);
     }
 
 ]]></Source>
@@ -266,30 +274,6 @@ class METPurchaseOrderService extends SysOperationServiceBase
             }
 
         }
-        purchTable.reread();
-        if (this.type == enum2int(METPurchActions::Confirm)
-            &&  purchTable.DocumentState == VersioningDocumentState::Approved
-            && purchTable.ChangeRequestRequired)
-        {
-            versioningPurchaseOrder.confirm();
-        }
-        else if(this.type == enum2int(METPurchActions::Confirmation)
-            && purchTable.DocumentState == VersioningDocumentState::Approved)
-        {
-            PurchFormLetter purchFormLetter = PurchFormLetter::construct(DocumentStatus::PurchaseOrder);
-            purchFormLetter.purchTable(purchTable);
-            PurchFormLetter.METparmServiceConfirmation(noYes::Yes);
-            purchFormLetter.parmExecutionMode(SysOperationExecutionMode::Synchronous);
-            if(purchFormLetter.validate())
-            {
-                purchFormLetter.update(purchTable,purchTable.PurchId);
-            }
-            else
-            {
-                processingMessage = "@MET:POConfirmationValidation";
-            }
-        }
-
     }
 
 ]]></Source>
@@ -309,15 +293,9 @@ class METPurchaseOrderService extends SysOperationServiceBase
             return;
         }
 
-        if (this.type == enum2int(METPurchActions::Cancel)
-                && !purchTable.isCanceled())
+        if (this.poeDIPOAMsg == POEDIPOAMsg::Rejected && !purchTable.isCanceled())
         {
             processingMessage = "@MET:PurchaseOrderNotCancelled";
-        }
-        else if(this.type != enum2int(METPurchActions::Cancel)
-                && !purchTable.isDocumentConfirmed())
-        {
-            processingMessage = "@MET:PurchaseOrderNotUpdated";
         }
 
         if (processingMessage)
@@ -371,44 +349,15 @@ class METPurchaseOrderService extends SysOperationServiceBase
                 case POEDIPOAMsg::AcceptedWithChanges :
                     metPurchTable.POEDIPOAMsg = POEDIPOAMsg::AcceptedWithChanges;
                     break;
-                case POEDIPOAMsg::Acknowledged :
-                    metPurchTable.POEDIPOAMsg = POEDIPOAMsg::Acknowledged;
-                    break;
-                case POEDIPOAMsg::None :
-                    metPurchTable.POEDIPOAMsg = POEDIPOAMsg::None;
-                    break;
                 case POEDIPOAMsg::Rejected :
                     metPurchTable.POEDIPOAMsg = POEDIPOAMsg::Rejected;
                     break;
             }
 
-            if (metPOEDIFAMsg == NoYes::Yes)
-            {
-                metPurchTable.POEDIFAMsg = NoYes::Yes;
-            }
-            else if (metPOEDIFAMsg == NoYes::No)
-            {
-                metPurchTable.POEDIFAMsg = NoYes::No;
-            }
-
-            if (metPOYardDAppointmentStartDateTime)
-            {
-                metPurchTable.POYardDAppointmentStartDateTime = metPOYardDAppointmentStartDateTime;
-            }
-
-            if (metPOYardDAppointmentEndDateTime)
-            {
-                metPurchTable.POYardDAppointmentEndDateTime = metPOYardDAppointmentEndDateTime;
-            }
-
-            if (metPOYardDAppointmentID)
-            {
-                metPurchTable.POYardDAppointmentID = metPOYardDAppointmentID;
-            }
             metPurchTable.update();
         }
 
-        if (confirmedDeliveryDate)
+        if (confirmedDeliveryDate && poeDIPOAMsg != POEDIPOAMsg::Rejected)
         {
             purchTable.reread();
             this.requestChange();
@@ -432,23 +381,13 @@ class METPurchaseOrderService extends SysOperationServiceBase
     {
         processingStatus                        = METProcessingStatus::None;
         dataAreaId                              = _purchaseOrderContract.parmDataAreaId();
-        type                                    = str2Enum(type, _purchaseOrderContract.parmType());
         purchaseOrderNumber                     = _purchaseOrderContract.parmPurchId();
         if(_purchaseOrderContract.parmPOEDIPOAMsg())
         {
             poeDIPOAMsg                             = str2Enum(poeDIPOAMsg, _purchaseOrderContract.parmPOEDIPOAMsg());
-
         }
-        if(_purchaseOrderContract.parmMETPOEDIFAMsg())
-        {
-            metPOEDIFAMsg                           = str2Enum(metPOEDIFAMsg, _purchaseOrderContract.parmMETPOEDIFAMsg());
-        }
-        metPOYardDAppointmentStartDateTime      = _purchaseOrderContract.parmMETPOYardDAppointmentStartDateTime();
-        metPOYardDAppointmentEndDateTime        = _purchaseOrderContract.parmMETPOYardDAppointmentEndDateTime();
         confirmedDeliveryDate                   = _purchaseOrderContract.parmConfirmedDeliveryDate();
-        metPOYardDAppointmentID                 = _purchaseOrderContract.parmMETAppointmentId();
         linesContractList                       = _purchaseOrderContract.parmLineContract();
-
     }
 
 ]]></Source>
@@ -462,7 +401,7 @@ class METPurchaseOrderService extends SysOperationServiceBase
     /// <returns>true if header to be updated;otherwise false.</returns>
     public boolean canUpdatePOHeader()
     {
-        return ((poeDIPOAMsg != METConstants::InvalidEnumValue)|| (metPOEDIFAMsg != METConstants::InvalidEnumValue) || metPOYardDAppointmentStartDateTime || metPOYardDAppointmentEndDateTime || metPOYardDAppointmentID);
+        return (poeDIPOAMsg != METConstants::InvalidEnumValue);//|| (metPOEDIFAMsg != METConstants::InvalidEnumValue) || metPOYardDAppointmentStartDateTime || metPOYardDAppointmentEndDateTime || metPOYardDAppointmentID);
     }
 
 ]]></Source>
@@ -489,8 +428,7 @@ class METPurchaseOrderService extends SysOperationServiceBase
     /// </summary>
     /// <returns>container</returns>
     private container validate()
-    {
-
+    { 
         if (!dataAreaId)
         {
             processingMessage = strFmt("@SYS84753", "@SYS177726");
@@ -500,13 +438,11 @@ class METPurchaseOrderService extends SysOperationServiceBase
             processingMessage = strFmt("@SYS84753", "@SYS23482");
         }
 
-        if (!processingMessage && 
-            !purchTable)
+        if (!processingMessage && !purchTable)
         {
             processingMessage = "@MET:PurchaseOrderNotFound";
         }
-        if (!processingMessage
-            && purchTable.ChangeRequestRequired)
+        if (!processingMessage && purchTable.ChangeRequestRequired)
         {
             boolean     canAffectNextYearBudgetSource;
             Ledger ledger = Ledger::findByLegalEntity(CompanyInfo::findDataArea(dataAreaId).RecId);
@@ -521,14 +457,40 @@ class METPurchaseOrderService extends SysOperationServiceBase
             }
         }
 
-        if (!processingMessage 
-            && purchTable.PurchStatus == PurchStatus::Canceled)
+        if (!processingMessage && purchTable.PurchStatus == PurchStatus::Canceled) 
         {
             processingMessage = "@MET:PurchaseOrderCancelled";
         }
+        
+        if (!processingMessage && purchTable.PurchStatus == PurchStatus::Invoiced) 
+        {
+            processingMessage = "@MET:POAlreadyInvoiced";
+        }
 
-        if (!processingMessage
-            && !purchTable.existPurchLine())
+        if (!processingMessage && purchTable.PurchStatus == PurchStatus::Received)
+        {
+            processingMessage = "@MET:POAlreadyReceived";
+        }
+
+        if (!processingMessage && purchTable)
+        {
+            METVendSiteSettingsSetup metVendSiteSettingsSetup;
+            select firstonly METVendSiteSettingsSetup where METVendSiteSettingsSetup.AssignedSite == purchTable.InventSiteId
+                && METVendSiteSettingsSetup.AssignedWH == purchTable.InventLocationId
+                && METVendSiteSettingsSetup.AssignedVendorAccount == purchTable.OrderAccount;
+            
+            if(!METVendSiteSettingsSetup.RecId)
+            { 
+                processingMessage = "@MET:VendSiteSettingErr";
+            }
+            else if (!METVendSiteSettingsSetup.POASetting)
+            {
+                processingMessage = "@MET:VendAuthPOA";
+            }
+        } 
+
+        //cb711 end
+        if (!processingMessage && !purchTable.existPurchLine())
         {
             processingMessage = "@MET:Nopurchaselinesexist";
         }
@@ -592,6 +554,30 @@ class METPurchaseOrderService extends SysOperationServiceBase
         }
 
         return isTracked;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>changePurchaseOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Service operation method to update the purchase order.
+    /// </summary>
+    /// <param name="_purchaseOrderContract">
+    /// The instance of <c>METPurchaseOrderServiceContract</c>
+    /// </param>
+    /// <returns>
+    /// The response <c>METPurchaseOrderContract</c>
+    /// </returns>
+    public METPurchaseOrderServiceResponseContract changePurchaseOrder(METPurchaseOrderServiceContract _purchaseOrderContract)
+    {
+        METProcessingStatus     result;
+        ErrorMessage            message;
+
+        [result, message] = this.updatePurchaseOrder(_purchaseOrderContract);
+
+        return METPurchaseOrderServiceResponseContract::newFromParameters(result, message);
     }
 
 ]]></Source>
