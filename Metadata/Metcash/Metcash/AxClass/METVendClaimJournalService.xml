@@ -21,6 +21,7 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
     InventLocationId        warehouse;
     Description255          itemDescription;
     ItemId                  itemId;
+    VendAccount             vendorAccount;
 
     #OCCRetryCount
 
@@ -169,23 +170,18 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
         if(!METVendorClaimTable::existClaimLinesToProcess(claimType, _InventLocationId))
             return;
 
-        while select sum(ClaimAmount), VendAccount, InventLocationId, ItemId
+        while select VendAccount
             from vendorClaimTable
-            group by vendorClaimTable.ClaimType, vendorClaimTable.VendAccount, vendorClaimTable.InventLocationId, vendorClaimTable.ItemId 
-            where vendorClaimTable.InventLocationId == _InventLocationId
-            &&      vendorClaimTable.ClaimType == MetVendClaimType::StandardCost
+            group by vendorClaimTable.VendAccount
+            where   vendorClaimTable.ClaimType == MetVendClaimType::StandardCost
             &&      vendorClaimTable.Claimed == NoYes::No
             &&      vendorClaimTable.ClaimStatus == METVendorClaimStatus::Approved
         {
             if(!journalTable)
             {
+                vendorAccount = vendorClaimTable.VendAccount;
                 this.createLedgerJournalTable();
             }
-            claimAmount = vendorClaimTable.ClaimAmount;
-            warehouse   = vendorClaimTable.InventLocationId;
-            itemDescription = InventTable ::find(vendorClaimTable.ItemId).itemDescriptionOrName();
-            itemId = vendorClaimTable.ItemId;
-            this.createLedgerJournalTrans();
         }
     }
 
@@ -201,6 +197,11 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
     {
         journalTable = journalTable.pdsInitFromledgerJournalName(journalName);
         journalTable.insert();
+
+        if (!journalTable)
+        {
+            this.createLedgerJournalTrans(vendorAccount);
+        }
     }
 
 ]]></Source>
@@ -211,63 +212,77 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
     /// <summary>
     /// Create journal lines for claims
     /// </summary>
-    private void createLedgerJournalTrans()
+    private void createLedgerJournalTrans(VendAccount _vendorAccount)
     {
-        LedgerJournalTrans ledgerJournalTrans;
+        LedgerJournalTrans  ledgerJournalTrans;
+        METVendorClaimTable vendorClaimTableLocal;
+
+        while select sum(ClaimAmount), ClaimType, VendAccount, InventLocationId, ClaimLineId
+            from vendorClaimTable
+            group by vendorClaimTable.ClaimType, vendorClaimTable.VendAccount, vendorClaimTable.InventLocationId, vendorClaimTable.ClaimLineId
+            where vendorClaimTable.VendAccount == _vendorAccount
+            &&      vendorClaimTable.ClaimType == MetVendClaimType::StandardCost
+            &&      vendorClaimTable.Claimed == NoYes::No
+            &&      vendorClaimTable.ClaimStatus == METVendorClaimStatus::Approved
+        {
        
-        if (claimAmount == 0)
-        {
-            return;
-        }
-        ledgerJournalTrans.clear();
-        ledgerJournalTrans.initValue();
-        ledgerJournalTrans.JournalNum            = journalTable.JournalNum;
-        ledgerJournalTrans.Voucher               = this.getClaimJournalVoucherNumberSeq().voucher();
-        ledgerJournalTrans.Invoice               = this.getClaimInvoiceNumberSeq().num();
-        ledgerJournalTrans.DocumentDate          = invoiceDate;
-        ledgerJournalTrans.TransDate             = invoiceDate;
-        ledgerJournalTrans.CurrencyCode          = journalTable.CurrencyCode;
-        ledgerJournalTrans.AmountCurDebit        = claimAmount > 0 ? claimAmount : 0;
-        ledgerJournalTrans.AmountCurCredit       = claimAmount > 0 ? 0 : -claimAmount;
-        ledgerJournalTrans.AccountType           = LedgerJournalACType::Vend;
-        ledgerJournalTrans.parmAccount(vendorClaimTable.VendAccount);
-        ledgerJournalTrans.OffsetAccountType = LedgerJournalACType::Ledger;
+            if (vendorClaimTable.ClaimAmount == 0)
+            {
+                return;
+            }
+            ledgerJournalTrans.clear();
+            ledgerJournalTrans.initValue();
+            ledgerJournalTrans.JournalNum            = journalTable.JournalNum;
+            ledgerJournalTrans.Voucher               = this.getClaimJournalVoucherNumberSeq().voucher();
+            ledgerJournalTrans.Invoice               = this.getClaimInvoiceNumberSeq().num();
+            ledgerJournalTrans.DocumentDate          = invoiceDate;
+            ledgerJournalTrans.TransDate             = invoiceDate;
+            ledgerJournalTrans.CurrencyCode          = journalTable.CurrencyCode;
+            ledgerJournalTrans.AmountCurDebit        = claimAmount > 0 ? claimAmount : 0;
+            ledgerJournalTrans.AmountCurCredit       = claimAmount > 0 ? 0 : -claimAmount;
+            ledgerJournalTrans.AccountType           = LedgerJournalACType::Vend;
+            ledgerJournalTrans.parmAccount(vendorClaimTable.VendAccount);
+            ledgerJournalTrans.OffsetAccountType = LedgerJournalACType::Ledger;
 
-        InventItemGroupItem  inventItemGroupItem;
-        InventTable          inventTable;
+            InventItemGroupItem  inventItemGroupItem;
+            InventTable          inventTable;
 
-        select firstonly ItemId,DataAreaId from inventTable
-                    where inventTable.ItemId == itemId
-                    join ItemGroupId from inventItemGroupItem
-                    where inventItemGroupItem.ItemId == inventTable.ItemId &&
-                    inventItemGroupItem.ItemDataAreaId == inventTable.DataAreaId;
+            select firstonly ItemId,DataAreaId from inventTable
+                        join ItemId, ItemDescription from vendorClaimTableLocal
+                        where vendorClaimTableLocal.ClaimLineId == vendorClaimTable.ClaimLineId
+                        && inventTable.ItemId == vendorClaimTableLocal.ItemId
+                        join ItemGroupId from inventItemGroupItem
+                        where inventItemGroupItem.ItemId == inventTable.ItemId &&
+                        inventItemGroupItem.ItemDataAreaId == inventTable.DataAreaId;
 
-        // Tobacco
+            // Tobacco
 
-        if (gupParameters.METTobaccoItemGroup == inventItemGroupItem.ItemGroupId)
-        {
-            ledgerJournalTrans.OffsetLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(gupParameters.METTobaccoOffsetAccount);
-        }
-        else
-        {
-            ledgerJournalTrans.OffsetLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(gupParameters.METNonTobaccoOffsetAccount);
-        }
+            if (gupParameters.METTobaccoItemGroup == inventItemGroupItem.ItemGroupId)
+            {
+                ledgerJournalTrans.OffsetLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(gupParameters.METTobaccoOffsetAccount);
+            }
+            else
+            {
+                ledgerJournalTrans.OffsetLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(gupParameters.METNonTobaccoOffsetAccount);
+            }
         
-        InventLocation inventLOcation;
+            InventLocation inventLOcation;
 
-        select firstonly METDefaultDimension from inventLOcation
-            where inventLOcation.InventLocationId == warehouse;
-        ledgerJournalTrans.DefaultDimension      = this.getToDefaultDimension(ledgerJournalTrans.DefaultDimension, inventLOcation.METDefaultDimension);
-        ledgerJournalTrans.OffsetDefaultDimension      = this.getToDefaultDimension(ledgerJournalTrans.OffsetDefaultDimension, inventLOcation.METDefaultDimension);
-        ledgerJournalTrans.Txt                         = this.getClaimInvoiceNumberSeq().num() + itemDescription;
-        ledgerJournalTrans.TaxGroup              = VendTable::find(vendorClaimTable.VendAccount).TaxGroup;
-        ledgerJournalTrans.TaxItemGroup          = InventTableModule::find(itemId, ModuleInventPurchSales::Sales).TaxItemGroupId;
+            select firstonly METDefaultDimension from inventLOcation
+                where inventLOcation.InventLocationId == vendorClaimTable.InventLocationId;
 
-        ledgerJournalTrans.insert();
+            ledgerJournalTrans.DefaultDimension      = this.getToDefaultDimension(ledgerJournalTrans.DefaultDimension, inventLOcation.METDefaultDimension);
+            ledgerJournalTrans.OffsetDefaultDimension      = this.getToDefaultDimension(ledgerJournalTrans.OffsetDefaultDimension, inventLOcation.METDefaultDimension);
+            ledgerJournalTrans.Txt                         = vendorClaimTableLocal.ItemDescription;
+            ledgerJournalTrans.TaxGroup              = VendTable::find(vendorClaimTable.VendAccount).TaxGroup;
+            ledgerJournalTrans.TaxItemGroup          = InventTableModule::find(itemId, ModuleInventPurchSales::Sales).TaxItemGroupId;
 
-        if((LedgerjournalTrans.RecId != 0))
-        {
-            this.updateClaimDetails(ledgerJournalTrans.Invoice, ledgerJournalTrans.DocumentDate);
+            ledgerJournalTrans.insert();
+
+            if((LedgerjournalTrans.RecId != 0))
+            {
+                this.updateClaimDetails(ledgerJournalTrans.Invoice, ledgerJournalTrans.DocumentDate);
+            }
         }
     }
 
