@@ -1,0 +1,331 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METTransferOrderBackOrderCancelTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Task service class for transfer order backorder cancellation.
+/// </summary>
+class METTransferOrderBackOrderCancelTaskService extends METSysOperationTaskService
+{
+    InventTransferLine transferLine;
+    METInventTransferLine metTransferLine;
+    guid  topPickingProcessId;
+    InventTransId transId;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Initializes the object.
+    /// </summary>
+    protected void initialise()
+    {
+        METTransferOrderBackOrderCancelContract contract;
+        
+        super();
+
+        // get the topPickingProcessId from the contract
+        contract  = dataContract as METTransferOrderBackOrderCancelContract;
+        topPickingProcessId = contract.parmTopPickingProcessId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    /// <param name = "_contract">
+    /// <c>METTransferOrderBackOrderCancelContract</c>.
+    /// </param>
+    public void process(METTransferOrderBackOrderCancelContract _contract)
+    {
+        this.processInternal(_contract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs tasks of the task service class.
+    /// </summary>
+    /// <param name = "_readPast">Table read past setting</param>
+    protected void processTask(boolean _readPast)
+    {
+        while (this.getDataFromTopPickingQueue(topPickingProcessId, _readPast))
+        {
+            try
+            {
+                this.execute();
+            }
+            catch (Exception::Error)
+            {
+                // Catch any exception so that any one error won't bring down
+                // the entire process of sales order substitution.
+                Global::exceptionTextFallThrough();
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDataFromTopPickingQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets data from queue.
+    ///</summary>
+    /// <param name = "_processId">Guid created and added in the contract <c>METTransferOrderBackOrderCancelQueue</c>.</param>
+    /// <param name = "_readPast">boolean to read past records or not</param>
+    /// <returns>True, if data is retrieved from the queue; otherwise; false.</returns>
+    private boolean getDataFromTopPickingQueue(guid _processId, boolean _readPast)
+    {
+        #OCCRetryCount
+    
+        METTransferOrderBackOrderCancelQueue topPickingQueue;
+        int  backOffWait;
+    
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockException;
+        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
+        Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
+        
+        topPickingQueue.readPast(_readPast);
+
+        try
+        {
+            ttsbegin;
+    
+            select firstonly pessimisticlock topPickingQueue
+                where topPickingQueue.ProcessId == _processId;
+
+            if (topPickingQueue.RecId)
+            {
+                transId = topPickingQueue.InventTransId;
+                topPickingQueue.delete();
+            }
+            else
+            {
+                transId = '';
+            }
+           
+            ttscommit;
+        }
+        catch (deadLockException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw deadLockException;
+                }
+            }
+            else
+            {
+                throw deadLockException;
+            }
+        }
+        catch (updateConflictException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+            }
+            else
+            {
+                throw updateConflictException;
+            }
+        }
+        catch (transientSqlConnectionError)
+        {
+            if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw transientSqlConnectionError;
+            }
+        }
+
+        return (transId != '');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    private void execute()
+    {
+        select firstonly transferLine
+            where transferLine.InventTransId == transId
+                join metTransferLine
+                    where metTransferLine.InventTransferLine == transferLine.RecId;
+
+        if (metTransferLine.OrderExtractStatus == METOrderExtractStatus::Extracted)
+        {
+            this.updateForExtractedLines();
+        }
+        else
+        {
+            this.updateForOpenLines();
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateForExtractedLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates for extracted line.
+    /// </summary>
+    private void updateForExtractedLines()
+    {
+        WMSOrderTrans orderTrans;
+        WMSPickingRoute pickingRoute;
+        
+        select sum(qty) from orderTrans
+            where orderTrans.inventTransId == transferLine.InventTransId
+                &&  orderTrans.inventTransRefId == transferLine.TransferId
+                &&  orderTrans.inventTransType == InventTransType::TransferOrderShip
+             join expeditionStatus from pickingRoute
+                group by expeditionStatus
+                    where orderTrans.routeId == pickingRoute.pickingRouteID
+                    &&    orderTrans.fullPallet == NoYes::No;
+
+        if (pickingRoute.expeditionStatus == WMSExpeditionStatus::Complete)
+        {
+            if (orderTrans.Qty < transferLine.QtyTransfer)
+            {
+                this.updateDeliverRemainder(orderTrans.Qty);
+            }
+        }
+        else if (pickingRoute.expeditionStatus == WMSExpeditionStatus::Cancelled)
+        {
+            this.updateDeliverRemainder(0);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateForOpenLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates for open lines.
+    /// </summary>
+    private void updateForOpenLines()
+    {
+        WMSOrderTrans                   orderTrans;
+        WMSPickingRoute                 pickingRoute;
+        InventQty                       activePLQty, 
+                                        completedPLQty, 
+                                        shippedPLQty;
+        boolean                         pickListExist,
+                                        pickListCancelled;
+
+        while select sum(qty) from orderTrans
+            where orderTrans.inventTransId == transferLine.InventTransId
+                &&  orderTrans.inventTransRefId == transferLine.TransferId
+                &&  orderTrans.inventTransType == InventTransType::TransferOrderShip
+            join expeditionStatus, pickingRouteID from pickingRoute
+                group by expeditionStatus, pickingRouteID
+                    where orderTrans.routeId == pickingRoute.pickingRouteID
+                    &&    orderTrans.fullPallet == NoYes::No
+        {
+            pickListExist = true;
+
+            if (pickingRoute.expeditionStatus == WMSExpeditionStatus::Activated)
+            {
+                activePLQty += orderTrans.qty;
+            }
+            else if (pickingRoute.expeditionStatus == WMSExpeditionStatus::Complete)
+            {
+                completedPLQty += orderTrans.qty;
+            }
+            else if (pickingRoute.expeditionStatus == WMSExpeditionStatus::Cancelled)
+            {
+                pickListCancelled = true;
+                break;
+            }
+
+        }
+
+        if (!pickListExist || pickListCancelled)
+        {
+            this.updateDeliverRemainder(0);
+        }
+        else
+        {
+            InventQty updateQty = activePLQty + completedPLQty - transferLine.QtyShipped;
+            this.updateDeliverRemainder(updateQty);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDeliverRemainder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates deliver remainder.
+    /// </summary>
+    /// <param name = "_qty">Qty.</param>
+    private void updateDeliverRemainder(InventQty _qty)
+    {
+        ttsbegin;
+
+        transferLine.reread();
+        transferLine.selectForUpdate(true);
+        transferLine.QtyRemainShip = _qty;
+        transferLine.updateDeliverRemainder();
+
+        metTransferLine = transferLine.metInventTransferLine();
+
+        if (metTransferLine.OrderExtractStatus != METOrderExtractStatus::Extracted)
+        {
+            metTransferLine.selectForUpdate(true);
+            metTransferLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+            metTransferLine.update();
+
+            METInventTransferTableExt::UpdateExtractionStatus(transferLine.TransferId);
+
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
