@@ -205,6 +205,38 @@ class METVendInvoiceMatching
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>getTaxCodes</Name>
+				<Source><![CDATA[
+    private container getTaxCodes(VendAccount _vendor, ItemId _itemId, METVariance _varianceAmount, MetGSTVariance _gstVariance)
+    {
+        METVendParameters metVendParameter = METVendParameters::find();
+        VendTable vendTable;
+        TaxGroup taxGroup;
+        TaxItemGroup taxItemGroup;
+
+        select firstonly TaxGroup from vendTable 
+            where vendTable.AccountNum == _vendor;
+        if(vendTable)
+        {
+            taxGroup = vendTable.TaxGroup;
+        }
+
+        if(_gstVariance == 0)
+        {
+            taxItemGroup = metVendParameter.TaxItemGroup;
+        }
+        else
+        {
+            InventTableModule inventTableModule = InventTableModule::find(_itemId, ModuleInventPurchSales::Purch);
+            taxItemGroup = inventTableModule.TaxItemGroupId;
+        }
+
+        return [taxGroup, taxItemGroup];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>createVarianceInvoiceLines</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -214,6 +246,8 @@ class METVendInvoiceMatching
     {
         METVendParameters   vendParameters = METVendParameters::find();
         MetVariance         varianceAmount = vendInvoiceInfoTable.displayMetVariance();
+        MetGSTVariance gstVariance = vendInvoiceInfoTable.displayMetGSTVariance();
+
         ReasonTable         reasonTable    = ReasonTable::find(vendParameters.ReasonCode);
 
         VendInvoiceInfoLine vendInvoiceInfoLine, varianceLine;
@@ -239,28 +273,99 @@ class METVendInvoiceMatching
             varianceLine.MetExtComment          = reasonTable.MetExtComment;
 
             PurchTable      purchTable          = vendInvoiceInfoTable.purchTable();
-            
-            varianceLine.TaxGroup               = vendParameters.TaxGroup;
-            varianceLine.TaxItemGroup           = vendParameters.TaxItemGroup;
 
             inventDim.InventSiteId              = purchTable.InventSiteId;
             inventDim.InventLocationId          = purchTable.InventLocationId;
-            
+            varianceLine.DefaultDimension       = vendInvoiceInfoTable.DefaultDimension;
+
             varianceLine.InventDimId            = InventDim::findOrCreate(inventDim).inventDimId;
 
             varianceLine.ReasonTableRef         = ReasonTableRef::createReasonTableRef(reasonTable.Reason, reasonTable.Description);
-
-            varianceLine.PurchPrice             = abs(varianceAmount);
-            varianceLine.modifiedField(fieldNum(VendInvoiceInfoLine, PurchPrice));
+            
+            //varianceLine.METVarianceLine = NoYes::Yes;
+            //varianceLine.METTaxAmount = abs(gstVariance);
 
             varianceLine.ReceiveNow = varianceAmount > 0 ? 1 : -1;
-
             varianceLine.vendDocumentLineInterface().modifiedReceiveNowWithPromptDefault(UnknownNoYes::Yes);
+            varianceLine.modifiedField(fieldNum(VendInvoiceInfoLine, ItemId));
+            varianceLine.LineNum = 1;// Vendor invoice will always have only one variance line and the standard line number startes from 10
+            
+            if(abs(varianceAmount) >= abs(gstVariance))
+            {
+                varianceLine.PurchPrice = abs(varianceAmount) - abs(gstVariance);
+            }
+            else
+            {
+                varianceLine.PurchPrice = 0;
+            }
+            varianceLine.modifiedField(fieldNum(VendInvoiceInfoLine, PurchPrice));
 
+            [varianceLine.TaxGroup, varianceLine.TaxItemGroup] = this.getTaxCodes(vendInvoiceInfoTable.InvoiceAccount, reasonTable.METItem, varianceAmount, gstVariance);
+            
             if(varianceLine.validateWrite())
             {
                 varianceLine.insert();
+                if (varianceLine.DefaultDimension == 0)
+                {
+                    if(vendInvoiceInfoTable.DefaultDimension != 0)
+                    {
+                        varianceLine.DefaultDimension = vendInvoiceInfoTable.DefaultDimension;
+                    }
+                    else if (purchTable.DefaultDimension != 0)
+                    {
+                        varianceLine.DefaultDimension = purchTable.DefaultDimension;
+                    }
+                    varianceLine.update();
+                }
+                if(abs(gstVariance) != 0)
+                {
+                    if(varianceLine.LineAmount <= 0)
+                    {
+                        this.updateTaxAmount(vendInvoiceInfoTable, varianceLine, -1 * abs(gstVariance));
+                    }
+                    else
+                    {
+                        this.updateTaxAmount(vendInvoiceInfoTable, varianceLine, abs(gstVariance));
+                    }
+                }
             }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTaxAmount</Name>
+				<Source><![CDATA[
+    private void updateTaxAmount(VendInvoiceInfoTable _infoTable, VendInvoiceInfoLine _infoLine, MetGSTVariance _gstVariance)
+    {
+        Tax tax;
+        PurchTotals purchTotals = PurchTotals::newParmTable(
+                                _infoTable,
+                                PurchUpdate::PackingSlip,
+                                _infoTable.ParmId,
+                                '',
+                                _infoTable.Ordering);
+        purchTotals.calc();
+        tax = purchTotals.tax();
+        TaxRegulationDetail taxReg  = TaxRegulation::newTaxRegulation(tax, null, _infoLine.tableid, _infoLine.Recid);
+
+        TmpTaxRegulation tmpTaxReg = taxReg.tmpTaxRegulationDetail();
+        TmpTaxWorkTrans tmpTaxWorkTrans = taxReg.tmpTaxWorkTrans();
+
+        select firstonly tmpTaxReg
+            where tmpTaxReg.SourceRecId == _infoLine.RecId &&
+                  tmpTaxReg.SourceTableId == _infoLine.TableId;
+
+        select firstonly tmpTaxWorkTrans
+            where tmpTaxWorkTrans.SourceRecId == _infoLine.RecId &&
+                  tmpTaxWorkTrans.SourceTableId == _infoLine.TableId;
+
+        if (tmpTaxReg)
+        {
+            taxReg.updateTaxRegulationAmount(tmpTaxReg, _gstVariance, true);
+            taxReg.saveTaxRegulation();
+            TaxIntegrationAdjustment::saveTaxAdjustment(_infoLine.TableId, _infoLine.RecId, tmpTaxWorkTrans, tmpTaxReg, true);
         }
     }
 
