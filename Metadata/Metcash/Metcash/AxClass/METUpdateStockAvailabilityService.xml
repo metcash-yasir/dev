@@ -38,9 +38,9 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
         stockAvailabilityDate   = _contract.parmMETStockAvailDate();
         productLifeCycleStateId = _contract.parmProductLifecycleStateId();
 
-        this.updateDOSInArgs();
+        boolean shouldProceedWithUpdates = this.updateDOSInArgs();
         
-        if (METVendParameters::find().UpdateFromParentToTransferSites)
+        if (shouldProceedWithUpdates && METVendParameters::find().UpdateFromParentToTransferSites)
         {
             try
             {
@@ -71,8 +71,9 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
     /// <summary>
     /// This method updates the selected or the current record of Default order setting for the Item, with 'Stock availability date' and 'Product lifecycle state'.
     /// </summary>
-    private void updateDOSInArgs()
+    private boolean updateDOSInArgs()
     {
+        boolean shouldUpdateReplenishmentsForThisPair;
         //Note: Not getting the args record directly from contract as this will be called in an intercompany call and RecId wont be usefull then.
         if (itemId && inventSiteId)
         {
@@ -82,32 +83,24 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
                     metInventItemDOSUpd.ItemStatus == enum2Str(METItemsStatus::Discontinued) ||
                     metInventItemDOSUpd.ItemStatus == enum2Str(METItemsStatus::PackChange)))
             {
-                boolean isLTNAState;
-
                 ttsBegin;
                 metInventItemDOSUpd.StockAvailDate = stockAvailabilityDate;
-                if (strLen(strTrim(productLifeCycleStateId)) == 0 &&
-                    metInventItemDOSUpd.ProductLifecycleStateId == enum2Str(METEcoResProductLifecycleStateStatus::LTNA))
-                {
-                    isLTNAState = true;
-                }
-                else
-                {
-                    metInventItemDOSUpd.ProductLifecycleStateId = productLifeCycleStateId;
-                }
+                metInventItemDOSUpd.ProductLifecycleStateId = productLifeCycleStateId;
                 metInventItemDOSUpd.doUpdate();
                 ttsCommit;
 
-                if (!isLTNAState)
+                Info(Strfmt("@MET:DefaultOrderSettingIsUpdatedWithStockAvailability", itemId, inventSiteId, stockAvailabilityDate, productLifeCycleStateId));
+
+                shouldUpdateReplenishmentsForThisPair = this.canProceedToUpdateDOS(metInventItemDOSUpd, productLifeCycleStateId);
+
+                if (shouldUpdateReplenishmentsForThisPair)
                 {
-                    Info(Strfmt("@MET:DefaultOrderSettingIsUpdatedWithStockAvailability", itemId, inventSiteId, stockAvailabilityDate, productLifeCycleStateId));
-                }
-                else
-                {
-                    Info(Strfmt("@MET:DefaultOrderSettingIsUpdatedJustWithStockAvailabilityDate", itemId, inventSiteId, stockAvailabilityDate, metInventItemDOSUpd.ProductLifecycleStateId));
+                    Info(strFmt("Default order settings update for replenishment sites of Item: %1 | Site: %2 cannot continue as Product Lifecylce State will not be updated to blank since existing state is %3.", itemId, inventSiteId, metInventItemDOSUpd.ProductLifecycleStateId));
                 }
             }
         }
+
+        return shouldUpdateReplenishmentsForThisPair;
     }
 
 ]]></Source>
@@ -229,12 +222,14 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
         join inventDimId, InventSiteId, InventLocationId from inventDim
             where inventDim.InventDimId == reqItemTable.CovInventDimId
         {
-            this.updateDefaultOrderSettingsForItemSite(_itemId, inventDim.InventSiteId);
+            boolean shouldUpdateReplenishmentsForThisPair =  this.updateDefaultOrderSettingsForItemSite(_itemId, inventDim.InventSiteId);
 
-            newCombos.add([_itemId, inventDim.InventSiteId]);
-
+            if (shouldUpdateReplenishmentsForThisPair)
+            {
+                newCombos.add([_itemId, inventDim.InventSiteId]);
+            }
         }
-
+        
         return newCombos;
     }
 
@@ -249,9 +244,10 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
     /// <param name = "_itemId">Unique ItemId</param>
     /// <param name = "_inventSideId">Unique SiteId</param>
     /// <param name = "_isMetInterCompanyPurchaseLegalEntity">Boolean value to determine the legal entity under which the update of replenishment is carreid out.Default value false for current legal entity</param>
-    public void updateDefaultOrderSettingsForItemSite(ItemId _itemId, InventSiteId _inventSideId, boolean _isMetInterCompanyPurchaseLegalEntity = false)
+    public boolean updateDefaultOrderSettingsForItemSite(ItemId _itemId, InventSiteId _inventSideId, boolean _isMetInterCompanyPurchaseLegalEntity = false)
     {
         #OCCRetryCount
+        boolean shouldUpdateReplenishmentsForThisPair;
 
         if (_itemId && _inventSideId)
         {
@@ -259,25 +255,43 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
             {
                 METInventItemOrderSetup metInventItemDOSUpd = METInventItemOrderSetup::findByItemAndSite(_itemId, _inventSideId, true);
 
-                if (metInventItemDOSUpd.RecId 
+                if (metInventItemDOSUpd.RecId
                     && (metInventItemDOSUpd.ItemStatus == enum2Str(METItemsStatus::Active) ||
                         metInventItemDOSUpd.ItemStatus == enum2Str(METItemsStatus::Discontinued) ||
                         metInventItemDOSUpd.ItemStatus == enum2Str(METItemsStatus::PackChange))
                     )
                 {
-                    ttsBegin;
-                    metInventItemDOSUpd.StockAvailDate = stockAvailabilityDate;
-                    metInventItemDOSUpd.ProductLifecycleStateId = productLifeCycleStateId;
-                    metInventItemDOSUpd.doUpdate();
-                    ttsCommit;
+                    boolean canUpdate = this.canProceedToUpdateDOS(metInventItemDOSUpd, productLifeCycleStateId);
 
-                    if (!_isMetInterCompanyPurchaseLegalEntity)
+                    if (canUpdate)
                     {
-                        Info(strFmt("@MET:DefaultOrderSettingIsUpdatedWithStockAvailability", _itemId, _inventSideId, stockAvailabilityDate, productLifeCycleStateId));
+                        ttsBegin;
+                        metInventItemDOSUpd.StockAvailDate = stockAvailabilityDate;
+                        metInventItemDOSUpd.ProductLifecycleStateId = productLifeCycleStateId;
+                        metInventItemDOSUpd.doUpdate();
+                        ttsCommit;
+
+                        if (!_isMetInterCompanyPurchaseLegalEntity)
+                        {
+                            Info(strFmt("@MET:DefaultOrderSettingIsUpdatedWithStockAvailability", _itemId, _inventSideId, stockAvailabilityDate, productLifeCycleStateId));
+                        }
+                        else
+                        {
+                            Info(strFmt("@MET:DefaultOrderSettingForLegalEntityIsUpdatedWithStockAvailability", _itemId, _inventSideId, curExt()));
+                        }
+
+                        shouldUpdateReplenishmentsForThisPair = canUpdate;
                     }
                     else
                     {
-                        Info(strFmt("@MET:DefaultOrderSettingForLegalEntityIsUpdatedWithStockAvailability", _itemId, _inventSideId, curExt()));
+                        if (!_isMetInterCompanyPurchaseLegalEntity)
+                        {
+                            Info(strFmt("Default order settings is not updated for Item: %1 Site: %2, as Product Lifecylce state will not be updated to blank since existing state is %3.", _itemId, _inventSideId, metInventItemDOSUpd.ProductLifecycleStateId));
+                        }
+                        else
+                        {
+                            Info(strFmt("Default order settings for Legal entity: %1, is not updated for Item: %2 Site: %3, since existing state '%4' cannot be set blank.", curExt(),_itemId, _inventSideId, metInventItemDOSUpd.ProductLifecycleStateId));
+                        }
                     }
                 }
                 else if(metInventItemDOSUpd.RecId)
@@ -319,6 +333,8 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
                 throw error(strFmt("@MET:UnexpectedErrorWhileUpdateStockAvailabilityDetails", _itemId, _inventSideId));
             }
         }
+
+        return shouldUpdateReplenishmentsForThisPair;
 
     }
 
@@ -417,9 +433,12 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
                 continue;
             }
 
-            this.updateDefaultOrderSettingsForItemSite(_itemId, inventDim.InventSiteId, _isMetInterCompanyPurchaseLegalEntity);
+            boolean shouldUpdateReplenishmentsForThisPair = this.updateDefaultOrderSettingsForItemSite(_itemId, inventDim.InventSiteId, _isMetInterCompanyPurchaseLegalEntity);
 
-            newCombosUnderInterCompanyLE.add([_itemId, inventDim.InventSiteId]);
+            if (shouldUpdateReplenishmentsForThisPair)
+            {
+                newCombosUnderInterCompanyLE.add([_itemId, inventDim.InventSiteId]);
+            }
         }
 
         return newCombosUnderInterCompanyLE;
@@ -482,6 +501,24 @@ internal final class METUpdateStockAvailabilityService extends SysOperationServi
             return true;
         }
         return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canProceedToUpdateDOS</Name>
+				<Source><![CDATA[
+    public boolean canProceedToUpdateDOS(METInventItemOrderSetup _metInventItemDOSUpd, EcoResProductLifecycleStateId _productLifeCycleStateId)
+    {
+        boolean canUpdate = true;
+
+        if (strLen(strLRTrim(_productLifeCycleStateId)) == 0 &&
+            _metInventItemDOSUpd.ProductLifecycleStateId == enum2Str(METEcoResProductLifecycleStateStatus::LTNA))
+        {
+            canUpdate = false;
+        }
+
+        return canUpdate;
     }
 
 ]]></Source>
