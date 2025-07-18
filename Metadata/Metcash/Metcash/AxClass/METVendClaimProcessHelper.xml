@@ -143,7 +143,6 @@ internal final class METVendClaimProcessHelper
     {
         InventDim   inventDim;
         GUPItemBasePrice    itemBasePriceLoc;
-        METVendorClaimTable vendorClaimTable;
 
         this.initParameters();
         this.initCostingVersion();
@@ -162,11 +161,8 @@ internal final class METVendClaimProcessHelper
             try
             {
                 ttsbegin;
-                vendorClaimTable = this.initVendorClaimFromItemBasePrice(itemBasePriceLoc);
-                if (vendorClaimTable.ClaimLineId)
+                if (this.processInventOnhand(itemBasePriceLoc))
                 {
-                    recordInsertList.add(vendorClaimTable);
-
                     itemBasePriceLoc.METVendClaimCreated = NoYes::Yes;
                     itemBasePriceLoc.update();
                 }
@@ -214,13 +210,57 @@ internal final class METVendClaimProcessHelper
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>processInventOnhand</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Bug 259384: CB434 Vendor claim journal is not getting auto posted because of missing key details
+    /// Adding a loop for inventory on hand from the item base price site
+    /// </summary>
+    /// <param name = "_itemBasePrice"><c>GUPItemBasePrice</c> record</param>
+    /// <returns>True if METVendorClaimTable created; otherwise, false.</returns>
+    private boolean processInventOnhand(GUPItemBasePrice _itemBasePrice)
+    {
+        InventDim inventDim;
+        boolean ret = false;
+        
+        // WH is always populated in the supplier list therefore _itemBasePrice.InventDimId has site + WH
+        inventDim = InventDim::find(_itemBasePrice.InventDimId);
+        InventDimParm   onHandDimParm;
+        onHandDimParm.initFromInventDim(inventDim);
+        InventOnhand    onHand = InventOnhand::newItemDim(_itemBasePrice.ItemId, inventDim, onHandDimParm);
+        
+        InventQtyAvailPhysical onHandQtyAvailPhysical = onHand.availPhysical();
+
+        // if we have stock on hand in the site + WH
+        if (onHandQtyAvailPhysical > 0)
+        {
+            METVendorClaimTable vendorClaimTableLocal = this.initVendorClaimFromItemBasePrice(_itemBasePrice, inventDim, onHandQtyAvailPhysical);
+            
+            if (vendorClaimTableLocal.ClaimLineId)
+            {
+                recordInsertList.add(vendorClaimTableLocal);
+                ret = true;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>initVendorClaimFromItemBasePrice</Name>
 				<Source><![CDATA[
     /// <summary>
     /// init from ItemBasePrice
     /// </summary>
+    /// <param name="_itemBasePrice">GUPItemBasePrice</param>
+    /// <param name="_inventDim">InventDim</param>
+    /// <param name="_availPhysical">InventQtyAvailPhysical</param>
     /// <returns>METVendorClaimTable</returns>
-    private METVendorClaimTable initVendorClaimFromItemBasePrice(GUPItemBasePrice    _itemBasePrice)
+    private METVendorClaimTable initVendorClaimFromItemBasePrice(GUPItemBasePrice _itemBasePrice,
+                                                                 InventDim        _inventDim,
+                                                                 InventQtyAvailPhysical _availPhysical)
     {
         METVendorClaimTable     vendorClaimTable;
         InventDim               inventDim = InventDim::find(_itemBasePrice.InventDimId);
@@ -230,72 +270,32 @@ internal final class METVendClaimProcessHelper
         if (newPrice < oldPrice)
         {
             vendorClaimTable.clear();
-            vendorClaimTable.Qty = this.inventoryOnHand(_itemBasePrice.ItemId, inventDim);
-            if (vendorClaimTable.Qty)
-            {
-                vendorClaimTable.ClaimLineId = numberSeq.num();
-                vendorClaimTable.ClaimType = MetVendClaimType::StandardCost;
-                vendorClaimTable.SiteId = inventDim.InventSiteId;
-                // Get Warehouse from On hand
-                InventOnhand    inventOnhand;
-                InventDimParm   inventDimParm;
+            
+            vendorClaimTable.ClaimLineId = numberSeq.num();
+            vendorClaimTable.ClaimType = MetVendClaimType::StandardCost;
+            vendorClaimTable.SiteId = _inventDim.InventSiteId;
 
-                inventDimParm.initFromInventDim(inventDim);
-                inventOnhand = InventOnhand::newParameters(_itemBasePrice.ItemId, inventDim, inventDimParm);
-                vendorClaimTable.InventLocationId = inventOnhand.inventSum().InventLocationId;
-                vendorClaimTable.ItemId = _itemBasePrice.ItemId;
-                vendorClaimTable.modifiedField(fieldNum(METVendorClaimTable, ItemId));
-                vendorClaimTable.UnitId = InventTableModule::find(_itemBasePrice.ItemId, ModuleInventPurchSales::Invent).UnitId;
-                vendorClaimTable.Qty = this.inventoryOnHand(_itemBasePrice.ItemId, inventDim);
-                vendorClaimTable.OldPrice = oldPrice;
-                vendorClaimTable.NewPrice = newPrice;
-                vendorClaimTable.UnitClaimAmount = decRound(vendorClaimTable.OldPrice - vendorClaimTable.NewPrice, 2);
-                vendorClaimTable.VendAccount = _itemBasePrice.AccountRelation;
-                vendorClaimTable.ItemGSTGroup = InventTableModule::find(_itemBasePrice.ItemId, ModuleInventPurchSales::Sales).TaxItemGroupId;
+            vendorClaimTable.InventLocationId = _inventDim.InventLocationId;
+            vendorClaimTable.ItemId = _itemBasePrice.ItemId;
+            vendorClaimTable.modifiedField(fieldNum(METVendorClaimTable, ItemId));
+            vendorClaimTable.UnitId = _itemBasePrice.UnitId;
+            vendorClaimTable.Qty = _availPhysical;
+            vendorClaimTable.OldPrice = oldPrice;
+            vendorClaimTable.NewPrice = newPrice;
+            vendorClaimTable.UnitClaimAmount = decRound(vendorClaimTable.OldPrice - vendorClaimTable.NewPrice, 2);
+            vendorClaimTable.VendAccount = _itemBasePrice.AccountRelation;
+            vendorClaimTable.ItemGSTGroup = InventTableModule::find(_itemBasePrice.ItemId, ModuleInventPurchSales::Purch).TaxItemGroupId;  
                 
-                
-                InventItemGroupItem inventItemGroupItem;
-                InventTable         inventTable;
+            InventItemGroupItem inventItemGroupItem = InventItemGroupItem::findByItemIdLegalEntity(vendorClaimTable.ItemId);
 
-                select firstonly ItemId,DataAreaId from inventTable
-                    where inventTable.ItemId == _itemBasePrice.ItemId
-                    join ItemGroupId from inventItemGroupItem
-                    where inventItemGroupItem.ItemId == inventTable.ItemId &&
-                    inventItemGroupItem.ItemDataAreaId == inventTable.DataAreaId;
-
-                if(gupParameters.METTobaccoItemGroup == inventItemGroupItem.ItemGroupId)
-                {
-                    vendorClaimTable.Tobacco = NoYes::Yes;
-                }
-                else
-                {
-                    vendorClaimTable.Tobacco = NoYes::No;
-                }
+            vendorClaimTable.Tobacco = gupParameters.METTobaccoItemGroup == inventItemGroupItem.ItemGroupId ? NoYes::Yes : NoYes::No;            
                
-                vendorClaimTable.setClaimAmount();
+            vendorClaimTable.setClaimAmount();
 
-                TaxItemGroupHeading      itemTaxGroup;      
-                TaxOnItem                taxOnItem;
-                TaxValue                 taxValue;
-              
-                select firstonly TaxItemGroup from itemTaxGroup
-                    where itemTaxGroup.TaxItemGroup == vendorClaimTable.ItemGSTGroup
-                join TaxCode from taxOnItem
-                    where taxOnItem.TaxItemGroup == itemTaxGroup.TaxItemGroup;
+            VendTable vendTable = VendTable::find(vendorClaimTable.VendAccount);
 
-                taxValue  = TaxData::percent(taxOnItem.TaxCode,
-                                     DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()),
-                                     0);
-
-                if(taxValue > 0)
-                {
-                    vendorClaimTable.TotalClaimAmount = vendorClaimTable.ClaimAmount + taxValue * vendorClaimTable.ClaimAmount;
-                }
-                else
-                {
-                    vendorClaimTable.TotalClaimAmount = vendorClaimTable.ClaimAmount;
-                }
-            }
+            vendorClaimTable.TotalClaimAmount = vendorClaimTable.ClaimAmount
+                + Tax::calcTaxAmount(vendTable.TaxGroup, vendorClaimTable.ItemGSTGroup, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), vendTable.Currency, vendorClaimTable.ClaimAmount, TaxModuleType::Purch);
         }
         return vendorClaimTable;
     }
@@ -557,7 +557,7 @@ internal final class METVendClaimProcessHelper
             LedgerJournalPost::postJournal(ledgerJournalTable, NoYes::Yes);
             
             ttsbegin;
-            select forupdate metVendorClaimTableUpdate
+            select firstonly forupdate metVendorClaimTableUpdate
                 where metVendorClaimTableUpdate.JournalId == ledgerJournalTable.JournalNum;
 
             if (metVendorClaimTableUpdate.RecId)
