@@ -19,58 +19,63 @@ class MetSalesReturnClaimwithsupplierService
     /// </summary>    
     public void process()
     {
-        Query                   query;
-        QueryBuildDataSource    qbdSalesTable, qbdSalesLine, qbdsReasonCode, qbdMetSalesLine;
+        Query       query;
+        QueryBuildDataSource    qbdSalesTable, qbdSalesLine;
         
         query = new Query();
-
-        qbdsReasonCode = query.addDataSource(tableNum(ReturnReasonCode));
-        qbdsReasonCode.addRange(fieldNum(ReturnReasonCode, METSupplierRelatedClaim)).value(enum2Str(NoYes::Yes));
-
-        qbdSalesTable = qbdsReasonCode.addDataSource(tableNum(SalesTable));
-        qbdSalesTable.addLink(FieldNum(ReturnReasonCode, ReasonCodeID), FieldNum(SalesTable, ReturnReasonCodeId));
-        qbdSalesTable.joinMode(JoinMode::InnerJoin);
-
-        qbdSalesTable.addRange(fieldNum(SalesTable, ReturnStatus)).value(enum2Str(ReturnStatusHeader::Closed));
-        qbdSalesTable.addRange(fieldNum(SalesTable, SalesType)).value(enum2Str(SalesType::ReturnItem));
+        qbdSalesTable = query.addDataSource(tableNum(SalesTable));
         
         qbdSalesLine = qbdSalesTable.addDataSource(TableNum(SalesLine));
         qbdSalesLine.addLink(FieldNum(SalesTable, SalesId), FieldNum(SalesLine, SalesId));
         qbdSalesLine.joinMode(JoinMode::InnerJoin);
 
-        qbdMetSalesLine = qbdSalesLine.addDataSource(TableNum(METSalesLine));
-        qbdMetSalesLine.addLink(FieldNum(SalesLine, RecId), FieldNum(METSalesLine, SalesLine));
-        qbdMetSalesLine.joinMode(JoinMode::InnerJoin);
-        qbdMetSalesLine.addRange(fieldNum(METSalesLine, PendingInvNumber)).value(SysQuery::valueEmptyString());        
+        qbdSalesTable.addRange(fieldNum(SalesTable, ReturnStatus)).value(enum2Str(ReturnStatusHeader::Closed));
+        qbdSalesTable.addRange(fieldNum(SalesTable, SalesType)).value(enum2Str(SalesType::ReturnItem));
 
         QueryRun    queryRun    = new QueryRun(query);
          
         while (queryRun.next())
         {
+            boolean             createInvoice = false;
             SalesTable          salesTable    = queryRun.get(tableNum(SalesTable));
             SalesLine           salesLine     = queryRun.get(tableNum(SalesLine));
-
+            METSalesLine        metSalesLine;
             ReqItemTable        reqItemTable;
-            InventDim           inventDim, inventDimloc;
-            InventSiteId        salesSite;
-            InventLocationId    salesWarehouse;
+            InventDim           inventDim;
+            InventSiteId        reqsite, salesSite;
+            InventLocationId    reqWarehouse, salesWarehouse;
+            VendAccount         vendAccount;
 
-            inventDimloc = InventDim::find(salesLine.inventDim().inventDimId);
-
-            salesSite      = inventDimloc.InventSiteId;
-            salesWarehouse = inventDimloc.InventLocationId;
-
-            select firstonly VendId from reqItemTable
-                where reqItemTable.ItemId == salesLine.ItemId
-                exists join inventDim 
-                where inventDim.InventDimId == reqItemTable.CovInventDimId
-                    && inventDim.InventSiteId == salesSite
-                    && inventDim.InventLocationId == salesWarehouse
-                    && reqItemTable.VendId != '';
-
-            if (reqItemTable.VendId)
+            if (ReturnReasonCode::find(salesTable.ReturnReasonCodeId).METSupplierRelatedClaim && !METSalesLine::find(salesLine.RecId).PendingInvNumber)
             {
-                this.findOrCreatePendingVendorInvoice(reqItemTable.VendId, salesTable, salesSite, salesWarehouse);
+                VendPackingSlipJour     vendPackingSlipJour;
+                VendInvoiceInfoTable    vendInvoiceInfoTableLoc, vendInvoiceInfoTableExist;
+                VendInvoiceInfoLine     vendInvoiceInfoLine;
+                VendPackingSlipTrans    vendPackingSlipTrans;
+                VendInvoiceInfoSubLine  vendInvoiceInfoSubLine;
+
+                salesSite      = salesLine.inventDim().InventSiteId;
+                salesWarehouse = salesLine.inventDim().InventLocationId;
+
+                while select reqItemTable 
+                    where reqItemTable.ItemId == salesLine.ItemId
+                    join inventDim 
+                    where inventDim.InventDimId == reqItemTable.CovInventDimId
+                        && inventDim.InventSiteId == salesSite
+                        && inventDim.InventLocationId == salesWarehouse
+                        && reqItemTable.VendId != ''
+                {
+                    if(!vendAccount)
+                    {
+                        vendAccount = reqItemTable.VendId;
+                        break;
+                    }
+                }
+
+                if(vendAccount)
+                {
+                    this.createPendingVendorInvoice(vendAccount, salesTable, salesSite, salesWarehouse);
+                }
             }
         }
     }
@@ -78,105 +83,85 @@ class MetSalesReturnClaimwithsupplierService
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>findOrCreatePendingVendorInvoice</Name>
+				<Name>createPendingVendorInvoice</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// find pending vendor invoice record
+    /// Create the pending vendor invoice of the PO.
     /// </summary>
     /// <param name = "_vendAccount">VendAccount</param>
     /// <param name = "_salesTable">SalesTable</param>
     /// <param name = "_returnSite">InventSiteId</param>
-    /// <param name = "_returnWarehouse">InventLocationID</param>
+    /// <param name = "_returnWarehous">InventLocationID</param>
     /// <returns>VendInvoiceInfoTable</returns>
-    public VendInvoiceInfoTable findOrCreatePendingVendorInvoice(VendAccount       _vendAccount, 
+    public VendInvoiceInfoTable createPendingVendorInvoice(VendAccount       _vendAccount, 
                                                             SalesTable       _salesTable,
                                                             InventSiteId     _returnSite,
-                                                            InventLocationID _returnWarehouse)
+                                                            InventLocationID _returnWarehous)
     {
         VendInvoiceInfoTable    vendInvoiceInfoTable;
+        VendInvoiceInfoSubTable vendInvoiceInfoSubTable;
+        VendInvoiceInfoLine     vendInvoiceInfoLine;
+        VendInvoiceInfoSubLine  vendInvoiceInfoSubLine;
+        PurchParmUpdate         purchParmUpdate;
+
+        PurchFormletterParmData     purchFormletterParmData = PurchFormletterParmData::newData(DocumentStatus::Invoice, VersioningUpdateType::Initial);
+        PurchFormLetter             purchFormLetter;
 
         ttsbegin;
         select vendInvoiceInfoTable
             where vendInvoiceInfoTable.METSalesId == _salesTable.SalesId
                 && vendInvoiceInfoTable.METReturnSite == _returnSite
-                && vendInvoiceInfoTable.METReturnWarehous == _returnWarehouse;
-        if (vendInvoiceInfoTable.RecId)
+                && vendInvoiceInfoTable.METReturnWarehous == _returnWarehous;
+        if(vendInvoiceInfoTable.RecId)
         {
             this.createPendingVendorInvoiceLines(_salesTable, vendInvoiceInfoTable);
         }
         else
         {
-            this.createPendingInvoice(_vendAccount, _salesTable, _returnSite, _returnWarehouse);
+            purchFormletterParmData.init();
+            purchFormletterParmData.parmOnlyCreateParmUpdate(true);
+            purchFormletterParmData.createData(false);
+            purchParmUpdate = purchFormletterParmData.parmParmUpdate();
+
+            vendInvoiceInfoTable.clear();
+            vendInvoiceInfoTable.initValue();
+
+            vendInvoiceInfoTable.DocumentOrigin  = DocumentOrigin::Manual;
+            vendInvoiceInfoTable.DeliveryName = '';
+            vendInvoiceInfoTable.InvoiceAccount = _vendAccount;
+       
+            vendInvoiceInfoTable.defaultRow(null, null, true);
+            vendInvoiceInfoTable.Num                    = _salesTable.ReturnItemNum;
+            vendInvoiceInfoTable.VendInvoiceSaveStatus  = VendInvoiceSaveStatus::Pending;
+            vendInvoiceInfoTable.DocumentDate           = systemDateGet();
+            vendInvoiceInfoTable.LastMatchVariance      = LastMatchVarianceOptions::OK;
+            vendInvoiceInfoTable.CashDiscDate           = _salesTable.Deadline;
+            vendInvoiceInfoTable.METReturnSite          = _returnSite;
+            vendInvoiceInfoTable.METReturnWarehous      = _returnWarehous;
+            vendInvoiceInfoTable.METSalesId             = _salesTable.SalesId;
+            vendInvoiceInfoTable.METReturnInvoices      = _salesTable.ReturnItemNum;
+
+            vendInvoiceInfoTable.insert();
+        
+            if(vendInvoiceInfoTable)
+            {
+                vendInvoiceInfoSubTable.clear();
+                vendInvoiceInfoSubTable.initValue();
+                vendInvoiceInfoSubTable.defaultRow();
+ 
+                vendInvoiceInfoSubTable.ParmId      = vendInvoiceInfoTable.ParmId;
+                vendInvoiceInfoSubTable.OrigPurchId = vendInvoiceInfoTable.PurchId;
+                vendInvoiceInfoSubTable.PurchName   = vendInvoiceInfoTable.PurchName;
+                vendInvoiceInfoSubTable.TableRefId  = vendInvoiceInfoTable.TableRefId;
+ 
+                vendInvoiceInfoSubTable.insert();
+            }
+
+            this.createPendingVendorInvoiceLines(_salesTable, vendInvoiceInfoTable);
         }
         ttscommit;
 
         return vendInvoiceInfoTable;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>createPendingInvoice</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Create the pending vendor invoice.
-    /// </summary>
-    /// <param name = "_vendAccount">vendAccount</param>
-    /// <param name = "_salesTable">salesTable</param>
-    /// <param name = "_returnSite">returnSite</param>
-    /// <param name = "_returnWarehouse">returnWarehouse</param>
-    public void createPendingInvoice(VendAccount      _vendAccount,
-                                     SalesTable       _salesTable,
-                                     InventSiteId     _returnSite,
-                                     InventLocationID _returnWarehouse)
-    {
-        VendInvoiceInfoTable    vendInvoiceInfoTable;
-        VendInvoiceInfoSubTable vendInvoiceInfoSubTable;
-        PurchParmUpdate         purchParmUpdate;
-
-        PurchFormletterParmData     purchFormletterParmData = PurchFormletterParmData::newData(DocumentStatus::Invoice, VersioningUpdateType::Initial);
-       
-        purchFormletterParmData.init();
-        purchFormletterParmData.parmOnlyCreateParmUpdate(true);
-        purchFormletterParmData.createData(false);
-        purchParmUpdate = purchFormletterParmData.parmParmUpdate();
-
-        vendInvoiceInfoTable.clear();
-        vendInvoiceInfoTable.initValue();
-
-        vendInvoiceInfoTable.DocumentOrigin  = DocumentOrigin::Manual;
-        vendInvoiceInfoTable.DeliveryName = '';
-        vendInvoiceInfoTable.InvoiceAccount = _vendAccount;
-       
-        vendInvoiceInfoTable.defaultRow(null, null, true);
-        vendInvoiceInfoTable.Num                    = _salesTable.ReturnItemNum;
-        vendInvoiceInfoTable.VendInvoiceSaveStatus  = VendInvoiceSaveStatus::Pending;
-        vendInvoiceInfoTable.DocumentDate           = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
-        vendInvoiceInfoTable.LastMatchVariance      = LastMatchVarianceOptions::OK;
-        vendInvoiceInfoTable.CashDiscDate           = _salesTable.Deadline;
-        vendInvoiceInfoTable.METReturnSite          = _returnSite;
-        vendInvoiceInfoTable.METReturnWarehous      = _returnWarehouse;
-        vendInvoiceInfoTable.METSalesId             = _salesTable.SalesId;
-        vendInvoiceInfoTable.METReturnInvoices      = _salesTable.ReturnItemNum;
-
-        vendInvoiceInfoTable.insert();
-        
-        if (vendInvoiceInfoTable)
-        {
-            vendInvoiceInfoSubTable.clear();
-            vendInvoiceInfoSubTable.initValue();
-            vendInvoiceInfoSubTable.defaultRow();
- 
-            vendInvoiceInfoSubTable.ParmId      = vendInvoiceInfoTable.ParmId;
-            vendInvoiceInfoSubTable.OrigPurchId = vendInvoiceInfoTable.PurchId;
-            vendInvoiceInfoSubTable.PurchName   = vendInvoiceInfoTable.PurchName;
-            vendInvoiceInfoSubTable.TableRefId  = vendInvoiceInfoTable.TableRefId;
- 
-            vendInvoiceInfoSubTable.insert();
-        }
-
-        this.createPendingVendorInvoiceLines(_salesTable, vendInvoiceInfoTable);
-    
     }
 
 ]]></Source>
@@ -283,7 +268,7 @@ class MetSalesReturnClaimwithsupplierService
     {
         METSalesLine    metSalesLine;
        
-        select firstonly forupdate metSalesLine 
+        select forupdate metSalesLine 
             where metSalesLine.SalesLine == _salesLine.RecId;
         if(metSalesLine.RecId)
         {
