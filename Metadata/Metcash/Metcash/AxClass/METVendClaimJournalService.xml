@@ -8,20 +8,19 @@
 /// </summary>
 internal final class METVendClaimJournalService extends SysOperationServiceBase implements BatchRetryable
 {
-    LedgerJournalTable      journalTable;
-    LedgerJournalName       journalName;
-    AmountCur               claimAmount;
+    LedgerJournalName           ledgerJournalName;
     METVendClaimJournalContract contract;
-    GUPParameters           gupParameters;
-    MetVendClaimType        claimType;
-    InvoiceDate             invoiceDate;
-    InventSiteId            siteId;
-    InventLocationId        inventLovcationId;
-    METVendorClaimTable     vendorClaimTable;
-    InventLocationId        warehouse;
-    Description255          itemDescription;
-    ItemId                  itemId;
-    VendAccount             vendorAccount;
+    GUPParameters               gupParameters;
+    MetVendClaimType            claimType;
+    InvoiceDate                 invoiceDate;
+    InventLocationId            warehouse;
+    Description255              itemDescription;
+    ItemId                      itemId;
+    VendAccount                 vendorAccount;
+    LanguageId                  languageId;
+
+    LedgerDimensionDefaultAccount tobaccoLedgerDim, nonTobaccoLedgerDim;
+    RecordInsertList              ledgerJournalTransRecordList;
 
     #OCCRetryCount
 
@@ -48,14 +47,19 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
 				<Name>initParameters</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Initialise variables
+    /// Initialise class variables
     /// </summary>
     private void initParameters()
     {
-        journalTable.clear();
-        claimAmount = 0;
         invoiceDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
-        journalName = LedgerJournalName::find(gupParameters.DiscountVendorClaimJournalName);
+        ledgerJournalName = LedgerJournalName::find(gupParameters.METVendClaimJournalNameStandardCost);
+
+        languageId = CompanyInfo::languageId();
+
+        tobaccoLedgerDim = LedgerDefaultAccountHelper::getDefaultAccountFromMainAccountRecId(gupParameters.METTobaccoOffsetAccount);
+        nonTobaccoLedgerDim = LedgerDefaultAccountHelper::getDefaultAccountFromMainAccountRecId(gupParameters.METNonTobaccoOffsetAccount);
+
+        ledgerJournalTransRecordList = new RecordInsertList(tableNum(LedgerJournalTrans));
     }
 
 ]]></Source>
@@ -67,10 +71,19 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
     /// Process claim 
     /// </summary>
     private void processClaims()
-    {
+    {        
+        METVendorClaimTable vendorClaimTable;
+        boolean first = true, createJournalHeader = false;
+        VendAccount prevVendAccount;
+        LedgerJournalTable ledgerJournalTable;
+        VendTable vendTable;
+
+        RecordSortedList journalHeaderList = new RecordSortedList(tableNum(LedgerJournalTable));
+        journalHeaderList.sortOrder(fieldNum(LedgerJournalTable, JournalNum));
+        
         this.initParameters();
         
-        if(!journalName)
+        if (!ledgerJournalName)
         {
             throw error(strFmt("@MET:ClaimJournalSetupMissingMsg", METVendClaimType::StandardCost));
         }
@@ -78,44 +91,40 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
         {
             throw error(strfmt("@GLS111556", new DictType(extendedtypenum(METVendClaimInvoiceNumberSequenceTable)).label(), "@GlobalUnifiedPricing:GUPParameters"));
         }
-
-        InventLocation inventLocation;  
+        
         QueryRun qr = new QueryRun(contract.getQuery());
         
         while (qr.next())
         {
-            inventLocation = qr.get(tableNum(InventLocation)); 
+            vendorClaimTable = qr.get(tableNum(METVendorClaimTable));
             try
             {
                 ttsbegin;
-                journalTable = null;
-                this.createClaimJournalForWarehouse(inventLocation.InventLocationId);
-                ttscommit;
-                //Split transaction blocks to separate journal creation and posting. In case posting fails, journal will remain in system and manual posting can be done
-                ttsbegin;
-                if(journalTable.RecId)
+                if (first)
                 {
-                    journalTable.selectForUpdate(true);
-                    if(contract.parmPostClaim())
-                    {
-                        if(journalTable.numOfLines() > 0)
-                        {
-                            this.postClaimJournal();
-                            info(strFmt("@MET:StandardCostVendorClaimJournalCreated", journalTable.JournalNum));
-                        }
-                        else
-                        {
-                            journalTable.delete();
-                            info(strFmt("@MET:StandardCostVendorClaimJournalDeleted", journalTable.JournalNum));
-                        }
-                    }
-                    else
-                    {
-                        info(strFmt("@MET:StandardCostVendorClaimSiteJournalCreated", journalTable.JournalNum, siteId));
-                    }
+                    createJournalHeader = true;
+                    first = false;
+                    vendTable = VendTable::find(vendorClaimTable.VendAccount);
+                }
+                else if (prevVendAccount != vendorClaimTable.VendAccount)
+                {
+                    createJournalHeader = true;
+                    vendTable = VendTable::find(vendorClaimTable.VendAccount);
                 }
 
-                ttscommit;
+                // Create one journal header per vendor account
+                if (createJournalHeader)
+                {
+                    ledgerJournalTable = this.createLedgerJournalTable();
+                    createJournalHeader = false;
+                    journalHeaderList.ins(ledgerJournalTable);
+                }
+
+                this.createJournalLines(vendorClaimTable, ledgerJournalTable, vendTable);
+
+                prevVendAccount = vendorClaimTable.VendAccount;
+                ttscommit;                
+                
             }
             catch (Exception::Error)
             {
@@ -152,37 +161,12 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
                 }
             }
         }
-    }
 
-]]></Source>
-			</Method>
-			<Method>
-				<Name>createClaimJournalForWarehouse</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Create journal header and lines
-    /// </summary>
-    /// <param name = "_siteId"></param>
-    private void createClaimJournalForWarehouse(InventLocationId _InventLocationId)
-    {
-        inventLovcationId = _InventLocationId;
-        
-        if(!METVendorClaimTable::existClaimLinesToProcess(claimType, _InventLocationId))
-            return;
+        // bulk insert journal lines before journal posting to improve performance
+        ledgerJournalTransRecordList.insertDatabase();
 
-        while select VendAccount
-            from vendorClaimTable
-            group by vendorClaimTable.VendAccount
-            where   vendorClaimTable.ClaimType == MetVendClaimType::StandardCost
-            &&      vendorClaimTable.Claimed == NoYes::No
-            &&      vendorClaimTable.ClaimStatus == METVendorClaimStatus::Approved
-        {
-            if(!journalTable)
-            {
-                vendorAccount = vendorClaimTable.VendAccount;
-                this.createLedgerJournalTable();
-            }
-        }
+        //Split transaction blocks to separate journal creation and posting. In case posting fails, journal will remain in system and manual posting can be done                
+        this.postJournalHeaders(journalHeaderList);
     }
 
 ]]></Source>
@@ -191,17 +175,41 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
 				<Name>createLedgerJournalTable</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Create journal for each site
+    /// Create journal header for each vendor
     /// </summary>
-    private void createLedgerJournalTable()
+    /// <returns><c>LedgerJournalTable</c> journal header record</returns>
+    private LedgerJournalTable createLedgerJournalTable()
     {
-        journalTable = journalTable.pdsInitFromledgerJournalName(journalName);
-        journalTable.insert();
+        LedgerJournalTable ledgerJournalTable;
+        
+        ledgerJournalTable.initFromLedgerJournalName(ledgerJournalName.JournalName);
+        ledgerJournalTable.insert();
 
-        if (!journalTable)
-        {
-            this.createLedgerJournalTrans(vendorAccount);
-        }
+        return ledgerJournalTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createJournalLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create journal lines for vendor claims
+    /// </summary>
+    /// <param name = "_vendorClaimTable"><c>METVendorClaimTable</c> record</param>
+    /// <param name = "_journalTable"><c>LedgerJournalTable</c> journal header record</param>
+    /// <param name = "_vendTable"><c>VendTable</c> record</param>
+    private void createJournalLines(METVendorClaimTable _vendorClaimTable, LedgerJournalTable _journalTable, VendTable _vendTable)
+    {      
+        // get the voucher and invoice number for the set of vendor/ledger lines
+        Voucher voucher = this.getClaimJournalVoucherNumberSeq().voucher();
+        InvoiceId invoiceId = this.getClaimInvoiceNumberSeq().num();
+
+        // Create the vendor journal line
+        this.createLedgerJournalTrans(LedgerJournalACType::Vend, _vendorClaimTable, _journalTable, _vendTable, voucher, invoiceId);
+
+        // Create the ledger journal line
+        this.createLedgerJournalTrans(LedgerJournalACType::Ledger, _vendorClaimTable, _journalTable, _vendTable, voucher, invoiceId);
     }
 
 ]]></Source>
@@ -210,79 +218,73 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
 				<Name>createLedgerJournalTrans</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Create journal lines for claims
+    /// Logic to create the journal lines for vendor and ledger accounts
     /// </summary>
-    private void createLedgerJournalTrans(VendAccount _vendorAccount)
+    /// <param name = "_accountType">Account type</param>
+    /// <param name = "_vendorClaimTable"><c>METVendorClaimTable</c> record</param>
+    /// <param name = "_journalTable"><c>LedgerJournalTable</c> journal header record</param>
+    /// <param name = "_vendTable"><c>VendTable</c> record</param>
+    /// <param name = "_voucher">Voucher number</param>
+    /// <param name = "_invoiceId">Invoice number</param>
+    private void createLedgerJournalTrans(LedgerJournalACType _accountType, 
+                                          METVendorClaimTable _vendorClaimTable, 
+                                          LedgerJournalTable  _journalTable, 
+                                          VendTable           _vendTable,                       
+                                          Voucher             _voucher, 
+                                          InvoiceId           _invoiceId)
     {
         LedgerJournalTrans  ledgerJournalTrans;
-        METVendorClaimTable vendorClaimTableLocal;
+        InventLocation      inventLocation;
+        AmountCur           claimAmount = _vendorClaimTable.ClaimAmount;
 
-        while select sum(ClaimAmount), ClaimType, VendAccount, InventLocationId, ClaimLineId
-            from vendorClaimTable
-            group by vendorClaimTable.ClaimType, vendorClaimTable.VendAccount, vendorClaimTable.InventLocationId, vendorClaimTable.ClaimLineId
-            where vendorClaimTable.VendAccount == _vendorAccount
-            &&      vendorClaimTable.ClaimType == MetVendClaimType::StandardCost
-            &&      vendorClaimTable.Claimed == NoYes::No
-            &&      vendorClaimTable.ClaimStatus == METVendorClaimStatus::Approved
+        ledgerJournalTrans.clear();
+        ledgerJournalTrans.initValue();
+        ledgerJournalTrans.JournalNum            = _journalTable.JournalNum;
+        ledgerJournalTrans.Voucher               = _voucher;
+        ledgerJournalTrans.Invoice               = _invoiceId;
+
+        ledgerJournalTrans.DocumentDate          = invoiceDate;
+        ledgerJournalTrans.TransDate             = invoiceDate;
+        ledgerJournalTrans.CurrencyCode          = _journalTable.CurrencyCode;
+        
+        ledgerJournalTrans.AccountType           = _accountType;
+
+        select firstonly METDefaultDimension from inventLocation
+            where inventLocation.InventLocationId == _vendorClaimTable.InventLocationId;
+
+        if (_accountType == LedgerJournalACType::Vend)
         {
-       
-            if (vendorClaimTable.ClaimAmount == 0)
+            ledgerJournalTrans.parmAccount(_vendorClaimTable.VendAccount);
+            ledgerJournalTrans.AmountCurDebit = claimAmount;
+
+            ledgerJournalTrans.DefaultDimension = DimensionDefaultFacade::serviceMergeDefaultDimensions(inventLocation.METDefaultDimension, ledgerJournalTrans.DefaultDimension);
+        }
+        else if (_accountType == LedgerJournalACType::Ledger)
+        {         
+            if (_vendorClaimTable.Tobacco)
             {
-                return;
-            }
-            ledgerJournalTrans.clear();
-            ledgerJournalTrans.initValue();
-            ledgerJournalTrans.JournalNum            = journalTable.JournalNum;
-            ledgerJournalTrans.Voucher               = this.getClaimJournalVoucherNumberSeq().voucher();
-            ledgerJournalTrans.Invoice               = this.getClaimInvoiceNumberSeq().num();
-            ledgerJournalTrans.DocumentDate          = invoiceDate;
-            ledgerJournalTrans.TransDate             = invoiceDate;
-            ledgerJournalTrans.CurrencyCode          = journalTable.CurrencyCode;
-            ledgerJournalTrans.AmountCurDebit        = claimAmount > 0 ? claimAmount : 0;
-            ledgerJournalTrans.AmountCurCredit       = claimAmount > 0 ? 0 : -claimAmount;
-            ledgerJournalTrans.AccountType           = LedgerJournalACType::Vend;
-            ledgerJournalTrans.parmAccount(vendorClaimTable.VendAccount);
-            ledgerJournalTrans.OffsetAccountType = LedgerJournalACType::Ledger;
-
-            InventItemGroupItem  inventItemGroupItem;
-            InventTable          inventTable;
-
-            select firstonly ItemId,DataAreaId from inventTable
-                        join ItemId, ItemDescription from vendorClaimTableLocal
-                        where vendorClaimTableLocal.ClaimLineId == vendorClaimTable.ClaimLineId
-                        && inventTable.ItemId == vendorClaimTableLocal.ItemId
-                        join ItemGroupId from inventItemGroupItem
-                        where inventItemGroupItem.ItemId == inventTable.ItemId &&
-                        inventItemGroupItem.ItemDataAreaId == inventTable.DataAreaId;
-
-            // Tobacco
-
-            if (gupParameters.METTobaccoItemGroup == inventItemGroupItem.ItemGroupId)
-            {
-                ledgerJournalTrans.OffsetLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(gupParameters.METTobaccoOffsetAccount);
+                ledgerJournalTrans.LedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(tobaccoLedgerDim, inventLocation.METDefaultDimension);
             }
             else
             {
-                ledgerJournalTrans.OffsetLedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(gupParameters.METNonTobaccoOffsetAccount);
+                ledgerJournalTrans.LedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(nonTobaccoLedgerDim, inventLocation.METDefaultDimension);
             }
+
+            ledgerJournalTrans.AmountCurCredit = claimAmount;
+            ledgerJournalTrans.TaxGroup     = _vendTable.TaxGroup;
+            ledgerJournalTrans.TaxItemGroup = _vendorClaimTable.ItemGSTGroup;
+        }
+
+        // Description – Claim line Id + Item description
+        ledgerJournalTrans.Txt = strFmt("@SYS112353", _vendorClaimTable.ClaimLineId, InventTable::find(_vendorClaimTable.ItemId).productDescription(languageId));
+
+        ledgerJournalTrans.markAsApprovedByCurrentUser();
         
-            InventLocation inventLOcation;
+        ledgerJournalTransRecordList.add(ledgerJournalTrans);
 
-            select firstonly METDefaultDimension from inventLOcation
-                where inventLOcation.InventLocationId == vendorClaimTable.InventLocationId;
-
-            ledgerJournalTrans.DefaultDimension      = this.getToDefaultDimension(ledgerJournalTrans.DefaultDimension, inventLOcation.METDefaultDimension);
-            ledgerJournalTrans.OffsetDefaultDimension      = this.getToDefaultDimension(ledgerJournalTrans.OffsetDefaultDimension, inventLOcation.METDefaultDimension);
-            ledgerJournalTrans.Txt                         = vendorClaimTableLocal.ItemDescription;
-            ledgerJournalTrans.TaxGroup              = VendTable::find(vendorClaimTable.VendAccount).TaxGroup;
-            ledgerJournalTrans.TaxItemGroup          = InventTableModule::find(itemId, ModuleInventPurchSales::Sales).TaxItemGroupId;
-
-            ledgerJournalTrans.insert();
-
-            if((LedgerjournalTrans.RecId != 0))
-            {
-                this.updateClaimDetails(ledgerJournalTrans.Invoice, ledgerJournalTrans.DocumentDate);
-            }
+        if (ledgerJournalTrans)
+        {
+            this.updateClaimDetails(ledgerJournalTrans.Invoice, ledgerJournalTrans.DocumentDate, _vendorClaimTable, _journalTable.JournalNum);
         }
     }
 
@@ -297,7 +299,7 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
     /// <returns>Voucher numebr sequence</returns>
     private NumberSeq getClaimJournalVoucherNumberSeq()
     {
-        return NumberSeq::newGetVoucherFromCode(NumberSequenceTable::find(journalName.NumberSequenceTable).NumberSequence,
+        return NumberSeq::newGetVoucherFromCode(NumberSequenceTable::find(ledgerJournalName.NumberSequenceTable).NumberSequence,
                                                 NumberSeqScopeFactory::createDefaultScope(),
                                                 false);
     }
@@ -327,7 +329,9 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
     /// </summary>
     /// <param name = "_invoiceId">Invoice number</param>
     /// <param name = "_invoiceDate">Invoice date</param>
-    private void updateClaimDetails(VendInvoiceId _invoiceId, InvoiceDate _invoiceDate)
+    /// <param name = "_vendorClaimTable"><c>METVendorClaimTable</c> record</param>
+    /// <param name = "_journalNum"><c>LedgerJournalTable</c> journal number</param>
+    private void updateClaimDetails(VendInvoiceId _invoiceId, InvoiceDate _invoiceDate, METVendorClaimTable _vendorClaimTable, LedgerJournalId _journalNum)
     {
         METVendorClaimTable vendorClaimTableUpd;
 
@@ -335,14 +339,11 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
             Setting ClaimInvoiceId  = _invoiceId,
                     ClaimDate       = _invoiceDate,
                     Claimed         = NoYes::Yes,
-                    JournalId       = journalTable.JournalNum,
-                    LedgerDimension = journalName.OffsetLedgerDimension
-            where vendorClaimTableUpd.SiteId == siteId
-            &&      vendorClaimTableUpd.ClaimType == claimType
-            &&      vendorClaimTableUpd.Claimed == NoYes::No
-            &&      vendorClaimTableUpd.ClaimStatus == METVendorClaimStatus::Approved
-            &&      vendorClaimTableUpd.VendAccount == vendorClaimTable.VendAccount
-            &&      vendorClaimTableUpd.ItemId == vendorClaimTable.ItemId;
+                    JournalId       = _journalNum,
+                    LedgerDimension = ledgerJournalName.OffsetLedgerDimension
+            // Bug 259384: CB434 Vendor claim journal is not getting auto posted because of missing key details
+            // One METVendorClaimTable record is processed to create journal line and then updated.
+            where   vendorClaimTableUpd.RecId == _vendorClaimTable.RecId;
     }
 
 ]]></Source>
@@ -353,11 +354,83 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
     /// <summary>
     /// Posts the claim journal
     /// </summary>
-    private void postClaimJournal()
+    /// <param name = "_ledgerJournalTable"><c>LedgerJournalTable</c> journal header record</param>
+    private void postClaimJournal(LedgerJournalTable _ledgerJournalTable)
     {
-        if (journalTable)
+        if (_ledgerJournalTable)
         {
-            LedgerJournalPost::postJournal(journalTable, NoYes::Yes);
+            LedgerJournalPost::postJournal(_ledgerJournalTable, NoYes::Yes);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postJournalHeaders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Post journals created or not
+    /// </summary>
+    /// <param name = "_journalHeaderList">Created journals from previous process</param>
+    private void postJournalHeaders(RecordSortedList _journalHeaderList)
+    {
+        boolean moreRecs;
+        LedgerJournalTable ledgerJournalTable;
+
+        moreRecs = _journalHeaderList.first(ledgerJournalTable);
+
+        while (moreRecs)
+        {
+            // if one journal posting errors, go to the next journal posting
+            try
+            {
+                ttsbegin;
+                if (contract.parmPostClaim())
+                {
+                    this.postClaimJournal(ledgerJournalTable);
+                    info(strFmt("@MET:StandardCostVendorClaimJournalPosted", ledgerJournalTable.JournalNum));
+                }
+                else
+                {
+                    info(strFmt("@MET:StandardCostVendorClaimJournalCreated", ledgerJournalTable.JournalNum));
+                }
+                moreRecs = _journalHeaderList.next(ledgerJournalTable);
+                ttscommit;
+            }
+            catch (Exception::Error)
+            {
+                error(strFmt("@MET:ErrorPostingJournal", ledgerJournalTable.JournalNum));
+                moreRecs = _journalHeaderList.next(ledgerJournalTable);                
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error("@Subledger:DeadlockErrorThrown");
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        error("@Subledger:UpdateConflictErrorThrown");
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    error("@Subledger:UpdateConflictErrorThrown");
+                }
+            }
         }
     }
 
@@ -373,28 +446,6 @@ internal final class METVendClaimJournalService extends SysOperationServiceBase 
     public boolean isRetryable()
     {
         return true;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>getToDefaultDimension</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Method to find the  to default dimension.
-    /// </summary>
-    /// <param name = "_fromDefaultDimension">From Default Dimension</param>
-    /// <param name = "_costCentreDefaultDimension">Cost Centre</param>
-    /// <returns>Default dimension.</returns>
-    public DimensionDefault getToDefaultDimension(
-      DimensionDefault                    _fromDefaultDimension,
-      DimensionDefault                    _costCentreDefaultDimension)
-    {
-        DimensionDefault    toDefaultDimension;
-      
-        toDefaultDimension = DimensionDefaultFacade::serviceMergeDefaultDimensions(_costCentreDefaultDimension, _fromDefaultDimension);
-
-        return toDefaultDimension;
     }
 
 ]]></Source>
