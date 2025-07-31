@@ -39,6 +39,7 @@ class METPalletRoundingPolicySearch
     InventDimId inventDimId;
 
     METInventItemOrderSetup metInventItemOrderSetup;
+    METPalletRoundingPolicySearchResultantHelper metPalletRoundingPolicySearchResultantHelper;
 
 }
 ]]></Declaration>
@@ -126,6 +127,12 @@ class METPalletRoundingPolicySearch
         inventDimId = palletRoundingPolicySearchParameters.parmInventDimId();
 
         metInventItemOrderSetup = METInventItemOrderSetup::findByItemAndSite(itemId, inventSiteId);
+        if (!metInventItemOrderSetup)
+        {
+            throw Error(strFmt("@MET:PalletRoundingInventItemOrderSetupError", itemId, inventSiteId));
+        }
+
+        metPalletRoundingPolicySearchResultantHelper = METPalletRoundingPolicySearchResultantHelper::construct();
     }
 
 ]]></Source>
@@ -158,7 +165,7 @@ class METPalletRoundingPolicySearch
     /// Searches for the pallet rounding policy and returns the pallet rounding policy record.
     /// </summary>
     /// <returns>METPalletRoundingPolicyLine if a pallet rounding policy record was found; otherwise, false.</returns>
-    public METPalletRoundingPolicyLine search()
+    public METPalletRoundingPolicySearchResultantHelper search()
     {
         METCustomerGroupAll                 accountCode;
         InventCustVendRel                   accountRelation;
@@ -263,8 +270,12 @@ class METPalletRoundingPolicySearch
                                     
                                     // Method to check if valid METPalletRoundingPolicyLine
                                     // Giving _palletRoundingPolicyLineRefRecId 0 as a parameter to avoid reselecting palletRoundingPolicyLine from above
-                                    //continueSearch = false;
-                                    break;
+                                    continueSearch = this.continueSearch(palletRoundingPolicyLine);
+                                    if (!continueSearch)
+                                    {
+                                        break;
+                                    }
+                                   
                                 }
                             }
 
@@ -293,25 +304,12 @@ class METPalletRoundingPolicySearch
 
                                     if (palletRoundingPolicyLine)
                                     {
-                                        continueSearch = this.continueSearch(palletRoundingPolicyLine);//, salesQtySum, salesUnit, inventDimId);
+                                        continueSearch = this.continueSearch(palletRoundingPolicyLine);
                                         if (!continueSearch)
                                         {
                                             break;
                                         }
                                     }
-                                }
-                            }
-                        }
-                        else if (palletRoundingPolicyLineRefRecId)
-                        {
-                            palletRoundingPolicyLine = METPalletRoundingPolicyLine::findRecId(palletRoundingPolicyLineRefRecId);
-
-                            if (palletRoundingPolicyLine)
-                            {
-                                continueSearch = this.continueSearch(palletRoundingPolicyLine);//, salesQtySum, salesUnit, inventDimId);
-                                if (!continueSearch)
-                                {
-                                    break;
                                 }
                             }
                         }
@@ -331,7 +329,8 @@ class METPalletRoundingPolicySearch
             }
         }
 
-        return palletRoundingPolicyLine;
+        metPalletRoundingPolicySearchResultantHelper.parmMETPalletRoundingPolicyLine(palletRoundingPolicyLine);
+        return metPalletRoundingPolicySearchResultantHelper;
     }
 
 ]]></Source>
@@ -486,8 +485,17 @@ class METPalletRoundingPolicySearch
 			<Method>
 				<Name>isRoundingThresholdSatisfied</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// This method is used to compare the calculated percentage with the rounding percentage of the searched rounding record.
+    /// </summary>
+    /// <param name = "_palletRoundingPolicyLine">Unique rounding record buffer</param>
+    /// <param name = "_salesQtySum">Summend sales line quanties grouped by customer, Item, site</param>
+    /// <param name = "_salesUnit">Unit on the sales line selected</param>
+    /// <param name = "_inventDimId">Unique invntory dimension record</param>
+    /// <returns>Boolean true,if comparison is successful, else false</returns>
     private boolean isRoundingThresholdSatisfied(METPalletRoundingPolicyLine _palletRoundingPolicyLine, Qty _salesQtySum, UnitOfMeasureSymbol _salesUnit, InventDimId _inventDimId)
     {
+        boolean isRoundingThresholdSatisfied ;
         Qty baseQty; // a PalletQty or PalletLayerQty based on PolicyType.
         InventQty salesLineInventQty;
         UnitOfMeasureSymbol inventUnitId = InventTableModule::find(this.ItemId, ModuleInventPurchSales::Invent).UnitId;
@@ -508,13 +516,34 @@ class METPalletRoundingPolicySearch
         }
 
         if (baseQty == 0)
-        return false;
+        {
+            return false;
+        }
 
         InventQty modQty = salesLineInventQty mod baseQty;
 
         real roundingPercentage = (modQty * 100.0) / baseQty;
+        
+        if(roundingPercentage >= _palletRoundingPolicyLine.RoundingPercentage)
+        {
+            isRoundingThresholdSatisfied = true;
 
-        return roundingPercentage >= _palletRoundingPolicyLine.RoundingPercentage;
+            // To update sales order line fields
+            // If above checks are successful, apply the pallet rounding.
+            // Convert the new quantity from the item's inventory unit of measure to the sales order unit of measure and apply it to the original sales order line (not on the bonus stock line).
+            InventQty salesLineRoundedInventQty = salesLineInventQty + baseQty - modQty;
+            InventQty salesLineDiffInventQty = salesLineRoundedInventQty - salesLineInventQty;
+
+            SalesQty salesLineRoundedSalesQty = EcoResProductUnitConverter::convertForReleasedProduct(this.ItemId,
+                                                                                       this.inventDimId,
+                                                                                       salesLineDiffInventQty,
+                                                                                       UnitOfMeasure::unitOfMeasureIdBySymbol(inventUnitId),
+                                                                                       UnitOfMeasure::unitOfMeasureIdBySymbol(salesUnit));
+
+            metPalletRoundingPolicySearchResultantHelper.parmSalesLineRoundedSalesQty(salesLineRoundedSalesQty);
+        }
+
+        return isRoundingThresholdSatisfied;
     }
 
 ]]></Source>
@@ -522,7 +551,12 @@ class METPalletRoundingPolicySearch
 			<Method>
 				<Name>continueSearch</Name>
 				<Source><![CDATA[
-    protected boolean continueSearch(METPalletRoundingPolicyLine _palletRoundingPolicyLine)//, Qty _salesQtySum, UnitOfMeasureSymbol _salesUnit, InventDimId _inventDimId)
+    /// <summary>
+    /// Method to determine if search has to continue even as when suitable pallet rounding record is determined and being validated.
+    /// </summary>
+    /// <param name = "_palletRoundingPolicyLine">Unique rounding record buffer</param>
+    /// <returns>Bollean true, if search as to continue. else false</returns>
+    protected boolean continueSearch(METPalletRoundingPolicyLine _palletRoundingPolicyLine)
     {
         boolean shouldContinueSearch = true;
         boolean isValidationSuccessfull = this.validate(_palletRoundingPolicyLine);
@@ -560,32 +594,35 @@ class METPalletRoundingPolicySearch
         
         if (!metInventItemOrderSetup)
         {
-            ret = checkFailed(strFmt("@MET:PalletRoundingInventItemOrderSetupError", itemId, inventSiteId));
+            throw Error(strFmt("@MET:PalletRoundingInventItemOrderSetupError", itemId, inventSiteId));
         }
 
-        void checkDefaultOrderSettings(FieldId _fieldId)
+        boolean checkDefaultOrderSettings(FieldId _fieldId)
         {
-            if (ret && !metInventItemOrderSetup.(_fieldId))
+            if (!metInventItemOrderSetup.(_fieldId))
             {
                 ret = checkFailed(strFmt("@MET:PalletRoundingInventItemOrderSetupPalletQtyError", fieldId2PName(metInventItemOrderSetup.TableId, _fieldId), itemId, inventSiteId));
             }
+            return ret;
         }
 
-        if (ret)
+        if (_palletRoundingPolicyLine.PolicyType == METRoundingPolicyType::Pallet)
         {
-            if (_palletRoundingPolicyLine.PolicyType == METRoundingPolicyType::Pallet)
-            {
-                checkDefaultOrderSettings(fieldNum(METInventItemOrderSetup, PalletQty));
-                checkDefaultOrderSettings(fieldNum(METInventItemOrderSetup, CartonPerPallet));
-            }
-            else if (_palletRoundingPolicyLine.PolicyType == METRoundingPolicyType::Layer)
-            {
-                checkDefaultOrderSettings(fieldNum(METInventItemOrderSetup, PalletLayerQty));
-                checkDefaultOrderSettings(fieldNum(METInventItemOrderSetup, CartonPerLayer));
-            }
+            checkDefaultOrderSettings(fieldNum(METInventItemOrderSetup, PalletQty));
+            checkDefaultOrderSettings(fieldNum(METInventItemOrderSetup, CartonPerPallet));
+        }
+        else if (_palletRoundingPolicyLine.PolicyType == METRoundingPolicyType::Layer)
+        {
+            checkDefaultOrderSettings(fieldNum(METInventItemOrderSetup, PalletLayerQty));
+            checkDefaultOrderSettings(fieldNum(METInventItemOrderSetup, CartonPerLayer));
+        }
+
+        if (!ret)
+        {
+            throw Error("@SYS326740");
         }
         
-        return ret;
+        return metPalletRoundingPolicySearchResultantHelper.parmHasInventOrderSetup(ret);
     }
 
 ]]></Source>

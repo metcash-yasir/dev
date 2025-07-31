@@ -99,25 +99,22 @@ internal final class METSalesLinePalletRoundingProcess
         
         // Check 1: The sales order line site, item and customer match an active pallet rounding policy.
         METPalletRoundingPolicySearch search = METPalletRoundingPolicySearch::construct(custAccount, inventSiteId, itemId, salesUnit, salesQtySum, inventDimId);
-        METPalletRoundingPolicyLine palletRoundingPolicyLine = search.search();
+        METPalletRoundingPolicySearchResultantHelper metPalletRoundingPolicySearchResultantHelper = search.search();
+
+        METPalletRoundingPolicyLine palletRoundingPolicyLine = metPalletRoundingPolicySearchResultantHelper.parmMETPalletRoundingPolicyLine();
         
         if (palletRoundingPolicyLine)
         {
-            // retrieve default order settings
-            metInventItemOrderSetup = METInventItemOrderSetup::findByItemAndSite(itemId, inventSiteId);
-            
-            // validate
-            if (this.validate(palletRoundingPolicyLine))
+            if (metPalletRoundingPolicySearchResultantHelper.parmHasInventOrderSetup())
             {
-                // round up quantities
-                this.palletRoundUp(palletRoundingPolicyLine);
+                this.palletRoundUp(metPalletRoundingPolicySearchResultantHelper);
             }
             else
             {
                 processed = false;
             }
         }
-
+        
         return processed;
     }
 
@@ -129,89 +126,54 @@ internal final class METSalesLinePalletRoundingProcess
     /// <summary>
     /// Roundup sales order line qty to pallet
     /// </summary>
-    /// <param name = "_palletRoundingPolicyLine">Pallet rounding policy line</param>
-    void palletRoundUp(METPalletRoundingPolicyLine _palletRoundingPolicyLine)
+    /// <param name = "_metPalletRoundingPolicySearchResultantHelper">METPalletRoundingPolicySearchResultantHelper class object having Pallet rounding policy line and other details</param>
+    void palletRoundUp(METPalletRoundingPolicySearchResultantHelper _metPalletRoundingPolicySearchResultantHelper)
     {        
-        Qty baseQty; // a PalletQty or PalletLayerQty based on PolicyType.
-        InventQty salesLineInventQty;
-        InventQty remainderPct;
-        UnitOfMeasureSymbol inventUnitId = InventTableModule::find(this.ItemId, ModuleInventPurchSales::Invent).UnitId;
+        METPalletRoundingPolicyLine palletRoundingPolicyLine = _metPalletRoundingPolicySearchResultantHelper.parmMETPalletRoundingPolicyLine();
+        SalesQty salesLineRoundedSalesQty = _metPalletRoundingPolicySearchResultantHelper.parmSalesLineRoundedSalesQty();
+       
+        ttsbegin;
+        // find the original sales line (not the bonus stock one)
+        SalesLine salesLine = SalesLine::metFindBonusStock(salesId, itemId, custAccount, salesUnit, inventDimId, NoYes::No, true);
 
-        // Check 3: Convert the Sales order line(s) quantity into the Inventory Unit of measure.
-        salesLineInventQty = EcoResProductUnitConverter::convertForReleasedProduct(this.ItemId,
-                                                                                   this.inventDimId,
-                                                                                   salesQtySum,
-                                                                                   UnitOfMeasure::unitOfMeasureIdBySymbol(salesUnit),
-                                                                                   UnitOfMeasure::unitOfMeasureIdBySymbol(inventUnitId));
-                                        
-        if (_palletRoundingPolicyLine.PolicyType == METRoundingPolicyType::Pallet)
+        if (salesLine)
         {
-            baseQty = metInventItemOrderSetup.PalletQty;
-        }
-        else if (_palletRoundingPolicyLine.PolicyType == METRoundingPolicyType::Layer)
-        {
-            baseQty = metInventItemOrderSetup.PalletLayerQty;
-        }
+            SalesQty origSalesQty = salesLine.SalesQty;
+                    
+            // round up to pallet qty
+            salesLine.SalesQty += salesLineRoundedSalesQty;
+                    
+            // very important to call this to update inventTrans qty and remainder qty
+            salesLine.salesQtyModified();
+            salesLine.update();
 
-        InventQty modQty = salesLineInventQty mod baseQty;
+            METSalesLine metSalesLine = METSalesLine::find(salesLine.RecId, true);
 
-        // Check 4: If the result percentage is equal or greater than the percentage defined in the pallet rounding policy, round up will be applied to the sales order line
-        if (((modQty * 100) / baseQty) >= _palletRoundingPolicyLine.RoundingPercentage)
-        {
-            // Update sales order line fields
-            // If above checks are successful, apply the pallet rounding.
-            // Convert the new quantity from the item's inventory unit of measure to the sales order unit of measure and apply it to the original sales order line (not on the bonus stock line).
-            InventQty salesLineRoundedInventQty = salesLineInventQty + baseQty - modQty;
-            InventQty salesLineDiffInventQty = salesLineRoundedInventQty - salesLineInventQty;
-
-            SalesQty salesLineRoundedSalesQty = EcoResProductUnitConverter::convertForReleasedProduct(this.ItemId,
-                                                                                       this.inventDimId,
-                                                                                       salesLineDiffInventQty,
-                                                                                       UnitOfMeasure::unitOfMeasureIdBySymbol(inventUnitId),
-                                                                                       UnitOfMeasure::unitOfMeasureIdBySymbol(salesUnit));
-
-            ttsbegin;
-            // find the original sales line (not the bonus stock one)
-            SalesLine salesLine = SalesLine::metFindBonusStock(salesId, itemId, custAccount, salesUnit, inventDimId, NoYes::No, true);
-
-            if (salesLine)
+            if (metSalesLine)
             {
-                SalesQty origSalesQty = salesLine.SalesQty;
-                    
-                // round up to pallet qty
-                salesLine.SalesQty += salesLineRoundedSalesQty;
-                    
-                // very important to call this to update inventTrans qty and remainder qty
-                salesLine.salesQtyModified();
-                salesLine.update();
+                metSalesLine.PalletRoundingApplied              = NoYes::Yes;
+                metSalesLine.PalletRoundingOriginalQty          = origSalesQty;
+                metSalesLine.PalletRoundingPolicyLineRefRecId   = palletRoundingPolicyLine.RecId;
+                metSalesLine.PalletRoundingPercentage           = palletRoundingPolicyLine.RoundingPercentage;
+                metSalesLine.RoundingPolicyType                 = palletRoundingPolicyLine.PolicyType;
 
-                METSalesLine metSalesLine = METSalesLine::find(salesLine.RecId, true);
-
-                if (metSalesLine)
-                {
-                    metSalesLine.PalletRoundingApplied              = NoYes::Yes;
-                    metSalesLine.PalletRoundingOriginalQty          = origSalesQty;
-                    metSalesLine.PalletRoundingPolicyLineRefRecId   = _palletRoundingPolicyLine.RecId;
-                    metSalesLine.PalletRoundingPercentage           = _palletRoundingPolicyLine.RoundingPercentage;
-                    metSalesLine.RoundingPolicyType                 = _palletRoundingPolicyLine.PolicyType;
-
-                    metSalesLine.update();
-                }
-                else
-                {
-                    throw error(strFmt("@MET:PalletRoundingMETSalesLineError", salesId,
-                                                                               itemId, 
-                                                                               custAccount, 
-                                                                               salesUnit, 
-                                                                               inventDimId));
-                }
+                metSalesLine.update();
             }
             else
             {
-                throw error(strFmt("@MET:PalletRoundingSalesLineError", salesLine.RecId));
+                throw error(strFmt("@MET:PalletRoundingMETSalesLineError", salesId,
+                                                                            itemId, 
+                                                                            custAccount, 
+                                                                            salesUnit, 
+                                                                            inventDimId));
             }
-            ttscommit;
         }
+        else
+        {
+            throw error(strFmt("@MET:PalletRoundingSalesLineError", salesLine.RecId));
+        }
+        ttscommit;
+        
     }
 
 ]]></Source>
@@ -227,7 +189,9 @@ internal final class METSalesLinePalletRoundingProcess
     protected boolean validate(METPalletRoundingPolicyLine _palletRoundingPolicyLine)
     {
         boolean ret = true;
-
+        // retrieve default order settings
+        metInventItemOrderSetup = METInventItemOrderSetup::findByItemAndSite(itemId, inventSiteId);
+            
         if (!metInventItemOrderSetup)
         {
             ret = checkFailed(strFmt("@MET:PalletRoundingInventItemOrderSetupError", itemId, inventSiteId));
