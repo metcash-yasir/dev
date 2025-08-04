@@ -1,0 +1,299 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>MetSalesReturnClaimwithsupplierService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Service class for CB197_SalesReturnsClaimswithaSupplier.
+/// </summary>
+class MetSalesReturnClaimwithsupplierService
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the main logic of the class.
+    /// </summary>    
+    public void process()
+    {
+        Query                   query;
+        QueryBuildDataSource    qbdSalesTable, qbdSalesLine, qbdsReasonCode, qbdMetSalesLine;
+        
+        query = new Query();
+
+        qbdsReasonCode = query.addDataSource(tableNum(ReturnReasonCode));
+        qbdsReasonCode.addRange(fieldNum(ReturnReasonCode, METSupplierRelatedClaim)).value(enum2Str(NoYes::Yes));
+
+        qbdSalesTable = qbdsReasonCode.addDataSource(tableNum(SalesTable));
+        qbdSalesTable.addLink(FieldNum(ReturnReasonCode, ReasonCodeID), FieldNum(SalesTable, ReturnReasonCodeId));
+        qbdSalesTable.joinMode(JoinMode::InnerJoin);
+
+        qbdSalesTable.addRange(fieldNum(SalesTable, ReturnStatus)).value(enum2Str(ReturnStatusHeader::Closed));
+        qbdSalesTable.addRange(fieldNum(SalesTable, SalesType)).value(enum2Str(SalesType::ReturnItem));
+        
+        qbdSalesLine = qbdSalesTable.addDataSource(TableNum(SalesLine));
+        qbdSalesLine.addLink(FieldNum(SalesTable, SalesId), FieldNum(SalesLine, SalesId));
+        qbdSalesLine.joinMode(JoinMode::InnerJoin);
+
+        qbdMetSalesLine = qbdSalesLine.addDataSource(TableNum(METSalesLine));
+        qbdMetSalesLine.addLink(FieldNum(SalesLine, RecId), FieldNum(METSalesLine, SalesLine));
+        qbdMetSalesLine.joinMode(JoinMode::InnerJoin);
+        qbdMetSalesLine.addRange(fieldNum(METSalesLine, PendingInvNumber)).value(SysQuery::valueEmptyString());        
+
+        QueryRun    queryRun    = new QueryRun(query);
+         
+        while (queryRun.next())
+        {
+            SalesTable          salesTable    = queryRun.get(tableNum(SalesTable));
+            SalesLine           salesLine     = queryRun.get(tableNum(SalesLine));
+
+            ReqItemTable        reqItemTable;
+            InventDim           inventDim, inventDimloc;
+            InventSiteId        salesSite;
+            InventLocationId    salesWarehouse;
+
+            inventDimloc = InventDim::find(salesLine.inventDim().inventDimId);
+
+            salesSite      = inventDimloc.InventSiteId;
+            salesWarehouse = inventDimloc.InventLocationId;
+
+            select firstonly VendId from reqItemTable
+                where reqItemTable.ItemId == salesLine.ItemId
+                exists join inventDim 
+                where inventDim.InventDimId == reqItemTable.CovInventDimId
+                    && inventDim.InventSiteId == salesSite
+                    && inventDim.InventLocationId == salesWarehouse
+                    && reqItemTable.VendId != '';
+
+            if (reqItemTable.VendId)
+            {
+                this.findOrCreatePendingVendorInvoice(reqItemTable.VendId, salesTable, salesSite, salesWarehouse);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findOrCreatePendingVendorInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// find pending vendor invoice record
+    /// </summary>
+    /// <param name = "_vendAccount">VendAccount</param>
+    /// <param name = "_salesTable">SalesTable</param>
+    /// <param name = "_returnSite">InventSiteId</param>
+    /// <param name = "_returnWarehouse">InventLocationID</param>
+    /// <returns>VendInvoiceInfoTable</returns>
+    public VendInvoiceInfoTable findOrCreatePendingVendorInvoice(VendAccount       _vendAccount, 
+                                                            SalesTable       _salesTable,
+                                                            InventSiteId     _returnSite,
+                                                            InventLocationID _returnWarehouse)
+    {
+        VendInvoiceInfoTable    vendInvoiceInfoTable;
+
+        ttsbegin;
+        select vendInvoiceInfoTable
+            where vendInvoiceInfoTable.METSalesId == _salesTable.SalesId
+                && vendInvoiceInfoTable.METReturnSite == _returnSite
+                && vendInvoiceInfoTable.METReturnWarehous == _returnWarehouse;
+        if (vendInvoiceInfoTable.RecId)
+        {
+            this.createPendingVendorInvoiceLines(_salesTable, vendInvoiceInfoTable);
+        }
+        else
+        {
+            this.createPendingInvoice(_vendAccount, _salesTable, _returnSite, _returnWarehouse);
+        }
+        ttscommit;
+
+        return vendInvoiceInfoTable;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPendingInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create the pending vendor invoice.
+    /// </summary>
+    /// <param name = "_vendAccount">vendAccount</param>
+    /// <param name = "_salesTable">salesTable</param>
+    /// <param name = "_returnSite">returnSite</param>
+    /// <param name = "_returnWarehouse">returnWarehouse</param>
+    public void createPendingInvoice(VendAccount      _vendAccount,
+                                     SalesTable       _salesTable,
+                                     InventSiteId     _returnSite,
+                                     InventLocationID _returnWarehouse)
+    {
+        VendInvoiceInfoTable    vendInvoiceInfoTable;
+        VendInvoiceInfoSubTable vendInvoiceInfoSubTable;
+        PurchParmUpdate         purchParmUpdate;
+
+        PurchFormletterParmData     purchFormletterParmData = PurchFormletterParmData::newData(DocumentStatus::Invoice, VersioningUpdateType::Initial);
+       
+        purchFormletterParmData.init();
+        purchFormletterParmData.parmOnlyCreateParmUpdate(true);
+        purchFormletterParmData.createData(false);
+        purchParmUpdate = purchFormletterParmData.parmParmUpdate();
+
+        vendInvoiceInfoTable.clear();
+        vendInvoiceInfoTable.initValue();
+
+        vendInvoiceInfoTable.DocumentOrigin  = DocumentOrigin::Manual;
+        vendInvoiceInfoTable.DeliveryName = '';
+        vendInvoiceInfoTable.InvoiceAccount = _vendAccount;
+       
+        vendInvoiceInfoTable.defaultRow(null, null, true);
+        vendInvoiceInfoTable.Num                    = _salesTable.ReturnItemNum;
+        vendInvoiceInfoTable.VendInvoiceSaveStatus  = VendInvoiceSaveStatus::Pending;
+        vendInvoiceInfoTable.DocumentDate           = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        vendInvoiceInfoTable.LastMatchVariance      = LastMatchVarianceOptions::OK;
+        vendInvoiceInfoTable.CashDiscDate           = _salesTable.Deadline;
+        vendInvoiceInfoTable.METReturnSite          = _returnSite;
+        vendInvoiceInfoTable.METReturnWarehous      = _returnWarehouse;
+        vendInvoiceInfoTable.METSalesId             = _salesTable.SalesId;
+        vendInvoiceInfoTable.METReturnInvoices      = _salesTable.ReturnItemNum;
+
+        vendInvoiceInfoTable.insert();
+        
+        if (vendInvoiceInfoTable)
+        {
+            vendInvoiceInfoSubTable.clear();
+            vendInvoiceInfoSubTable.initValue();
+            vendInvoiceInfoSubTable.defaultRow();
+ 
+            vendInvoiceInfoSubTable.ParmId      = vendInvoiceInfoTable.ParmId;
+            vendInvoiceInfoSubTable.OrigPurchId = vendInvoiceInfoTable.PurchId;
+            vendInvoiceInfoSubTable.PurchName   = vendInvoiceInfoTable.PurchName;
+            vendInvoiceInfoSubTable.TableRefId  = vendInvoiceInfoTable.TableRefId;
+ 
+            vendInvoiceInfoSubTable.insert();
+        }
+
+        this.createPendingVendorInvoiceLines(_salesTable, vendInvoiceInfoTable);
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPendingVendorInvoiceLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create the pending vendor invoice lines of the PO.
+    /// </summary>
+    /// <param name = "_salesTable">SalesTable</param>
+    /// <param name = "_vendInvoiceInfoTable">VendInvoiceInfoTable</param>
+    public void createPendingVendorInvoiceLines(SalesTable          _salesTable, 
+                                                VendInvoiceInfoTable _vendInvoiceInfoTable)
+    {
+        SalesLine               salesLine;
+        VendInvoiceInfoLine     vendInvoiceInfoLine;
+
+        while select salesLine
+            where salesLine.SalesId == _salesTable.SalesId
+        {
+            vendInvoiceInfoLine.clear();
+
+            vendInvoiceInfoLine.initValue();
+
+            vendInvoiceInfoLine.ParmId              = _vendInvoiceInfoTable.ParmId;
+            vendInvoiceInfoLine.LineNum             = any2int(salesLine.LineNum);
+            vendInvoiceInfoLine.DeliveryName        = _vendInvoiceInfoTable.DeliveryName;
+            vendInvoiceInfoLine.TableRefId          = _vendInvoiceInfoTable.TableRefId;
+            vendInvoiceInfoLine.currencyCode        = _vendInvoiceInfoTable.CurrencyCode;
+
+            vendInvoiceInfoLine.InvoiceAccount      = _vendInvoiceInfoTable.InvoiceAccount;
+            vendInvoiceInfoLine.InventDimId         = salesLine.InventDimId;
+            vendInvoiceInfoLine.OrderAccount        = _vendInvoiceInfoTable.OrderAccount;
+            vendInvoiceInfoLine.ItemId              = salesLine.ItemId;
+            vendInvoiceInfoLine.InventTransId       = salesLine.InventTransId;
+
+            vendInvoiceInfoLine.DocumentOrigin      = DocumentOrigin::Manual;
+            vendInvoiceInfoLine.ReceiveNow          = salesLine.SalesQty;
+ 
+            vendInvoiceInfoLine.PurchUnit           = salesLine.SalesUnit;
+            vendInvoiceInfoLine.PurchPrice          = salesLine.SalesPrice;
+            vendInvoiceInfoLine.InventNow           = salesLine.SalesQty;
+            vendInvoiceInfoLine.LineAmount          = salesLine.LineAmount;
+            vendInvoiceInfoLine.DefaultDimension    = salesLine.DefaultDimension;
+            vendInvoiceInfoLine.ProcurementCategory = EcoResProductCategory::findByItemIdCategoryHierarchyRole(salesLine.ItemId, EcoResCategoryNamedHierarchyRole::Procurement).Category;
+            
+            //Insert pending invoice lines.
+            vendInvoiceInfoLine.insert();
+            
+            //Insert pending invoice sub-lines.
+            this.createPendingVendorInvoiceInfoSubLines(salesLine.InventTransId, vendInvoiceInfoLine);
+            this.updatePendingInvRef(salesLine, _vendInvoiceInfoTable);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPendingVendorInvoiceInfoSubLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create the pending vendor invoice lines of the PO.
+    /// </summary>
+    /// <param name = "_inventTransId">InventTransId</param>
+    /// <param name = "_vendInvoiceInfoLine">VendInvoiceInfoLine</param>
+    public void createPendingVendorInvoiceInfoSubLines(InventTransId _inventTransId, VendInvoiceInfoLine _vendInvoiceInfoLine)
+    {
+        VendPackingSlipTrans    vendPackingSlipTrans;
+        VendInvoiceInfoSubLine  vendInvoiceInfoSubLine;
+
+        vendInvoiceInfoSubLine.clear();
+
+        //Insert the sub line details from the table <c>VendPackingSlipTrans</c>
+        while select InventTransId, PackingSlipId, Qty, RecId, TableId from vendPackingSlipTrans
+            where vendPackingSlipTrans.InventTransId == _inventTransId
+        {
+            vendInvoiceInfoSubLine.initValue();
+            vendInvoiceInfoSubLine.defaultRow();
+
+            vendInvoiceInfoSubLine.ParmId               = _vendInvoiceInfoLine.ParmId;
+            vendInvoiceInfoSubLine.InventNow            = vendPackingSlipTrans.Qty;
+            vendInvoiceInfoSubLine.ReceiveNow           = vendPackingSlipTrans.Qty;
+            vendInvoiceInfoSubLine.DocumentId           = vendPackingSlipTrans.PackingSlipId;
+            vendInvoiceInfoSubLine.LineRefRecId         = _vendInvoiceInfoLine.RecId;
+            vendInvoiceInfoSubLine.JournalRefRecId      = vendPackingSlipTrans.RecId;
+            vendInvoiceInfoSubLine.JournalRefTableId    = vendPackingSlipTrans.TableId;
+
+            vendInvoiceInfoSubLine.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePendingInvRef</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update invoice number.
+    /// </summary>
+    /// <param name = "_salesLine">SalesLine</param>
+    /// <param name = "_vendInvInfoTable">VendInvoiceInfoTable</param>
+    public void updatePendingInvRef(SalesLine _salesLine, VendInvoiceInfoTable _vendInvInfoTable)
+    {
+        METSalesLine    metSalesLine;
+       
+        select firstonly forupdate metSalesLine 
+            where metSalesLine.SalesLine == _salesLine.RecId;
+        if(metSalesLine.RecId)
+        {
+            metSalesLine.PendingInvNumber = _vendInvInfoTable.Num;
+            metSalesLine.doUpdate();
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
