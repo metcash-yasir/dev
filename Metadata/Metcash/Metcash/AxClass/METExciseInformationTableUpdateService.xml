@@ -33,7 +33,7 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
         METExciseRegisterOriginTypes                metExciseRegisterOriginTypes;
         METExciseInformationTableUpdateContract     contract;
 
-        while select ReferenceId, TransactionType from metExciseRegisterOriginTypes
+        while select ReferenceId, TransactionType, CreateDutyCredit from metExciseRegisterOriginTypes
             where metExciseRegisterOriginTypes.UpdateRegister == NoYes::Yes
         {
             if (this.isExecutingInBatch())
@@ -51,6 +51,7 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
 
                 contract.parmReferenceId(metExciseRegisterOriginTypes.ReferenceId);
                 contract.parmTransactionType(metExciseRegisterOriginTypes.TransactionType);
+                contract.parmCreateDutyCredit(metExciseRegisterOriginTypes.CreateDutyCredit);
 
                 batchHeader.addRuntimeTask(runTaskController, this.getCurrentBatchTask().RecId);
 
@@ -64,6 +65,7 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
 
                 contract.parmReferenceId(metExciseRegisterOriginTypes.ReferenceId);
                 contract.parmTransactionType(metExciseRegisterOriginTypes.TransactionType);
+                contract.parmCreateDutyCredit(metExciseRegisterOriginTypes.CreateDutyCredit);
 
                 this.runExciseInformationTableUpdate(contract);
 
@@ -143,6 +145,11 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                     {
                         metExciseInformationTable.InventoryQty  = metInventTransExciseRegisterUpdateView.Qty;
                         metExciseInformationTable.AvailableQty  = 0.00;
+
+                        if (_contract.parmCreateDutyCredit() == NoYes::Yes)
+                        {
+                            this.createDutyEditRecords(metInventTransExciseRegisterUpdateView);
+                        }
 
                         validInsert = true;
                     }
@@ -226,6 +233,7 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
 
         recordInsertList.insertDatabase();
         dutyRollVarianceRecordInsertList.insertDatabase();
+        dutyCreditTableRecordInsertList.insertDatabase();
     }
 
 ]]></Source>
@@ -536,6 +544,86 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                     }
             }
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createDutyEditRecords</Name>
+				<Source><![CDATA[
+    private void createDutyEditRecords(METInventTransExciseRegisterUpdateView _metInventTransExciseRegisterUpdateView)
+    {
+        Salestable salestable;
+
+        dutyCreditTable.clear();
+        dutyCreditTable.SiteId = InventDim::find(_metInventTransExciseRegisterUpdateView.inventDimId).inventSiteId;
+        dutyCreditTable.ItemId = _metInventTransExciseRegisterUpdateView.ItemId;
+
+        METExciseSiteDutySetup  exciseSiteDutySetup;
+
+        select firstonly ValueForDuty from exciseSiteDutySetup
+            where exciseSiteDutySetup.ItemId == dutyCreditTable.ItemId
+            && exciseSiteDutySetup.SiteId == dutyCreditTable.SiteId;
+
+        dutyCreditTable.DutyRate = exciseSiteDutySetup.ValueForDuty;
+        container conDutyCredit = METExciseInformationTableUpdateService::consumeDutyCredit(dutyCreditTable.ItemId, dutyCreditTable.SiteId, _metInventTransExciseRegisterUpdateView.Qty);
+        dutyCreditTable.CreditClosed = conPeek(conDutyCredit, 2);
+        dutyCreditTable.CreditRemaining = conPeek(conDutyCredit, 1);
+        dutyCreditTable.ReturnQuantity = _metInventTransExciseRegisterUpdateView.Qty;
+        METInventTable metInventTable = METInventTable::find(_metInventTransExciseRegisterUpdateView.ItemId);
+        dutyCreditTable.TariffItemCodeBaseRecid = metInventTable.METTariffItemCodeBaseRecid;
+
+        select firstonly ReturnItemNum from salestable
+            where salestable.SalesId == _metInventTransExciseRegisterUpdateView.ReferenceId;
+
+        dutyCreditTable.RMANumber = salestable.ReturnItemNum;
+
+        if (dutyCreditTable.validateWrite())
+        {
+            dutyCreditTableRecordInsertList.add(dutyCreditTable);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>consumeDutyCredit</Name>
+				<Source><![CDATA[
+    public static container consumeDutyCredit(ItemId _itemId, InventSiteId _siteId, InventQty _saleQty)
+    {
+        InventQty remainingQty = _saleQty;
+        METDutyCreditTable dutyCreditTable;
+
+        ttsbegin;
+    
+        while select forupdate dutyCreditTable order by RecId asc
+            where dutyCreditTable.ItemId == _itemId &&
+              dutyCreditTable.SiteId == _siteId &&
+              dutyCreditTable.CreditClosed == NoYes::No
+        {
+            if (dutyCreditTable.CreditRemaining >= remainingQty)
+            {
+                dutyCreditTable.CreditRemaining -= remainingQty;
+
+                if (dutyCreditTable.CreditRemaining == 0)
+                {
+                    dutyCreditTable.CreditClosed = NoYes::Yes;
+                }
+
+                remainingQty = 0;
+                break;
+            }
+            else
+            {
+                remainingQty -= dutyCreditTable.CreditRemaining;
+                dutyCreditTable.CreditRemaining = 0;
+                dutyCreditTable.CreditClosed = NoYes::Yes;
+            }
+        }
+
+        ttscommit;
+
+        return [dutyCreditTable.CreditRemaining,  dutyCreditTable.CreditClosed];
     }
 
 ]]></Source>
