@@ -10,9 +10,11 @@
 class METExciseInformationTableUpdateService extends SysOperationServiceBase
 {
     METDutyRollVariance             dutyRollVariance;
+    METDutyCreditTable              dutyCreditTable;
     METExciseInformationTable       metExciseInformationTable;
     RecordInsertList                recordInsertList = new RecordInsertList(tableNum(METExciseInformationTable), false, false, false, false, false);
     RecordInsertList                dutyRollVarianceRecordInsertList = new RecordInsertList(tableNum(METDutyRollVariance));
+    RecordInsertList                dutyCreditTableRecordInsertList = new RecordInsertList(tableNum(METDutyCreditTable));
 
 }
 ]]></Declaration>
@@ -31,7 +33,7 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
         METExciseRegisterOriginTypes                metExciseRegisterOriginTypes;
         METExciseInformationTableUpdateContract     contract;
 
-        while select ReferenceId, TransactionType from metExciseRegisterOriginTypes
+        while select ReferenceId, TransactionType, CreateDutyCredit from metExciseRegisterOriginTypes
             where metExciseRegisterOriginTypes.UpdateRegister == NoYes::Yes
         {
             if (this.isExecutingInBatch())
@@ -49,6 +51,7 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
 
                 contract.parmReferenceId(metExciseRegisterOriginTypes.ReferenceId);
                 contract.parmTransactionType(metExciseRegisterOriginTypes.TransactionType);
+                contract.parmCreateDutyCredit(metExciseRegisterOriginTypes.CreateDutyCredit);
 
                 batchHeader.addRuntimeTask(runTaskController, this.getCurrentBatchTask().RecId);
 
@@ -62,6 +65,7 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
 
                 contract.parmReferenceId(metExciseRegisterOriginTypes.ReferenceId);
                 contract.parmTransactionType(metExciseRegisterOriginTypes.TransactionType);
+                contract.parmCreateDutyCredit(metExciseRegisterOriginTypes.CreateDutyCredit);
 
                 this.runExciseInformationTableUpdate(contract);
 
@@ -88,6 +92,7 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
     {
         METInventTransExciseRegisterUpdateView          metInventTransExciseRegisterUpdateView;
         boolean                                         validInsert;
+        boolean                                         isReturn;
 
         while select metInventTransExciseRegisterUpdateView
             where metInventTransExciseRegisterUpdateView.ReferenceCategory == _contract.parmReferenceId()
@@ -95,9 +100,12 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                     where metInventTransExciseRegisterUpdateView.InventTransRecId == metExciseInformationTable.InventTransRefRecId
         {
             validInsert = false;
-
-            if ((_contract.parmTransactionType() == METTransactionType::Positive && metInventTransExciseRegisterUpdateView.Qty > 0) ||
-                (_contract.parmTransactionType() == METTransactionType::Negative && metInventTransExciseRegisterUpdateView.Qty < 0))
+            isReturn = metInventTransExciseRegisterUpdateView.ReferenceCategory == InventTransType::Sales && SalesTable::find(metInventTransExciseRegisterUpdateView.ReferenceId).ReturnItemNum ? true : false;
+            
+            if ((_contract.parmTransactionType() == METTransactionType::Positive && metInventTransExciseRegisterUpdateView.Qty > 0 && !isReturn) ||
+                (_contract.parmTransactionType() == METTransactionType::Negative && metInventTransExciseRegisterUpdateView.Qty < 0) ||
+                (metInventTransExciseRegisterUpdateView.ReferenceCategory == InventTransType::Sales &&
+                isReturn && _contract.parmTransactionType() == METTransactionType::Negative && metInventTransExciseRegisterUpdateView.Qty > 0))
             {
                 metExciseInformationTable.clear();
                 metExciseInformationTable.ReferenceNumber       = metInventTransExciseRegisterUpdateView.ReferenceId;
@@ -141,6 +149,11 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                     {
                         metExciseInformationTable.InventoryQty  = metInventTransExciseRegisterUpdateView.Qty;
                         metExciseInformationTable.AvailableQty  = 0.00;
+
+                        if (_contract.parmCreateDutyCredit() == NoYes::Yes)
+                        {
+                            this.createDutyEditRecords(metInventTransExciseRegisterUpdateView);
+                        }
 
                         validInsert = true;
                     }
@@ -224,6 +237,7 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
 
         recordInsertList.insertDatabase();
         dutyRollVarianceRecordInsertList.insertDatabase();
+        dutyCreditTableRecordInsertList.insertDatabase();
     }
 
 ]]></Source>
@@ -235,6 +249,7 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
     /// Run process method
     /// </summary>
     /// <param name = "_contract">Contract class reference</param>
+    /// <param name = "_refId">Reference id</param>
     public void runExciseInformationTableUpdateForOrder(METExciseInformationTableUpdateContract _contract, InventTransRefId _refId = '')
     {
         SalesLine salesLine;
@@ -533,6 +548,58 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                         break;
                     }
             }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createDutyEditRecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a duty credit record based on the excise register update view.
+    /// </summary>
+    /// <param name="_metInventTransExciseRegisterUpdateView">
+    /// The excise register update view containing item ID, quantity, inventDimId, and reference ID.
+    /// </param>
+    /// <remarks>
+    /// This method performs the following:
+    /// - Retrieves site ID from the inventDim record.
+    /// - Looks up duty rate from METExciseSiteDutySetup based on item and site.
+    /// - Populates the duty credit table with item, site, duty rate, quantity, return quantity, and tariff code.
+    /// - Retrieves the RMA number from the sales order based on the reference ID.
+    /// - Validates and adds the record to the duty credit insert list if valid.
+    /// </remarks>
+
+    private void createDutyEditRecords(METInventTransExciseRegisterUpdateView _metInventTransExciseRegisterUpdateView)
+    {
+        Salestable salestable;
+
+        dutyCreditTable.clear();
+        dutyCreditTable.SiteId = InventDim::find(_metInventTransExciseRegisterUpdateView.inventDimId).inventSiteId;
+        dutyCreditTable.ItemId = _metInventTransExciseRegisterUpdateView.ItemId;
+
+        METExciseSiteDutySetup  exciseSiteDutySetup;
+
+        select firstonly ValueForDuty from exciseSiteDutySetup
+            where exciseSiteDutySetup.ItemId == dutyCreditTable.ItemId
+            && exciseSiteDutySetup.SiteId == dutyCreditTable.SiteId;
+
+        dutyCreditTable.DutyRate = exciseSiteDutySetup.ValueForDuty;
+        dutyCreditTable.CreditClosed = NoYes::No;
+        dutyCreditTable.CreditRemaining = _metInventTransExciseRegisterUpdateView.Qty;
+        dutyCreditTable.ReturnQuantity = _metInventTransExciseRegisterUpdateView.Qty;
+        METInventTable metInventTable = METInventTable::find(_metInventTransExciseRegisterUpdateView.ItemId);
+        dutyCreditTable.TariffItemCodeBaseRecid = metInventTable.METTariffItemCodeBaseRecid;
+
+        select firstonly ReturnItemNum from salestable
+            where salestable.SalesId == _metInventTransExciseRegisterUpdateView.ReferenceId;
+
+        dutyCreditTable.RMANumber = salestable.ReturnItemNum;
+
+        if (dutyCreditTable.validateWrite())
+        {
+            dutyCreditTableRecordInsertList.add(dutyCreditTable);
         }
     }
 
