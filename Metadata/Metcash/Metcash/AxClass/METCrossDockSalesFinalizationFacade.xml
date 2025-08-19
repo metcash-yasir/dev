@@ -321,16 +321,13 @@ public class METCrossDockSalesFinalizationFacade
         InventTransferLine      inventTransferLine;
         METInventTransferLine   metInventTransferLine;
         SalesLine               salesLine;
-        InventTable             inventTable;
-        Qty                     salesQty;
-        boolean                 isFullyReserved;
 
         // For each TO line originating from SO line (xDock)
-        while select QtyReceived, ItemId, QtyTransfer  from inventTransferLine
+        while select QtyReceived, ItemId, QtyTransfer, UnitId from inventTransferLine
                where inventTransferLine.TransferId == _transferId
                 join metInventTransferLine
                where metInventTransferLine.InventTransferLine == inventTransferLine.RecId
-                join InventTransId, QtyOrdered, RemainSalesPhysical, RemainInventPhysical from salesLine
+                join InventTransId, QtyOrdered, RemainSalesPhysical, RemainInventPhysical, SalesUnit from salesLine
                where salesLine.InventTransId == metInventTransferLine.SalesLineTransId
         {
             METInventTransReserveService reserveService;
@@ -341,30 +338,58 @@ public class METCrossDockSalesFinalizationFacade
 
             // reserve the TO receipt qty against the corresponding SO line
             reserveService.reserve(inventTransferLine.QtyReceived);
+            // Update the delivery remainder on the SO line
+            this.updateDeliveryReminder(inventTransferLine, salesLine);
+        }
+    }
 
-            //CB238 236447 Part 3 update delivery remainder
-            inventTable = InventTable::find(inventTransferLine.ItemId);
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDeliveryReminder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// If the transfer order line is not fully reserved, then update the delivery remainder on the sales line.
+    /// </summary>
+    /// <param name = "_inventTransferLine"><t>InventTransferLine</t> table buffer</param>
+    /// <param name = "_salesLine"><t>SalesLine</t> table buffer</param>
+    private void updateDeliveryReminder(InventTransferLine _inventTransferLine, SalesLine _salesLine)
+    {
+        //CB238 236447 Part 3 update delivery remainder
+        SalesQty qtyShortageSalesUnit;
+        InventTable inventTable;
+        boolean isFullyReserved;
+
+        select firstonly Product from inventTable
+            where inventTable.ItemId == _inventTransferLine.ItemId;
+
+        // Determine if the SO line is fully reserved
+        isFullyReserved = (_inventTransferLine.QtyTransfer <= _inventTransferLine.QtyReceived);
+
+        if (!isFullyReserved)
+        {
+            SalesQty qtyShortage = _inventTransferLine.QtyTransfer - _inventTransferLine.QtyReceived;
 
             // Get the unit of measure for the sales unit to update the delivery remainder
-            salesQty = UnitOfMeasureConverter::convert((inventTransferLine.QtyTransfer - inventTransferLine.QtyReceived),  
-               UnitOfMeasure::unitOfMeasureIdBySymbol(inventTable.inventUnitId()),
-               UnitOfMeasure::unitOfMeasureIdBySymbol(inventTable.salesUnitId()),
+            qtyShortageSalesUnit = UnitOfMeasureConverter::convert(qtyShortage,
+               UnitOfMeasure::unitOfMeasureIdBySymbol(_inventTransferLine.UnitId),
+               UnitOfMeasure::unitOfMeasureIdBySymbol(_salesLine.SalesUnit),
                NoYes::Yes,
-                InventTable::itemProduct(inventTransferLine.ItemId),
+               inventTable.Product,
                NoYes::Yes);
-
-            // Determine if the SO line is fully reserved
-            isFullyReserved = (salesLine.QtyOrdered <= salesLine.RemainSalesPhysical);
-
-            // Update the SO line's delivery remainder fields
-            SalesLine salesLineUpd = SalesLine::findInventTransId(salesLine.InventTransId, true);
-            if (salesLineUpd.RecId && !isFullyReserved) 
-            {
-                salesLineUpd.RemainSalesPhysical = salesQty; 
-                salesLineUpd.RemainInventPhysical = inventTransferLine.QtyTransfer - inventTransferLine.QtyReceived; 
-                salesLineUpd.update();
-            }
             
+            // Update the SO line's delivery remainder fields
+            SalesLine salesLineUpd = SalesLine::findInventTransId(_salesLine.InventTransId, true);
+
+            if (salesLineUpd)
+            {
+                SalesUpdateRemain salesUpdateRemain = SalesUpdateRemain::construct();
+                boolean updated = salesUpdateRemain.updateDeliverRemainder(
+                salesLineUpd,
+                salesLineUpd.RemainSalesPhysical - qtyShortageSalesUnit,
+                salesLineUpd.RemainInventPhysical - qtyShortage,
+                salesLineUpd.orig().PdsCWRemainInventPhysical - (_inventTransferLine.PdsCWQtyTransfer - _inventTransferLine.PdsCWQtyReceived));
+            }
         }
     }
 
