@@ -72,8 +72,71 @@ final class METSalesLine_Extension
         SalesTable      salesTable = SalesTable::find(this.SalesId);
         METSalesLine    metSalesLine;
 
-        //NS-Added for the Task 122004: CB274 - Intercompany Transfers
         boolean intercompanyTransferFulfillment = false; //C - Added for the Task 122004: CB274 - Intercompany Transfers
+
+        intercompanyTransferFulfillment = this.updateIntercompanySODetails();
+
+        next insert(_dropInvent, _findMarkup, _childBuffer, _skipCreditLimitCheck, _skipWHSProcesses, _interCompanyInventTransId );
+
+        metSalesLine = this.metSalesLine();
+
+        //NS-Added for the Task 122004: CB274 - Intercompany Transfers
+        if (intercompanyTransferFulfillment == true)
+        {
+            metSalesLine.ExcludeFromDualWrite = NoYes::Yes;
+        }
+        //NE-Added for the Task 122004: CB274 - Intercompany Transfers
+
+        // CB173 Sales Order Extract Screen V2 - refactor
+        this.metSetSalesUnitFields(metsalesLine);
+        this.metSetActualUnitFields(metsalesLine);
+        // CB871_CB872 Sales returns . Get unit in shipcase during return order line export
+        this.metSetWMSFactor(metsalesLine);
+
+        // Sales order Return / Claims
+        if (salesTable.SalesType == SalesType::ReturnItem)
+        {
+            this.metSetExciseDutyFields(metSalesLine);
+        }
+        // Sales order Return / Claims
+        
+        if (metSalesLine.RecId == 0)
+        {
+            this.metPackMETSalesLine(metSalesLine);
+            this.SysExtensionSerializerMap::postInsert();
+        }
+
+        //Start-BUG-240252
+        if (salesTable.METOrderExtractStatus != metSalesLine.OrderExtractStatus)
+        {
+            salesTable.selectForUpdate(true);
+            salesTable.metUpdateExtractStatus();
+        }
+        //End-BUG-240252
+
+        //NS - Added for Task 269070: CB887 - BlueYonder to D365 (Intercompany Fulfilment)
+        this.updatePOReplenishmentReference();
+        //NE - Added for Task 269070: CB887 - BlueYonder to D365 (Intercompany Fulfilment)
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateIntercompanySODetails</Name>
+				<Source><![CDATA[
+    // <summary>
+    /// Updates the intercompany sales order (SO) details based on fulfillment status from the originating company.
+    /// Added for the Task 122004: CB274 - Intercompany Transfers
+    /// </summary>
+    /// <returns>
+    /// Returns <c>true</c> if the originating intercompany sales order has been fulfilled and the current sales order's
+    /// inventory dimensions are updated accordingly; otherwise, returns <c>false</c>.
+    /// </returns>
+    public boolean updateIntercompanySODetails()
+    {
+        boolean     intercompanyTransferFulfillment = false;
+        SalesTable  salesTable                      = SalesTable::find(this.SalesId);
 
         if (salesTable.InterCompanyOrigin == InterCompanyOrigin::Derived)
         {
@@ -118,46 +181,52 @@ final class METSalesLine_Extension
                 this.InventDimId = inventDimLoc.inventDimId;
             }
         }
-        //NE-Added for the Task 122004: CB274 - Intercompany Transfers
+        return intercompanyTransferFulfillment;
+    }
 
-        next insert(_dropInvent, _findMarkup, _childBuffer, _skipCreditLimitCheck, _skipWHSProcesses, _interCompanyInventTransId );
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePOReplenishmentReference</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates the replenishment Sales order reference on the corresponding Purchase order line.
+    /// </summary>
+    /// <remarks>
+    /// This method attempts to find the matching <c>PurchLine</c> based on the replenishment PO reference
+    /// stored on the Sales line. It ensures that the <c>ItemId</c> and inventory dimensions (site, warehouse,
+    /// location) match between the Sales line and the Purchase line before updating the reference.
+    /// Once the correct <c>PurchLine</c> is identified, the method updates its <c>METReplenishmentSOReference</c>
+    /// field with the current Sales order ID, thereby establishing a cross-reference between the two documents.
+    /// </remarks>
+    public void updatePOReplenishmentReference()
+    {
+        PurchLine purchLine;
 
-        metSalesLine = this.metSalesLine();
-
-        //NS-Added for the Task 122004: CB274 - Intercompany Transfers
-        if (intercompanyTransferFulfillment == true)
+        if (this.METReplenishmentPOReference)
         {
-            metSalesLine.ExcludeFromDualWrite = NoYes::Yes;
-        }
-        //NE-Added for the Task 122004: CB274 - Intercompany Transfers
+            InventDim   salesInventDim = InventDim::find(this.InventDimId);
+            InventDim   purchInventDim;
 
-        // CB173 Sales Order Extract Screen V2 - refactor
-        this.metSetSalesUnitFields(metsalesLine);
-        this.metSetActualUnitFields(metsalesLine);
-        // CB871_CB872 Sales returns . Get unit in shipcase during return order line export
-        this.metSetWMSFactor(metsalesLine);
+            select firstonly forupdate purchLine
+                where purchLine.PurchId == this.METReplenishmentPOReference
+                && purchLine.ItemId == this.ItemId
+                && purchLine.PurchUnit == this.SalesUnit
+                && purchLine.PurchQty == this.SalesQty
+                    join purchInventDim
+                    where purchInventDim.InventSiteId == salesInventDim.InventSiteId
+                    && purchInventDim.InventLocationId == salesInventDim.InventLocationId
+                    && purchInventDim.wMSLocationId == salesInventDim.wMSLocationId;
 
-        // Sales order Return / Claims
-        if (salesTable.SalesType == SalesType::ReturnItem)
-        {
-            this.metSetExciseDutyFields(metSalesLine);
-        }
-        // Sales order Return / Claims
-        
-        if (metSalesLine.RecId == 0)
-        {
-            this.metPackMETSalesLine(metSalesLine);
-            this.SysExtensionSerializerMap::postInsert();
-        }
+            if (purchLine.RecId)
+            {
+                ttsbegin;
+                purchLine.METReplenishmentSOReference = this.SalesId;
+                purchLine.update();
+                ttscommit;
+            }
 
-        //Start-BUG-240252
-        if (salesTable.METOrderExtractStatus != metSalesLine.OrderExtractStatus)
-        {
-            salesTable.selectForUpdate(true);
-            salesTable.metUpdateExtractStatus();
         }
-        //End-BUG-240252
-
     }
 
 ]]></Source>
