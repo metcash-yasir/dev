@@ -11,6 +11,7 @@ class METReserveEventOrdersService extends METSysOperationService
 {
     private METReserveEventOrdersContract contract;
     private guid topPickingProcessId;
+    private Set salesIdSet;
     
 }
 ]]></Declaration>
@@ -69,6 +70,26 @@ class METReserveEventOrdersService extends METSysOperationService
     public void process(METReserveEventOrdersContract _contract)
     {
         this.processInternal(_contract);
+
+        // Bug 281545: CB515 - Not sending for repricing on Extraction
+        // After all threads are completed, update the order processing status to ready for pricing
+        if (salesIdSet && salesIdSet.elements() > 0)
+        {
+            SetEnumerator se = salesIdSet.getEnumerator();
+
+            while (se.moveNext())
+            {
+                SalesId salesId = se.current();
+
+                SalesTable salesTable = SalesTable::find(salesId);
+                METSalesTable metSalesTable = salesTable.metSalesTable();
+                ttsbegin;
+                metSalesTable.selectForUpdate(true);
+                metSalesTable.OrderProcessingStatus = METSalesOrderProcessingStatus::ReadyForPricing;
+                metSalesTable.update();
+                ttscommit;
+            }
+        }
     }
 
 ]]></Source>
@@ -80,10 +101,10 @@ class METReserveEventOrdersService extends METSysOperationService
     /// Initialise global variables.
     /// </summary>
     public void initialise()
-    {
+    {        
         super();
 
-        this.stageDataIntoQueue();
+        salesIdSet = this.stageDataIntoQueue();
     }
 
 ]]></Source>
@@ -94,9 +115,10 @@ class METReserveEventOrdersService extends METSysOperationService
     /// <summary>
     /// Stages data int table <c>METReserveEventOrdersQueue</c>.
     /// </summary>
-    void stageDataIntoQueue()
+    Set stageDataIntoQueue()
     {
         #OCCRetryCount
+        Set ret;
 
         contract            = dataContract as METReserveEventOrdersContract;
         topPickingProcessId = newGuid();
@@ -106,7 +128,7 @@ class METReserveEventOrdersService extends METSysOperationService
             ttsbegin;
 
             METReserveEventOrdersQueue::cleanUpReserveEventOrdersQueue();
-            this.stageEventOrders();
+            ret = this.stageEventOrders();
 
             ttscommit;
 
@@ -145,6 +167,8 @@ class METReserveEventOrdersService extends METSysOperationService
             // catch the errors so processing can continue
             curext(); // avoids a warning about an empty block
         }
+
+        return ret;
     }
 
 ]]></Source>
@@ -155,11 +179,12 @@ class METReserveEventOrdersService extends METSysOperationService
     /// <summary>
     /// Stages event orders.
     /// </summary>
-    private void stageEventOrders()
+    private Set stageEventOrders()
     {
         METReserveEventOrdersTmp   eventOrdersTmp;
         METReserveEventOrdersQueue eventOrdersQueue;
         Query                      query;
+        Set                        ret;
 
         query = contract.initQuery();
         /*
@@ -169,43 +194,14 @@ class METReserveEventOrdersService extends METSysOperationService
         */
         eventOrdersTmp = METReserveEventOrdersTmp::populateTmp(query);
         
-        /*
-        insert_recordset does support insert operation involving constants.
-        Hence, records from the temp table are inserted with the constant value for ProcessId.
-        */
-        InventParameters inventParameter = InventParameters::find();
-        CompanyInfo companyInfo = CompanyInfo::find();
+        insert_recordset eventOrdersQueue(ProcessId, SalesLineTransId, POLink)
+        select topPickingProcessId, SalesLineTransId, POLink from eventOrdersTmp;     
 
-        //CB238 - If supply from transfer orders is enabled, 
-        //then, do not attempt reservation/substitution for orders with below conditions
-        // 1. Sales order is marked as an internal cross dock order
-        // 2. if the Warehouse is a CSD warehouse
-        if(!inventParameter.METSupplyFromTransfer)
-        {
-            insert_recordset eventOrdersQueue(ProcessId, SalesLineTransId, POLink)
-            select topPickingProcessId, SalesLineTransId, POLink from eventOrdersTmp;
-        }
-        else
-        {
-            SalesLine salesLine;
-            SalesTable salesTable;
-            METSalesTable metSalesTable;
-            InventLocation inventLocation;
+        // Bug 281545: CB515 - Not sending for repricing on Extraction
+        // Get the SalesId for the query used to populate the queue so we can update the order processing status to ready for pricing at the end
+        ret = this.initSalesIdset(eventOrdersTmp);
 
-            insert_recordset eventOrdersQueue(ProcessId, SalesLineTransId, POLink)
-            select topPickingProcessId, SalesLineTransId, POLink from eventOrdersTmp
-                exists join salesLine
-                where salesLine.InventTransId == eventOrdersTmp.SalesLineTransId
-                exists join salesTable
-                where salesTable.SalesId == salesLine.SalesId
-                exists join metSalesTable
-                where metSalesTable.SalesTable == salesTable.RecId
-                && metSalesTable.InternalCrossDockOrder == NoYes::No
-                exists join inventLocation
-                where inventLocation.InventLocationId == salesTable.InventLocationId
-                && inventLocation.METCSDWarehouse == NoYes::No;
-
-        }
+        return ret;
     }
 
 ]]></Source>
@@ -237,6 +233,32 @@ class METReserveEventOrdersService extends METSysOperationService
     protected METSysOperationTaskDataContract taskDataContractObject()
     {
         return new METReserveEventOrdersContract();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initSalesIdSet</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialises the salesId set from the temp table.
+    /// </summary>
+    /// <param name = "_eventOrdersTmp">Reserve event orders temp table</param>
+    /// <returns>Set of salesId</returns>
+    Set initSalesIdSet(METReserveEventOrdersTmp _eventOrdersTmp)
+    {
+        SalesLine salesLine;
+        Set ret = new Set(Types::String);
+
+        while select _eventOrdersTmp
+                join salesLine
+            group by salesLine.SalesId
+               where salesLine.InventTransId == _eventOrdersTmp.SalesLineTransId            
+        {
+            ret.add(salesLine.SalesId);
+        }
+
+        return ret;
     }
 
 ]]></Source>
