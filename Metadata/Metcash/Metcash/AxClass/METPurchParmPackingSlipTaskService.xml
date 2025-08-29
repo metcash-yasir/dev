@@ -59,6 +59,12 @@ class METPurchParmPackingSlipTaskService extends METSysOperationTaskService
             }
 
             ttscommit;
+
+            //CB256, CB257, CB260 – Purchase Order Receipt Details- new changes w.r.t cancel PO lines
+            if (purchParmTable && !METPurchTable::find(purchParmTable.PurchId).POBackOrderSetting)
+            {
+                this.cancelPOLinesForZeroQtyAndSubmitToWorkfLow(purchParmTable.PurchId);
+            }
         }
         while (purchParmTable);
     }
@@ -74,7 +80,7 @@ class METPurchParmPackingSlipTaskService extends METSysOperationTaskService
     private void execute()
     {
         parmId = purchParmTable.ParmId;
-
+       
         //CB369 -ImportedItemsReceiving - start
         if (PurchTable::find(purchParmTable.PurchId).PurchStatus == PurchStatus::Invoiced)
         {
@@ -86,7 +92,6 @@ class METPurchParmPackingSlipTaskService extends METSysOperationTaskService
             this.registerPurchLine();
             this.postPackingSlip();
         }
-        
     }
 
 ]]></Source>
@@ -314,6 +319,143 @@ class METPurchParmPackingSlipTaskService extends METSysOperationTaskService
                                                                                                                   DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));
         
         updateReceived.run();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelPOLinesForZeroQtyAndSubmitToWorkfLow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancel PO lines for zero qty on parm lines and submit to workflow
+    /// </summary>
+    /// <param name = "_purchId">PurchId</param>
+    public void cancelPOLinesForZeroQtyAndSubmitToWorkfLow(PurchId _purchId)
+    {
+        #OCCRetryCount
+
+        try
+        {
+            PurchParmLine   purchParmLine;
+            PurchLine       purchLine;
+            PurchTable      purchTable;
+
+            this.performChangeRequest(_purchId);
+
+            ttsbegin;
+            while select LineNum, ItemId from purchParmLine
+                where purchParmLine.ParmId ==  purchParmTable.ParmId                
+                && purchParmLine.PdsCWPreviousReceiveNow == 0
+                && purchParmLine.PdsCWReceiveNow == 0
+                && purchParmLine.ReceiveNow == 0
+            join purchLine
+                where purchLine.PurchId == purchParmTable.PurchId
+                && purchLine.LineNumber == purchParmLine.LineNum
+                && purchLine.ItemId == purchParmLine.ItemId
+                && purchLine.IsDeleted == NoYes::No
+                && purchLine.PurchStatus != PurchStatus::Canceled
+            {
+                purchLine.selectForUpdate(true);
+                purchLine.RemainInventPhysical  = 0;
+                purchLine.RemainPurchPhysical   = 0;
+                purchLine.PdsCWRemainInventPhysical = 0;
+                purchLine.update();
+            }
+
+            ttscommit;
+
+            // Run the workflow post the delivery remainder
+            this.submitToWorkflow(_purchId);
+           
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Error)
+        {
+            throw error("@SYS93835");
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>performChangeRequest</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Auto execute the request change
+    /// </summary>
+    /// <param name = "_purchId">Purch id</param>
+    private void performChangeRequest(PurchId _purchId)
+    {
+        PurchTable purchTable;
+   
+        ttsbegin;
+        select forupdate purchTable where purchTable.PurchId  == _purchId;
+        VersioningPurchaseOrder::newPurchaseOrder(purchTable).createChangeRequest();
+        ttscommit;
+
+        if (purchTable.DocumentState == VersioningDocumentState::Draft
+                && purchTable.ChangeRequestRequired)
+        {
+            SourceDocumentHeader    sourceDocumentHeader;
+            SourceDocumentLine      sourceDocumentLine;
+
+            sourceDocumentHeader = SourceDocumentHeader::find(purchTable.SourceDocumentHeader);
+            AccountingDistributionProcessor::cacheAccountingDistNumbersForHeader(sourceDocumentHeader);
+
+            while select sourceDocumentLine
+                where sourceDocumentLine.SourceDocumentHeader == sourceDocumentHeader.RecId
+                && sourceDocumentLine.ParentSourceDocumentLine == 0
+                && (sourceDocumentLine.AccountingStatus == SourceDocumentLineAccountingStatus::FullyDistributed)
+            {
+                SourceDocumentProcessorFacade::submitSourceDocumentLineImplementation(sourceDocumentLine.getSourceDocumentLineImplementation(),
+                        false,
+                        SourceDocumentLineAccountingStatus::Draft);
+            }
+
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>submitToWorkflow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Submit purchase order to workflow
+    /// </summary>
+    /// <param name = "_purchId">Purch id</param>
+    public void submitToWorkflow(PurchId _purchId)
+    {
+        PurchTable purchTable;
+
+        ttsbegin;
+        select forupdate purchTable where purchTable.PurchId  == _purchId;        
+        purchTable.selectForUpdate(true);
+        purchTable.submitToWorkflow(workflowTypeStr(PurchTableTemplate), '', false);
+        ttscommit;
     }
 
 ]]></Source>
