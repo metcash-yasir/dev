@@ -9,7 +9,6 @@
 [ExtensionOf(tablestr(PurchLine))]
 final class METPurchLine_Extension
 {
-
 }
 ]]></Declaration>
 		<Methods>
@@ -47,27 +46,6 @@ final class METPurchLine_Extension
 
                 break;
         }
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>metCancelPurchaseOrderLine</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Cancel purchase order line
-    /// </summary>
-    public void metCancelPurchaseOrderLine()
-    {
-        PurchLine purchLine = PurchLine::findRecId(this.RecId, true);
-        
-        ttsbegin;
-        purchLine.RemainInventPhysical       = 0;
-        purchLine.RemainPurchPhysical        = 0;
-        purchLine.PdsCWRemainInventPhysical  = 0;
-
-        purchLine.update();
-        ttscommit;
     }
 
 ]]></Source>
@@ -816,6 +794,175 @@ final class METPurchLine_Extension
         {
             warning(strFmt("@MET:OneOrMoreLinesNotSetWithBarcodeOrUnitprice"));
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copyToNewLineFromNewSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copy the new sales line (After substituted from IOM) to a new purch line on the reference PO.
+    /// </summary>
+    /// <param name = "_salesLineNew">Sales line</param>
+    /// <returns>Purchase line</returns>
+    public PurchLine copyToNewLineFromNewSalesLine(SalesLine _salesLineNew)
+    {
+        PurchTable              purchTable;
+        PurchLine               purchLineNew, purchLineExisting;
+        METPurchLine            metPurchLineNew, metPurchLineExisting;
+        InventItemPurchSetup    purchSetup;
+
+        purchTable              = PurchTable::find(_salesLineNew.METReplenishmentPOReference);
+        purchLineExisting       = this.getExistingPurchLine(_salesLineNew, true);
+        metPurchLineExisting    = purchLineExisting.metPurchLine();
+        
+        ttsbegin;
+        buf2Buf(metPurchLineExisting, metPurchLineNew);
+
+        metPurchLineExisting = METPurchLine::find(purchLineExisting.RecId, true);
+        
+        metPurchLineExisting.ChangeReasonCode = METVendParameters::find().POChangeReasonCode;;
+        metPurchLineExisting.update();
+
+        metPurchLineNew.PurchLine = 0;
+
+        purchLineNew.initFromPurchTable(purchTable);
+        purchLineNew.initFromPurchLine(purchLineExisting, true, true, true);
+
+        purchLineNew.ItemId             = _salesLineNew.ItemId;
+        purchLineNew.PackedExtensions   = conNull();
+        purchLineNew.PurchUnit          = InventItemPurchSetup::find(purchLineNew.ItemId, purchLineNew.InventDimId).METPurchUnit;
+        
+        purchLineNew.itemIdChanged();
+        purchLineNew.PurchQty = _salesLineNew.SalesQty;
+        
+        PurchLine::modifyPurchQty(purchLineNew, purchLineNew.inventDim(), false);
+        
+        purchLineNew.metPackMETPurchLine(metPurchLineNew);
+        purchLineNew.LineAmount = 0;
+        purchLineNew.PriceUnit  = 0;
+
+        purchLineNew.createLine(true, false, false, false, false);
+
+        ttscommit;
+
+        METPurchaseOrderProcessHelper::confirmPurchaseOrder(purchTable.PurchId);
+
+        return purchLineNew;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getExistingPurchLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the existing purchase order line which was cancelled at the time of sales line substitution through IOM.
+    /// </summary>
+    /// <param name = "_salesLine">Sales line</param>
+    /// <param name = "_getCanclledLine">Decides whether a cancelled line or open lines to be returned</param>
+    /// <returns></returns>
+    public PurchLine getExistingPurchLine(SalesLine _salesLine, boolean _getCanclledLine)
+    {
+        PurchLine   existingPurchLine, retPurchLine;
+
+        if (!_getCanclledLine)
+        {
+            select firstonly existingPurchLine
+                where existingPurchLine.PurchId == _salesLine.METReplenishmentPOReference
+                && existingPurchLine.ItemId == _salesLine.ItemId
+                && existingPurchLine.PurchUnit == _salesLine.SalesUnit
+                && existingPurchLine.PurchStatus != PurchStatus::Canceled;
+
+            if (existingPurchLine.RecId)
+            {
+                retPurchLine = existingPurchLine;
+            }
+        }
+        else if (_getCanclledLine)
+        {
+            select firstonly existingPurchLine
+                where existingPurchLine.PurchId == _salesLine.METReplenishmentPOReference
+                && existingPurchLine.ItemId == _salesLine.ItemId
+                && existingPurchLine.PurchUnit == _salesLine.SalesUnit
+                && existingPurchLine.PurchStatus == PurchStatus::Canceled;
+
+            if (existingPurchLine.RecId)
+            {
+                retPurchLine = existingPurchLine;
+            }
+        }
+
+        return retPurchLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metCancelPurchLineFromSalesLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Substitute the reference PO line from a substituted sales line when done through IOM.
+    /// </summary>
+    public void metCancelPurchLineFromSalesLine()
+    {
+        PurchLine purchLine = PurchLine::findRecId(this.RecId);
+
+        ttsbegin;
+        purchLine.selectForUpdate(true);
+
+        purchLine.RemainInventPhysical       = 0;
+        purchLine.RemainPurchPhysical        = 0;
+        purchLine.PdsCWRemainInventPhysical  = 0;
+        purchLine.update();
+
+        InventMovement::bufferSetRemainQty(purchLine);
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getProductReceiptForReplenishmentOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the packing slip id from the referenced sales order.
+    /// </summary>
+    /// <param name = "_purchId"></param>
+    /// <returns></returns>
+    public static PackingSlipId getProductReceiptForReplenishmentOrder(PurchId _purchId)
+    {
+        SalesId         salesId;
+        FormRun         formRun;
+        PurchLine       purchLine;
+        PurchParmLine   purchParmLine;
+        PackingSlipId   packingSlipId;
+        PurchParmTable  purchParmTable;
+        CustPackingSlipJour custPackingSlipJour;
+
+        select firstonly METReplenishmentSOReference from purchLine
+            where purchLine.PurchId == _purchId
+            && purchLine.PurchStatus == PurchStatus::Backorder
+            && purchLine.METReplenishmentSOReference != '';
+
+        if (purchLine.METReplenishmentSOReference)
+        {
+            changecompany(InventParameters::find().METInternalCustLegelEntity)
+            {
+                // Find the corresponding packing slip journal for the sales order.
+                // We order by CreatedDateTime descending to get the latest one, but this can be adjusted.
+                select firstonly PackingSlipId from custPackingSlipJour
+                    where custPackingSlipJour.SalesId == purchLine.METReplenishmentSOReference;
+
+                if (custPackingSlipJour.PackingSlipId)
+                {
+                    packingSlipId = custPackingSlipJour.PackingSlipId;
+                }
+            }
+        }
+
+        return packingSlipId;
     }
 
 ]]></Source>
