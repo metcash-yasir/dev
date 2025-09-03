@@ -9,104 +9,200 @@
 /// </summary>
 class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
 {
-    List                    itemList;
-    List                    siteList;
-    boolean                 filterItemSite;
-    str                     currUser                = curUserId();
-    RecordInsertList        recordInsertListItemSite = new RecordInsertList(tableNum(METExciseSiteDutySetup));
-
+    METDutyAdValorumClaimGenerateContract   dataContract;
+    METDutyAdValorumClaimTmp                dutyAdValorumClaimTmp;
+    List                                    itemList;
+    List                                    siteList;
+    boolean                                 filterItemSite;
+    boolean                                 generateClaim;
+    int                                     totalTasks;
+    
 }
 ]]></Declaration>
 		<Methods>
 			<Method>
-				<Name>processOperation</Name>
-				<Source>
-					<![CDATA[
+				<Name>scheduleTasks</Name>
+				<Source><![CDATA[
+    // <summary>
+    /// Schedules tasks
     /// <summary>
-    /// main process method
-    /// </summary>
-    /// <param name = "_dataContract">Contract</param>
-    public void processOperation(METDutyAdValorumClaimGenerateContract _dataContract)
+    public void scheduleTasks()
     {
-        METVendClaimProcessHelper   vendClaimProcessHelper;
-        METDutyRollVariance     dutyRollVarianceGrouped;
-        METDutyRollVariance     dutyRollVariance;
-        METDutyRollVariance     dutyRollVarianceDelete;
-        METExciseSiteDutySetup  exciseSiteDutySetup;
-        METInventTable          metInventTable;
-        METTariffItemCode       tariffItemCode;
-        RecordInsertList        recordInsertList = new RecordInsertList(tableNum(METExciseSiteDutySetup));
-        boolean dutyBySite  = _dataContract.parmDutyValuesBySite();
-        boolean generateClaim = _dataContract.parmGenerateClaims();
-        UserId                  batchUser = curUserId();
+        #OCCRetryCount
 
-        filterItemSite          = _dataContract.parmFilterItemSite();
-        itemList                = _dataContract.parmItemList();
-        siteList                = _dataContract.parmSiteList();
+        METDutyAdValorumClaimGenerateContract  taskContract;
+        SysOperationServiceController          controller;
+        Int                                    bundlesize;
+        BatchHeader                            batchHeader;
+        int                                    counter = 0;
+        Int                                    numOfOrders = this.getTotalRecords();
+        container                              conItems;
+        Set                                    tasks;
+
+        bundleSize = real2int(roundUp((numOfOrders / totalTasks), 1.0));
+
+        Info(strFmt("Number of records: %1", numOfOrders));
+        Info(strFmt("BundleSize : %1", bundleSize));
+
+        batchHeader  = this.getCurrentBatchHeader();
+        tasks = new Set(Types::Class);
+
+        if (batchHeader == null)
+        {
+            batchHeader = batchHeader::construct();
+        }
+
+        try
+        {
+            while select dutyAdValorumClaimTmp
+            {
+                counter += 1;
+
+                if (counter == 1)
+                {
+                    conItems = conNull();
+                }
+
+                conItems += [dutyAdValorumClaimTmp];
+    
+                if (counter == bundlesize)
+                {
+                    controller      = new SysOperationServiceController(
+                                                    classStr(METDutyAdValorumClaimGenerateJob),
+                                                    methodStr(METDutyAdValorumClaimGenerateJob, process));
+
+                    controller.parmDialogCaption(strFmt("@MET:GenerateAdValorumClaimSubTask", counter));
+
+                    taskContract = controller.getDataContractObject() as METDutyAdValorumClaimGenerateContract;
+                    
+                    taskContract.parmConItems(conItems);
+                    taskContract.parmDutyValuesBySite(dataContract.parmDutyValuesBySite());
+                    taskContract.parmFilterItemSite(dataContract.parmFilterItemSite());
+                    taskContract.parmGenerateClaims(dataContract.parmGenerateClaims());
+                   
+                    batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
+                    tasks.add(controller);
+
+                    counter = 0;
+                }
+            }
+
+            if (counter > 0)
+            {
+                controller      = new SysOperationServiceController(
+                                                    classStr(METDutyAdValorumClaimGenerateJob),
+                                                    methodStr(METDutyAdValorumClaimGenerateJob, process));
+
+                controller.parmDialogCaption(strFmt("@MET:GenerateAdValorumClaimSubTask", counter));
+
+                taskContract = controller.getDataContractObject() as METDutyAdValorumClaimGenerateContract;
+
+                taskContract.parmConItems(conItems);
+                taskContract.parmDutyValuesBySite(dataContract.parmDutyValuesBySite());
+                taskContract.parmFilterItemSite(dataContract.parmFilterItemSite());
+                taskContract.parmGenerateClaims(dataContract.parmGenerateClaims());
+
+                batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
+                tasks.add(controller);
+            }
+
+            if (generateClaim)
+            {
+                this.scheduleFinalTaskToProcessClaims(batchHeader, tasks);
+            }
+              
+            batchHeader.save();
+        }
+        catch(Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>scheduleFinalTaskToProcessClaims</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Schedules final task to process claims.
+    /// </summary>
+    /// <param name = "_batchHeader">Batch header.</param>
+    /// <param name = "_tasks">Tasks.</param>
+    private void scheduleFinalTaskToProcessClaims(BatchHeader _batchHeader, Set _tasks)
+    {
+        METDutyAdValorumClaimGenerateContract  contract;
+        SysOperationServiceController controller;
+        SetEnumerator tasksEnum;
+        int subTask;
+
+        controller  = new SysOperationServiceController(
+                                                    classStr(METDutyAdValorumClaimGenerateJob),
+                                                    methodStr(METDutyAdValorumClaimGenerateJob, processFinalClaims));
+
+        subTask = _tasks.elements() + 1;
+
+        controller.parmDialogCaption(strFmt("@MET:GenerateAdValorumClaimSubTask", subTask));
+        
+        contract = controller.getDataContractObject() as METDutyAdValorumClaimGenerateContract;
+
+        contract.parmPhysicalTableName(dutyAdValorumClaimTmp.getPhysicalTableName());
+        _batchHeader.addTask(controller);
+
+        tasksEnum =_tasks.getEnumerator();
+
+        while (tasksEnum && tasksEnum.moveNext())
+        {
+            SysOperationServiceController taskController = tasksEnum.current();
+            _batchHeader.addDependency(controller, taskController, BatchDependencyStatus::Finished);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateDataInTmp</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generate data in tmp table.
+    /// </summary>
+    private void generateDataInTmp()
+    {
+        
+        METDutyRollVariance         dutyRollVarianceGrouped;
+        METDutyRollVariance         dutyRollVariance;
+        METExciseSiteDutySetup      exciseSiteDutySetup;
         
         if (generateClaim)
         {
-            vendClaimProcessHelper = new METVendClaimProcessHelper();
-            vendClaimProcessHelper.initParameters();
-            vendClaimProcessHelper.initLedgerJournalParm();
-            vendClaimProcessHelper.createLedgerJournalTable();
+            this.deleteDutyRollVariance();
         }
 
         if (!filterItemSite)
         {
-            while select dutyRollVarianceGrouped
-                group by ItemId, Site
-                where dutyRollVarianceGrouped.InventTransType == InventTransType::Purch
-        
-            {
-                select firstonly dutyRollVariance
-                order by CreatedDateTime
-                where dutyRollVariance.ItemId == dutyRollVarianceGrouped.ItemId
-                    && dutyRollVariance.Site == dutyRollVarianceGrouped.Site
-                    && dutyRollVariance.InventTransType == InventTransType::Purch;
-
-                if (dutyBySite)
-                {
-                    metInventTable = metInventTable::find(dutyRollVariance.ItemId);
-                    exciseSiteDutySetup = METExciseSiteDutySetup::find(dutyRollVariance.Site, dutyRollVariance.ItemId);
-
-                    METDutyRollValuesTable dutyRollValuesTable;
-                    METDutyRollValuesLine dutyRollValuesLine;
-
-                    select firstonly AverageVFD, TotalDutyPerCase from dutyRollValuesLine
-                        exists join dutyRollValuesTable
-                        where dutyRollValuesTable.RecId == dutyRollValuesLine.RefRecId
-                        && dutyRollValuesLine.Site == dutyRollVarianceGrouped.Site
-                        && dutyRollValuesLine.ItemId == dutyRollVarianceGrouped.ItemId
-                        && dutyRollValuesTable.Status == METDutyRollStatus::Active;
-
-                    exciseSiteDutySetup.ValueForDuty    = dutyRollValuesLine.AverageVFD;
-                    tariffItemCode  = METTariffItemCode::findRecId(metInventTable.METTariffItemCodeBaseRecid);
-                    //Duty amount = (pack size * Bottlesize * (AlcStrn/100) * Duty-LAL) + (VFD * (Adval Rate/100))
-
-                    exciseSiteDutySetup.DutyTotal   = dutyRollValuesLine.TotalDutyPerCase;
-                    exciseSiteDutySetup.CalcDate    = DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone());
-                    exciseSiteDutySetup.RunBy       = batchUser;
-                    if (exciseSiteDutySetup.RecId)
-                    {
-                        ttsbegin;
-                        exciseSiteDutySetup.selectForUpdate(true);
-                        exciseSiteDutySetup.update();
-                        ttscommit;
-                    }
-                    else
-                    {
-                        exciseSiteDutySetup.ItemId  = dutyRollVariance.ItemId;
-                        exciseSiteDutySetup.SiteId  = dutyRollVariance.Site;
-                        recordInsertList.add(exciseSiteDutySetup);
-                    }
-                }
-                if (generateClaim && dutyRollVariance.ClaimAmount != 0)
-                {
-                    vendClaimProcessHelper.parmDutyRollVariance(dutyRollVariance);
-                    vendClaimProcessHelper.processForDutyVariance();
-                }
-            }
+            insert_recordset dutyAdValorumClaimTmp (ItemId, Site)
+                select ItemId, Site from dutyRollVarianceGrouped
+                        group by ItemId, Site
+                    where dutyRollVarianceGrouped.InventTransType == InventTransType::Purch
+                        && dutyRollVarianceGrouped.ClaimCreated == NoYes::No;
         }
         else
         {
@@ -116,11 +212,10 @@ class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
 
                 while (iter.moveNext())
                 {
-                    InventSiteId siteId  = iter.current(); 
+                    InventSiteId siteId  = iter.current();
                     this.processSite(siteId);
                 }
 
-                recordInsertListItemSite.insertDatabase();
             }
             else if (!itemList.empty())
             {
@@ -132,23 +227,64 @@ class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
                 {
                     this.processSite(dutyRollVarianceGroupedSite.Site);
                 }
-                recordInsertListItemSite.insertDatabase();
             }
         }
+    }
 
-        if (dutyBySite & !filterItemSite)
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// main process method
+    /// </summary>
+    /// <param name = "_dataContract">Contract</param>
+    public void processOperation(METDutyAdValorumClaimGenerateContract _dataContract)
+    {
+        try
         {
-            recordInsertList.insertDatabase();
-        }
-        if (generateClaim)
-        {
-            vendClaimProcessHelper.postLedgerJournal();
+            ttsbegin;
 
-            delete_from dutyRollVarianceDelete
-                where dutyRollVarianceDelete.SiteSpeceificDutyUpdated == NoYes::Yes
-                && dutyRollVarianceDelete.ClaimCreated == NoYes::Yes
-				&& dutyRollVarianceDelete.InventTransType == InventTransType::Purch;
+            filterItemSite = _dataContract.parmFilterItemSite();
+            itemList       = _dataContract.parmItemList();
+            siteList       = _dataContract.parmSiteList();
+            generateClaim  = _dataContract.parmGenerateClaims();
+            totalTasks     = _dataContract.parmParallelTasksNumber();
+            dataContract   = _dataContract;
+
+            this.generateDataInTmp();
+            this.scheduleTasks();
+
+            ttscommit;
         }
+        catch
+        {
+            error ("@WAX:UpdateCancelled");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteDutyRollVariance</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes duty roll variance records created before the current month.
+    /// </summary>
+    private void deleteDutyRollVariance()
+    {
+        METDutyRollVariance     dutyRollVariance;
+
+        utcdatetime systemDateTime = DateTimeUtil::getSystemDateTime();
+        utcdatetime dateTimeStartMth = DateTimeUtil::newDateTime(DateTimeUtil::date(DateTimeUtil::addDays(systemDateTime, 1 - DateTimeUtil::day(systemDateTime))), 0);
+        
+        ttsbegin;
+        delete_from dutyRollVariance
+            where dutyRollVariance.ClaimCreated == NoYes::Yes
+               && dutyRollVariance.CreatedDateTime < dateTimeStartMth
+               && dutyRollVariance.InventTransType == InventTransType::Purch;
+        ttscommit;
     }
 
 ]]></Source>
@@ -162,80 +298,47 @@ class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
     /// <param name = "_siteId">InventSiteId</param>
     public void processSite(InventSiteId _siteId)
     {
+        RecordInsertList dutyAdValorumClaimList;
+        METDutyAdValorumClaimTmp dutyAdValorumClaimTmpLocal;
+
         if (!itemList.empty())
         {
             ListEnumerator iter = itemList.getEnumerator();
+            dutyAdValorumClaimList = new RecordInsertList(tableNum(METDutyAdValorumClaimTmp), true, true, true, true, true, dutyAdValorumClaimTmp);
 
             while (iter.moveNext())
             {
-                ItemId itemId  = iter.current();
-                this.processItemSite(_siteId, itemId);
+                ItemId itemId = iter.current();
+
+                dutyAdValorumClaimTmpLocal.clear();
+
+                dutyAdValorumClaimTmpLocal.Site = _siteId;
+                dutyAdValorumClaimTmpLocal.ItemId = ItemId;
+
+                dutyAdValorumClaimList.add(dutyAdValorumClaimTmpLocal);
             }
+
+            ttsbegin;
+            dutyAdValorumClaimList.insertDatabase();
+            ttscommit;
         }
+
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>processItemSite</Name>
+				<Name>getTotalRecords</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Process site & item
+    /// Get the total number records to be processed
     /// </summary>
-    /// <param name = "_siteId">InventSiteId</param>
-    /// <param name = "_itemId">ItemId</param>
-    public void processItemSite(InventSiteId _siteId, ItemId _itemId)
+    /// <returns>Count</returns>
+    public int getTotalRecords()
     {
-        METDutyRollVariance     dutyRollVariance;
-
-        select firstonly dutyRollVariance
-            order by CreatedDateTime
-            where dutyRollVariance.ItemId == _itemId
-                && dutyRollVariance.Site == _siteId
-                && dutyRollVariance.InventTransType == InventTransType::Purch;
-
-        if (dutyRollVariance)
-        {
-            MetInventTable          metInventTable = METInventTable::find(dutyRollVariance.ItemId);
-            METExciseSiteDutySetup  exciseSiteDutySetup = METExciseSiteDutySetup::find(dutyRollVariance.Site, dutyRollVariance.ItemId);
-
-            METDutyRollValuesTable dutyRollValuesTable;
-            METDutyRollValuesLine dutyRollValuesLine;
-
-            select firstonly AverageVFD, TotalDutyPerCase from dutyRollValuesLine
-                exists join dutyRollValuesTable
-                where dutyRollValuesTable.RecId == dutyRollValuesLine.RefRecId
-                && dutyRollValuesLine.Site == _siteId
-                && dutyRollValuesLine.ItemId == _itemId
-                && dutyRollValuesTable.Status == METDutyRollStatus::Active;
-
-            exciseSiteDutySetup.ValueForDuty    = dutyRollValuesLine.AverageVFD;
-            METTariffItemCode tariffItemCode    = METTariffItemCode::findRecId(metInventTable.METTariffItemCodeBaseRecid);
-            //Duty amount = (pack size * Bottlesize * (AlcStrn/100) * Duty-LAL) + (VFD * (Adval Rate/100))
-
-            exciseSiteDutySetup.DutyTotal   = dutyRollValuesLine.TotalDutyPerCase;
-            exciseSiteDutySetup.CalcDate    = DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone());
-            exciseSiteDutySetup.RunBy       = currUser;
-            if (exciseSiteDutySetup.RecId)
-            {
-                ttsbegin;
-                exciseSiteDutySetup.selectForUpdate(true);
-                exciseSiteDutySetup.update();
-                ttscommit;
-            }
-            else
-            {
-                exciseSiteDutySetup.ItemId  = dutyRollVariance.ItemId;
-                exciseSiteDutySetup.SiteId  = dutyRollVariance.Site;
-                recordInsertListItemSite.add(exciseSiteDutySetup);
-            }
-            ttsbegin;
-            dutyRollVariance.selectForUpdate(true);
-            dutyRollVariance.SiteSpeceificDutyUpdated   = NoYes::Yes;
-            dutyRollVariance.ClaimCreated               = NoYes::No;
-            dutyRollVariance.update();
-            ttscommit;
-        }
+        select count(RecId) from dutyAdValorumClaimTmp;
+        
+        return int642int(dutyAdValorumClaimTmp.RecId);
     }
 
 ]]></Source>
