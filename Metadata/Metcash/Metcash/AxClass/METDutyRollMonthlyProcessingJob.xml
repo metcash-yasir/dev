@@ -8,6 +8,10 @@ final class METDutyRollMonthlyProcessingJob
     boolean             runForExcise;
     RecordInsertList    recordInsertList;
     TransDate           startDate;    
+    private TransDate   effectiveDate;
+    private boolean     cpi;
+    private utcdatetime effectiveDateTime;
+
 
 }
 ]]></Declaration>
@@ -16,8 +20,9 @@ final class METDutyRollMonthlyProcessingJob
 				<Name>process</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Main processing method
-    /// <summary>
+    /// Main process method
+    /// </summary>
+    /// <param name = "_contract">_contract</param>
     public void process(METDutyRollMonthlyContract _contract) 
     {
         #OCCRetryCount
@@ -29,9 +34,12 @@ final class METDutyRollMonthlyProcessingJob
         try
         {
             ttsbegin;
-            runForExcise    = _contract.parmRunForExcise();
-            startDate       = _contract.parmStartDate();
-            conItems        = _contract.parmConItems();
+            runForExcise        = _contract.parmRunForExcise();
+            startDate           = _contract.parmStartDate();
+            conItems            = _contract.parmConItems();
+            effectiveDate       = _contract.parmEffectiveDate();
+            effectiveDateTime   = DateTimeUtil::newDateTime(_contract.parmEffectiveDate(), 0);
+            cpi                 = _contract.parmCpi();
 
             recordInsertList    = new RecordInsertList(tableNum(METDutyRollValuesLine));
          
@@ -100,11 +108,11 @@ final class METDutyRollMonthlyProcessingJob
         dutyRollValuesLine.ItemName     = inventTable.NameAlias;
         dutyRollValuesLine.Unit         = inventTable.salesUnitId();
         dutyRollValuesLine.AverageVFD   = this.calcAvgDutyCase(_itemId, _siteId);
-        tariffItemCode                  = METTariffItemCode::findRecId(metInventTable.METTariffItemCodeBaseRecid);
+        tariffItemCode                  = METTariffItemCode::findRecId(metInventTable.METTariffItemCodeBaseRecid,effectiveDate);
         //Duty amount = (pack size * Bottlesize * (AlcStrn/100) * Duty-LAL) + (VFD * (Adval Rate/100))
         dutyRollValuesLine.TotalDutyPerCase = metInventTable.ItemPack * metInventTable.BottleSize * (metInventTable.AlcoholContent/100) * tariffItemCode.DutyLAL + (dutyRollValuesLine.AverageVFD * tariffItemCode.AdValoremOrBeerSubsidyRate/100);
 
-        if(runForExcise)
+        if(runForExcise || cpi)
         {
             exciseSiteDutySetup = METExciseSiteDutySetup::find(_siteId, _itemId, true);
             if (exciseSiteDutySetup.RecId)
@@ -132,7 +140,7 @@ final class METDutyRollMonthlyProcessingJob
     /// <param name = "_itemId">ItemId</param>
     /// <param name = "_siteId">InventSiteId</param>
     /// <returns>METValueForDuty</returns>
-    private METValueForDuty calcAvgDutyCase(ItemId   _itemId, InventSiteId   _siteId)
+    private METValueForDuty calcAvgDutyCase(ItemId _itemId, InventSiteId _siteId)
     {
         METValueForDuty avgDuty;
         METExciseInformationTable   exciseInformationTable;
@@ -143,20 +151,27 @@ final class METDutyRollMonthlyProcessingJob
         TransDateTime               currentDateTime;
         TransDate                   transDate;
         int                         countRecords;
+        InventTransferLine          inventTransferLine;
         Amount                      dutyRateReceived = 0;
+        METPOTODutyRecords          metPOTODutyRecords;
+        RecordInsertList            recordInsertListTmp;
 
-        transDate = DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone());
+        recordInsertListtmp = new RecordInsertList(tableNum(METDutyRollMonthlyTmp), true, true, true, true, true, metPOTODutyRecords);
+
+        transDate = effectiveDate;//DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone());
         endDateTime = DateTimeUtil::addSeconds(DateTimeUtil::newDateTime(transDate+1, 0), - 1);
         transDate = mkDate(1, mthOfYr(transDate), year(transDate));
         startDateTime = DateTimeUtil::newDateTime(transDate, 0);
-        currentDateTime = DateTimeUtil::utcNow();
 
-        while select firstonly10 validtimestate(currentDateTime) DutyRateReceived from exciseRegisterEntry
+        if (this.isCurrentOrFutureMonth(effectiveDate))
+        {
+            // future date
+            while select firstonly10 DutyRateReceived from exciseRegisterEntry
             order by CreatedDateTime desc
             where  exciseRegisterEntry.ItemId == _itemId
                 && exciseRegisterEntry.SiteId == _siteId
             exists join exciseInformationTable
-            where exciseInformationTable.InventTransType == InventTransType::Purch
+            where  exciseInformationTable.InventTransType == InventTransType::Purch
                 && exciseInformationTable.ItemId == _itemId
                 && exciseInformationTable.SiteId == _siteId
                 && exciseInformationTable.ReferenceNumber == exciseRegisterEntry.OrderNumber
@@ -164,22 +179,150 @@ final class METDutyRollMonthlyProcessingJob
             where purchLine.InventTransId == exciseInformationTable.InventTransId
                 && purchLine.CreatedDateTime >= startDateTime
                 && purchLine.CreatedDateTime <= endDateTime
-        {
-            if (countRecords == METConstants::TenValue)
             {
-                break;
+                if (countRecords == METConstants::TenValue)
+                {
+                    /// createddateteime + dutyvalue
+                    break;
+                }
+                metPOTODutyRecords.CreatedDateTimeVal = purchLine.CreatedDateTime;
+                metPOTODutyRecords.DutyRateReceived = exciseRegisterEntry.DutyRateReceived;
+                recordInsertList.add(metPOTODutyRecords);
+
+                dutyRateReceived += exciseRegisterEntry.DutyRateReceived;
+                countRecords++;
             }
-
-            dutyRateReceived += exciseRegisterEntry.DutyRateReceived;
-            countRecords++;
+            // check for Transfer order records 
+            countRecords = 0;
+            while select firstonly10 DutyRateReceived from exciseRegisterEntry
+            order by CreatedDateTime desc
+            where  exciseRegisterEntry.ItemId == _itemId
+                && exciseRegisterEntry.SiteId == _siteId
+            exists join exciseInformationTable
+            where  exciseInformationTable.InventTransType == InventTransType::TransferOrderReceive
+                && exciseInformationTable.ItemId == _itemId
+                && exciseInformationTable.SiteId == _siteId
+                && exciseInformationTable.ReferenceNumber == exciseRegisterEntry.OrderNumber
+            exists join inventTransferLine
+            where inventTransferLine.InventTransId == exciseInformationTable.InventTransId
+                && inventTransferLine.CreatedDateTime >= startDateTime
+                && inventTransferLine.CreatedDateTime <= endDateTime
+            {
+                if (countRecords == METConstants::TenValue)
+                {
+                    /// createddateteime + dutyvalue
+                    break;
+                }
+                metPOTODutyRecords.CreatedDateTimeVal = inventTransferLine.CreatedDateTime;
+                metPOTODutyRecords.DutyRateReceived = exciseRegisterEntry.DutyRateReceived;
+                recordInsertList.add(metPOTODutyRecords);
+                dutyRateReceived += exciseRegisterEntry.DutyRateReceived;
+                countRecords++;
+            }
+            recordInsertList.insertDatabase();
+            select firstonly10 sum (DutyRateReceived) from metPOTODutyRecords
+                order by CreatedDateTimeVal desc;
+             
+            if (countRecords)
+            {
+                avgDuty = metPOTODutyRecords.DutyRateReceived / (countRecords);//dutyRateReceived
+            }
         }
-
-        if (countRecords)
+        else
         {
-            avgDuty = dutyRateReceived / (countRecords);
+            // current month dort by modified date of PurchLine
+            while select firstonly10 DutyRateReceived from exciseRegisterEntry
+            order by purchLine.ModifiedDateTime desc
+            where  exciseRegisterEntry.ItemId == _itemId
+                && exciseRegisterEntry.SiteId == _siteId
+            exists join exciseInformationTable
+            where  exciseInformationTable.InventTransType == InventTransType::Purch
+                && exciseInformationTable.ItemId == _itemId
+                && exciseInformationTable.SiteId == _siteId
+                && exciseInformationTable.ReferenceNumber == exciseRegisterEntry.OrderNumber
+            exists join purchLine
+            where purchLine.InventTransId == exciseInformationTable.InventTransId 
+            {
+                if (countRecords == METConstants::TenValue)
+                {
+                    /// createddateteime + dutyvalue
+                    break;
+                }
+                metPOTODutyRecords.CreatedDateTimeVal = purchLine.CreatedDateTime;
+                metPOTODutyRecords.DutyRateReceived = exciseRegisterEntry.DutyRateReceived;
+                recordInsertList.add(metPOTODutyRecords);
+                dutyRateReceived += exciseRegisterEntry.DutyRateReceived;
+                countRecords++;
+            }
+            // check for Transfer order records
+            countRecords = 0;
+            while select firstonly10 DutyRateReceived from exciseRegisterEntry
+            order by inventTransferLine.ModifiedDateTime desc
+            where  exciseRegisterEntry.ItemId == _itemId
+                && exciseRegisterEntry.SiteId == _siteId
+            exists join exciseInformationTable
+            where  exciseInformationTable.InventTransType == InventTransType::TransferOrderReceive
+                && exciseInformationTable.ItemId == _itemId
+                && exciseInformationTable.SiteId == _siteId
+                && exciseInformationTable.ReferenceNumber == exciseRegisterEntry.OrderNumber
+            exists join inventTransferLine
+            where inventTransferLine.InventTransId == exciseInformationTable.InventTransId
+                && inventTransferLine.CreatedDateTime >= startDateTime
+                && inventTransferLine.CreatedDateTime <= endDateTime
+            {
+                if (countRecords == METConstants::TenValue)
+                {
+                    /// createddateteime + dutyvalue
+                    break;
+                }
+                metPOTODutyRecords.CreatedDateTimeVal = inventTransferLine.CreatedDateTime;
+                metPOTODutyRecords.DutyRateReceived = exciseRegisterEntry.DutyRateReceived;
+                recordInsertList.add(metPOTODutyRecords);
+                dutyRateReceived += exciseRegisterEntry.DutyRateReceived;
+                countRecords++;
+            }
+            recordInsertList.insertDatabase();
+
+            select firstonly10 sum (DutyRateReceived) from metPOTODutyRecords
+                order by CreatedDateTimeVal desc;
+             
+            if (countRecords)
+            {
+                avgDuty = metPOTODutyRecords.DutyRateReceived / (countRecords);//dutyRateReceived
+            }
+        
         }
-            
         return avgDuty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isCurrentOrFutureMonth</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get current or future month
+    /// </summary>
+    /// <param name = "_inputDate">_inputDate</param>
+    /// <returns>boolean</returns>
+    public boolean isCurrentOrFutureMonth(Transdate _inputDate)
+    {
+        date currentDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+    
+        // Check if the date is in current month
+        if (mthOfYr(_inputDate) == mthOfYr(currentDate) && year(_inputDate) == year(currentDate))
+        {
+            return true; // Current month
+        }
+    
+        // Check if the date is in future month
+        if ((year(_inputDate) > year(currentDate)) ||
+        (year(_inputDate) == year(currentDate) && mthOfYr(_inputDate) > mthOfYr(currentDate)))
+        {
+            return true; // Future month
+        }
+    
+        return false; // Past month
     }
 
 ]]></Source>
