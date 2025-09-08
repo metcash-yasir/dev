@@ -1,0 +1,206 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METBulkWorkflowWorkItemManagerSubTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Service class for approved / reject / delegate free text invoice batch job.
+/// </summary>
+/// Added for CFR4 bulk approval AR invoice.
+class METBulkWorkflowWorkItemManagerSubTaskService extends SysOperationServiceBase
+{
+    RefRecId                    startRecId;
+    RefRecId                    endRecId;
+    WorkflowComment             workflowComment;
+    WorkflowWorkItemActionType  actionType;
+    UserId                      userId;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Starts processing the operation to approve / reject / delegate free text invoices.
+    /// </summary>
+    /// <param name="_contract">The contract containing the parameters for the subtask operation.</param>
+    public void processOperation(METBulkWorkflowWorkItemManagerSubTaskContract _contract)
+    {
+        if (!_contract.parmStartRefRecId() || !_contract.parmEndRefRecId())
+        {
+            throw error("@SYS342993");
+        }
+        else
+        {
+            startRecId      = _contract.parmStartRefRecId();
+            endRecId        = _contract.parmEndRefRecId();
+            workflowComment = _contract.parmWorkFlowComment();
+            actionType      = _contract.parmWorkflowActionType();
+            userId          = _contract.parmUserId();
+
+            this.PerformWorkflowAction();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>PerformWorkflowAction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Approve or reject or delegate the workflow.
+    /// </summary>
+    public void PerformWorkflowAction()
+    {
+        CustInvoiceTable            custInvoiceTable;
+        QueryBuildDataSource        qbds;
+        WorkflowWorkItemTable       workItemTable;
+        int                         maxRetries = 5;
+        boolean                     hasError = false;
+        Line                        fromLine;
+        str                         logMessage, wFComment; 
+        SysInfologEnumerator        enumerator;
+        SysInfologMessageStruct     msgStruct;
+        MenuItemName                menuItemName;
+        str                         workflowType;
+
+
+        Query query = new Query();
+        qbds = query.addDataSource(tableNum(CustInvoiceTable));
+        qbds.addRange(fieldNum(CustInvoiceTable, RecId)).value(SysQuery::range(startRecId,endRecId));
+        qbds.clearRange(fieldNum(CustInvoiceTable, METBulkWorkflowSelected));
+        qbds.addRange(fieldNum(CustInvoiceTable, METBulkWorkflowSelected)).value(queryValue(NoYes::Yes));
+
+        QueryRun qRun = new QueryRun(query);
+
+        while (qRun.next())
+        {
+            custInvoiceTable = qRun.get(tableNum(CustInvoiceTable));    
+            fromLine         = infologLine() + 1;
+            hasError         = false;
+            logMessage       = '';
+
+            try
+            {
+                ttsbegin;
+
+                switch (actionType)
+                {
+                    case WorkflowWorkItemActionType::Complete:
+                        wFComment      = workflowComment;
+                        workflowType   = "@SYS10158";
+                        menuItemName   = menuitemActionStr(CustFreeInvoiceApprovalApprove);
+                        userId         =  curUserId();
+                        break;
+
+                    case WorkflowWorkItemActionType::Return:
+                        wFComment      = workflowComment;
+                        workflowType   = "@SYS784";
+                        menuItemName   = menuitemActionStr(CustFreeInvoiceApprovalReject);
+                        userId         = curUserId();
+                        break;
+                        
+                    case WorkflowWorkItemActionType::Delegate:
+                        wFComment      = workflowComment;
+                        workflowType   = "@SYS104367";
+                        menuItemName   = menuitemActionStr(CustFreeInvoiceDelegate);
+                        break;
+
+                    default:
+                        break;
+                }
+
+                select firstonly workItemTable
+                    where (workItemTable.Type      == WorkflowWorkItemType::WorkItem
+                    || workItemTable.Type           == WorkflowWorkItemType::Return)
+                    && workItemTable.Status         == WorkflowWorkItemStatus::Pending
+                    &&  workItemTable.RefTableId    == tableNum(CustInvoiceTable)
+                    &&  workItemTable.RefRecId      == custInvoiceTable.RecId;
+
+                WorkflowWorkItemActionManager::dispatchWorkItemAction(
+                                    workItemTable,
+                                    wFComment,
+                                    userId,
+                                    actionType,
+                                    menuItemName);
+
+                info(strFmt("@MET:METFTIWFActionManager", workflowType));
+
+                ttscommit;
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= maxRetries)
+                    {
+                        error(strFmt("@MET:METFTIWFUpdateConflictError", custInvoiceTable.METDMFImportFileName));
+                        hasError = true;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    error(strFmt("@MET:METFTIWFUpdateConflictError", custInvoiceTable.METDMFImportFileName));
+                    hasError = true;
+                }
+            }
+            catch (Exception::deadlock)
+            {
+                if (xSession::currentRetryCount() >= maxRetries)
+                {
+                    error(strFmt("@MET:METFTIWFDeadLockError", custInvoiceTable.METDMFImportFileName));
+                    hasError = true;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::Error)
+            {
+                error(strFmt("@MET:METFTIWFError", custInvoiceTable.METDMFImportFileName));
+                hasError = true;
+            }
+            finally
+            {
+                if (hasError)
+                {
+                    enumerator = SysInfologEnumerator::newData(infolog.copy(fromLine, infologline()));
+                    
+                    while (enumerator.moveNext())
+                    {
+                        msgStruct   = new SysInfologMessageStruct(enumerator.currentMessage());
+                        logMessage += msgStruct.message() + ' ';
+                    }
+                }
+                
+                custInvoiceTable.reread();
+                if (custInvoiceTable.RecId)
+                {
+                    ttsbegin;
+                    custInvoiceTable.selectForUpdate(true);
+                    custInvoiceTable.METBulkWorkflowSelected = NoYes::No;
+                    custInvoiceTable.Log = logMessage;
+                    custInvoiceTable.update();
+                    ttscommit;
+                }
+            }
+        }
+
+        if (hasError)
+        {
+            //ensure batch status is "Error"
+            throw Exception::Error;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
