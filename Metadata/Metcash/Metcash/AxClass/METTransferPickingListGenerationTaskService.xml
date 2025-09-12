@@ -10,6 +10,9 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
 {
 
     boolean lineSubstituted = false;
+    boolean partialStockAvailable = false;
+    boolean updateExtractionStatus = true;
+   
 
     
 
@@ -73,26 +76,41 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
         //CB238 - xDock
         InventTransferTable inventTransferTable = InventTransferTable::find(_dataContract.parmTransferId());
 
-        if (inventTransferTable.metInventTransferTableExt().AllowBackorder == false)
-        {
-            while select forupdate metInventTransferLineCancel
-                join inventTransferLineCancel
-                    where inventTransferLineCancel.RecId == metInventTransferLineCancel.InventTransferLine  &&
-                        inventTransferLineCancel.TransferId == inventTransferTable.TransferId
-            {
-                if (inventTransferLineCancel.displayQtyReservedPhysical() == 0)
-                {
-                    inventTransferLineCancel.selectForUpdate(true);
-                    //If there is less stock than the QtyTransfer, then set QtyRemainShip to the available stock
-                    inventTransferLineCancel.QtyRemainShip = inventTransferLineCancel.QtyRemainShip - (inventTransferLineCancel.QtyTransfer - inventTransferLineCancel.displayQtyReservedPhysical());
-                    inventTransferLineCancel.updateDeliverRemainder(); //std code contains ttsbegin and ttscommit
 
-                    info(strFmt("@MET:NoStockTO", inventTransferLineCancel.TransferId, inventTransferLineCancel.ItemId));
+        ttsbegin;
+        while select forupdate metInventTransferLineCancel
+            join inventTransferLineCancel
+                where inventTransferLineCancel.RecId == metInventTransferLineCancel.InventTransferLine
+                && metInventTransferLineCancel.OrderExtractStatus != METOrderExtractStatus::Extracted
+                && inventTransferLineCancel.TransferId == inventTransferTable.TransferId
+        {
+            if (inventTransferLineCancel.displayQtyReservedPhysical() == 0)
+            {
+                inventTransferLineCancel.selectForUpdate(true);
+                //If there is less stock than the QtyTransfer, then set QtyRemainShip to the available stock
+                inventTransferLineCancel.QtyRemainShip = inventTransferLineCancel.QtyRemainShip - (inventTransferLineCancel.QtyTransfer - inventTransferLineCancel.displayQtyReservedPhysical());
+                inventTransferLineCancel.PdsCWQtyRemainShip = inventTransferLineCancel.PdsCWQtyRemainShip - (inventTransferLineCancel.PdsCWQtyTransfer - inventTransferLineCancel.displayQtyReservedPhysical());
+                inventTransferLineCancel.updateDeliverRemainder(); //std code contains ttsbegin and ttscommit
+
+                info(strFmt("@MET:NoStockTO", inventTransferLineCancel.TransferId, inventTransferLineCancel.ItemId));
+            }
+
+            if (updateExtractionStatus)
+            {
+                metInventTransferLineCancel.reread();
+                if (!partialStockAvailable)
+                {
                     metInventTransferLineCancel.OrderExtractStatus = METOrderExtractStatus::Extracted;
-                    metInventTransferLineCancel.update();
                 }
+                else
+                {
+                    metInventTransferLineCancel.OrderExtractStatus = METOrderExtractStatus::Open;
+                }
+                metInventTransferLineCancel.update();
             }
         }
+        ttscommit;
+       
         inventTransferParmTable.TransferId          = _dataContract.parmTransferId();
         inventTransferParmTable.UpdateType          = InventTransferUpdateType::PickingList;
         // CB715_TransferOrderExtract
@@ -292,6 +310,8 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
         InventQty       reserveQty;
         Qty             availPhysical;
 
+        boolean allowBackOrder = METInventTransferTableExt::findByTransferId(_transferId).AllowBackorder;
+
         while select transferLine
              where transferLine.TransferId == _transferId
                 join inventTransOrigin
@@ -311,7 +331,6 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
             {
                 InventMovement  movement;
                 InventQty       qtyToReserve;
-                PdsCWInventQty  cwQtyToReserve;
 
                 if (inventTrans.isUpdatedEstimated())
                 {
@@ -323,17 +342,37 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
                     continue;
                 }
 
-                InventTransSum inventTransSum = InventTransSum::construct();
-               
-                qtyToReserve = -inventTransSum.pdsCWidOnOrder(movement.inventTransOriginId(), movement.transChildType(), movement.transChildRefId());
-                cwQtyToReserve = qtyToReserve;
+                InventOnHand onHand = InventOnHand::newParameters(transferLine.ItemId, transferLine.inventDim(),inventDimParm);
+
+                availPhysical = onHand.pdsCWAvailPhysical();                
                 
-                qtyToReserve = this.defaultCatchWeightReserveQuantity(transferLine.ItemId, cwQtyToReserve);
+                reserveQty = (availPhysical >= transferLine.PdsCWQtyTransfer) ? transferLine.PdsCWQtyTransfer : availPhysical;
+
+                if (allowBackOrder)
+                {
+                    if (availPhysical == 0)
+                    {
+                        updateExtractionStatus = false;
+                    }
+
+                    if (availPhysical < transferLine.PdsCWQtyTransfer)
+                    {
+                        partialStockAvailable = true;
+                    }
+                }
+
+                // Skip reservation if nothing is available
+                if (reserveQty <= 0)
+                {
+                    continue;
+                }
+
+                qtyToReserve = this.defaultCatchWeightReserveQuantity(transferLine.ItemId, reserveQty);
 
                 ttsbegin;
                 // Create the reservation object
                 transferLine.selectForUpdate(true);
-                InventUpd_Reservation::updateReserveBuffer(transferLine, -qtyToReserve, InventMovSubType::None, -cwQtyToReserve);
+                InventUpd_Reservation::updateReserveBuffer(transferLine, -qtyToReserve, InventMovSubType::None, -reserveQty);
                 ttscommit;
 
             }
@@ -344,8 +383,21 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
                 {
                     InventOnHand onHand = InventOnHand::newParameters(transferLine.ItemId, transferLine.inventDim(),inventDimParm);
                     availPhysical = onHand.availPhysical();
-
+                    
                     reserveQty = (availPhysical >= transferLine.QtyTransfer) ? transferLine.QtyTransfer : availPhysical;
+
+                    if (allowBackOrder)
+                    {
+                        if (availPhysical == 0)
+                        {
+                            updateExtractionStatus = false;
+                        }
+
+                        if (availPhysical < transferLine.QtyTransfer)
+                        {
+                            partialStockAvailable = true;
+                        }
+                    }
 
                     // Skip reservation if nothing is available
                     if (reserveQty <= 0)
