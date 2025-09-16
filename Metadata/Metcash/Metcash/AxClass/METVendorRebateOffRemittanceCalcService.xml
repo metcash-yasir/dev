@@ -9,6 +9,8 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
     private guid queueId;
     Query userQuery;
     METVendorRebateOffRemittanceCalcContract mainContract;
+    METVendParameters metVendParameters;
+
 }
 ]]></Declaration>
 		<Methods>
@@ -90,26 +92,64 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
     /// </param>
     public void process(METVendorRebateOffRemittanceCalcContract _contract)
     {
-        METVendParameters metVendParameters = METVendParameters::find();
+        mainContract = _contract;
 
-        if (metVendParameters.VendorRebatesEnabled == NoYes::Yes)
+        if(!this.validate())
         {
-            mainContract = _contract;
+            return;
+        }
 
-            userQuery = new Query(_contract.getQuery());
-            QueryBuildDataSource qbdrInventDim = userQuery.dataSourceTable(tableNum(InventDim));
-            QueryBuildDataSource qbdrPackJour = userQuery.dataSourceTable(tableNum(VendPackingSlipJour));
-            QueryBuildDataSource qbdrPurchTable = userQuery.dataSourceTable(tablenum(PurchTable));
-            QueryBuildRange qbrCustomerReq;
+        userQuery = new Query(_contract.getQuery());
+        QueryBuildDataSource qbdrInventDim = userQuery.dataSourceTable(tableNum(InventDim));
+        QueryBuildDataSource qbdrPackJour = userQuery.dataSourceTable(tableNum(VendPackingSlipJour));
+        QueryBuildDataSource qbdrPurchTable = userQuery.dataSourceTable(tablenum(PurchTable));
+        QueryBuildRange qbrCustomerReq;
 
-            dataContract = _contract as METVendorRebateOffRemittanceCalcContract;
-            qbdrInventDim.addRange(fieldNum(InventDim, InventSiteId)).value(_contract.parmInventSite());
+        dataContract = _contract as METVendorRebateOffRemittanceCalcContract;
+        qbdrInventDim.addRange(fieldNum(InventDim, InventSiteId)).value(_contract.parmInventSite());
         
             qbdrPackJour.addRange(fieldNum(VendPackingSlipJour, DeliveryDate)).value('< ' + SysQuery::value(_contract.parmAsOfDate()));
 
             this.initialise();
             this.processInternal(_contract);
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate pre-process conditions
+    /// </summary>
+    /// <returns>true if the conditions are met, otherwise false</returns>
+    private boolean validate()
+    {
+        boolean ret = true;
+
+        metVendParameters = METVendParameters::find();
+
+        if (metVendParameters.VendorRebatesEnabled == NoYes::No)
+        {
+            ret = ret && checkFailed('@MET:RebAccrRebateParmError');
+        }
+
+        if(metVendParameters.RebateAccrualJournalName == '')
+        {
+            ret = ret && checkFailed('@MET:RebAccrJournalMissing');
+        }
+        else
+        {
+            LedgerJournalName ledgerJour = LedgerJournalName::find(metVendParameters.RebateAccrualJournalName);
+
+            if(ledgerJour && !ledgerJour.OffsetLedgerDimension)
+            {
+                ret = ret && checkFailed(strFmt('@MET:RebAccrLedgerMissing', ledgerJour.JournalName));
+            }
+        }
+
+        return ret;
     }
 
 ]]></Source>
@@ -209,8 +249,9 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
         PurchTable PurchTable;
 
         userQuery.clearAllFields();
-
+        
         QueryBuildDataSource qbdsVendPackingSlipTrans = userQuery.dataSourceName(tableStr(VendPackingSlipTrans));
+        qbdsVendPackingSlipTrans.addRange(fieldnum(VendPackingSlipTrans, METRemittanceJournalId)).value(SysQueryRangeUtil::valueEmptyString());
         qbdsVendPackingSlipTrans.addSelectionField(fieldNum(VendPackingSlipTrans, RecId));
         qbdsVendPackingSlipTrans.addSelectionField(fieldNum(VendPackingSlipTrans, InventDimId));
         qbdsVendPackingSlipTrans.addSelectionField(fieldNum(VendPackingSlipTrans, DefaultDimension));
@@ -239,31 +280,14 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
             || PurchTable.PurchOrderFormNum like 'VR*'
             || PurchTable.PurchOrderFormNum like 'SR*');
 
-        MarkupAutoLine markupAutoLine;
-        MarkupAutoTable markupAutoTable;
-        METPurchGroup purchGroup;
-
-        update_recordset processQueue
-            setting ChargeCode = markupAutoLine.MarkupCode,
-                ChargePercent = markupAutoLine.Value
-            join markupAutoLine
-            where markupAutoLine.TableRecId == markupAutoTable.RecId
-            && markupAutoLine.TableTableId == markupAutoTable.TableId
-            join markupAutoTable
-            where markupAutoTable.ModuleType == MarkupModuleType::Vend
-            && markupAutoTable.AccountCode == TableGroupAll::Table
-            && markupAutoTable.AccountRelation == processQueue.VendAccount
-            && markupAutoTable.ModuleCategory == HeadingLine::Line
-            exists join purchGroup
-            where purchGroup.PurchGroupId == markupAutoLine.METPurchGroupId
-            && purchGroup.InvoiceType == METPurchGroupInvoiceType::Warehouse;
-
         this.updateChargeDetails();
 
         //Remove all packing slips which do not have a charge code mapping for the vendor or the purchase group invoice type is not warehouse.
         delete_from processQueue
             where processQueue.ChargeCode == ''
             && processQueue.ProcessId == queueId;
+
+        this.checkAndRemoveRecordsWithoutDebitAccount();
 
         METVendorRebateSiteJournalStaging siteStaging;
 
@@ -276,20 +300,72 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>checkAndRemoveRecordsWithoutDebitAccount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if the debit account code is defined for charge code, if not defined then ignore those transactions.
+    /// </summary>
+    private void checkAndRemoveRecordsWithoutDebitAccount()
+    {
+        METVendorRebateOffRemittanceCalcStaging processQueue;
+
+        while select ChargeCode from processQueue
+            group by ChargeCode
+            where processQueue.ProcessId == queueId
+            && !processQueue.CustomerLedgerDimension
+        {
+            warning(strFmt('@MET:RebAccrDebitAccountMissing', processQueue.ChargeCode));
+
+            METVendorRebateOffRemittanceCalcStaging processQueueDel;
+
+            ttsbegin;
+            delete_from processQueueDel
+                where processQueueDel.ProcessId == queueId
+                && processQueueDel.ChargeCode == processQueue.ChargeCode
+                && !processQueueDel.CustomerLedgerDimension;
+            ttscommit;
+        }
+
+        while select ChargeCode from processQueue
+            group by ChargeCode
+            where processQueue.ProcessId == queueId
+            && !processQueue.ChargeAmount
+        {
+            warning(strFmt('@MET:RebAccrNoValueToPost', processQueue.ChargeCode));
+
+            METVendorRebateOffRemittanceCalcStaging processQueueDel;
+
+            ttsbegin;
+            delete_from processQueueDel
+                where processQueueDel.ProcessId == queueId
+                && processQueueDel.ChargeCode == processQueue.ChargeCode
+                && !processQueueDel.ChargeAmount;
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>updateChargeDetails</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Update required details from charges master to staging table.
+    /// </summary>
     private void updateChargeDetails()
     {
         METVendorRebateOffRemittanceCalcStaging processQueue;
         MarkupCode chargeCode;
         MarkupValue chargePer;
+        RefRecId ledgerDimension;
 
         while select VendAccount, ItemId, DlvMode, SiteId, wmsLocationId from processQueue
             group by VendAccount, ItemId, DlvMode, SiteId, wmsLocationId
             where processQueue.ProcessId == queueId
             && processQueue.ChargeCode == ''
         {
-            [chargeCode, chargePer] = this.findChargeDetails(processQueue);
+            [chargeCode, chargePer, ledgerDimension] = this.findChargeDetails(processQueue);
             if (chargeCode)
             {
                 METVendorRebateOffRemittanceCalcStaging processQueueUpd;
@@ -297,6 +373,7 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
                 update_recordset processQueueUpd
                     setting ChargeCode = chargeCode,
                     ChargePercent = chargePer,
+                    CustomerLedgerDimension = ledgerDimension,
                     ChargeAmount = processQueueUpd.LineAmount * (chargePer/100)
                     where processQueueUpd.VendAccount == processQueue.VendAccount
                     && processQueueUpd.ItemId == processQueue.ItemId
@@ -312,6 +389,11 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
 			<Method>
 				<Name>findChargeDetails</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Finds the charge code and charge percent based on condition
+    /// </summary>
+    /// <param name = "_record">staging record</param>
+    /// <returns>container that includes, charge code, percent, credit account to post the transaction</returns>
     private container findChargeDetails(METVendorRebateOffRemittanceCalcStaging _record)
     {
         MarkupAutoTable markupAutoTable;
@@ -344,12 +426,15 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
                 && markupAutoTable.ModuleType == MarkupModuleType::Vend;
         }
 
-        if(!markupAutoTable)
+        MarkupTable markupTable;
+
+        if(markupAutoTable)
         {
             markupAutoLine = this.findMarkupLine(markupAutoTable, _record);
+            markupTable = MarkupTable::find(MarkupModuleType::Vend, markupAutoLine.MarkupCode);
         }
 
-        return [markupAutoLine.MarkupCode, markupAutoLine.Value];
+        return [markupAutoLine.MarkupCode, markupAutoLine.Value, markupTable.CustomerLedgerDimension];
 
     }
 
@@ -358,6 +443,12 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
 			<Method>
 				<Name>findMarkupLine</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Find Markup line matching given condition
+    /// </summary>
+    /// <param name = "_markupTable">Markup table buffer</param>
+    /// <param name = "_record">Staging table record</param>
+    /// <returns>MarkupAutoLine table buffer</returns>
     private MarkupAutoLine findMarkupLine(MarkupAutoTable _markupTable, METVendorRebateOffRemittanceCalcStaging _record)
     {
         MarkupAutoLine markupAutoLine;
