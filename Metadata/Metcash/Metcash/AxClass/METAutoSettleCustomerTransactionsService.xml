@@ -4,195 +4,152 @@
 	<SourceCode>
 		<Declaration><![CDATA[
 /// <summary>
-/// The service class for the batch job
+/// Service class for auto-settling customer transactions grouped by invoice.
 /// </summary>
-/// 
-class METAutoSettleCustomerTransactionsService extends SysOperationServiceBase
+class METAutoSettleCustomerTransactionsService
 {
-    
 }
 ]]></Declaration>
 		<Methods>
 			<Method>
-				<Name>processOperation</Name>
+				<Name>process</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// The process method for the post picking list registration batch job
+    /// Entry point for processing settlement logic.
     /// </summary>
-    /// <param name = "_contract">The data contract object</param>    
-    public void processOperation(METAutoSettleCustomerTransactionsContract _contract)
+    /// <param name="_contract">Contract containing the query to execute.</param>
+    public void process(METAutoSettleCustomerTransactionsContract _contract)
     {
-        METPickList metPickList;
-        SalesLine salesLine;
-        WMSOrderTrans wmsOrderTrans;
-        
-        int bundlesize, numOfOrders, task, totalTasks, i;        
-        Set orderList = new Set(Types::String);
-
-        this.updateStaging();
-
-        numOfOrders = this.getNumOfOrders();
-        task = 1;
-        totalTasks = _contract.parmTasks();
-
-        if (totalTasks <= 0)
+        try
         {
-            totalTasks = 1;
-        }
+            QueryRun queryRun = new QueryRun(_contract.getQuery());
 
-        bundleSize = real2int(roundUp((numOfOrders / totalTasks), 1.0));
+            str currentInvoice = '';
+            List custTransOpenBuffer = new List(Types::Record);
 
-        BatchHeader batchHeader = this.getCurrentBatchHeader();
+            while (queryRun.next())
+            {
+                CustTrans custTransTmp = queryRun.get(tableNum(CustTrans));
+                CustTransOpen custTransOpenTmp = queryRun.get(tableNum(CustTransOpen));
 
-        if (batchHeader == null)
-        {
-            batchHeader = batchHeader::construct();
-        }
-
-        batchHeader.parmCaption("@MET:METAutoPostPickList");
-
-        while select metPickList order by metPickList.PickListNumber
-            where metPickList.Error == NoYes::No
-        {           
-            if (!orderList.in(metPickList.PickListNumber))
-            {                
-                if (i == bundlesize)
+                if (!custTransTmp || custTransTmp.Invoice == '')
                 {
-                    SysOperationServiceController postPackingSlipRegistrationController = new SysOperationServiceController(
-                                                            classStr(METPostPickListSubTask),
-                                                            methodStr(METPostPickListSubTask, postPackingSlipRegistrationSubTask));
-
-                    postPackingSlipRegistrationController.parmDialogCaption(strFmt("@MET:PostPackingSlipSubTask", task));
-
-                    METPostPickListDataContract metPostPackingSlipDataContract = postPackingSlipRegistrationController.getDataContractObject() as METPostPickListDataContract;
-                    metPostPackingSlipDataContract.parmOrderList(orderList);
-
-                    batchHeader.addRuntimeTask(postPackingSlipRegistrationController, this.getCurrentBatchTask().RecId);
-                    orderList = new Set(Types::String);
-                    task++;
-                    i = 0;
+                    continue;
                 }
+
+                if (currentInvoice != '' && custTransTmp.Invoice != currentInvoice)
+                {
+                    this.settleInvoiceGroup(custTransOpenBuffer, currentInvoice);
+                    custTransOpenBuffer = new List(Types::Record);
+                }
+
+                currentInvoice = custTransTmp.Invoice;
+                custTransOpenBuffer.addEnd(custTransOpenTmp);
             }
-        }           
-        
-        
-        batchHeader.save();
+
+            // Final group settlement
+            if (custTransOpenBuffer.elements() > 0)
+            {
+                this.settleInvoiceGroup(custTransOpenBuffer, currentInvoice);
+            }
+        }
+        catch (Exception::CLRError)
+        {
+            System.Exception clrEx = CLRInterop::getLastException();
+            error(strFmt("@MET:CLRAutoSettlement", clrEx.get_Message()));
+        }
+        catch (Exception::Error)
+        {
+            error("@MET:XPPAutoSettlement");
+        }
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>getNumOfOrders</Name>
+				<Name>settleInvoiceGroup</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Gets the number of orders
+    /// Settles a group of transactions for a specific invoice.
     /// </summary>
-    /// <returns>Total number of orders to be processed by a Batch job</returns>
-    private int getNumOfOrders()
+    /// <param name="custTransOpenBuffer">List of CustTransOpen records.</param>
+    /// <param name="invoice">Invoice number for logging.</param>
+    private void settleInvoiceGroup(List custTransOpenBuffer, str invoice)
     {
-        METPickList metPickList;        
+        try
+        {
+            CustTable custTable = this.getCustomerFromBuffer(custTransOpenBuffer);
 
-        select count(RecId) from metPickList
-            group by TransRefId;
+            if (!custTable)
+            {
+                warning(strFmt("@MET:CustomerNotFoundInvoice", invoice));
+                return;
+            }
 
-        return metPickList.RecId;
+            ttsbegin;
+
+            CustVendOpenTransManager settleManager = CustVendOpenTransManager::construct(custTable);
+            settleManager.parmSettlePostingDate(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+            settleManager.parmSettlePostingType(SettleDatePrinc::DaysDate);
+
+            ListEnumerator bufferEnum = custTransOpenBuffer.getEnumerator();
+            while (bufferEnum.moveNext())
+            {
+                CustTransOpen bufferedTransOpen = bufferEnum.current();
+                CustTrans bufferedTrans;
+
+                select firstOnly RecId, CurrencyCode from bufferedTrans
+                    where bufferedTrans.RecId == bufferedTransOpen.RefRecId;
+
+                if (!bufferedTrans || bufferedTrans.CurrencyCode == '')
+                {
+                    continue;
+                }
+
+                settleManager.updateTransMarked(bufferedTransOpen, true);
+            }
+
+            settleManager.settleMarkedTrans();
+            info(strFmt("@MET:InvoiceSettleForCustomer", invoice, custTable.AccountNum));
+
+            ttscommit;
+        }
+        catch (Exception::CLRError)
+        {
+            System.Exception clrEx = CLRInterop::getLastException();
+            error(strFmt("@MET:CLRSettleInvoice", invoice, clrEx.get_Message()));
+        }
+        catch (Exception::Error)
+        {
+            error(strFmt("@MET:XPPSettleInvoice", invoice));
+        }
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>updateStaging</Name>
+				<Name>getCustomerFromBuffer</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Updates the staging table
+    /// Retrieves the customer record from the first transaction in the buffer.
     /// </summary>
-    private void updateStaging()
-    {   
-        ttsbegin;
-
-        this.updateInventoryReference();
-        this.updateErrorMessages();
-
-        ttscommit;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>updateErrorMessages</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Update the error messages
-    /// </summary>
-    private void updateErrorMessages()
+    /// <param name="custTransOpenBuffer">List of CustTransOpen records.</param>
+    /// <returns>CustTable record or null.</returns>
+    private CustTable getCustomerFromBuffer(List custTransOpenBuffer)
     {
-        METPickList metPickList, metPickListForSelect;
-        WMSPickingRoute wmsPickingRoute;
-        WMSOrderTrans wmsOrderTrans;
+        CustTransOpen firstTransOpen;
+        CustTable custTable;
 
-        // We have updated inventory references already. Empty reference means invalid pick list number.
-        update_recordset metPickList setting
-            Error = NoYes::Yes,
-            ErrorMsg = '@MET:METPickListDoesNotExist'
-        where metPickList.TransRefId == METConstants::emptyString; 
+        ListEnumerator bufferEnum = custTransOpenBuffer.getEnumerator();
 
-        // We have updated inventory references already. Empty original line number means invalid line number.
-        update_recordset metPickList setting
-            Error = NoYes::Yes,
-            ErrorMsg = '@MET:METPickListLineDoesNotExist'
-        where metPickList.OriginalLineNumber != metPickList.LineNumber; 
+        if (bufferEnum.moveNext())
+        {
+            firstTransOpen = bufferEnum.current();
+            select firstOnly AccountNum, RecId from custTable
+                where custTable.AccountNum == firstTransOpen.AccountNum;
+        }
 
-        // Check if valid Item number has been passed 
-        update_recordset metPickList setting
-            Error = NoYes::Yes,
-            ErrorMsg = '@MET:METPickListProductDoesNotExist'
-        notexists join wmsOrderTrans
-            where wmsOrderTrans.routeId == metPickList.PickListNumber            
-            && wmsOrderTrans.ItemId == metPickList.ItemNumber;
-            
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>updateInventoryReference</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Update the inventory references
-    /// </summary>
-    private void updateInventoryReference()
-    {
-        METPickList metPickList;
-        WMSPickingRoute wmsPickingRoute;
-        SalesLine salesLine;
-        InventTransferLine inventTransferLine;
-
-        // Update inventory reference - Sales Id or Transfer order number
-        update_recordset metPickList setting 
-            TransRefId = wmsPickingRoute.transRefId,
-            TransType = wmsPickingRoute.transType
-        join wmsPickingRoute
-            where wmsPickingRoute.pickingRouteID == metPickList.PickListNumber;
-
-        // Update Line number from SalesLine table for Sales picking lists
-        update_recordset metPickList setting
-            OriginalLineNumber = salesLine.LineNum,
-            LineInventTransId = salesLine.InventTransId
-        join salesLine
-            where salesLine.salesId == metPickList.TransRefId
-            && salesLine.LineNum == metPickList.LineNumber
-            && salesLine.ItemId == metPickList.ItemNumber
-            && metPickList.TransType == InventTransType::Sales;
-
-        // Update Line number from Transfer order table for Transfer picking lists
-        update_recordset metPickList setting
-            OriginalLineNumber = inventTransferLine.LineNum
-        join inventTransferLine
-            where inventTransferLine.TransferId == metPickList.TransRefId
-            && inventTransferLine.ItemId == metPickList.ItemNumber
-            && inventTransferLine.LineNum == metPickList.LineNumber
-            && (metPickList.TransType == InventTransType::TransferOrderReceive || metPickList.TransType == InventTransType::TransferOrderShip);
-
+        return custTable;
     }
 
 ]]></Source>
