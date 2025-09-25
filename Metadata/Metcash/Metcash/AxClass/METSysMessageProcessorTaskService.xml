@@ -1,0 +1,564 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSysMessageProcessorTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// CB166_SalesOrderSubstitutes
+/// Post sales order creation processing multithread batch task
+/// inspired from new class LedgerJournalBatchPost
+/// </summary>
+class METSysMessageProcessorTaskService extends SysOperationServiceBase
+{    
+    boolean isExecutingInBatch, isMainBatchTask;
+    SysMessageQueue messageQueue;
+    SysMessageRecId messageRecId;
+    //SysMessageProcessingState messageProcessingState;
+    SysMessageProcessorBatchAffinity            affinity;
+    UserConnection                  secondConnection;
+    int counter;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    protected void initialise()
+    {
+        secondConnection   = new UserConnection();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    /// <param name = "_contract">
+    /// <c>METPostSalesOrderCreationProcessingContract</c>.
+    /// </param>
+    public void process(METSysMessageProcessorContract _contract)
+    {
+        messageQueue = _contract.parmMessageQueue();
+        isMainBatchTask    = _contract.parmIsMainBatchTask();
+        affinity = _contract.parmTopPickingProcessId();
+        
+        this.initialise();
+
+        this.processTask(true);
+
+        if (isMainBatchTask)
+        {
+            //last run of main task thread to make sure all others have been processed
+            this.processTask(false);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTaskOld</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the batch tasks.
+    /// </summary>
+    /// <param name = "_readPast">Read past table setting.</param>
+    public void processTaskOld(boolean _readPast)
+    {        
+        while (this.getMessageFromQueue(_readPast))
+        {
+            try
+            {
+                setPrefix(strFmt("Processing message %1", this.messageRecId));
+                
+                //ttsbegin;
+                if (this.messageRecId)
+                {
+                    print "Processing message ", this.messageRecId;
+                    this.execute(this.messageRecId);
+                    info(strFmt("Message processed %1", this.messageRecId));
+                }
+                //ttscommit;
+            }
+            catch (Exception::Error)
+            {
+                // Catch any exception so that any one error won't bring down
+                // the entire process of sales order substitution.
+                Global::exceptionTextFallThrough();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the batch tasks.
+    /// </summary>
+    /// <param name = "_readPast">Read past table setting.</param>
+    public void processTask(boolean _readPast)
+    {
+        SysMessageProcessingState messageProcessingState;
+        messageProcessingState.readPast(_readPast);
+        
+        do
+        {
+            try
+            {
+                ttsbegin;                
+                
+                select firstonly pessimisticlock message
+                    from messageProcessingState
+                    where messageProcessingState.MessageQueue == messageQueue
+                       && messageProcessingState.State == SysMessageState::Queued;
+
+                setPrefix(strFmt("Processing message %1", messageProcessingState.Message));
+                //ttsbegin;
+                if (messageProcessingState.Message)
+                {
+                    this.messageRecId = messageProcessingState.Message;
+                    /*counter++;
+
+                    VNGMessageProcessorDebug table;
+                    table.Counter = counter;
+                    table.MessageRecId = messageProcessingState.Message;
+                    table.insert();*/
+                    
+                    print "Processing message ", messageProcessingState.Message;
+                    this.execute(messageProcessingState.Message);
+                    info(strFmt("Message processed %1", messageProcessingState.Message));
+                }
+                //ttscommit;
+                ttscommit;
+            }
+            catch (Exception::Error)
+            {
+                // Catch any exception so that any one error won't bring down
+                // the entire process of sales order substitution.
+                Global::exceptionTextFallThrough();
+            }
+        }
+        while (messageProcessingState);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    /// <param name = "_salesId">Sales order to substitute.</param>
+    private boolean execute(SysMessageRecId _messageRecId)
+    {
+        boolean ret;
+        
+        //SysMessageProcessorInstrumentationLogger    instrumentationLogger;
+        //SysMessageProcessorBatchAffinity            affinity;
+        //SysMessageQueue                             messageQueue;
+        UserConnection                              bundleConnection;
+        SysMessageQueueMetadata                     messageQueueMetadata;
+        //SysMessageProcessorTaskErrorState           lastErrorState;
+        
+        #OCCRetryCount
+
+        boolean failed;
+        boolean isInMessageProcessing = false;
+        boolean isInMessageCancellation = false;
+
+        SysMessageProcessorMessageLog log;
+        List processedLog = new List(Types::Record);
+        List failedDependencyLog = new List(Types::Record);
+        RecordInsertList recordInsertList = new RecordInsertList(tableNum(SysMessageProcessorMessageLog));
+
+        try
+        {
+            /*if (this.inTransactionScope())
+            {
+                throw error(Error::wrongUseOfFunction(funcName()));
+            }*/
+
+            //lastErrorState = null;
+
+            //ttsbegin;
+
+            //boolean continueTransaction;
+            //do
+            //{
+            isInMessageProcessing = false;
+            isInMessageCancellation = false;
+
+            //Array recordArray = rowListEnumerator.current();
+            //SysMessageProcessorTaskBundleMessage bundleMessage = recordArray.value(SysMessageProcessorTaskBundleMessageTable);
+            SysMessageProcessorTaskBundleMessage bundleMessage;
+            bundleMessage.NextState = SysMessageState::Processed;
+            //SysMessage message = recordArray.value(SysMessageTable);
+            SysMessage message = SysMessage::find(_messageRecId);
+            //SysMessageProcessingState messageProcessingState = recordArray.value(SysMessageProcessingStateTable);
+            SysMessageProcessingState messageProcessingState = SysMessageProcessingState::find(_messageRecId);
+
+            //log = recordArray.value(SysMessageProcessorMessageLogTable);
+            select firstonly log order by createddatetime desc where log.Message == _messageRecId;
+
+            if (log || messageProcessingState.State == SysMessageState::Failed)
+            {
+                failed = log.Result != SysMessageProcessingResult::Processed;
+                //continue;
+                return false;
+            }
+
+            //this.ensureTakePessimisticLockIfRequired(message);
+
+                /*using (SysInstrumentationActivityContext activityContext = instrumentationLogger.messageProcessorTask().processMessage(message, messageProcessingState))
+                {
+                    activityContext.addCustomProperty(fieldStr(SysMessage, MessageQueue), enum2Symbol(enumNum(SysMessageQueue), messageQueue));
+                    activityContext.addCustomProperty(fieldStr(SysMessage, MessageType), enum2Symbol(enumNum(SysMessageType), message.MessageType));
+                    */
+            infolog.clear();
+            log = this.createLog(message, bundleMessage.NextState);
+
+                    /*if (failed && bundleMessage.SequenceDependency)
+                    {
+                        log.result(SysMessageProcessingResult::FailedDependency);
+                        failedDependencyLog.addEnd(log);
+                        activityContext.addCustomProperty(fieldStr(SysMessageProcessorMessageLog, Result), enum2Symbol(enumNum(SysMessageProcessingResult), SysMessageProcessingResult::FailedDependency));
+                        continueTransaction = true;
+                    }
+                    else
+                    {*/
+            if (bundleMessage.NextState == SysMessageState::Processed)
+            {
+                isInMessageProcessing = true;
+
+                this.executeStateTransition(message, SysMessageState::Processed);
+
+                log.result(SysMessageProcessingResult::Processed);
+                processedLog.addEnd(log);
+                //activityContext.addCustomProperty(fieldStr(SysMessageProcessorMessageLog, Result), enum2Symbol(enumNum(SysMessageProcessingResult), SysMessageProcessingResult::Processed));
+            }
+            else if (bundleMessage.NextState == SysMessageState::Cancelled)
+            {
+                isInMessageCancellation = true;
+
+                this.executeStateTransition(message, SysMessageState::Cancelled, true);
+
+                log.result(SysMessageProcessingResult::Cancelled);
+                processedLog.addEnd(log);
+                //activityContext.addCustomProperty(fieldStr(SysMessageProcessorMessageLog, Result), enum2Symbol(enumNum(SysMessageProcessingResult), SysMessageProcessingResult::Cancelled));
+            }
+            else
+            {
+                throw error(Error::wrongUseOfFunction(funcName()));
+            }
+
+            failed = false;
+                        //continueTransaction = !bundleMessage.Commit;
+                    //}
+                //}
+                    
+            /*}
+            while (continueTransaction && rowListEnumerator.moveNext());*/
+
+            this.addLogToRecordInsertList(processedLog.getEnumerator(), recordInsertList);
+            this.addLogToRecordInsertList(failedDependencyLog.getEnumerator(), recordInsertList);
+            recordInsertList.insertDatabase();
+
+            this.updateMessageStateToDesiredNextState(processedLog.elements());
+
+            //ttscommit;
+        }
+        catch (Exception::DuplicateKeyException)
+        {
+            /*lastErrorState = SysMessageProcessorTaskErrorState::construct(
+                    rowListEnumerator.current(),
+                    log,
+                    processedLog,
+                    failedDependencyLog,
+                    recordInsertList,
+                    isInMessageProcessing,
+                    isInMessageCancellation);*/
+
+            throw Exception::DuplicateKeyException;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            /*lastErrorState = SysMessageProcessorTaskErrorState::construct(
+                    rowListEnumerator.current(),
+                    log,
+                    processedLog,
+                    failedDependencyLog,
+                    recordInsertList,
+                    isInMessageProcessing,
+                    isInMessageCancellation);*/
+
+            throw Exception::UpdateConflict;
+        }
+        catch (Exception::Deadlock)
+        {
+            /*lastErrorState = SysMessageProcessorTaskErrorState::construct(
+                    rowListEnumerator.current(),
+                    log,
+                    processedLog,
+                    failedDependencyLog,
+                    recordInsertList,
+                    isInMessageProcessing,
+                    isInMessageCancellation);*/
+
+            throw Exception::Deadlock;
+        }
+        catch (Exception::TransientSqlConnectionError)
+        {
+            /*lastErrorState = SysMessageProcessorTaskErrorState::construct(
+                    rowListEnumerator.current(),
+                    log,
+                    processedLog,
+                    failedDependencyLog,
+                    recordInsertList,
+                    isInMessageProcessing,
+                    isInMessageCancellation);
+*/
+            throw Exception::TransientSqlConnectionError;
+        }
+        catch
+        {
+            failed = true;
+
+            /*SysMessageProcessorTaskErrorState errorState = SysMessageProcessorTaskErrorState::construct(
+                    rowListEnumerator.current(),
+                    log,
+                    processedLog,
+                    failedDependencyLog,
+                    recordInsertList,
+                    isInMessageProcessing,
+                    isInMessageCancellation);
+
+            this.onMessageProcessingUnrecoverableError(errorState);*/
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getMessageFromQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get sales order id to substitute from the top picking queue <c>METPostSalesOrderCreationProcessingQueue</c>
+    /// </summary>
+    /// <param name = "_processId">Guid created and added in the contract <c>METPostSalesOrderCreationProcessingContract</c></param>
+    /// <param name = "_readPast">boolean to read past records or not</param>
+    /// <returns>Get sales order id to substitute</returns>
+    private SysMessageRecId getMessageFromQueue(boolean _readPast)
+    {
+        //SysMessage message;
+        SysMessageProcessingState messageProcessingState;
+        
+        #OCCRetryCount
+        int backOffWait;
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockException;
+        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
+        Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
+        
+        messageProcessingState.readPast(_readPast);
+
+        try
+        {
+            ttsbegin;
+    
+            /*select firstonly pessimisticlock recid
+            from message
+                exists join messageProcessingState
+            where  messageProcessingState.Message == message.RecId
+                && message.MessageQueue == messageQueue
+                && messageProcessingState.State == SysMessageState::Queued;
+
+            if (message.RecId)
+            {
+                this.messageRecId = message.RecId;*/
+
+            select firstonly pessimisticlock message
+            from messageProcessingState
+            where messageProcessingState.MessageQueue == messageQueue
+               && messageProcessingState.State == SysMessageState::Queued;
+
+            if (messageProcessingState.Message)
+            {
+                this.messageRecId = messageProcessingState.Message;
+                counter++;
+
+                VNGMessageProcessorDebug table;
+                table.Counter = counter;
+                table.MessageRecId = messageProcessingState.Message;
+                table.insert();
+            }
+            else
+            {
+                // no sales order id found from top picking queue
+                this.messageRecId = 0;
+            }
+
+            ttscommit;
+        }
+        catch (deadLockException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw deadLockException;
+                }
+            }
+            else
+            {
+                throw deadLockException;
+            }
+        }
+        catch (updateConflictException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+            }
+            else
+            {
+                throw updateConflictException;
+            }
+        }
+        catch (transientSqlConnectionError)
+        {
+            if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw transientSqlConnectionError;
+            }
+        }
+
+        return this.messageRecId;
+       
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>inTransactionScope</Name>
+				<Source><![CDATA[
+    private boolean inTransactionScope()
+    {
+        return appl.ttsLevel() != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLog</Name>
+				<Source><![CDATA[
+    private SysMessageProcessorMessageLog createLog(SysMessage _message, SysMessageState _nextState)
+    {
+        SysMessageProcessorMessageLog log1 = SysMessageProcessorMessageLog::createLog(_message, _nextState);
+        log1.BatchAffinity = affinity;
+
+        return log1;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>executeStateTransition</Name>
+				<Source><![CDATA[
+    private void executeStateTransition(SysMessage _message, SysMessageState _nextState, boolean _skipTransitionValidation = false)
+    {
+        SysMessageTypeMetadata messageTypeMetadata = SysMessageTypeMetadata::construct(_message.MessageType);
+        //METPEPricingMessageType messageTypeMetadata = SysMessageTypeMetadata::construct(_message.MessageType);
+
+        if (_skipTransitionValidation || messageTypeMetadata.allowStateTransition(_message, _nextState))
+        {
+            SysMessageTarget messageTarget = SysMessageTarget::find(_message.MessageTarget);
+            SysMessageTargetInstanceTypeMetadata messageTargetInstanceType = SysMessageTargetInstanceTypeMetadata::construct(messageTarget.InstanceRelationType);
+            CompanyId companyId = messageTargetInstanceType.getCompanyId(messageTarget);
+
+            if (companyId)
+            {
+                changecompany (companyId)
+                {
+                    messageTypeMetadata.processMessageStateTransition(_message, SysMessageStateTransition::newFromStates(_message.messageProcessingState().State, _nextState));
+                }
+            }
+            else
+            {
+                messageTypeMetadata.processMessageStateTransition(_message, SysMessageStateTransition::newFromStates(_message.messageProcessingState().State, _nextState));
+            }
+        }
+        else
+        {
+            throw Error(strFmt("@MessageProcessor:Error_RequestedStateTransitionNotAllowed", _message.RecId));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addLogToRecordInsertList</Name>
+				<Source><![CDATA[
+    private void addLogToRecordInsertList(ListEnumerator _enumerator, RecordInsertList _recordInsetList)
+    {
+        while (_enumerator.moveNext())
+        {
+            _recordInsetList.add(_enumerator.current());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMessageStateToDesiredNextState</Name>
+				<Source><![CDATA[
+    private void updateMessageStateToDesiredNextState(int64 _expectedUpdateCount)
+    {
+        SysMessageProcessingState       messageProcessingState;
+        SysMessageProcessorMessageLog   messageLog;
+
+        update_recordset messageProcessingState
+            setting State = messageLog.NextState
+            where messageProcessingState.State == SysMessageState::Queued
+            join messageLog
+            where messageLog.Message == messageProcessingState.Message
+               && (messageLog.Result == SysMessageProcessingResult::Processed || messageLog.Result == SysMessageProcessingResult::Cancelled)
+               && messageLog.CreatedTransactionId == appl.curTransactionId();
+
+        if (_expectedUpdateCount != messageProcessingState.RowCount())
+        {
+            throw Exception::UpdateConflict;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
