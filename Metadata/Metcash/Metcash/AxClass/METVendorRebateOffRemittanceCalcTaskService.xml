@@ -12,6 +12,7 @@ public class METVendorRebateOffRemittanceCalcTaskService extends METSysOperation
     LedgerJournalTable journalTable;
     LedgerJournalName journalName;
     LedgerJournalEngine journalEngine;
+    RecordInsertList transInsertList = new RecordInsertList(tableNum(LedgerJournalTrans));
 
 }
 ]]></Declaration>
@@ -24,10 +25,7 @@ public class METVendorRebateOffRemittanceCalcTaskService extends METSysOperation
     /// </summary>
     protected void initialise()
     {
-        
-        
         super();
-
         // get the topPickingProcessId from the contract
         contract = dataContract as METVendorRebateOffRemittanceCalcTaskContract;
         queueId = contract.parmTopPickingProcessId();
@@ -45,89 +43,73 @@ public class METVendorRebateOffRemittanceCalcTaskService extends METSysOperation
     protected void processTask(boolean _readPast)
     {
         METVendorRebateOffRemittanceCalcStaging transStaging;
-        ttsbegin;
+        
         while (this.getDataFromTopPickingQueue(queueId, _readPast))
         {
-            journalTable = this.findOrCreateJournal();
-            journalName = LedgerJournalName::find(journalTable.JournalName);
-            
-            journalEngine = LedgerJournalEngine::construct(journalName.JournalType);
-
-            if (contract.parmGroupByChargeCode() && contract.parmGroupByDepartment())
-            {
-                 while select sum(ChargeAmount) from transStaging
-                    group by ChargeCode, Department
-                    where transStaging.ProcessId == queueId
-                    && transStaging.SiteId == siteId
-                {
-                    MarkupTable markupTable = MarkupTable::find(MarkupModuleType::Vend, transStaging.ChargeCode);
-
-                    LedgerJournalTrans trans;
-                    trans.clear();
-                    trans.initValue();
-                    
-                    this.setLedgerJournalTrans(trans, transStaging);
-
-                    if (trans.validateWrite())
-                    {
-                        trans.insert();
-                    }
-                }
-            }
-            else if (contract.parmGroupByChargeCode())
-            {
-                while select sum(ChargeAmount) from transStaging
-                    group by ChargeCode
-                    where transStaging.ProcessId == queueId
-                    && transStaging.SiteId == siteId
-                {
-                    MarkupTable markupTable = MarkupTable::find(MarkupModuleType::Vend, transStaging.ChargeCode);
-
-                    LedgerJournalTrans trans;
-                    trans.clear();
-                    trans.initValue();
-                    
-                    this.setLedgerJournalTrans(trans, transStaging);
-
-                    if (trans.validateWrite())
-                    {
-                        trans.insert();
-                    }
-                }
-            }
-
-            ttscommit;
-
             try
             {
-                LedgerJournalCheckPost::newLedgerJournalTable(journalTable, NoYes::Yes).run();
-
-                VendPackingSlipTrans packingSlipTrans;
+                ttsbegin;
+                journalTable = this.findOrCreateJournal();
+                journalName = LedgerJournalName::find(journalTable.JournalName);
             
-                update_recordset packingslipTrans
-                    setting METRemittanceJournalId = journalTable.JournalNum
-                join transStaging
-                    where transStaging.PackingSlipTransRecId == packingSlipTrans.recid
-                    && transStaging.SiteId == siteId
-                    && transStaging.ProcessId == queueId;
+                journalEngine = LedgerJournalEngine::construct(journalName.JournalType);
+
+                AmountCur amt;
+                select sum(ChargeAmount) from transStaging
+                        where transStaging.ProcessId == queueId
+                            && transStaging.SiteId == siteId
+                        && transStaging.LineAmount != 0;
+
+                LedgerJournalTrans transDebit = this.createLedgerJournalTrans(transStaging, DebitCredit::Debit, '');
+
+                if (contract.parmGroupByChargeCode() && contract.parmGroupByDepartment())
+                {
+                    while select sum(ChargeAmount) from transStaging
+                        group by ChargeCode, Department, CustomerLedgerDimension
+                        where transStaging.ProcessId == queueId
+                            && transStaging.SiteId == siteId
+                            && transStaging.LineAmount != 0
+                    {
+                        if(abs(transStaging.ChargeAmount) < 1)
+                        {
+                            continue;
+                        }
+
+                        amt += roundUpdec(abs(transStaging.ChargeAmount),2);
+
+                        this.createLedgerJournalTrans(transStaging, DebitCredit::Credit, transDebit.Voucher);
+                    }
+                }
+                else if (contract.parmGroupByChargeCode())
+                {
+                    while select sum(ChargeAmount) from transStaging
+                        group by ChargeCode, CustomerLedgerDimension
+                        where transStaging.ProcessId == queueId
+                            && transStaging.SiteId == siteId
+                            && transStaging.LineAmount != 0
+                    {
+                        if(abs(transStaging.ChargeAmount) < 1)
+                        {
+                            continue;
+                        }
+
+                        amt += roundUpdec(abs(transStaging.ChargeAmount),2);
+
+                        this.createLedgerJournalTrans(transStaging, DebitCredit::Credit, transDebit.Voucher);
+                    }
+                }
+                //To avoid penny difference between debit and credit entries, we sum the amount on credits and update that back to debit transaction. 
+                transDebit.AmountCurDebit = amt;
+                transInsertList.add(transDebit);
+
+                transInsertList.insertDatabase();
+                this.postJournal(journalTable);
+
+                ttscommit;
             }
             catch
             {
-                ttsbegin;
-                journalTable.reread();
-                journalTable.selectForUpdate(true);
-                journalTable.delete();
-                ttscommit;
-            }
-            finally
-            {
-                ttsbegin;
-                
-                delete_from transStaging
-                    where transStaging.SiteId == siteId
-                        && transStaging.ProcessId == queueId;
-                
-                ttscommit;
+                continue;
             }
         }
     }
@@ -135,26 +117,168 @@ public class METVendorRebateOffRemittanceCalcTaskService extends METSysOperation
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>setLedgerJournalTrans</Name>
+				<Name>prePostCleanUp</Name>
 				<Source><![CDATA[
-    private void setLedgerJournalTrans(LedgerJournalTrans _trans, METVendorRebateOffRemittanceCalcStaging _transStaging)
+    /// <summary>
+    /// Clean-up zero value lines if exists
+    /// </summary>
+    /// <param name = "_journalTable"><t>LedgerJournalTrans</t> table buffer</param>
+    private void prePostCleanUp(LedgerJournalTable _journalTable)
     {
-        MarkupTable markupTable = MarkupTable::find(MarkupModuleType::Vend, _transStaging.ChargeCode);
+        LedgerJournalTrans transDel;
+
+        ttsbegin;
+        delete_from transDel
+            where transDel.JournalNum == _journalTable.JournalNum
+            && transDel.AmountCurCredit == 0
+            && transDel.AmountCurDebit == 0;
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Once the rebate journal is created, validate and post the same.
+    /// </summary>
+    /// <param name = "_journalTable"><t>LedgerJournalTable</t> record buffer</param>
+    private void postJournal(LedgerJournalTable _journalTable)
+    {
+        METVendorRebateOffRemittanceCalcStaging transStaging;
+        try
+        {
+            //Clean-up 0 value lines
+            this.prePostCleanUp(_journalTable);
+
+            LedgerJournalCheckPost::newLedgerJournalTable(journalTable, NoYes::Yes).run();
+
+            VendPackingSlipTrans packingSlipTrans;
+            JournalId journalId = _journalTable.JournalNum;
+            packingslipTrans.skipAosValidation(true);
+            packingslipTrans.skipDataMethods(true);
+            packingslipTrans.skipDataSourceValidateWrite(true);
+
+            update_recordset packingslipTrans
+                setting METRemittanceJournalId = journalId
+            exists join transStaging
+                where transStaging.PackingSlipTransRecId == packingSlipTrans.recid
+                && transStaging.SiteId == siteId
+                && transStaging.ProcessId == queueId;
+        }
+        catch
+        {
+            ttsbegin;
+            _journalTable.reread();
+            _journalTable.selectForUpdate(true);
+            _journalTable.delete();
+            ttscommit;
+        }
+        finally
+        {
+            ttsbegin;
+                
+            delete_from transStaging
+                where transStaging.SiteId == siteId
+                    && transStaging.ProcessId == queueId;
+                
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createLedgerJournalTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates <t>LedgerJournalTrans</t> records
+    /// </summary>
+    /// <param name = "_transStaging">Staging record buffer</param>
+    /// <param name = "_debitCredit">Debit or credit entry</param>
+    /// <param name = "_voucher">Voucher number to use</param>
+    /// <returns><t>LedgerJournalTrans</t> table buffer</returns>
+    private LedgerJournalTrans createLedgerJournalTrans(METVendorRebateOffRemittanceCalcStaging _transStaging, DebitCredit _debitCredit, Voucher _voucher)
+    {
+        LedgerJournalTrans trans;
+        trans.clear();
+        trans.initValue();
         
-        if (journalEngine && !_trans.Voucher)
+        if (journalEngine)
         {
             journalEngine.ledgerJournalTable(LedgerJournalTable::find(journalTable.journalNum));
-            journalEngine.initValue(_trans);
+
+            if(_voucher != '')
+            {
+                trans.Voucher = _voucher;
+            }
+
+            journalEngine.initValue(trans);
         }
 
-        _trans.TransDate = contract.parmAsOnDate();
-        _trans.OffsetAccountType = journalName.OffsetAccountType;
-        _trans.OffsetLedgerDimension = journalName.OffsetLedgerDimension;
-        _trans.JournalNum = journalTable.JournalNum;
-        _trans.AccountType = LedgerJournalACType::Ledger;
-        _trans.LedgerDimension = markupTable.CustomerLedgerDimension;
-        _trans.AmountCurCredit = abs(_transStaging.ChargeAmount);
-        _trans.OffsetDefaultDimension = journalName.DefaultDimension;
+        MainAccountRecId mainAccountRecId = LedgerDimensionFacade::getMainAccountRecIdFromLedgerDimension(journalName.OffsetLedgerDimension);
+        if(_debitCredit == DebitCredit::Debit)
+        {
+            trans.Txt =strFmt('@SYS76785', siteId, MainAccount::find(mainAccountRecId).Name);
+        }
+        else
+        {
+            if(_transStaging.Department)
+            {
+                trans.Txt = strFmt('@EnterpriseAssetManagementAppSuite:EntAssetForecastUpdateCalc_InfoLogPrefix_Format', siteId, _transStaging.ChargeCode, _transStaging.Department);
+            }
+            else
+            {
+                trans.Txt = strFmt('@SYS76785', siteId, _transStaging.ChargeCode);
+            }
+        }
+        
+        trans.TransDate = contract.parmAsOnDate();
+        trans.AccountType = LedgerJournalACType::Ledger;
+
+        if(_debitCredit == DebitCredit::Debit)
+        {
+            trans.LedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(journalName.OffsetLedgerDimension, journalName.DefaultDimension);
+            trans.AmountCurDebit = roundUpdec(abs(_transStaging.ChargeAmount),2);
+        }
+        else
+        {
+            trans.LedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(_transStaging.CustomerLedgerDimension, journalName.DefaultDimension);
+            trans.AmountCurCredit = roundUpdec(abs(_transStaging.ChargeAmount),2);
+        }
+
+        journalEngine.initDefaultDimension(trans);
+        trans.modifiedField(fieldNum(LedgerJournalTrans, LedgerDimension));
+        journalEngine.accountModified(trans);
+
+        trans.JournalNum = journalTable.JournalNum;
+
+        
+        trans.ReverseDate = journalTable.ReverseDate;
+        trans.ReverseEntry = journalTable.ReverseEntry;
+
+        if (trans.validateWrite() && _debitCredit == DebitCredit::Credit)
+        {
+            transInsertList.add(trans);
+        }
+
+        return trans;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getJournalDescription</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Construct and return journal description
+    /// </summary>
+    /// <param name = "_date">Transaction date</param>
+    /// <returns>Journal description to use on <t>LedgerJournalTable</t></returns>
+    private str getJournalDescription(TransDate _date)
+    {
+        return strFmt('@MET:RebAccrJournalDesc', mthName(mthOfYr(_date)), year(_date));
     }
 
 ]]></Source>
@@ -162,26 +286,35 @@ public class METVendorRebateOffRemittanceCalcTaskService extends METSysOperation
 			<Method>
 				<Name>findOrCreateJournal</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Find or create a <t>LedgerJournalTable</t> table buffer.
+    /// </summary>
+    /// <returns><t>LedgerJournalTable</t> table buffer matching the condition</returns>
     private LedgerJournalTable findOrCreateJournal()
     {
         LedgerJournalTable journalTableLoc;
 
         select firstonly journalTableLoc
             where journalTableLoc.METSiteId == siteId
-            && journalTableLoc.METAsOfDate == contract.parmAsOnDate();
+            && journalTableLoc.METAsOfDate == contract.parmAsOnDate()
+            && !journalTableLoc.Posted;
         
         if (!journalTableLoc)
         {
             journalTableLoc.clear();
+
             journalTableLoc.JournalName = METVendParameters::find().RebateAccrualJournalName;
             journalTableLoc.initFromLedgerJournalName();
-            journalTableLoc.Name = strFmt('Vendor rebate accrual for the period Mar2025');
+
             journalTableLoc.METSiteId = siteId;
             journalTableLoc.METAsOfDate = contract.parmAsOnDate();
             journalTableLoc.ReverseDate = contract.parmReversalDate();
             journalTableLoc.ReverseEntry = NoYes::Yes;
-
             journalTableLoc.insert();
+
+            journalTableLoc.Name = this.getJournalDescription(contract.parmAsOnDate());
+            journalTableLoc.ReverseEntry = NoYes::Yes;
+            journalTableLoc.update();
         }
 
         return journalTableLoc;
@@ -192,6 +325,10 @@ public class METVendorRebateOffRemittanceCalcTaskService extends METSysOperation
 			<Method>
 				<Name>process</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the process
+    /// </summary>
+    /// <param name = "_dataContract"><c>METVendorRebateOffRemittanceCalcTaskContract</c> contract class instance</param>
     public void process(METVendorRebateOffRemittanceCalcTaskContract _dataContract)
     {
         this.processInternal(_dataContract);
