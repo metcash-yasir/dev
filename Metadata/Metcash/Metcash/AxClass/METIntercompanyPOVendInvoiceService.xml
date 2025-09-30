@@ -22,7 +22,7 @@ public class METIntercompanyPOVendInvoiceService extends SysOperationServiceBase
     {
         Query       query       = new Query(SysOperationHelper::base64Decode(_contract.parmPackedQuery()));
         QueryRun    queryRun    = new QueryRun(query);
-     
+
         while (queryRun.next())
         {
             SalesId                 metFulfillmentSOReference;
@@ -34,8 +34,10 @@ public class METIntercompanyPOVendInvoiceService extends SysOperationServiceBase
             VendInvoiceInfoTable    vendInvoiceInfoTableLoc;
             VendInvoiceInfoLine     vendInvoiceInfoLine;
             VendInvoiceInfoSubLine  vendInvoiceInfoSubLine;
-            SalesLine               salesLine;
-
+            SalesLine               salesLine;            
+            Set                     invoiceSet = new Set(Types::Record);
+            SetEnumerator           invoiceSetEnumerator;
+  
             metFulfillmentSOReference = purchTable.InterCompanySalesId;
 
             while select purchLine
@@ -54,9 +56,25 @@ public class METIntercompanyPOVendInvoiceService extends SysOperationServiceBase
 
                 if (custInvoiceJour)
                 {
-                    this.createPendingVendorInvoice(purchLine, salesLine);
+                    vendInvoiceInfoTableLoc = this.createPendingVendorInvoice(purchLine, salesLine);
+
+                    if(!invoiceSet.in(vendInvoiceInfoTableLoc))
+                    {
+                        invoiceSet.add(vendInvoiceInfoTableLoc);
+                    }
                 }
             }
+
+            if (!invoiceSet.empty())
+            {
+                invoiceSetEnumerator = invoiceSet.getEnumerator();
+                invoiceSetEnumerator.reset();
+
+                while (invoiceSetEnumerator.moveNext())
+                {
+                    this.submitInvoiceToWorkflow(invoiceSetEnumerator.current());
+                }
+            }           
         }
     }
 
@@ -86,7 +104,9 @@ public class METIntercompanyPOVendInvoiceService extends SysOperationServiceBase
             VendInvoiceInfoLine     vendInvoiceInfoLine;
             VendInvoiceInfoSubLine  vendInvoiceInfoSubLine;
             SalesLine               salesLine;
-
+            Set                     invoiceSet = new Set(Types::Record);
+            SetEnumerator           invoiceSetEnumerator;
+            
             if ((purchTable.METIntercompanyTransferReplenishment == NoYes::Yes || purchTable.InterCompanyOrder == NoYes::Yes)
                 && purchTable.PurchStatus != PurchStatus::Invoiced)
             {
@@ -107,8 +127,24 @@ public class METIntercompanyPOVendInvoiceService extends SysOperationServiceBase
                     }
                     if (custInvoiceJour)
                     {
-                        this.createPendingVendorInvoice(purchLine, salesLine);
+                        vendInvoiceInfoTableLoc = this.createPendingVendorInvoice(purchLine, salesLine);
+
+                        if(!invoiceSet.in(vendInvoiceInfoTableLoc))
+                        {
+                            invoiceSet.add(vendInvoiceInfoTableLoc);
+                        }
                     }
+                }
+            }
+
+            if (!invoiceSet.empty())
+            {
+                invoiceSetEnumerator = invoiceSet.getEnumerator();
+                invoiceSetEnumerator.reset();
+
+                while (invoiceSetEnumerator.moveNext())
+                {
+                    this.submitInvoiceToWorkflow(invoiceSetEnumerator.current());
                 }
             }
         }
@@ -182,49 +218,59 @@ public class METIntercompanyPOVendInvoiceService extends SysOperationServiceBase
     public VendInvoiceInfoTable createPendingVendorInvoice(PurchLine _purchLine, SalesLine _salesLine)
     {
         PurchTable              purchTable      = PurchTable::find(_purchLine.PurchId);
-        CustInvoiceJour         custInvoiceJour = this.findCustInvoiceJour(_salesLine);
+        CustInvoiceJour         custInvoiceJour;
         CustInvoiceTrans        custInvoiceTrans;
         VendPackingSlipJour     vendPackingSlipJour;
         VendInvoiceInfoTable    vendInvoiceInfoTable;
 
-        select firstonly custInvoiceTrans
-            where custInvoiceTrans.ParentRecId == custInvoiceJour.RecId;
-
-        vendInvoiceInfoTable.clear();
-        vendInvoiceInfoTable.initValue();
-        vendInvoiceInfoTable.initFromPurchTable(purchTable);
-
-        vendInvoiceInfoTable.DocumentOrigin = DocumentOrigin::Manual;
-        vendInvoiceInfoTable.defaultRow(null, null, true);
-
-        vendInvoiceInfoTable.Num                    = custInvoiceJour.InvoiceId;
-        vendInvoiceInfoTable.ParmId                 = formletterParmData::getNewParmId();
-        vendInvoiceInfoTable.Payment                = VendTable::find(purchTable.InvoiceAccount).PaymTermId;
-        vendInvoiceInfoTable.Approved               = NoYes::Yes;
-        vendInvoiceInfoTable.TableRefId             = formletterParmData::getNewTableRefId();
-        vendInvoiceInfoTable.Description            = _salesLine.SalesId;
-        vendInvoiceInfoTable.MetImportGST           = custInvoiceTrans.TaxAmount;
-        vendInvoiceInfoTable.DocumentDate           = vendInvoiceInfoTable.ReceivedDate;
-        vendInvoiceInfoTable.METClaimInvoice        = NoYes::Yes;
-        vendInvoiceInfoTable.MetImportAmount        = custInvoiceJour.InvoiceAmount;
-        vendInvoiceInfoTable.LastMatchVariance      = LastMatchVarianceOptions::Unknown;
-
-        if (vendInvoiceInfoTable.validateWrite())
+        changecompany(purchTable.InterCompanyCompanyId)
         {
-            vendInvoiceInfoTable.insert();
+            custInvoiceJour = this.findCustInvoiceJour(_salesLine);
 
-            VendInvoiceInfoSubTable vendInvoiceInfoSubTable;
+            select firstonly custInvoiceTrans
+                where custInvoiceTrans.ParentRecId == custInvoiceJour.RecId;
+        }
 
-            vendInvoiceInfoSubTable.clear();
-            vendInvoiceInfoSubTable.initValue();
-            vendInvoiceInfoSubTable.defaultRow();
+        select firstonly vendInvoiceInfoTable
+                        where vendInvoiceInfoTable.PurchId == purchTable.PurchId
+                        && vendInvoiceInfoTable.Num == custInvoiceJour.InvoiceId;
+
+        if (!vendInvoiceInfoTable.RecId)
+        {
+            vendInvoiceInfoTable.clear();
+            vendInvoiceInfoTable.initValue();
+            vendInvoiceInfoTable.initFromPurchTable(purchTable);
+            vendInvoiceInfoTable.DocumentOrigin = DocumentOrigin::Manual;
+            vendInvoiceInfoTable.defaultRow(null, null, true);
+
+            vendInvoiceInfoTable.Num                    = custInvoiceJour.InvoiceId;
+            vendInvoiceInfoTable.ParmId                 = formletterParmData::getNewParmId();
+            vendInvoiceInfoTable.Payment                = VendTable::find(purchTable.InvoiceAccount).PaymTermId;
+            vendInvoiceInfoTable.Approved               = NoYes::Yes;
+            vendInvoiceInfoTable.TableRefId             = formletterParmData::getNewTableRefId();
+            vendInvoiceInfoTable.Description            = _salesLine.SalesId;
+            vendInvoiceInfoTable.MetImportGST           = custInvoiceJour.SumTax;
+            vendInvoiceInfoTable.METClaimInvoice        = NoYes::Yes;
+            vendInvoiceInfoTable.MetImportAmount        = custInvoiceJour.InvoiceAmount; 
+            vendInvoiceInfoTable.LastMatchVariance      = LastMatchVarianceOptions::Unknown;
+
+            if (vendInvoiceInfoTable.validateWrite())
+            {
+                vendInvoiceInfoTable.insert();
+
+                VendInvoiceInfoSubTable vendInvoiceInfoSubTable;
+
+                vendInvoiceInfoSubTable.clear();
+                vendInvoiceInfoSubTable.initValue();
+                vendInvoiceInfoSubTable.defaultRow();
  
-            vendInvoiceInfoSubTable.ParmId          = vendInvoiceInfoTable.ParmId;
-            vendInvoiceInfoSubTable.PurchName       = vendInvoiceInfoTable.PurchName;
-            vendInvoiceInfoSubTable.TableRefId      = vendInvoiceInfoTable.TableRefId;
-            vendInvoiceInfoSubTable.OrigPurchId     = vendInvoiceInfoTable.PurchId;
+                vendInvoiceInfoSubTable.ParmId          = vendInvoiceInfoTable.ParmId;
+                vendInvoiceInfoSubTable.PurchName       = vendInvoiceInfoTable.PurchName;
+                vendInvoiceInfoSubTable.TableRefId      = vendInvoiceInfoTable.TableRefId;
+                vendInvoiceInfoSubTable.OrigPurchId     = vendInvoiceInfoTable.PurchId;
  
-            vendInvoiceInfoSubTable.insert();
+                vendInvoiceInfoSubTable.insert();
+            }
         }
 
         this.createPendingVendorInvoiceLines(vendInvoiceInfoTable, _purchLine, custInvoiceTrans);
@@ -249,42 +295,105 @@ public class METIntercompanyPOVendInvoiceService extends SysOperationServiceBase
         VendInvoiceInfoLine     vendInvoiceInfoLine;
         VendInvoiceInfoSubLine  vendInvoiceInfoSubLine;
 
-        vendInvoiceInfoLine.clear();
-        vendInvoiceInfoLine.initValue();
-        vendInvoiceInfoLine.initFromPurchLine(_purchLine);
+        select firstonly vendInvoiceInfoLine
+            where vendInvoiceInfoLine.ParmId == _vendInvoiceInfoTable.ParmId
+                    && vendInvoiceInfoLine.TableRefId == _vendInvoiceInfoTable.TableRefId
+                    && vendInvoiceInfoLine.ItemId == _purchLine.ItemId
+                    && vendInvoiceInfoLine.PurchUnit == _purchLine.PurchUnit
+                    && vendInvoiceInfoLine.PurchPrice == _purchLine.PurchPrice
+                    && vendInvoiceInfoLine.LineAmount == _purchLine.LineAmount;
 
-        vendInvoiceInfoLine.ItemId              = _purchLine.ItemId;
-        vendInvoiceInfoLine.ParmId              = _vendInvoiceInfoTable.ParmId;
-        vendInvoiceInfoLine.PurchUnit           = _purchLine.PurchUnit;
-        vendInvoiceInfoLine.InventNow           = _purchLine.PurchQty;
-        vendInvoiceInfoLine.PurchPrice          = _purchLine.PurchPrice;
-        vendInvoiceInfoLine.LineAmount          = _purchLine.LineAmount;
-        vendInvoiceInfoLine.TableRefId          = _vendInvoiceInfoTable.TableRefId;
-        vendInvoiceInfoLine.ReceiveNow          = _custInvoiceTrans.Qty;
-        vendInvoiceInfoLine.PriceUnit           = _custInvoiceTrans.SalesPrice;
-        vendInvoiceInfoLine.LineAmount          = _custInvoiceTrans.LineAmount;
-        vendInvoiceInfoLine.OrigPurchId         = _purchLine.PurchId;
-        vendInvoiceInfoLine.DeliveryName        = _vendInvoiceInfoTable.DeliveryName;
-        vendInvoiceInfoLine.currencyCode        = _vendInvoiceInfoTable.CurrencyCode;
-        vendInvoiceInfoLine.OrderAccount        = _vendInvoiceInfoTable.OrderAccount;
-        vendInvoiceInfoLine.DocumentOrigin      = DocumentOrigin::Manual;
-        vendInvoiceInfoLine.InvoiceAccount      = _vendInvoiceInfoTable.InvoiceAccount;
-    
-        vendInvoiceInfoLine.ProcurementCategory = EcoResProductCategory::findByItemIdCategoryHierarchyRole(_purchLine.ItemId, EcoResCategoryNamedHierarchyRole::Procurement).Category;
-    
-        vendInvoiceInfoLine.insert();
-
-        if (vendInvoiceInfoLine.RecId)
+        if (!vendInvoiceInfoLine.RecId)
         {
-            vendInvoiceInfoSubLine.clear();
+            vendInvoiceInfoLine.clear();
+            vendInvoiceInfoLine.initValue();
+            vendInvoiceInfoLine.initFromPurchLine(_purchLine);
+
+            vendInvoiceInfoLine.ItemId              = _purchLine.ItemId;
+            vendInvoiceInfoLine.ParmId              = _vendInvoiceInfoTable.ParmId;
+            vendInvoiceInfoLine.PurchUnit           = _purchLine.PurchUnit;
+            vendInvoiceInfoLine.InventNow           = _purchLine.PurchQty;
+            vendInvoiceInfoLine.PurchPrice          = _purchLine.PurchPrice;
+            vendInvoiceInfoLine.LineAmount          = _purchLine.LineAmount;
+            vendInvoiceInfoLine.TableRefId          = _vendInvoiceInfoTable.TableRefId;
+            vendInvoiceInfoLine.ReceiveNow          = _custInvoiceTrans.Qty;
+            vendInvoiceInfoLine.PriceUnit           = _custInvoiceTrans.SalesPrice;
+            vendInvoiceInfoLine.LineAmount          = _custInvoiceTrans.LineAmount;
+            vendInvoiceInfoLine.DeliveryName        = _vendInvoiceInfoTable.DeliveryName;
+            vendInvoiceInfoLine.currencyCode        = _vendInvoiceInfoTable.CurrencyCode;
+            vendInvoiceInfoLine.OrderAccount        = _vendInvoiceInfoTable.OrderAccount;
+            vendInvoiceInfoLine.DocumentOrigin      = DocumentOrigin::Manual;
+            vendInvoiceInfoLine.InvoiceAccount      = _vendInvoiceInfoTable.InvoiceAccount;
+    
+            vendInvoiceInfoLine.ProcurementCategory = EcoResProductCategory::findByItemIdCategoryHierarchyRole(_purchLine.ItemId, EcoResCategoryNamedHierarchyRole::Procurement).Category;
+    
+            vendInvoiceInfoLine.insert();
+
+            if (vendInvoiceInfoLine.RecId)
+            {
+                this.createPendingVendorInvoiceInfoSubLines(_purchLine.InventTransId, vendInvoiceInfoLine, _custInvoiceTrans.PdsCWQty);
+                this.metUpdateReceiptedData(vendInvoiceInfoLine, _purchLine);
+            }
+        }       
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metUpdateReceiptedData</Name>
+				<Source><![CDATA[
+    protected void metUpdateReceiptedData(VendInvoiceInfoLine _vendInvoiceInfoLine, PurchLine _purchLine)
+    {
+        ttsbegin;
+        _vendInvoiceInfoLine.reread();
+        _vendInvoiceInfoLine.selectForUpdate(true);
+        _vendInvoiceInfoLine.METReceiptedUnit           = _purchLine.PurchPrice;
+        _vendInvoiceInfoLine.METReceiptedQuantity       = _vendInvoiceInfoLine.purchQtyMatched();
+        _vendInvoiceInfoLine.METReceiptedCWQuantity     = _vendInvoiceInfoLine.pdsCWQtyMatched();// sumCWQtyMap.lookup(key);
+        _vendInvoiceInfoLine.METReceiptedLineNetAmount  = _vendInvoiceInfoLine.METReceiptedQuantity * _purchLine.PurchPrice; //sumValueMap.lookup(key);
+
+        if (_vendInvoiceInfoLine.PurchPrice != _vendInvoiceInfoLine.METReceiptedUnit)
+        {
+            _vendInvoiceInfoLine.metInitReasonCode(_vendInvoiceInfoLine.metGetVarianceReasonCodes(METVarianceCategory::Price), true);
+        }
+                
+        _vendInvoiceInfoLine.update();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPendingVendorInvoiceInfoSubLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create the pending vendor invoice lines of the PO.
+    /// </summary>
+    /// <param name = "_vendInvoiceInfoTable">VendInvoiceInfoTable</param>
+    /// <param name = "_purchLine">PurchLine</param>
+    /// <param name = "_invoiceQty">VendPackingSlipTrans</param>
+    public void createPendingVendorInvoiceInfoSubLines(InventTransId _inventTransId, VendInvoiceInfoLine _vendInvoiceInfoLine, PdsCWInventQty _pdsCWInventQty)
+    {
+        VendPackingSlipTrans    vendPackingSlipTrans;
+        VendInvoiceInfoSubLine  vendInvoiceInfoSubLine;
+
+        vendInvoiceInfoSubLine.clear();
+
+        //Insert the sub line details from the table <c>VendPackingSlipTrans</c>
+        while select InventTransId, PackingSlipId, Qty, RecId, TableId from vendPackingSlipTrans
+            where vendPackingSlipTrans.InventTransId ==_inventTransId
+        {
             vendInvoiceInfoSubLine.initValue();
             vendInvoiceInfoSubLine.defaultRow();
 
-            vendInvoiceInfoSubLine.ParmId           =   vendInvoiceInfoLine.ParmId;
-            vendInvoiceInfoSubLine.InventNow        =   vendInvoiceInfoLine.ReceiveNow;
-            vendInvoiceInfoSubLine.ReceiveNow       =   vendInvoiceInfoLine.ReceiveNow;
-            vendInvoiceInfoSubLine.LineRefRecId     =   vendInvoiceInfoLine.RecId;
-            vendInvoiceInfoSubLine.LineRefRecId     =   vendInvoiceInfoLine.RecId;
+            vendInvoiceInfoSubLine.ParmId               = _vendInvoiceInfoLine.ParmId;
+            vendInvoiceInfoSubLine.InventNow            = vendPackingSlipTrans.Qty;
+            vendInvoiceInfoSubLine.ReceiveNow           = vendPackingSlipTrans.Qty;
+            vendInvoiceInfoSubLine.PdsCWInventNow      = _pdsCWInventQty;
+            vendInvoiceInfoSubLine.DocumentId           = vendPackingSlipTrans.PackingSlipId;
+            vendInvoiceInfoSubLine.LineRefRecId         = _vendInvoiceInfoLine.RecId;
+            vendInvoiceInfoSubLine.JournalRefRecId      = vendPackingSlipTrans.RecId;
+            vendInvoiceInfoSubLine.JournalRefTableId    = vendPackingSlipTrans.TableId;
 
             vendInvoiceInfoSubLine.insert();
         }
@@ -293,17 +402,17 @@ public class METIntercompanyPOVendInvoiceService extends SysOperationServiceBase
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>submitClaimInvoiceToWorkflow</Name>
+				<Name>submitInvoiceToWorkflow</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Submit claim to workflow.
+    /// Submit Invoice to workflow.
     /// </summary>
-    /// <param name = "_claimInvoiceTable">VendInvoiceInfoTable</param>
-    private void submitClaimInvoiceToWorkflow(VendInvoiceInfoTable _claimInvoiceTable)
+    /// <param name = "_invoiceTable">VendInvoiceInfoTable</param>
+    private void submitInvoiceToWorkflow(VendInvoiceInfoTable _invoiceTable)
     {
-        if(_claimInvoiceTable && _claimInvoiceTable.existLine() && _claimInvoiceTable.canSubmitToWorkflow())
+        if(_invoiceTable && _invoiceTable.existLine() && _invoiceTable.canSubmitToWorkflow())
         {
-            VendInvoiceHeaderWorkflow::submitToWorkflow(_claimInvoiceTable, _claimInvoiceTable.Description);
+            VendInvoiceHeaderWorkflow::submitToWorkflow(_invoiceTable, _invoiceTable.Description);
         }
     }
 
