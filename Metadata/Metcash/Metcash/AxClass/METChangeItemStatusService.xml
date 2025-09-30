@@ -10,6 +10,9 @@
 class METChangeItemStatusService
 {
     InventParameters InventParameters = InventParameters::find();
+    ItemId mainItemId;
+    InventSiteId mainSiteId;
+
 }
 ]]></Declaration>
 		<Methods>
@@ -130,6 +133,9 @@ class METChangeItemStatusService
             METReqItemTableInventDimView metReqItemTableInventDimView;
 
             metInventItemOrderSetup = _queryRun.get(tableNum(METInventItemOrderSetup));
+
+            mainItemId = metInventItemOrderSetup.ItemId;
+            mainSiteId = metInventItemOrderSetup.SiteId;
 
             InventSite inventSite = InventSite::find(InventDim::find(metInventItemOrderSetup.InventDimId).InventSiteId);
 
@@ -288,8 +294,8 @@ class METChangeItemStatusService
                     METInventItemOrderSetup metInventItemOrderSetupTransferSite, metInventItemOrderSetupTransferSiteTempItem, metInventItemOrderSetupMainSite;
 
                     select firstonly metInventItemOrderSetupMainSite
-                        where metInventItemOrderSetupMainSite.SiteId == _inventLocation.InventSiteId
-                        && metInventItemOrderSetupMainSite.ItemId == _metInventItemOrderSetup.ItemId;
+                        where metInventItemOrderSetupMainSite.SiteId == mainSiteId
+                        && metInventItemOrderSetupMainSite.ItemId == mainItemId;
 
                     select firstonly forupdate metInventItemOrderSetupTransferSite
                         where metInventItemOrderSetupTransferSite.SiteId == _metInventItemOrderSetup.SiteId
@@ -299,7 +305,7 @@ class METChangeItemStatusService
 
                     if(metInventItemOrderSetupMainSite && metInventItemOrderSetupTransferSite)
                     {
-                        this.copyDelReasonAndVendReplacementFromSourceToTransferSiteMain(metInventItemOrderSetupMainSite, metInventItemOrderSetupTransferSite);
+                        this.copyDelReasonAFromSourceToTransferSiteAndDeleteMain(metInventItemOrderSetupMainSite, metInventItemOrderSetupTransferSite);
                     }
 
                     select firstonly forupdate metInventItemOrderSetupTransferSiteTempItem
@@ -310,11 +316,14 @@ class METChangeItemStatusService
                     
                     if(metInventItemOrderSetupMainSite && metInventItemOrderSetupTransferSiteTempItem)
                     {
-                        this.copyDelReasonAndVendReplacementFromSourceToTransferSiteMain(metInventItemOrderSetupMainSite, metInventItemOrderSetupTransferSiteTempItem);
+                        this.copyDelReasonAFromSourceToTransferSiteAndDeleteMain(metInventItemOrderSetupMainSite, metInventItemOrderSetupTransferSiteTempItem);
                     }
                 }
-                this.updateStatusToDeletedMain(_metInventItemOrderSetup.ItemId, InventDim::find(_metInventItemOrderSetup.InventDimId), _metInventItemOrderSetup); // Delete status to Main item
-                this.updateStatusToDeletedMain(_metInventItemOrderSetup.TempItemPackChg, InventDim::find(_metInventItemOrderSetup.InventDimId), METInventItemOrderSetup::findByItemAndSite(_metInventItemOrderSetup.TempItemPackChg, _metInventItemOrderSetup.SiteId)); // Delete status to Temp item
+                else
+                {
+                    this.updateStatusToDeletedMain(_metInventItemOrderSetup.ItemId, InventDim::find(_metInventItemOrderSetup.InventDimId), _metInventItemOrderSetup); // Delete status to Main item
+                    this.updateStatusToDeletedMain(_metInventItemOrderSetup.TempItemPackChg, InventDim::find(_metInventItemOrderSetup.InventDimId), METInventItemOrderSetup::findByItemAndSite(_metInventItemOrderSetup.TempItemPackChg, _metInventItemOrderSetup.SiteId)); // Delete status to Temp item
+                }
                 
                 if (_calledFromTransferSite) // Change status to delete job for all child linked 
                 {
@@ -1361,8 +1370,146 @@ class METChangeItemStatusService
                         }
                     }
                 }
+
+                //Intercompany in other legal entity
+                
+                if (inventParameters.METInterCompanyPurchaseLegalEntity)
+                {
+                    Set setWarehouse = new Set(Types::String);
+
+                    while select InventSiteId, InventLocationId from metReqItemTableInventDimView
+                        where metReqItemTableInventDimView.ItemId == metInventItemOrderSetup.ItemId
+                        && metReqItemTableInventDimView.InventSiteId == metInventItemOrderSetup.SiteId
+                    {
+                        if (InventLocation::find(metReqItemTableInventDimView.InventLocationId).METNDCWarehouse)
+                        {
+                            InventLocation inventLocation;
+
+                            while select InventLocationId from inventLocation
+                                where inventLocation.METNDCWarehouse == NoYes::Yes
+                            {
+                                if (!setWarehouse.in(inventLocation.InventLocationId))
+                                {
+                                    setWarehouse.add(inventLocation.InventLocationId);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            if (!setWarehouse.in(metReqItemTableInventDimView.InventLocationId))
+                            {
+                                setWarehouse.add(metReqItemTableInventDimView.InventLocationId);
+                            }
+                        }
+                    }
+
+                    changecompany(inventParameters.METInterCompanyPurchaseLegalEntity)
+                    {
+                        METReqItemTableInventDimView metReqItemTableInventDimViewIntCom;
+                        METItemStatusWarehouses metItemStatusWarehousesIntCom;
+
+                        while select InventSiteId, InventLocationId, VendIntercompanyWarehouse from metReqItemTableInventDimViewIntCom
+                            where metReqItemTableInventDimViewIntCom.ItemId == metInventItemOrderSetup.ItemId
+                            && metReqItemTableInventDimViewIntCom.ReqPOType == ReqPOType::Purch
+                            && metReqItemTableInventDimViewIntCom.METInterCompanySourced == NoYes::Yes
+                            notexists join metItemStatusWarehousesIntCom
+                            where metItemStatusWarehousesIntCom.InventLocationId == metReqItemTableInventDimViewIntCom.InventLocationId
+                        {
+                            if (setWarehouse.in(metReqItemTableInventDimViewIntCom.VendIntercompanyWarehouse))
+                            {
+                                this.updateStatusToNew(METInventItemOrderSetup::findByItemAndSite(metInventItemOrderSetup.ItemId, metReqItemTableInventDimViewIntCom.InventSiteId, true));
+                                METInventItemOrderSetup::updateChildItemSiteStatus(metInventItemOrderSetup.ItemId, metReqItemTableInventDimViewIntCom.InventSiteId);
+
+                                //update new to all transfer sites
+                                METChangeItemStatusHelper metChangeItemStatusHelperIntCom = new METChangeItemStatusHelper();
+                                metChangeItemStatusHelperIntCom.updateItemStatusOfTransferSite(metInventItemOrderSetup.ItemId, metReqItemTableInventDimViewIntCom.InventSiteId, METItemStatusTable::findByStatus(METItemsStatus::New).ItemStatus);
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copyDelReasonAFromSourceToTransferSiteAndDeleteMain</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copy reason code, vend replacement and update to Deleted status for main item and child items
+    /// </summary>
+    /// <param name = "_metInventItemOrderSetupSource">METInventItemOrderSetup</param>
+    /// <param name = "_metInventItemOrderSetupDestination">METInventItemOrderSetup</param>
+    private void copyDelReasonAFromSourceToTransferSiteAndDeleteMain(METInventItemOrderSetup _metInventItemOrderSetupSource, METInventItemOrderSetup _metInventItemOrderSetupDestination)
+    {
+        if (_metInventItemOrderSetupDestination)
+        {
+            this.copyDelReasonAFromSourceToTransferSiteAndDelete(_metInventItemOrderSetupSource,_metInventItemOrderSetupDestination);
+
+            METSalesItemSubstitutionParentChild childItems;
+            METInventItemOrderSetup metInventItemOrderSetupForChildItems;
+                                                        
+            while select ChildItemID, InventSiteId from childItems
+                join forupdate metInventItemOrderSetupForChildItems
+                where childItems.ParentItemID == _metInventItemOrderSetupDestination.ItemId
+                && childItems.InventSiteId == _metInventItemOrderSetupDestination.SiteId
+                && metInventItemOrderSetupForChildItems.ItemId == childItems.ChildItemID
+                && metInventItemOrderSetupForChildItems.SiteId == childItems.InventSiteId
+            {
+                this.copyDelReasonAFromSourceToTransferSiteAndDelete(_metInventItemOrderSetupDestination,metInventItemOrderSetupForChildItems);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copyDelReasonAFromSourceToTransferSiteAndDelete</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copy deletion reason and Vend replacement and make status as Deleted
+    /// </summary>
+    /// <param name = "_metInventItemOrderSetupSource">METInventItemOrderSetup</param>
+    /// <param name = "_metInventItemOrderSetupDestination">METInventItemOrderSetup</param>
+    private void copyDelReasonAFromSourceToTransferSiteAndDelete(METInventItemOrderSetup _metInventItemOrderSetupSource, METInventItemOrderSetup _metInventItemOrderSetupDestination)
+    {
+        InventItemPurchSetup inventItemPurchSetup = InventItemPurchSetup::find(_metInventItemOrderSetupDestination.ItemId,_metInventItemOrderSetupDestination.InventDimId);
+        InventItemInventSetup inventItemInventSetup = InventItemInventSetup::find(_metInventItemOrderSetupDestination.ItemId,_metInventItemOrderSetupDestination.InventDimId);
+
+        if (_metInventItemOrderSetupDestination)
+        {
+            ttsbegin;
+            _metInventItemOrderSetupDestination.selectForUpdate(true);
+            _metInventItemOrderSetupDestination.ItemStatus      = METConstants::Deleted;
+            _metInventItemOrderSetupDestination.DiscontinueDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+            _metInventItemOrderSetupDestination.VendReplacement = _metInventItemOrderSetupSource.VendReplacement;
+            _metInventItemOrderSetupDestination.DeletionReason  = _metInventItemOrderSetupSource.DeletionReason;
+            _metInventItemOrderSetupDestination.DeleteStatusDate    = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+            _metInventItemOrderSetupDestination.SubrangeId          = '';
+            _metInventItemOrderSetupDestination.SubrangeDesc        = '';
+            _metInventItemOrderSetupDestination.update();
+            ttscommit;
+        }
+
+        if (inventItemPurchSetup)
+        {
+            ttsbegin;
+            inventItemPurchSetup.selectForUpdate(true);
+            inventItemPurchSetup.Stopped = true;
+            inventItemPurchSetup.update();
+            ttscommit;
+        }
+        if (inventItemInventSetup)
+        {
+            ttsbegin;
+            inventItemInventSetup.selectForUpdate(true);
+            inventItemInventSetup.Override = true;
+            inventItemInventSetup.Stopped = true;
+            inventItemInventSetup.update();
+            ttscommit;
+        }
+
     }
 
 ]]></Source>
