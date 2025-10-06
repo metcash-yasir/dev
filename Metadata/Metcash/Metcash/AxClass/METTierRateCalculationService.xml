@@ -12,6 +12,8 @@ SRSReportParameterAttribute(classStr(METTierRateCalculationContract))
 public class METTierRateCalculationService extends SysOperationServiceBase
 {
     TAMRebateDate rebateDateOutsideDateRange;
+    FiscalCalendarID calendarId;
+
 }
 ]]></Declaration>
 		<Methods>
@@ -24,52 +26,14 @@ public class METTierRateCalculationService extends SysOperationServiceBase
     /// <param name = "_contract">_contract</param>
     public void process(METTierRateCalculationContract _contract)
     {
-        FiscalCalendarPeriod fiscalCalendarPeriod;
-        FiscalCalendar fiscalCal;
-        FiscalCalendarYear fiscalCalYear;
-        FiscalCalendarID calendarId = FiscalCalendar::find(Ledger::fiscalCalendar(CompanyInfo::current())).CalendarId;
-
-        FromDate fromDate = _contract.parmFromDate();
-        FromDate toDate = _contract.parmToDate();
-
-        ttsbegin;
-        
-        select firstonly METNoOfWeeksForPeriod from fiscalCalendarPeriod
-            exists join fiscalCalYear
-                where fiscalCalendarPeriod.FiscalCalendarYear == fiscalCalYear.RecId
-            exists join fiscalCal
-                where fiscalCal.RecId == fiscalCalYear.FiscalCalendar
-                && fiscalCal.CalendarId == calendarId
-                && fiscalCalendarPeriod.Type == FiscalPeriodType::Operating
-                && ((fiscalCalendarPeriod.StartDate >= _contract.parmFromDate() && fiscalCalendarPeriod.StartDate <= _contract.parmToDate()) ||
-                (fiscalCalendarPeriod.EndDate >= _contract.parmFromDate() && fiscalCalendarPeriod.EndDate <= _contract.parmToDate()) ||
-            (fiscalCalendarPeriod.startDate <= _contract.parmFromDate() && fiscalCalendarPeriod.endDate >= _contract.parmToDate()));
-
-        int weekPeriod = 0;
-        int calendarMonth = 0;
-
-        if (fiscalCalendarPeriod.METNoOfWeeksForPeriod == METNoOfWeeksForPeriod::Five)
-        {
-            calendarMonth = 5;
-        }
-        else if (fiscalCalendarPeriod.METNoOfWeeksForPeriod == METNoOfWeeksForPeriod::Four)
-        {
-            calendarMonth = 4;
-        }
-        else if(fiscalCalendarPeriod.METNoOfWeeksForPeriod == METNoOfWeeksForPeriod::Empty)
-        {
-            throw error("@MET:SetNoOfWeeks");
-        }
-
         TAMRebateDeal rebateDeal;
         TAMRebateTable rebateTable;
-        TAMRebateLine rebateLine;
-        METTierRebateTrans tierRebateTrans;
         METTierRateTrans tierRateTrans;
-        TAMRebateDate rebateDate;
-        CustInvoiceTrans custInvoiceTrans;
-        CustInvoiceJour custInvoiceJour;
-        CustTable custTable;
+        FromDate fromDate = _contract.parmFromDate();
+        FromDate toDate = _contract.parmToDate();
+        calendarId = FiscalCalendar::find(Ledger::fiscalCalendar(CompanyInfo::current())).CalendarId;
+
+        ttsbegin;  
 
         select firstonly Deal,RecId from rebateDeal
         where rebateDeal.Deal == _contract.parmRebateDealRecId();
@@ -88,159 +52,15 @@ public class METTierRateCalculationService extends SysOperationServiceBase
         delete_from tierRateTrans
             where tierRateTrans.TAMRebateDealId == rebateDeal.Deal;
 
-        while select rebateTable
+        select firstonly rebateTable
         where rebateTable.METTierLineType == METTierLineType::Rate
-        && rebateTable.RebateDeal == rebateDeal.RecId
-        {
-            int i = 2;
+           && rebateTable.RebateDeal == rebateDeal.RecId;
 
-            GUPPricingRuleCopy pricingRuleCopyCustHeader;
-            Query custQuery;
-                
-            if (rebateTable.PricingRuleHeader)
-            {
-                pricingRuleCopyCustHeader.initFromPricingRule(GUPPricingRule::find(rebateTable.PricingRuleHeader));
-                custQuery = GUPPricingObjectQueryBuilder::constructFromPricingRuleCopy(pricingRuleCopyCustHeader).build();
-            }
-
-            while select custInvoiceTrans join custInvoiceJour
-            where custInvoiceJour.SalesId == custInvoiceTrans.SalesId
-            && custInvoiceJour.InvoiceId == custInvoiceTrans.InvoiceId
-            && custInvoiceJour.InvoiceDate == custInvoiceTrans.InvoiceDate
-            && custInvoiceJour.numberSequenceGroup == custInvoiceTrans.numberSequenceGroup
-            && custInvoiceTrans.InvoiceDate >= _contract.parmFromDate()
-            && custInvoiceTrans.InvoiceDate <= _contract.parmToDate()
-            join RecId from custTable
-                where custTable.AccountNum == custInvoiceJour.OrderAccount
-            {
-                if (custQuery)
-                {
-                        
-                    SysQuery::findOrCreateRange(custQuery.dataSourceTable(tableNum(CustTable)), fieldNum(CustTable, RecId)).value(queryValue(custTable.RecId));
-                    QueryRun queryRun = new QueryRun(custQuery);
-
-                    custQuery.firstOnly1(true);
-
-                    if (!queryRun.next())
-                    {
-                        continue;
-                    }
-                }
+        // Bug 289018: CB201 - Volumetric Tier Rebates - Calculate Rate picking up incorrect dates
+        this.createTierRateTransactions(fromDate, toDate, rebateTable, TAMRebateTransactionType::Provision); 
+               
+        this.createTierRateTransactions(fromDate, toDate, rebateTable, TAMRebateTransactionType::Rebate);
                     
-                i = 2 ;
-
-                while (i > 0)
-                {
-                    tierRebateTrans.clear();
-                    tierRebateTrans.Claimed = NoYes::No;
-                    tierRebateTrans.CurrencyCode = custInvoiceTrans.CurrencyCode;
-                    tierRebateTrans.DefaultDimension = custInvoiceTrans.DefaultDimension;
-                    tierRebateTrans.InventDimId = rebateTable.InventDimId;
-                    tierRebateTrans.ExcludeRebateManagement = NoYes::No;
-                    tierRebateTrans.ItemId = custInvoiceTrans.ItemId;
-                    tierRebateTrans.PostingAmount = custInvoiceTrans.LineAmount;
-                    tierRebateTrans.RefCompanyId = custInvoiceTrans.DataAreaId;
-                    tierRebateTrans.RefRecId = custInvoiceTrans.RecId;
-                    tierRebateTrans.RefTableId = custInvoiceTrans.TableId;
-                    tierRebateTrans.RebateAmount  = custInvoiceTrans.LineAmount;
-                    tierRebateTrans.RebateFromDate = _contract.parmFromDate();
-                    tierRebateTrans.RebateToDate = _contract.parmToDate();
-                    tierRebateTrans.RebateId = rebateTable.RebateId;
-                    tierRebateTrans.RebateQty = custInvoiceTrans.Qty;
-                    tierRebateTrans.RebateRefAccount = custInvoiceJour.OrderAccount;
-                    tierRebateTrans.RebateRefAmount = custInvoiceTrans.LineAmount;
-                    tierRebateTrans.RebateRefDate = custInvoiceTrans.InvoiceDate;
-                    tierRebateTrans.RebateRefQty = custInvoiceTrans.Qty;
-                    tierRebateTrans.RebateRefId = custInvoiceJour.SalesId;
-                    tierRebateTrans.RebateRefSoldToAccount = custInvoiceJour.OrderAccount;
-                    tierRebateTrans.TAMRebateDealId = rebateTable.TAMRebateDeal().Deal;
-                    
-                    if (i==1)
-                    {
-                        tierRebateTrans.RebateTransactionType = TAMRebateTransactionType::Provision;
-                        i--;
-                    }
-                    else if (i==2)
-                    {
-                        tierRebateTrans.RebateTransactionType = TAMRebateTransactionType::Rebate;
-                        i--;
-                    }
-                   
-                    // FreeText invoice if freetext = no than salestype journal Dont insert records
-                    If (rebateTable.IncludeFreeText || (!rebateTable.IncludeFreeText && custInvoiceJour.SalesType == SalesType::Sales))
-                    {
-                        tierRebateTrans.insert();
-                    }
-                }
-            }
-           
-            select firstonly rebateDate
-            where rebateDate.RebateId == rebateTable.RebateId;
-            
-            //TransDate fromDate = _contract.parmFromDate();
-
-            if (rebateDate.RebateFromDate <= _contract.parmFromDate() && _contract.parmToDate() <= rebateDate.RebateToDate)
-            {
-                while select StartDate, EndDate from fiscalCalendarPeriod
-                    exists join fiscalCalYear
-                        where fiscalCalendarPeriod.FiscalCalendarYear == fiscalCalYear.RecId
-                    exists join fiscalCal
-                        where fiscalCal.RecId == fiscalCalYear.FiscalCalendar
-                            && fiscalCal.CalendarId == calendarId
-                            && fiscalCalendarPeriod.Type == FiscalPeriodType::Operating
-                            && ((fiscalCalendarPeriod.StartDate >= _contract.parmFromDate() && fiscalCalendarPeriod.StartDate <= _contract.parmToDate()) ||
-                                (fiscalCalendarPeriod.EndDate >= _contract.parmFromDate() && fiscalCalendarPeriod.EndDate <= _contract.parmToDate()) ||
-                                (fiscalCalendarPeriod.startDate <= _contract.parmFromDate() && fiscalCalendarPeriod.endDate >= _contract.parmToDate()))
-                {
-                    tierRateTrans.clear();
-                    tierRateTrans.FromDate = fiscalCalendarPeriod.StartDate;
-                    tierRateTrans.ToDate = fiscalCalendarPeriod.EndDate;
-                    tierRateTrans.TAMRebateDealId = rebateDeal.Deal;
-                    tierRateTrans.RebateTransactionType = TAMRebateTransactionType::Rebate;
-                    tierRateTrans.RebateId = rebateTable.RebateId;
-
-                    select sum(RebateRefAmount) from tierRebateTrans
-                        where tierRebateTrans.RebateRefDate >= tierRateTrans.FromDate
-                                && tierRebateTrans.RebateRefDate <= tierRateTrans.ToDate
-                                && tierRebateTrans.RebateId == rebateTable.RebateId
-                                && tierRebateTrans.TAMRebateDealId == tierRateTrans.TAMRebateDealId
-                                && tierRebateTrans.RebateTransactionType == TAMRebateTransactionType::Rebate;
-
-                    if (tierRebateTrans.RebateRefAmount)
-                    {                        
-                        tierRateTrans.AgEligibleTransAmount = tierRebateTrans.RebateRefAmount;
-                        
-                        if (calendarMonth)
-                        {
-                            tierRateTrans.WeeklyAverage = tierRateTrans.AgEligibleTransAmount/calendarMonth;
-                        }
-
-                        select firstonly rebateLine
-                        where rebateLine.RebateFrom <= tierRateTrans.WeeklyAverage
-                        && rebateLine.RebateLimit >= tierRateTrans.WeeklyAverage
-                        && rebateLine.RebateId == rebateTable.RebateId;
-
-                        tierRateTrans.EligibleRebate = rebateLine.RebateAmount;
-
-                        tierRateTrans.insert();
-
-                        update_recordSet tierRebateTrans
-                        setting METTierRateTransRecID = tierRateTrans.RecId
-                            where tierRebateTrans.RebateRefDate >= tierRateTrans.FromDate
-                                && tierRebateTrans.RebateRefDate <= tierRateTrans.ToDate
-                                && tierRebateTrans.RebateId == rebateTable.RebateId
-                                && tierRebateTrans.TAMRebateDealId == tierRateTrans.TAMRebateDealId
-                                && tierRebateTrans.RebateTransactionType == TAMRebateTransactionType::Rebate;
-                                            
-                    }
-                }
-
-                // Bug 289018: CB201 - Volumetric Tier Rebates - Calculate Rate picking up incorrect dates
-                this.createTierRateTransactions(fromDate, toDate, rebateTable, TAMRebateTransactionType::Provision);                
-            }
-                    
-        }
-
         ttscommit;
     }
 
@@ -295,6 +115,11 @@ public class METTierRateCalculationService extends SysOperationServiceBase
         {
             ToDate rebateToDate = rebateDatePeriod.findToDate(rebateFromDate);
             
+            this.createRebateTransaction(max(rebateFromDate, rebateDateOutsideDateRange.RebateFromDate),
+                                           min(rebateToDate, rebateDateOutsideDateRange.RebateToDate),
+                                           _rebateTable,
+                                           _rebateTransactionType);
+            
             this.createTierRateTransaction(max(rebateFromDate, rebateDateOutsideDateRange.RebateFromDate), 
                                            min(rebateToDate, rebateDateOutsideDateRange.RebateToDate),
                                            _rebateTable, 
@@ -346,6 +171,11 @@ public class METTierRateCalculationService extends SysOperationServiceBase
         {
             ToDate rebateToDate = rebateDatePeriod.findToDate(rebateFromDate);
             
+            this.createRebateTransaction(max(rebateFromDate, rebateDateOutsideDateRange.RebateFromDate),
+                                           min(rebateToDate, rebateDateOutsideDateRange.RebateToDate),
+                                           _rebateTable,
+                                           _rebateTransactionType);
+
             this.createTierRateTransaction(max(rebateFromDate, rebateDateInsideDateRange.RebateFromDate),
                                            min(rebateToDate, rebateDateInsideDateRange.RebateToDate),
                                            _rebateTable, 
@@ -376,14 +206,15 @@ public class METTierRateCalculationService extends SysOperationServiceBase
     /// <param name = "_rebateTransactionType">Rebate transaction type</param>
     protected void createTierRateTransaction(FromDate _fromDate, ToDate _toDate, TAMRebateTable _rebateTable, TAMRebateTransactionType _rebateTransactionType)
     {
-        METTierRebateTrans tierRebateTrans;
-        METTierRateTrans tierRateTrans; 
-        TAMRebateLine rebateLine;
+        METTierRebateTrans  tierRebateTrans;
+        METTierRateTrans    tierRateTrans; 
+        TAMRebateLine       rebateLine;
+        TAMRebateFrom       rebateFrom;
 
         tierRateTrans.clear();
         tierRateTrans.FromDate = _fromDate;
         tierRateTrans.ToDate = _toDate;
-        tierRateTrans.TAMRebateDealId = TAMRebateDeal::find(_rebateTable.RebateDeal).Deal;
+        tierRateTrans.TAMRebateDealId = _rebateTable.TAMRebateDeal().Deal;
         tierRateTrans.RebateTransactionType = _rebateTransactionType;
         tierRateTrans.RebateId = _rebateTable.RebateId;
 
@@ -398,10 +229,26 @@ public class METTierRateCalculationService extends SysOperationServiceBase
         {
             tierRateTrans.AgEligibleTransAmount = tierRebateTrans.RebateRefAmount;
 
+            if (_rebateTransactionType == TAMRebateTransactionType::Provision)
+            {
+                rebateFrom = tierRateTrans.AgEligibleTransAmount;                
+            }
+            else if (_rebateTransactionType == TAMRebateTransactionType::Rebate)
+            {
+                int calendarMonth = FiscalCalendarPeriod::metCalendarMonth(_fromDate, _toDate, calendarId);  
+
+                if (calendarMonth)
+                {
+                    tierRateTrans.WeeklyAverage = tierRateTrans.AgEligibleTransAmount/calendarMonth;
+                }
+
+                rebateFrom = tierRateTrans.WeeklyAverage;
+            }
+
             select firstonly rebateLine
-                    where rebateLine.RebateFrom <= tierRateTrans.AgEligibleTransAmount
-                    && rebateLine.RebateLimit >= tierRateTrans.AgEligibleTransAmount
-                    && rebateLine.RebateId == _rebateTable.RebateId;
+                        where rebateLine.RebateFrom <= rebateFrom
+                        && rebateLine.RebateLimit >= rebateFrom
+                        && rebateLine.RebateId == _rebateTable.RebateId;
 
             tierRateTrans.EligibleRebate = rebateLine.RebateAmount;
 
@@ -415,6 +262,92 @@ public class METTierRateCalculationService extends SysOperationServiceBase
                     && tierRebateTrans.TAMRebateDealId == tierRateTrans.TAMRebateDealId
                     && tierRebateTrans.RebateTransactionType == _rebateTransactionType;
         }        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createRebateTransaction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Bug 289018: CB201 - Volumetric Tier Rebates - Calculate Rate picking up incorrect dates
+    /// Copied and refactored the existing code to create the rebate transaction records with the correct date range
+    /// </summary>
+    /// <param name = "_fromDate">From date</param>
+    /// <param name = "_toDate">To date</param>
+    /// <param name = "_rebateTable">Rebate management number</param>
+    /// <param name = "_rebateTransactionType">Rebate transaction type</param>
+    protected void createRebateTransaction(FromDate _fromDate, ToDate _toDate, TAMRebateTable _rebateTable, TAMRebateTransactionType _rebateTransactionType)
+    {
+        CustInvoiceTrans custInvoiceTrans;
+        CustInvoiceJour custInvoiceJour;
+        METTierRebateTrans tierRebateTrans;
+        CustTable custTable;
+
+        GUPPricingRuleCopy pricingRuleCopyCustHeader;
+        Query custQuery;
+                
+        if (_rebateTable.PricingRuleHeader)
+        {
+            pricingRuleCopyCustHeader.initFromPricingRule(GUPPricingRule::find(_rebateTable.PricingRuleHeader));
+            custQuery = GUPPricingObjectQueryBuilder::constructFromPricingRuleCopy(pricingRuleCopyCustHeader).build();
+        }
+
+        while select custInvoiceTrans join custInvoiceJour
+            where custInvoiceJour.SalesId == custInvoiceTrans.SalesId
+            && custInvoiceJour.InvoiceId == custInvoiceTrans.InvoiceId
+            && custInvoiceJour.InvoiceDate == custInvoiceTrans.InvoiceDate
+            && custInvoiceJour.numberSequenceGroup == custInvoiceTrans.numberSequenceGroup
+            && custInvoiceTrans.InvoiceDate >= _fromDate
+            && custInvoiceTrans.InvoiceDate <= _toDate
+            join RecId from custTable
+                where custTable.AccountNum == custInvoiceJour.OrderAccount
+        {
+            if (custQuery)
+            {
+                        
+                SysQuery::findOrCreateRange(custQuery.dataSourceTable(tableNum(CustTable)), fieldNum(CustTable, RecId)).value(queryValue(custTable.RecId));
+                QueryRun queryRun = new QueryRun(custQuery);
+
+                custQuery.firstOnly1(true);
+
+                if (!queryRun.next())
+                {
+                    continue;
+                }
+            }                    
+
+            tierRebateTrans.clear();
+            tierRebateTrans.Claimed = NoYes::No;
+            tierRebateTrans.CurrencyCode = custInvoiceTrans.CurrencyCode;
+            tierRebateTrans.DefaultDimension = custInvoiceTrans.DefaultDimension;
+            tierRebateTrans.InventDimId = _rebateTable.InventDimId;
+            tierRebateTrans.ExcludeRebateManagement = NoYes::No;
+            tierRebateTrans.ItemId = custInvoiceTrans.ItemId;
+            tierRebateTrans.PostingAmount = custInvoiceTrans.LineAmount;
+            tierRebateTrans.RefCompanyId = custInvoiceTrans.DataAreaId;
+            tierRebateTrans.RefRecId = custInvoiceTrans.RecId;
+            tierRebateTrans.RefTableId = custInvoiceTrans.TableId;
+            tierRebateTrans.RebateAmount  = custInvoiceTrans.LineAmount;
+            tierRebateTrans.RebateFromDate = _fromDate;
+            tierRebateTrans.RebateToDate = _toDate;
+            tierRebateTrans.RebateId = _rebateTable.RebateId;
+            tierRebateTrans.RebateQty = custInvoiceTrans.Qty;
+            tierRebateTrans.RebateRefAccount = custInvoiceJour.OrderAccount;
+            tierRebateTrans.RebateRefAmount = custInvoiceTrans.LineAmount;
+            tierRebateTrans.RebateRefDate = custInvoiceTrans.InvoiceDate;
+            tierRebateTrans.RebateRefQty = custInvoiceTrans.Qty;
+            tierRebateTrans.RebateRefId = custInvoiceJour.SalesId;
+            tierRebateTrans.RebateRefSoldToAccount = custInvoiceJour.OrderAccount;
+            tierRebateTrans.TAMRebateDealId = _rebateTable.TAMRebateDeal().Deal;
+            tierRebateTrans.RebateTransactionType = _rebateTransactionType;      
+                   
+            // FreeText invoice if freetext = no than salestype journal Dont insert records
+            if (_rebateTable.IncludeFreeText || (!_rebateTable.IncludeFreeText && custInvoiceJour.SalesType == SalesType::Sales))
+            {
+                tierRebateTrans.insert();
+            }            
+        }
     }
 
 ]]></Source>
