@@ -5,11 +5,6 @@
 		<Declaration><![CDATA[
 public abstract class METCustomerMDFCalculation
 {
-    CustAccount custAccount;
-    InventSiteId siteId;
-    SalesInventLocationId locationId;
-    ItemId itemId;
-
 }
 ]]></Declaration>
 		<Methods>
@@ -18,7 +13,7 @@ public abstract class METCustomerMDFCalculation
 				<Source><![CDATA[
     public Query getQuery()
     {
-        return new Query(querystr(METCustomerMDFSetupQuery));
+        return new Query(querystr(METCustomerMDFCalculationWMSOrderTransQuery));
     }
 
 ]]></Source>
@@ -28,12 +23,6 @@ public abstract class METCustomerMDFCalculation
 				<Source><![CDATA[
     Query updateQuery(Query _query)
     {
-        QueryBuildDataSource  qbdsCustomerMDFTable = _query.dataSourceTable(tableNum(MetCustomerMdfTable));
-        
-        qbdsCustomerMDFTable.addRange(fieldNum(MetCustomerMdfTable, CustAccount)).value(custAccount);
-        qbdsCustomerMDFTable.addRange(fieldNum(MetCustomerMdfTable, InventSiteId)).value(siteId);
-        qbdsCustomerMDFTable.addRange(fieldNum(MetCustomerMdfTable, InventLocationId)).value(locationId);
-
         return _query;
     }
 
@@ -44,18 +33,129 @@ public abstract class METCustomerMDFCalculation
 				<Source><![CDATA[
     void process()
     {
-        Query query = this.getQuery();
-        query = this.updateQuery(query);
+        #OCCRetryCount
+                 
+        try
+        {
+            ttsbegin;
 
-        QueryRun queryRun = new QueryRun(query);
+            Query query = this.updateQuery(this.getQuery());
+
+            this.processQuery(query);
+
+            ttscommit;
+
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Error)
+        {
+            // catch the errors so processing can continue
+            curext(); // avoids a warning about an empty block
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processQuery</Name>
+				<Source><![CDATA[
+    private void processQuery(Query _query)
+    {
+        QueryRun queryRun = new QueryRun(_query);
+        Map custMDFSetupTableMap = new Map(Types::String, Types::Container);
+
+        RecordInsertList custMDFCalculationTransList = new RecordInsertList(tableNum(METCustomerMDFCalculationTrans));
 
         while(queryRun.next())
         {
-            MetCustomerMdfSetupTable customerMdfSetupTable = queryRun.get(tableNum(MetCustomerMdfSetupTable));
+            WMSOrderTrans wMSOrderTrans = queryRun.get(tableNum(WMSOrderTrans));
+            METWMSOrderTrans metWMSOrderTrans = queryRun.get(tableNum(METWMSOrderTrans));
 
-            if(this.shouldProcessItem(customerMdfSetupTable, itemId))
+            CustAccount custAccount = wMSOrderTrans.customer;
+            InventSiteId siteId = wMSOrderTrans.inventDim().InventSiteId;
+            InventLocationId locationId = wMSOrderTrans.inventDim().InventLocationId;
+            ItemId itemId = wMSOrderTrans.itemId;
+
+            str custMDFSetupTableMapKey = strFmt("%1|%2|%3|%4", custAccount, siteId, locationId, itemId);
+
+            container custMDFSetupTableMapValue;
+            
+            if (custMDFSetupTableMap.exists(custMDFSetupTableMapKey))
             {
+                custMDFSetupTableMapValue = custMDFSetupTableMap.lookup(custMDFSetupTableMapKey);
+            }
+            else
+            {
+                custMDFSetupTableMapValue = METCustomerMDFSetupHelper::construct().getCustomerMDFSetupTableList(custAccount, siteId, locationId, itemId);
+                custMDFSetupTableMap.insert(custMDFSetupTableMapKey, custMDFSetupTableMapValue);
+            }
 
+            if(conlen(custMDFSetupTableMapValue))
+            {
+                this.processRecord(custMDFCalculationTransList, wMSOrderTrans, custMDFSetupTableMapValue);
+            }
+
+            metWMSOrderTrans.selectForUpdate(true);
+            metWMSOrderTrans.CustMDFCalculated = NoYes::Yes;
+            metWMSOrderTrans.update();
+        }
+
+        custMDFCalculationTransList.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processRecord</Name>
+				<Source><![CDATA[
+    private void processRecord(RecordInsertList _custMDFCalculationTransList, WMSOrderTrans _wMSOrderTrans, container _custMDFSetupList)
+    {
+        for (int i = 1; i <= conLen(_custMDFSetupList); i++)
+        {
+            METCustomerMDFSetupTable customerMDFSetupTable = conPeek(_custMDFSetupList, i);
+            METCustomerMDFTable customerMDFTable = METCustomerMDFTable::findRecId(customerMDFSetupTable.RefRecId);
+            METCustomerMDFCalculationRecord calculationRecord = METCustomerMDFCalculationRecord::construct(customerMDFSetupTable);
+
+            METCustomerMDFCalculationTrans customerMDFCalculationTrans;
+            customerMDFCalculationTrans.initValueFromCustomerMDFTable(customerMDFTable);
+            customerMDFCalculationTrans.initValueFromCustomerMDFSetupTable(customerMDFSetupTable);
+            customerMDFCalculationTrans.ShipmentId = this.getShipmentId(_wMSOrderTrans);
+            customerMDFCalculationTrans.ShipDate = _wMSOrderTrans.dlvDate;
+            customerMDFCalculationTrans.Qty = calculationRecord.calcQty();
+            customerMDFCalculationTrans.Amount = calculationRecord.calcAmount(this.getInvoiceAmount(_wMSOrderTrans));
+            customerMDFCalculationTrans.DeliveryFee = calculationRecord.calcDeliveryFee(this.getDeliveryQty(_wMSOrderTrans));
+
+            if (customerMDFCalculationTrans.validateWrite())
+            {
+                _custMDFCalculationTransList.add(customerMDFCalculationTrans);
             }
         }
     }
@@ -63,94 +163,39 @@ public abstract class METCustomerMDFCalculation
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>shouldProcessItem</Name>
+				<Name>getShipmentId</Name>
 				<Source><![CDATA[
-    boolean shouldProcessItem(MetCustomerMdfSetupTable _customerMdfSetupTable, ItemId _itemId)
+    private MetShipmentId getShipmentId(WMSOrderTrans _wMSOrderTrans)
     {
-        boolean ret = true;
-
-        switch(_customerMdfSetupTable.ItemScope)
-        {
-            case METItemScope::AllItems:
-                ret = true;
-                break;
-            case METItemScope::ExplicitItemInclusion:
-                ret = this.isItemExplicitlyIncluded(_customerMdfSetupTable, _itemId);
-                break;
-            case METItemScope::ItemsWithExclusions:
-                ret = !this.isItemExcluded(_customerMdfSetupTable, _itemId);
-                break;
-        }
-
-        return ret;
+        METSalesOrderShipmentLoadLines salesOrderShipmentLoadLines;
+        select firstonly ShipmentId from salesOrderShipmentLoadLines
+            where salesOrderShipmentLoadLines.WMSOrderTransRecId == _wMSOrderTrans.RecId;
+        return salesOrderShipmentLoadLines.ShipmentId;
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>isItemExplicitlyIncluded</Name>
+				<Name>getInvoiceAmount</Name>
 				<Source><![CDATA[
-    boolean isItemExplicitlyIncluded(MetCustomerMdfSetupTable _customerMdfSetupTable, ItemId _itemId)
+    private Amount getInvoiceAmount(WMSOrderTrans _wMSOrderTrans)
     {
-        return true;
-    }
+        SalesLine salesLine;
 
-]]></Source>
-			</Method>
-			<Method>
-				<Name>isItemExcluded</Name>
-				<Source><![CDATA[
-    boolean isItemExcluded(MetCustomerMdfSetupTable _customerMdfSetupTable, ItemId _itemId)
-    {
-        return true;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>parmCustAccount</Name>
-				<Source><![CDATA[
-    public CustAccount parmCustAccount(CustAccount _custAccount = custAccount)
-    {
-        custAccount = _custAccount;
-
-        return custAccount;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>parmInventSiteId</Name>
-				<Source><![CDATA[
-    public InventSiteId parmInventSiteId(InventSiteId _siteId = siteId)
-    {
-        siteId = _siteId;
-
-        return siteId;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>parmLocationId</Name>
-				<Source><![CDATA[
-    public SalesInventLocationId parmLocationId(SalesInventLocationId _locationId = locationId)
-    {
-        locationId = _locationId;
-
-        return locationId;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>parmItemId</Name>
-				<Source><![CDATA[
-    public ItemId parmItemId(ItemId _itemId = itemId)
-    {
-        itemId = _itemId;
+        select firstonly sum(LineAmount) from salesLine
+            where salesLine.inventTransId == _wMSOrderTrans.inventTransId;
         
-        return itemId;
+        return salesLine.LineAmount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDeliveryQty</Name>
+				<Source><![CDATA[
+    private Qty getDeliveryQty(WMSOrderTrans _wMSOrderTrans)
+    {
+        return _wMSOrderTrans.qty;
     }
 
 ]]></Source>
