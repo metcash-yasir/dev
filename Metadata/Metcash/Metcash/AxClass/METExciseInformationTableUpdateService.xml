@@ -292,8 +292,8 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
             && metExciseRegisterEntry.VersionNumber > metExciseInformationTable.VersionNumber
         {
             METExciseInformationTable   metExciseInformationTableUpd    = METExciseInformationTable::findByRecId(metExciseInformationTable.RecId, true);
-            METDutyRollVariance         metDutyRollVariance;    
-
+            METDutyRollVariance         metDutyRollVariance;
+            
             if ((_contract.parmTransactionType() == METTransactionType::Positive && metExciseRegisterEntry.ReceiptQuantity > 0)  ||
                 (_contract.parmTransactionType() == METTransactionType::Negative && metExciseRegisterEntry.ReceiptQuantity < 0))
             {
@@ -309,7 +309,8 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                     where metDutyRollVariance.Lodgement == metExciseInformationTable.Lodgement
                     && metDutyRollVariance.ItemId == metExciseInformationTable.ItemId
                     && metDutyRollVariance.OrderNumber == metExciseInformationTable.ReferenceNumber;
-
+                
+                METVendorClaimAmount metDutyRollVarianceClaimQtyOrig = metDutyRollVariance.ClaimAmount; //Naren
                 metDutyRollVariance.DutyValue       = metExciseRegisterEntry.DutyRateReceived;
                 MetVariance dutyRollVarianceValue   = metDutyRollVariance.AverageVFD ? (metDutyRollVariance.DutyValue - metDutyRollVariance.AverageVFD) : 0;
 
@@ -331,13 +332,21 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                 {
                     metDutyRollVariance.VarianceExceedsThreshold = NoYes::No;
                 }
-                metDutyRollVariance.ClaimAmount = (dutyRollVariance.AdValoremRate / 100) * dutyRollVariance.VarianceAmount;
+                metDutyRollVariance.ClaimAmount     = (metDutyRollVariance.AdValoremRate / 100) * metDutyRollVariance.VarianceAmount;
+                metDutyRollVariance.IsAccrualPosted = metDutyRollVarianceClaimQtyOrig != metDutyRollVariance.ClaimAmount ? NoYes::No : metDutyRollVariance.IsAccrualPosted;
 
                 if (metExciseInformationTableUpd.RecId && metDutyRollVariance.RecId)
                 {
                     ttsbegin;
                     metExciseInformationTableUpd.update();
-                    metDutyRollVariance.update();                
+                    metDutyRollVariance.update();  
+
+                    // Accrual journal creation & automation Posting for duty roll value difference claim variance update.
+                    if (metDutyRollVarianceClaimQtyOrig != metDutyRollVariance.ClaimAmount)
+                    {
+                        METVendorClaimAmount accrualPostingAmt = metDutyRollVarianceClaimQtyOrig - metDutyRollVariance.ClaimAmount;
+                        METExciseInformationTableUpdateService::createAccrualJournal(metDutyRollVariance, metInventTransExciseRegisterUpdateView, accrualPostingAmt);
+                    }                   
                     ttscommit;
                 }
             }
@@ -350,7 +359,7 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
 				<Name>addingExciseInformationRecordToRecordList</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Add the Excise information records to teh record list
+    /// Add the Excise information records to the record list
     /// </summary>
     /// <param name = "_metExciseInformationTable"> Excise information record </param>
     /// <param name = "_validInsert"> indicates valid record or not</param>
@@ -711,12 +720,20 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                         dutyRollVariance.OrderNumber = _metExciseInformationTable.ReferenceNumber;
                         dutyRollVariance.VendAccount = (select firstonly OrderAccount from PurchTable where PurchTable.PurchId == dutyRollVariance.OrderNumber).OrderAccount;
                         dutyRollVariance.InventTransType = _inventTransType;
+                        dutyRollVariance.ExciseRegisterReferenceId = _metExciseInformationTable.ExciseRegisterReferenceId;
 
                         if (dutyRollVariance.validateWrite())
                         {
+                            // Accrual journal creation & automation Posting for duty roll value claim variance.
+                            ttsbegin;                            
+                            if (dutyRollVariance.ClaimAmount)
+                            {
+                                METExciseInformationTableUpdateService::createAccrualJournal(dutyRollVariance, metInventTransExciseRegisterUpdateView, dutyRollVariance.ClaimAmount);
+                            }                          
+                            ttscommit;
+
                             dutyRollVarianceRecordInsertList.add(dutyRollVariance);
                         }
-
                         break;
                     }
             }
@@ -772,6 +789,68 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
         if (dutyCreditTable.validateWrite())
         {
             dutyCreditTableRecordInsertList.add(dutyCreditTable);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getErrorMsg</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Captures the current error message
+    /// </summary>
+    /// <param name = "infoLogdata"> InfologData </param>
+    /// <returns> str </returns>
+    public static str getErrorMsg(InfologData infoLogdata)
+    {
+        SysInfoLogEnumerator    sysInfologEnumerator = SysInfologEnumerator::newData(infoLogdata);
+        str                     errorMsg = '';
+        
+        while(sysInfologEnumerator.moveNext())
+        {
+            if(sysInfologEnumerator.currentException())
+            {
+                SysInfologMessageStruct infoMessageStruct = SysInfologMessageStruct::construct(sysInfologEnumerator.currentMessage());
+                errorMsg += infoMessageStruct.message();
+            }
+        }
+
+        return errorMsg;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAccrualJournal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// creates the Accrual journals
+    /// </summary>
+    /// <param name = "_metDutyRollVariance"> METDutyRollVariance </param>
+    /// <param name = "_metInventTransExciseRegisterUpdateView"> METInventTransExciseRegisterUpdateView </param>
+    /// <param name = "_accrualPostingAmt"> METVendorClaimAmount </param>
+    public static void createAccrualJournal(METDutyRollVariance _metDutyRollVariance, METInventTransExciseRegisterUpdateView _metInventTransExciseRegisterUpdateView, METVendorClaimAmount _accrualPostingAmt)
+    {
+        METExciseDutyParameteres metExciseDutyParameteres = METExciseDutyParameteres::find();
+
+        if(metExciseDutyParameteres.AccuralAccountNum && metExciseDutyParameteres.DutyVarianceAccountNum && metExciseDutyParameteres.JournalName)
+        {
+            try
+            {
+                METDutyRollVarianceAccuralJournalPostingHelper::createAccuralJournal(metExciseDutyParameteres, _metDutyRollVariance, _metInventTransExciseRegisterUpdateView, _accrualPostingAmt);
+            }
+            catch (Exception::Error)
+            {
+                str errorMsg = METExciseInformationTableUpdateService::getErrorMsg(infolog.infologData());
+            
+                error(strFmt(errorMsg + "@MET:AccrualJournalPostFailedMsg",
+                        _metDutyRollVariance.Lodgement, _metDutyRollVariance.ItemId, _metDutyRollVariance.PurchId));
+            }
+        }
+        else
+        {
+            error("@MET:DutyRollVarianceParameterErrMsg");
         }
     }
 
