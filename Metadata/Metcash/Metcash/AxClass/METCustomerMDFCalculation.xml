@@ -3,11 +3,187 @@
 	<Name>METCustomerMDFCalculation</Name>
 	<SourceCode>
 		<Declaration><![CDATA[
-public class METCustomerMDFCalculation
+public abstract class METCustomerMDFCalculation
 {
 }
-
 ]]></Declaration>
-		<Methods />
+		<Methods>
+			<Method>
+				<Name>getQuery</Name>
+				<Source><![CDATA[
+    public Query getQuery()
+    {
+        return new Query(querystr(METCustomerMDFCalculationWMSOrderTransQuery));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateQuery</Name>
+				<Source><![CDATA[
+    Query updateQuery(Query _query)
+    {
+        return _query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    void process()
+    {
+        #OCCRetryCount
+                 
+        try
+        {
+            ttsbegin;
+
+            Query query = this.updateQuery(this.getQuery());
+
+            this.processQuery(query);
+
+            ttscommit;
+
+        }
+        catch (Exception::Deadlock)
+        {
+            if (xSession::currentRetryCount() >= #RetryNum)
+            {
+                throw Exception::Deadlock;
+            }
+            else
+            {
+                retry;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Error)
+        {
+            // catch the errors so processing can continue
+            curext(); // avoids a warning about an empty block
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processQuery</Name>
+				<Source><![CDATA[
+    private void processQuery(Query _query)
+    {
+        QueryRun queryRun = new QueryRun(_query);
+        Map custMDFSetupTableMap = new Map(Types::String, Types::Container);
+
+        RecordInsertList custMDFCalculationTransList = new RecordInsertList(tableNum(METCustomerMDFCalculationTrans));
+
+        while(queryRun.next())
+        {
+            WMSOrderTrans wMSOrderTrans = queryRun.get(tableNum(WMSOrderTrans));
+            METWMSOrderTrans metWMSOrderTrans = queryRun.get(tableNum(METWMSOrderTrans));
+
+            CustAccount custAccount = wMSOrderTrans.customer;
+            InventSiteId siteId = wMSOrderTrans.inventDim().InventSiteId;
+            InventLocationId locationId = wMSOrderTrans.inventDim().InventLocationId;
+            ItemId itemId = wMSOrderTrans.itemId;
+
+            str custMDFSetupTableMapKey = strFmt("%1|%2|%3|%4", custAccount, siteId, locationId, itemId);
+
+            container custMDFSetupTableMapValue;
+            
+            if (custMDFSetupTableMap.exists(custMDFSetupTableMapKey))
+            {
+                custMDFSetupTableMapValue = custMDFSetupTableMap.lookup(custMDFSetupTableMapKey);
+            }
+            else
+            {
+                custMDFSetupTableMapValue = METCustomerMDFSetupHelper::construct().getCustomerMDFSetupTableList(custAccount, siteId, locationId, itemId);
+                custMDFSetupTableMap.insert(custMDFSetupTableMapKey, custMDFSetupTableMapValue);
+            }
+
+            if(conlen(custMDFSetupTableMapValue))
+            {
+                this.processRecord(custMDFCalculationTransList, wMSOrderTrans, custMDFSetupTableMapValue);
+            }
+
+            metWMSOrderTrans.selectForUpdate(true);
+            metWMSOrderTrans.CustMDFCalculated = NoYes::Yes;
+            metWMSOrderTrans.update();
+        }
+
+        custMDFCalculationTransList.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processRecord</Name>
+				<Source><![CDATA[
+    private void processRecord(RecordInsertList _custMDFCalculationTransList, WMSOrderTrans _wMSOrderTrans, container _custMDFSetupList)
+    {
+        for (int i = 1; i <= conLen(_custMDFSetupList); i++)
+        {
+            METCustomerMDFSetupTable customerMDFSetupTable = conPeek(_custMDFSetupList, i);
+            METCustomerMDFTable customerMDFTable = METCustomerMDFTable::findRecId(customerMDFSetupTable.RefRecId);
+            METCustomerMDFCalculationRecord calculationRecord = METCustomerMDFCalculationRecord::construct(customerMDFSetupTable);
+
+            METCustomerMDFCalculationTrans customerMDFCalculationTrans;
+            customerMDFCalculationTrans.initValueFromCustomerMDFTable(customerMDFTable);
+            customerMDFCalculationTrans.initValueFromCustomerMDFSetupTable(customerMDFSetupTable);
+            switch(customerMDFTable.ConsolidationMethodEDT)
+            {
+                case METConsolidationMethodEDT::Shipment:
+                    customerMDFCalculationTrans.ShipmentId = this.getShipmentId(_wMSOrderTrans);
+                    break;
+                case METConsolidationMethodEDT::Daily:
+                    customerMDFCalculationTrans.ShipDate = _wMSOrderTrans.dlvDate;
+                    break;
+                default:
+                    throw error(strFmt("Unsupported Consolidation Method: %1", enum2str(customerMDFTable.ConsolidationMethodEDT)));
+            }
+            customerMDFCalculationTrans.Qty = calculationRecord.calcQty(_wMSOrderTrans);
+            customerMDFCalculationTrans.Amount = calculationRecord.calcAmount(_wMSOrderTrans);
+            customerMDFCalculationTrans.DeliveryFee = calculationRecord.calcDeliveryFee(_wMSOrderTrans);
+
+            if (customerMDFCalculationTrans.validateWrite())
+            {
+                _custMDFCalculationTransList.add(customerMDFCalculationTrans);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getShipmentId</Name>
+				<Source><![CDATA[
+    private MetShipmentId getShipmentId(WMSOrderTrans _wMSOrderTrans)
+    {
+        METSalesOrderShipmentLoadLines salesOrderShipmentLoadLines;
+        select firstonly ShipmentId from salesOrderShipmentLoadLines
+            where salesOrderShipmentLoadLines.WMSOrderTransRecId == _wMSOrderTrans.RecId;
+        return salesOrderShipmentLoadLines.ShipmentId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
 	</SourceCode>
 </AxClass>
