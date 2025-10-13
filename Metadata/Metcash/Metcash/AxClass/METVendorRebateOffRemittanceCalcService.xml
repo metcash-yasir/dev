@@ -260,11 +260,16 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
         qbdsVendPackingSlipTrans.addSelectionField(fieldNum(VendPackingSlipTrans, DlvMode));
 
         Query::insert_recordset(metVendorRemittenceStageTmp, this.getFieldMap(qbdsVendPackingSlipTrans.uniqueId(), 0), userQuery);
-
+        
+        PurchAutomaticPurchaseDocumentLineChargeV2Entity chargeEntity;
+        METPurchGroup purchGroup;
+       
         //Transfer the data from tmp table to Process queue with process Id.
+        
         insert_recordset processQueue
-            (ProcessId, PackingSlipTransRecId, InventDimId, DefaultDimension, LineAmount, ItemId, DlvMode, SiteId, wMSLocationId, Department, CustomerReference, VendAccount)
-            select queueId, PackingSlipTransRecId, InventDimId, DefaultDimension, LineAmount, ItemId, DlvMode
+            (ProcessId, PackingSlipTransRecId, InventDimId, DefaultDimension, LineAmount, ItemId, DlvMode, 
+                SiteId, wMSLocationId, Department, CustomerReference, VendAccount, ChargeCode, ChargePercent, PurchGroupId)
+        select queueId, PackingSlipTransRecId, InventDimId, DefaultDimension, LineAmount, ItemId, DlvMode
             from metVendorRemittenceStageTmp
             join InventSiteId, wMSLocationId from inventDim 
                 where inventDim.inventDimId == metVendorRemittenceStageTmp.InventDimId
@@ -277,15 +282,30 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
             && !(PurchTable.PurchOrderFormNum like 'HD*'
             || PurchTable.PurchOrderFormNum like 'VO*'
             || PurchTable.PurchOrderFormNum like 'VR*'
-            || PurchTable.PurchOrderFormNum like 'SR*');
-
-        this.updateChargeDetails();
+            || PurchTable.PurchOrderFormNum like 'SR*')
+            join PurchaseChargeCode, ChargePercentage, METPurchGroupId from chargeEntity
+            where chargeEntity.ChargingVendorAccountNumber == PurchTable.InvoiceAccount
+            && chargeEntity.METFromDate <= mainContract.parmAsOfDate()
+            && chargeEntity.METToDate >= mainContract.parmAsOfDate()
+            exists join purchGroup
+            where purchGroup.PurchGroupId == chargeEntity.METPurchGroupId
+            && purchGroup.InvoiceType == METPurchGroupInvoiceType::Warehouse;
 
         //Remove all packing slips which do not have a charge code mapping for the vendor or the purchase group invoice type is not warehouse.
         delete_from processQueue
             where processQueue.ChargeCode == ''
             && processQueue.ProcessId == queueId;
 
+        MarkupTable markupTable;
+
+        update_recordset processQueue
+            setting CustomerLedgerDimension = markupTable.CustomerLedgerDimension,
+            ChargeAmount = processQueue.LineAmount * (processQueue.ChargePercent/100)
+            where processQueue.ProcessId == queueId
+            join markupTable
+            where markupTable.MarkupCode == processQueue.ChargeCode
+            && markupTable.ModuleType == MarkupModuleType::Vend;
+        
         this.checkAndRemoveRecordsWithoutDebitAccount();
 
         METVendorRebateSiteJournalStaging siteStaging;
@@ -386,6 +406,60 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>findChargeForVendor</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds the charge code and charge percent based on condition
+    /// </summary>
+    /// <param name = "_record">staging record</param>
+    /// <returns>container that includes, charge code, percent, credit account to post the transaction</returns>
+    private container findChargeForVendor(VendAccount _vendor, ItemId _itemId, InventSiteId _siteId, WMSLocationId _location)
+    {
+        MarkupAutoTable markupAutoTable;
+        MarkupAutoLine markupAutoLine;
+
+        select firstonly markupAutoTable
+            where markupAutoTable.AccountRelation == _vendor
+            && markupAutoTable.AccountCode == TableGroupAll::Table
+            && markupAutoTable.ModuleCategory == HeadingLine::Line
+            && markupAutoTable.ModuleType == MarkupModuleType::Vend
+            && markupAutoTable.ItemCode == TableGroupAll::Table
+            && markupAutoTable.ItemRelation == _itemId;
+
+        if (!markupAutoTable)
+        {
+            select firstonly markupAutoTable
+                where markupAutoTable.AccountRelation == _vendor
+                && markupAutoTable.AccountCode == TableGroupAll::Table
+                && markupAutoTable.ModuleCategory == HeadingLine::Line
+                && markupAutoTable.ModuleType == MarkupModuleType::Vend
+                && markupAutoTable.ItemCode == TableGroupAll::All;
+        }
+
+        if(!markupAutoTable)
+        {
+            select firstonly markupAutoTable
+                where markupAutoTable.AccountRelation == _vendor
+                && markupAutoTable.AccountCode == TableGroupAll::Table
+                && markupAutoTable.ModuleCategory == HeadingLine::Line
+                && markupAutoTable.ModuleType == MarkupModuleType::Vend;
+        }
+
+        MarkupTable markupTable;
+
+        if(markupAutoTable)
+        {
+            markupAutoLine = this.findMarkupLine(markupAutoTable, _siteId, _location);
+            markupTable = MarkupTable::find(MarkupModuleType::Vend, markupAutoLine.MarkupCode);
+        }
+
+        return [markupAutoLine.MarkupCode, markupAutoLine.Value, markupTable.CustomerLedgerDimension];
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>findChargeDetails</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -429,7 +503,7 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
 
         if(markupAutoTable)
         {
-            markupAutoLine = this.findMarkupLine(markupAutoTable, _record);
+            markupAutoLine = this.findMarkupLine(markupAutoTable, _record.SiteId, _record.wMSLocationId);
             markupTable = MarkupTable::find(MarkupModuleType::Vend, markupAutoLine.MarkupCode);
         }
 
@@ -448,7 +522,7 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
     /// <param name = "_markupTable">Markup table buffer</param>
     /// <param name = "_record">Staging table record</param>
     /// <returns>MarkupAutoLine table buffer</returns>
-    private MarkupAutoLine findMarkupLine(MarkupAutoTable _markupTable, METVendorRebateOffRemittanceCalcStaging _record)
+    private MarkupAutoLine findMarkupLine(MarkupAutoTable _markupTable, InventSiteId _siteId, WMSLocationId _location)
     {
         MarkupAutoLine markupAutoLine;
         MarkupAutoTable markupAutoTable = _markupTable;
@@ -459,8 +533,8 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
                 && markupAutoLine.TableRecId == markupAutoTable.RecId
                 && markupAutoLine.FromDate <= mainContract.parmAsOfDate()
                 && markupAutoLine.ToDate >= mainContract.parmAsOfDate()
-                && markupAutoLine.InventSiteId == _record.SiteId
-                && markupAutoLine.InventLocationId == _record.wMSLocationId
+                && markupAutoLine.InventSiteId == _siteId
+                && markupAutoLine.InventLocationId == _location
             exists join purchGroup
                 where purchGroup.PurchGroupId == markupAutoLine.METPurchGroupId
                 && purchGroup.InvoiceType == METPurchGroupInvoiceType::Warehouse;
@@ -472,7 +546,7 @@ public class METVendorRebateOffRemittanceCalcService extends METSysOperationServ
                     && markupAutoLine.TableRecId == markupAutoTable.RecId
                     && markupAutoLine.FromDate <= mainContract.parmAsOfDate()
                     && markupAutoLine.ToDate >= mainContract.parmAsOfDate()
-                    && markupAutoLine.InventSiteId == _record.SiteId
+                    && markupAutoLine.InventSiteId == _siteId
                 exists join purchGroup
                     where purchGroup.PurchGroupId == markupAutoLine.METPurchGroupId
                     && purchGroup.InvoiceType == METPurchGroupInvoiceType::Warehouse;
