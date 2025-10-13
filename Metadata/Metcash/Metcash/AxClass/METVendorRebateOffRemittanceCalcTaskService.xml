@@ -54,14 +54,6 @@ public class METVendorRebateOffRemittanceCalcTaskService extends METSysOperation
             
                 journalEngine = LedgerJournalEngine::construct(journalName.JournalType);
 
-                AmountCur amt;
-                select sum(ChargeAmount) from transStaging
-                        where transStaging.ProcessId == queueId
-                            && transStaging.SiteId == siteId
-                        && transStaging.LineAmount != 0;
-
-                //LedgerJournalTrans transDebit = this.createLedgerJournalTrans(transStaging, DebitCredit::Debit, '');
-
                 if (contract.parmGroupByChargeCode() && contract.parmGroupByDepartment())
                 {
                     while select sum(ChargeAmount) from transStaging
@@ -70,14 +62,7 @@ public class METVendorRebateOffRemittanceCalcTaskService extends METSysOperation
                             && transStaging.SiteId == siteId
                             && transStaging.LineAmount != 0
                     {
-                        if(abs(transStaging.ChargeAmount) < 1)
-                        {
-                            continue;
-                        }
-
-                        amt += roundUpdec(abs(transStaging.ChargeAmount),2);
-
-                        this.createLedgerJournalTrans(transStaging, DebitCredit::Credit, '');
+                        this.createLedgerJournalTrans(transStaging);
                     }
                 }
                 else if (contract.parmGroupByChargeCode())
@@ -93,14 +78,9 @@ public class METVendorRebateOffRemittanceCalcTaskService extends METSysOperation
                             continue;
                         }
 
-                        amt += roundUpdec(abs(transStaging.ChargeAmount),2);
-
-                        this.createLedgerJournalTrans(transStaging, DebitCredit::Credit, '');
+                        this.createLedgerJournalTrans(transStaging);
                     }
                 }
-                //To avoid penny difference between debit and credit entries, we sum the amount on credits and update that back to debit transaction. 
-                //transDebit.AmountCurDebit = amt;
-                //transInsertList.add(transDebit);
 
                 transInsertList.insertDatabase();
                 this.postJournal(journalTable);
@@ -109,6 +89,16 @@ public class METVendorRebateOffRemittanceCalcTaskService extends METSysOperation
             }
             catch
             {
+                ttsbegin;
+                journalTable.reread();
+                journalTable.selectForUpdate(true);
+                journalTable.delete();
+
+                delete_from transStaging
+                where transStaging.SiteId == siteId
+                    && transStaging.ProcessId == queueId;
+                ttscommit;
+
                 continue;
             }
         }
@@ -147,8 +137,6 @@ public class METVendorRebateOffRemittanceCalcTaskService extends METSysOperation
     private void postJournal(LedgerJournalTable _journalTable)
     {
         METVendorRebateOffRemittanceCalcStaging transStaging;
-        try
-        {
             //Clean-up 0 value lines
             this.prePostCleanUp(_journalTable);
 
@@ -166,25 +154,77 @@ public class METVendorRebateOffRemittanceCalcTaskService extends METSysOperation
                 where transStaging.PackingSlipTransRecId == packingSlipTrans.recid
                 && transStaging.SiteId == siteId
                 && transStaging.ProcessId == queueId;
-        }
-        catch
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createDefaultDimensionFromDisplayValues</Name>
+				<Source><![CDATA[
+    private DimensionDefault createDefaultDimensionFromDisplayValues(Map dimNameValueMap)
+    {
+        // Map: Key = dimension name (e.g., "Department"), Value = display value (e.g., "HR")
+    
+        DimensionAttributeValueSetStorage dimStorage = new DimensionAttributeValueSetStorage();
+        DimensionAttribute dimensionAttribute;
+        DimensionAttributeValue dimensionAttributeValue;
+        DimensionValue dimensionValue;
+        str dimName, dimDisplayValue;
+
+        MapEnumerator mapEnumerator = dimNameValueMap.getEnumerator();
+
+        while (mapEnumerator.moveNext())
         {
-            ttsbegin;
-            _journalTable.reread();
-            _journalTable.selectForUpdate(true);
-            _journalTable.delete();
-            ttscommit;
+            dimName = mapEnumerator.currentKey();        // e.g., "CostCenter"
+            dimDisplayValue = mapEnumerator.currentValue();  // e.g., "007"
+
+            // Find the DimensionAttribute (e.g., CostCenter)
+            dimensionAttribute = DimensionAttribute::findByName(dimName);
+
+            // Try to find or create the value based on display value
+            dimensionAttributeValue = DimensionAttributeValue::findByDimensionAttributeAndValue(
+            dimensionAttribute,
+            dimDisplayValue,
+            false,   // do not create if not exists
+            true     // search by display value
+        );
+
+            if (!dimensionAttributeValue)
+            {
+                throw error(strFmt("Value '%1' for dimension '%2' not found.", dimDisplayValue, dimName));
+            }
+
+            // Add to storage
+            dimStorage.addItem(dimensionAttributeValue);
         }
-        finally
+
+        // Create and return the DefaultDimension (RecId)
+        return dimStorage.save();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDimensionDisplayValue</Name>
+				<Source><![CDATA[
+    private str getDimensionDisplayValue(DimensionDefault defaultDimension, str dimensionAttributeName)
+    {
+        DimensionAttribute dimensionAttribute = DimensionAttribute::findByName(dimensionAttributeName);
+
+        if (!dimensionAttribute)
         {
-            ttsbegin;
-                
-            delete_from transStaging
-                where transStaging.SiteId == siteId
-                    && transStaging.ProcessId == queueId;
-                
-            ttscommit;
+            return '';
         }
+
+        DimensionAttributeValueSetStorage dimStorage = DimensionAttributeValueSetStorage::find(defaultDimension);
+        DimensionAttributeValue dimAttrValue = DimensionAttributeValue::find(dimStorage.getValueByDimensionAttribute(dimensionAttribute.RecId));
+
+        if (!dimAttrValue)
+        {
+            return ''; // Not set in this DefaultDimension
+        }
+
+        return dimAttrValue.DisplayValue;
     }
 
 ]]></Source>
@@ -199,66 +239,60 @@ public class METVendorRebateOffRemittanceCalcTaskService extends METSysOperation
     /// <param name = "_debitCredit">Debit or credit entry</param>
     /// <param name = "_voucher">Voucher number to use</param>
     /// <returns><t>LedgerJournalTrans</t> table buffer</returns>
-    private LedgerJournalTrans createLedgerJournalTrans(METVendorRebateOffRemittanceCalcStaging _transStaging, DebitCredit _debitCredit, Voucher _voucher)
+    private LedgerJournalTrans createLedgerJournalTrans(METVendorRebateOffRemittanceCalcStaging _transStaging)
     {
         LedgerJournalTrans trans;
         trans.clear();
         trans.initValue();
         
+        DimensionDisplayValue dimVal = this.getDimensionDisplayValue(InventSite::find(siteid).DefaultDimension, METConstants::costCenter);
+        Map dimValMap = new Map(Types::String, Types::String);
+        dimValMap.insert(METConstants::costCenter, dimVal);
+        dimValMap.insert(METConstants::Department, _transStaging.Department);
+        DimensionDefault dimDefault = this.createDefaultDimensionFromDisplayValues(dimValMap);
+
+        LedgerDimensionAccount ledgerDim = LedgerDimensionFacade::serviceCreateLedgerDimension(_transStaging.CustomerLedgerDimension, dimDefault);
+        LedgerDimensionAccount offsetDim = LedgerDimensionFacade::serviceCreateLedgerDimension(journalTable.OffsetLedgerDimension, dimDefault);
+        
+       
         if (journalEngine)
         {
             journalEngine.ledgerJournalTable(LedgerJournalTable::find(journalTable.journalNum));
-
-            if(_voucher != '')
-            {
-                trans.Voucher = _voucher;
-            }
-
             journalEngine.initValue(trans);
         }
 
-        MainAccountRecId mainAccountRecId = LedgerDimensionFacade::getMainAccountRecIdFromLedgerDimension(journalName.OffsetLedgerDimension);
-        if(_debitCredit == DebitCredit::Debit)
+        if(_transStaging.Department)
         {
-            trans.Txt =strFmt('@SYS76785', siteId, MainAccount::find(mainAccountRecId).Name);
+            trans.Txt = strFmt('@EnterpriseAssetManagementAppSuite:EntAssetForecastUpdateCalc_InfoLogPrefix_Format', siteId, _transStaging.ChargeCode, _transStaging.Department);
         }
         else
         {
-            if(_transStaging.Department)
-            {
-                trans.Txt = strFmt('@EnterpriseAssetManagementAppSuite:EntAssetForecastUpdateCalc_InfoLogPrefix_Format', siteId, _transStaging.ChargeCode, _transStaging.Department);
-            }
-            else
-            {
-                trans.Txt = strFmt('@SYS76785', siteId, _transStaging.ChargeCode);
-            }
+            trans.Txt = strFmt('@SYS76785', siteId, _transStaging.ChargeCode);
         }
         
         trans.TransDate = contract.parmAsOnDate();
         trans.AccountType = LedgerJournalACType::Ledger;
-
-        if(_debitCredit == DebitCredit::Debit)
+        trans.LedgerDimension = ledgerDim;// LedgerDimensionFacade::serviceCreateLedgerDimension(_transStaging.CustomerLedgerDimension, journalName.DefaultDimension);
+        
+        if(_transStaging.ChargeAmount > 0)
         {
-            trans.LedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(journalName.OffsetLedgerDimension, journalName.DefaultDimension);
             trans.AmountCurDebit = roundUpdec(abs(_transStaging.ChargeAmount),2);
         }
         else
         {
-            trans.LedgerDimension = LedgerDimensionFacade::serviceCreateLedgerDimension(_transStaging.CustomerLedgerDimension, journalName.DefaultDimension);
             trans.AmountCurCredit = roundUpdec(abs(_transStaging.ChargeAmount),2);
         }
 
         journalEngine.initDefaultDimension(trans);
         trans.modifiedField(fieldNum(LedgerJournalTrans, LedgerDimension));
         journalEngine.accountModified(trans);
-
+        trans.OffsetLedgerDimension = offsetDim;
+        trans.modifiedField(fieldNum(LedgerJournalTrans, OffsetLedgerDimension));
         trans.JournalNum = journalTable.JournalNum;
-
-        
         trans.ReverseDate = journalTable.ReverseDate;
         trans.ReverseEntry = journalTable.ReverseEntry;
 
-        if (trans.validateWrite() && _debitCredit == DebitCredit::Credit)
+        if (trans.validateWrite())
         {
             transInsertList.add(trans);
         }
