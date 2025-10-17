@@ -3,6 +3,18 @@
 	<Name>METPOContinuingPermissionNoticeDP</Name>
 	<SourceCode>
 		<Declaration><![CDATA[
+/// <summary>
+/// Data provider class for the MET PO Continuing Permission Notice report.
+/// </summary>
+/// <remarks>
+/// This class is responsible for preparing and populating temporary data used in the Continuing Permission Notice SSRS report.
+/// It extends <c>SrsReportDataProviderPreProcessTempDB</c>, enabling pre-processing logic to fill TempDB tables before report execution.
+/// The <c>SRSReportParameterAttribute</c> binds this class to the <c>METPOContinuingPermissionNoticeContract</c>, which defines the report parameters.
+/// Key responsibilities:
+/// - Retrieve and transform purchase order and excise-related data.
+/// - Populate temporary tables with enriched metadata for reporting.
+/// - Support filtering and parameterization via the associated contract class.
+/// </remarks>
 [SRSReportParameterAttribute(classstr(METPOContinuingPermissionNoticeContract))]
 class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessTempDB
 {
@@ -18,8 +30,14 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
 				<Name>processReport</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Process report
+    /// Executes the report data preparation logic for the Continuing Permission Notice.
     /// </summary>
+    /// <remarks>
+    /// This method is called by the SSRS framework during report generation. It performs the following:
+    /// - Retrieves and processes purchase order and excise-related data.
+    /// - Populates the temporary table <c>METPOContinuingPermissionNoticeLineTmp</c> with enriched line-level details.
+    /// - Ensures all required fields are calculated and formatted for rendering in the report layout.
+    /// </remarks>
     public void processReport()
     {
         METPOContinuingPermissionNoticeContract contract = this.parmDataContract() as METPOContinuingPermissionNoticeContract;
@@ -35,6 +53,11 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
 
         METPurchTable metPurchTable = METPurchTable::find(purchTable.PurchId);
 
+        // Proceed only if:
+        // - PurchTable record exists
+        // - The order is marked as UnderBond
+        // - There is at least one negative line (return)
+        // - The vendor return flag is set
         if (purchTable.RecId && metPurchTable.UnderBond && purchLineNegative.RecId && metPurchTable.VendorReturn)
         {
             this.insertHeaderData();
@@ -136,20 +159,27 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
 				<Name>insertLineData</Name>
 				<Source><![CDATA[
     /// <summary>
-    ///  Inserts the report line data.
+    /// Inserts temporary line records for purchase order continuing permission notice based on purchase lines and associated lodgement data.
     /// </summary>
+    /// <remarks>
+    /// This method processes each purchase line in the current purchase order:
+    /// - If a lodgement is already recorded on the METPurchLine, it is split and used directly.
+    /// - If no lodgement exists, it calculates applicable lodgements using getMetLodgement(),
+    ///   which returns a list of [Lodgement ID, Available Quantity] pairs.
+    /// Each lodgement entry is passed to prepareRecordListTmp() to populate the temporary table.
+    /// Finally, all records are inserted into the database using a RecordInsertList.
+    /// </remarks>
     public void insertLineData()
     {
         const str defaultUOM = 'EA';
+
         PurchLine purchLine;
         InventTable inventTable;
         InventDim inventDim;
         METInventTable metInventTable;
         METPurchLine metPurchLine;
-        
-        METExciseRegisterEntry exciseRegister;
-        METExciseInformationTable metExciseInformationTable;
         METTariffItemCodeBase tariffCodeBase;
+
         insertList = new RecordInsertList(tableNum(METPOContinuingPermissionNoticeLineTmp), false, false, false, false, false, line);
 
         while select purchLine
@@ -162,39 +192,78 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
             where tariffCodeBase.RecId == metInventTable.METTariffItemCodeBaseRecid
         outer join RecId, InventSiteId from inventDim
             where inventDim.inventDimId == purchLine.InventDimId
-        outer join RecId, Lodgement from metPurchLine
+        outer join RecId, Lodgement, BottleSupplied from metPurchLine
             where metPurchLine.PurchLine == purchLine.RecId
         {
-            METLodgement lodgement;
-            InventQty qty;
+            List lodgementList = new List(Types::Container);
 
-            if (metPurchLine.Lodgement)
+            if (metPurchLine.Lodgement && metPurchLine.BottleSupplied)
             {
-                lodgement = metPurchLine.Lodgement;
-            }
-            else
-            {
-                [lodgement, qty] = this.getMetLodgement(purchLine.ItemId, inventDim.InventSiteId, purchLine.QtyOrdered);
-            }
+                // Split both strings into lists
+                List lodgementSplit = strSplit(metPurchLine.Lodgement, ',');
+                List bottleSplit = strSplit(metPurchLine.BottleSupplied, ',');
 
-            if (lodgement)
-            {
-                List lodgementList = strSplit(lodgement, ',');
-                ListEnumerator enum = lodgementList.getEnumerator();
+                ListEnumerator lodgementEnum = lodgementSplit.getEnumerator();
+                ListEnumerator bottleEnum = bottleSplit.getEnumerator();
 
-                while (enum.moveNext())
+                // Pair each lodgement with its corresponding bottle quantity
+                while (lodgementEnum.moveNext() && bottleEnum.moveNext())
                 {
-                    line.BondMark = any2Str(enum.current());
+                    METLodgement lodgementId = any2Str(lodgementEnum.current());
+                    real bottlesSupplied = str2num(any2Str(bottleEnum.current()));
 
-                    this.prepareRecordListTmp(purchLine, inventTable, metInventTable, tariffCodeBase, lodgement, true, qty);
+                    lodgementList.addEnd([lodgementId, bottlesSupplied]);
                 }
             }
             else
             {
-                this.prepareRecordListTmp(purchLine, inventTable, metInventTable, tariffCodeBase, lodgement, false);
+                // Calculate lodgements based on available excise inventory
+                lodgementList = this.getMetLodgement(
+                purchLine.ItemId,
+                inventDim.InventSiteId,
+                purchLine.QtyOrdered);
+            }
+
+            // Check if lodgementList has entries
+            if (!lodgementList.empty())
+            {
+                // Iterate lodgementList and call prepareRecordListTmp for each entry
+                ListEnumerator enum = lodgementList.getEnumerator();
+
+                while (enum.moveNext())
+                {
+                    container pair = enum.current();
+                    METLodgement lodgementId = conPeek(pair, 1);
+                    NumberOf bottleQty = conPeek(pair, 2);
+
+                    this.prepareRecordListTmp(purchLine,
+                                            inventTable,
+                                            metInventTable,
+                                            tariffCodeBase,
+                                            lodgementList,
+                                            lodgementId,
+                                            bottleQty,
+                                            true,
+                                            purchLine.QtyOrdered);
+                }
+            }
+            else
+            {
+                // Handle case when lodgementList is empty
+                List emptyList = new List(Types::Container);
+
+                this.prepareRecordListTmp(purchLine,
+                                        inventTable,
+                                        metInventTable,
+                                        tariffCodeBase,
+                                        emptyList,
+                                        '',    // Empty lodgementId
+                                        0,     // Zero bottleQty
+                                        false, // Indicates no lodgements
+                                        purchLine.QtyOrdered);
             }
         }
-            
+
         insertList.insertDatabase();
     }
 
@@ -295,42 +364,92 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
 			<Method>
 				<Name>prepareRecordListTmp</Name>
 				<Source><![CDATA[
-    private void prepareRecordListTmp(PurchLine _purchLine, InventTable _inventTable, METInventTable _metInventTable, METTariffItemCodeBase _tariffCodeBase, METLodgement _lodgement, boolean _isLodgement, InventQty _availableQty = 0)
+    /// <summary>
+    /// Prepares and inserts a temporary line record for the purchase order continuing permission notice.
+    /// </summary>
+    /// <param name="_purchLine">The purchase line being processed.</param>
+    /// <param name="_inventTable">The item master record associated with the purchase line.</param>
+    /// <param name="_metInventTable">Extended item metadata including bottle size, alcohol content, and pack quantity.</param>
+    /// <param name="_tariffCodeBase">Tariff item code details for customs and excise reporting.</param>
+    /// <param name="_lodgement">List of containers [Lodgement, BottlesSupplied].</param>
+    /// <param name="_isLodgement">Flag indicating whether lodgement logic is applied.</param>
+    /// <param name="_availableQty">Total available quantity (used only if _isLodgement is true).</param>
+    private void prepareRecordListTmp(
+    PurchLine _purchLine,
+    InventTable _inventTable,
+    METInventTable _metInventTable,
+    METTariffItemCodeBase _tariffCodeBase,
+    List _lodgement,
+    MetLodgement _metLodgement,
+    NumberOf _bottleQty,
+    boolean _isLodgement,
+    InventQty _availableQty = 0)
     {
         const str defaultUOM = 'EA';
 
         METExciseRegisterEntry exciseRegister;
         METPurchLine metPurchLine;
 
-        if (_lodgement)
+        str lodgementStr = '';
+        str bottleStr = '';
+
+        // Loop through the lodgement list and build comma-separated strings
+        // for both Lodgement IDs and Bottles Supplied. Also capture the last
+        // lodgement for use in excise lookup and line population.
+        ListEnumerator enum = _lodgement.getEnumerator();
+        while (enum.moveNext())
         {
-            // Find the matching purch line
+            container pair = enum.current();
+            METLodgement lodgementId = conPeek(pair, 1);
+            real bottleQty = conPeek(pair, 2);
+
+            lodgementStr = lodgementStr == '' ? lodgementId : strFmt('%1,%2', lodgementStr, lodgementId);
+            bottleStr = bottleStr == '' ? strFmt('%1', bottleQty) : strFmt('%1,%2', bottleStr, bottleQty);
+        }
+
+        // Update or insert the METPurchLine record with the combined lodgement
+        // and bottle quantity strings. If the record exists, append to it;
+        // otherwise, create a new one.
+        if (!_lodgement.empty())
+        {
             select firstonly metPurchLine
                 where metPurchLine.PurchLine == _purchLine.RecId;
 
             if (metPurchLine.RecId)
             {
                 ttsbegin;
-                // Update existing record
                 metPurchLine.selectForUpdate(true);
-                metPurchLine.Lodgement = _lodgement;
+                metPurchLine.Lodgement = lodgementStr;
+                metPurchLine.BottleSupplied = bottleStr;
                 metPurchLine.update();
                 ttscommit;
             }
             else
             {
-                // Insert new record
                 metPurchLine.PurchLine = _purchLine.RecId;
-                metPurchLine.Lodgement = _lodgement;
+                metPurchLine.Lodgement = lodgementStr;
+                metPurchLine.BottleSupplied = bottleStr;
                 metPurchLine.insert();
             }
         }
 
-        exciseRegister = METExciseRegisterEntry::find(_lodgement,_purchLine.inventDim().InventSiteId,_purchLine.ItemId);
-            
-        METPurchaseWMSFactor purchaseWMSFactor = UnitOfMeasureConversion::findByConversion(UnitOfMeasure::findBySymbol(_purchLine.PurchUnit).RecId, UnitOfMeasure::findBySymbol(defaultUOM).RecId, EcoResProduct::findByProductNumber(_purchLine.ItemId).RecId).Factor;
-        
-        line.BottlesSupplied = _isLodgement ? abs(_availableQty) : abs(purchaseWMSFactor * _purchLine.PurchQty);
+        // Set BondMark using the last lodgement in the list
+        line.BondMark = _metLodgement;
+
+        // Retrieve excise register entry for the item and site using the last lodgement
+        exciseRegister = METExciseRegisterEntry::find(
+        _metLodgement,
+        _purchLine.inventDim().InventSiteId,
+        _purchLine.ItemId);
+
+        // Convert purchase quantity to bottles using UOM conversion
+        METPurchaseWMSFactor purchaseWMSFactor = UnitOfMeasureConversion::findByConversion(
+        UnitOfMeasure::findBySymbol(_purchLine.PurchUnit).RecId,
+        UnitOfMeasure::findBySymbol(defaultUOM).RecId,
+        EcoResProduct::findByProductNumber(_purchLine.ItemId).RecId).Factor;
+
+        // Populate the temporary line record with all required fields
+        line.BottlesSupplied = _isLodgement ? abs(_bottleQty) : abs(purchaseWMSFactor * _purchLine.PurchQty);
         line.ItemId = _purchLine.ItemId;
         line.ItemDescription = _inventTable.productName(SystemParameters::getSystemLanguageId());
         line.BottleSize = _metInventTable.BottleSize;
@@ -338,7 +457,7 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
         line.Strength = _metInventTable.AlcoholContent;
         line.PurchUoM = _purchLine.PurchUnit;
         line.Quantity = _purchLine.PurchQty;
-        line.LitresOfAlcoholCalculated = abs(_metInventTable.BottleSize * line.BottlesSupplied * (_metInventTable.AlcoholContent/100));
+        line.LitresOfAlcoholCalculated = abs(_metInventTable.BottleSize * line.BottlesSupplied * (_metInventTable.AlcoholContent / 100));
         line.ValueTIU = exciseRegister.TIUV;
         line.TariffItem = _tariffCodeBase.TariffItem;
         line.CountryOfOrigin = _metInventTable.CountryCode;
@@ -346,6 +465,8 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
         line.ValueDuty = exciseRegister.DutyRateReceived;
         line.InvoiceAccount = purchTable.InvoiceAccount;
         line.PurchId = purchTable.PurchId;
+
+        // Add the populated line to the insert list for batch processing
         insertList.add(line);
     }
 
@@ -355,63 +476,65 @@ class METPOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
 				<Name>getMetLodgement</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Concatenated lodgement details.
+    /// Allocates purchase line quantity across open lodgements in chronological order.
+    /// Updates available quantity and lodgement status, and returns a list of [Lodgement ID, Bottles Supplied].
     /// </summary>
-    /// <param name = "_itemId">Item Id</param>
-    /// <param name = "_siteId">Site Id</param>
-    /// <param name = "_purchLineQty">Purchase order line quantity</param>
-    /// <returns></returns>
-    private container getMetLodgement(ItemId _itemId, InventSiteId _siteId, Qty _purchLineQty)
+    /// <param name="_itemId">Item ID to allocate lodgements for.</param>
+    /// <param name="_siteId">Site ID where lodgements are stored.</param>
+    /// <param name="_purchLineQty">Quantity to be fulfilled from lodgements.</param>
+    /// <returns>
+    /// A List of containers, each containing [Lodgement ID, Bottles Supplied].
+    /// </returns>
+    private List getMetLodgement(ItemId _itemId, InventSiteId _siteId, Qty _purchLineQty)
     {
-        container                 conResult;
+        List resultList = new List(Types::Container);
         METExciseInformationTable metExciseInformationTablePO;
-        METLodgement              metLodgement;
-        real                      remainingQty = abs(_purchLineQty);
+        real remainingQty = abs(_purchLineQty);
 
         ttsbegin;
+
+        // Select open lodgements in chronological order
         while select forupdate metExciseInformationTablePO
-            order by CreatedDateTime asc
-                where metExciseInformationTablePO.InventTransType == InventTransType::Purch &&
-                metExciseInformationTablePO.ItemId == _itemId &&
-                metExciseInformationTablePO.SiteId == _siteId &&
-                metExciseInformationTablePO.LodgementClosed == NoYes::No
+        order by CreatedDateTime asc
+            where metExciseInformationTablePO.InventTransType == InventTransType::Purch &&
+              metExciseInformationTablePO.ItemId == _itemId &&
+              metExciseInformationTablePO.SiteId == _siteId &&
+              metExciseInformationTablePO.LodgementClosed == NoYes::No
         {
-            if (remainingQty > 0)
+            if (remainingQty <= 0)
             {
-                // Subtract the available quantity from the remaining
-                remainingQty -= metExciseInformationTablePO.AvailableQty;
+                break; // Stop if required quantity is fulfilled
+            }
 
-                if (remainingQty >= 0)
-                {
-                    metExciseInformationTablePO.AvailableQty = 0;
-                    metExciseInformationTablePO.LodgementClosed = NoYes::Yes;
-                }
-                else
-                {
-                    metExciseInformationTablePO.AvailableQty = abs(remainingQty);
-                }
-                metExciseInformationTablePO.update();
+            real availableQtyBefore = metExciseInformationTablePO.AvailableQty;
+            real bottlesSupplied = 0;
 
-                // Append Lodgement to result string
-                if (!metLodgement)
-                {
-                    metLodgement = metExciseInformationTablePO.Lodgement;
-                }
-                else
-                {
-                    metLodgement += ',' + metExciseInformationTablePO.Lodgement;
-                }
+            if (remainingQty >= availableQtyBefore)
+            {
+                // Use full available quantity
+                bottlesSupplied = availableQtyBefore;
+                remainingQty -= availableQtyBefore;
 
-                conResult = [metLodgement, metExciseInformationTablePO.AvailableQty];
+                metExciseInformationTablePO.AvailableQty = 0;
+                metExciseInformationTablePO.LodgementClosed = NoYes::Yes;
             }
             else
             {
-                break; // Exit if no more quantity is needed
+                // Use partial quantity
+                bottlesSupplied = remainingQty;
+                metExciseInformationTablePO.AvailableQty = availableQtyBefore - remainingQty;
+                remainingQty = 0;
             }
+
+            metExciseInformationTablePO.update();
+
+            // Add [Lodgement ID, Bottles Supplied] to result list
+            resultList.addEnd([metExciseInformationTablePO.Lodgement, bottlesSupplied]);
         }
+
         ttscommit;
 
-        return conResult;
+        return resultList;
     }
 
 ]]></Source>
