@@ -118,7 +118,7 @@ public class METDeliveryNoteReportDP extends SrsReportDataProviderPreProcessTemp
             headerTableTmp.ShipConfirmDate      = soShipmentHeader.ConfirmedShipDate;
             headerTableTmp.CustAccount          = soShipmentHeader.CustAccount;
 
-            conSalesId = this.getReturnSO(soShipmentHeader.CustAccount);
+            conSalesId = this.getSOCount(soShipmentHeader.CustAccount);
 
             headerTableTmp.SalesId              = conLen(conSalesId) > 1 ? METConstants::Multiple : salesTable.SalesId;
             headerTableTmp.RouteStop            = strFmt("@MET:METStringBackSlash",soShipmentHeader.Route,soShipmentHeader.RouteStopNum);
@@ -126,10 +126,6 @@ public class METDeliveryNoteReportDP extends SrsReportDataProviderPreProcessTemp
             headerTableTmp.Phone                = docuBrandingDetails.Phone;
             headerTableTmp.Email                = docuBrandingDetails.Email;
                 
-            if(!conFind(conSalesId, salesTable.SalesId))
-            {
-                conSalesId  += salesTable.SalesId;
-            }
             this.initializeLine(shipmentId);
 
             headerTableTmp.Cartons              = cartons;
@@ -163,21 +159,44 @@ public class METDeliveryNoteReportDP extends SrsReportDataProviderPreProcessTemp
             where soShipmentLineLoc.ShipmentId == _shipmentId
         {
             InventTable     inventTableloc  = InventTable::find(soShipmentLineLoc.ItemId);
-            SalesLine       salesLineLoc = SalesLine::find(soShipmentLineLoc.OrderNum, soShipmentLineLoc.LineNum);
+            SalesLine       salesLineLoc    = SalesLine::find(soShipmentLineLoc.OrderNum, soShipmentLineLoc.LineNum);
                 
             lineTableTmp.SalesId            = soShipmentLineLoc.OrderNum;
             lineTableTmp.ItemId             = soShipmentLineLoc.ItemId;
             lineTableTmp.ItemDescription    = EcoResProductTranslation::findByProductLanguage(inventTableloc.Product,SystemParameters::getSystemLanguageId()).Description;
             lineTableTmp.UOM                = salesLineLoc.SalesUnit;
-            lineTableTmp.Qty                = soShipmentLineLoc.PickedQty;
+
+            // Use delivered qty (converted to shipped unit) for the line Qty (this was the existing behaviour)
+            InventQty deliveredQty  = this.getDeliveredQty(salesLineLoc, soShipmentLineLoc.PickedQty);
+            lineTableTmp.Qty        = deliveredQty;
+
+            // Determine the leaf sub-commodity code for the product
+            str subCommodityCode = this.getItemSubCommodityCode(inventTableloc.Product);
+
+            // If sub-commodity code is one of the listed codes => treat as keg (increment by picked qty)
+            // Otherwise sum delivered quantities into cartons (sum of #23 Delivered Qty)
+            if (subCommodityCode    == '5020801'
+                || subCommodityCode == '5010401'
+                || subCommodityCode == '5050501'
+                || subCommodityCode == '5010499'
+                || subCommodityCode == '5041001'
+                || subCommodityCode == '5020899'
+                || subCommodityCode == '5030104')
+            {
+                kegs += deliveredQty;
+            }
+            else
+            {
+                cartons += deliveredQty;
+            }
 
             if(this.isItemSubcomodityCodeExist(inventTableloc.Product))
             {
-                kegs    += soShipmentLineLoc.PickedQty;
+                kegs    += this.getDeliveredQty(salesLineLoc, soShipmentLineLoc.PickedQty);
             }
             else if(inventTableloc.salesUnitId() like METConstants::UOMOuterMultiple)
             {
-                cartons += soShipmentLineLoc.PickedQty;
+                cartons += this.getDeliveredQty(salesLineLoc, soShipmentLineLoc.PickedQty);
             }
 
             lineTableTmp.BundleReportHeaderGuidStr = bundleHeaderReportGuid;
@@ -221,23 +240,107 @@ public class METDeliveryNoteReportDP extends SrsReportDataProviderPreProcessTemp
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>getReturnSO</Name>
+				<Name>getItemSubCommodityCode</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// method to get the list of sales return order for the customer
+    /// Get the leaf (last node) sub-commodity code for the product's category mapping.
+    /// Returns empty string when none found.
     /// </summary>
-    /// <param name = "_custAccount">CustAccount</param>
-    /// <returns>container</returns>
-    protected container getReturnSO(CustAccount _custAccount)
+    /// <param name="_product">RefRecId of EcoResProduct</param>
+    /// <returns>str code of the leaf category</returns>
+    protected str getItemSubCommodityCode(RefRecId _product)
     {
-        SalesTable      salesTableReturn;
-        container       conSalesId;
+        EcoResProductCategory   ecoResProductCategory;
+        EcoResCategory          ecoResCategory;
+        EcoResCategory          ecoResCategoryChild;
 
-        while select salesTableReturn
-            where salesTableReturn.SalesType == SalesType::ReturnItem &&
-                salesTableReturn.CustAccount == _custAccount
+        // Iterate categories attached to product and return the first leaf category code found.
+        // A leaf category is assumed to have no child categories.
+        while select ecoResProductCategory
+            where ecoResProductCategory.Product == _product
+            join ecoResCategory
+                where ecoResCategory.RecId == ecoResProductCategory.Category
         {
-            conSalesId += salesTableReturn.SalesId;
+            // Check if this category has any child categories; if not, treat as leaf and return its Code.
+            select firstonly ecoResCategoryChild
+                where ecoResCategoryChild.ParentCategory == ecoResCategory.RecId;
+
+            if (!ecoResCategoryChild.RecId)
+            {
+                return ecoResCategory.Code;
+            }
+        }
+
+        return '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDeliveredQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the delivered quantity in shipped unit.
+    /// </summary>
+    /// <param name = "_salesLine"></param>
+    /// <param name = "_pickedQty"></param>
+    /// <returns></returns>
+    public InventQty getDeliveredQty(SalesLine _salesLine, InventQty _pickedQty)
+    {
+        Factor                  factor;
+        InventQty               deliveryNoteQty;
+        InventDim               inventDim, inventDimDefaultSetting;
+        UnitOfMeasureSymbol     shippedUnitId;
+        InventItemSalesSetup    inventItemSalesSetup;
+        UnitOfMeasureFromRecId  fromUnit, toUnit;
+
+        inventDim       = InventDim::find(_salesLine.InventDimId);
+        shippedUnitId   = InventTableModule::find(_salesLine.ItemId, ModuleInventPurchSales::Invent).UnitId;
+
+        select firstonly METSalesUnit from inventItemSalesSetup
+            join inventDimDefaultSetting
+            where inventDimDefaultSetting.inventDimId == inventItemSalesSetup.InventDimId
+                && inventItemSalesSetup.ItemId == _salesLine.ItemId
+                && inventDimDefaultSetting.InventSiteId == inventDim.InventSiteId;
+
+        //Get the unit conversion rule and factor.
+        fromUnit    = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(inventItemSalesSetup.METSalesUnit);
+        toUnit      = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(shippedUnitId);
+        factor      = EcoResProductUnitConverter::convertForReleasedProduct(
+                                    _salesLine.ItemId,
+                                    _salesLine.inventDimId,
+                                    1,
+                                    fromUnit,
+                                    toUnit,
+                                    NoYes::No,
+                                    NoYes::No);
+
+        deliveryNoteQty = _pickedQty / factor;
+
+        return deliveryNoteQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSOCount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the sales order count for customer account.
+    /// </summary>
+    /// <param name = "_custAccount">Customer account</param>
+    /// <returns>Container</returns>
+    protected container getSOCount(CustAccount _custAccount)
+    {
+        int             conValue;
+        container       conSalesId;
+        SalesTable      salesTable;
+
+        while select salesTable
+            where salesTable.CustAccount == _custAccount
+        {
+            conValue++;
+            conSalesId += conIns(conSalesId, conValue, salesTable.SalesId);
         }
 
         return conSalesId;
