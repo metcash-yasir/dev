@@ -190,8 +190,13 @@ public  class METTransferOrderExtractScreenProcessor
 
         void setValues()
         {
-            METInventTransferLineActuals transActualsReserve, transActualsOnOrder;
+            METInventTransferLineActuals transActualsReserve, transActualsOnOrder, transActualsCase;
             InventTransferLine transLineActual;
+            METInventTransferLine metInventTransferLine;
+            METCase cases;
+            METCase brokenCase;
+            METCase actCases;
+            METCase actBrokenCases;
 
             select sum(CasesOrdered), sum(BrokenCase), sum(TotalVolume), sum(TotalWeight), sum(ActualBrokenCases), 
                 sum(ActualCases), sum(ActualVolume), sum(ActualWeight), sum(ActualWeightEA), sum(ActualVolumeEA), sum(PalletVolume), sum(ActualPalletVolume)
@@ -210,13 +215,68 @@ public  class METTransferOrderExtractScreenProcessor
                         where transLineActual.RecId == transActualsOnOrder.RecId
                             && transLineActual.TransferId == metTransferOrderExtractScreenTmp.TransferId;
 
+
+            select sum(cases), sum(BrokenCase) from metInventTransferLine
+                exists join transLineActual
+                    where metInventTransferLine.InventTransferLine == transLineActual.RecId
+                        && transLineActual.TransferId == metTransferOrderExtractScreenTmp.TransferId;
+
+            cases = metInventTransferLine.Cases;
+            brokenCase = metInventTransferLine.BrokenCase;
+
+            CompanyInfo companyInfo = CompanyInfo::find();
+
+            if (companyInfo.METLegalEntityType == METLegalEntityType::Food)
+            {
+                actCases = cases;
+                actBrokenCases = brokenCase;
+            }
+            else
+            {
+                InventItemSalesSetup inventItemSalesSetup;
+                inventDim           InventDimSetup;
+                Factor              factorCase;
+                UnitOfMeasureFromRecId  salesDefaultUnit,alternateUnit;
+                
+                actCases = 0;
+                actBrokenCases = 0;
+
+                while select ItemId, InventDimId, InventSiteId, QtyTransfer from transActualsCase
+                    where (transActualsCase.StatusIssue == StatusIssue::Picked
+                        || transActualsCase.StatusIssue == StatusIssue::ReservPhysical)
+                        exists join transLineActual
+                            where transLineActual.RecId == transActualsCase.RecId
+                                && transLineActual.TransferId == metTransferOrderExtractScreenTmp.TransferId
+                {
+
+                    select firstonly METSalesUnit, METAltSalesUnit, RecId from inventItemSalesSetup
+                        where inventItemSalesSetup.ItemId == transActualsCase.ItemId
+                            exists join InventDimSetup
+                                where InventDimSetup.InventDimId == inventItemSalesSetup.InventDimId
+                                &&    InventDimSetup.InventSiteId == transActualsCase.InventSiteId;
+
+                    salesDefaultUnit = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(inventItemSalesSetup.METSalesUnit);
+                    alternateUnit = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(inventItemSalesSetup.METAltSalesUnit ? inventItemSalesSetup.METAltSalesUnit : METConstants::unitEach);
+                    
+                    factorCase = EcoResProductUnitConverter::convertForReleasedProduct(
+                                        transActualsCase.ItemId,
+                                        transActualsCase.InventDimId,
+                                        1,
+                                        salesDefaultUnit,
+                                        alternateUnit,
+                                        NoYes::No,
+                                        NoYes::No);
+
+                    actCases += transActualsCase.Qty div factorCase;
+                    actBrokenCases += transActualsCase.Qty mod factorCase;
+                }
+            }
+
             //Set values for form level summary
             totalPallets += real2int(transActualsReserve.PalletVolume ? transActualsReserve.PalletVolume : transActualsOnOrder.PalletVolume);
             totalActualPallets += real2int(transActualsReserve.ActualPalletVolume ? transActualsReserve.ActualPalletVolume : transActualsOnOrder.ActualPalletVolume);
 
-            METCase cases = real2int(transActualsReserve.CasesOrdered ? transActualsReserve.CasesOrdered : transActualsOnOrder.CasesOrdered);
             totalCases += cases;
-            METCase actCases = real2int(transActualsReserve.ActualCases ? transActualsReserve.ActualCases : transActualsOnOrder.ActualCases);
             totalActualCases += actCases;
 
             METUOMVolume volume = transActualsReserve.TotalVolume ? transActualsReserve.TotalVolume : transActualsOnOrder.TotalVolume;
@@ -229,9 +289,7 @@ public  class METTransferOrderExtractScreenProcessor
             Weight actWeight = (transActualsReserve.ActualWeight ?  (transActualsReserve.ActualWeight + transActualsReserve.ActualWeightEA) : (transActualsOnOrder.ActualWeight + transActualsOnOrder.ActualWeightEA));
             totalActualWeight += actWeight;
 
-            METCase brokenCase = real2int(transActualsReserve.BrokenCase ? transActualsReserve.BrokenCase : transActualsOnOrder.BrokenCase);
             totalBrokenCases += brokenCase;
-            METCase actBrokenCases = real2int(transActualsReserve.ActualBrokenCases ? transActualsReserve.ActualBrokenCases : transActualsOnOrder.ActualBrokenCases);
             totalActualBrokenCases += actBrokenCases;
             
             metTransferOrderExtractScreenTmp.Cases = cases; 
@@ -364,8 +422,7 @@ public  class METTransferOrderExtractScreenProcessor
         //Step 1: Insert records that match the filter criteria choosen by customer
         insert_recordset metExtractScreenTmp(TransferId, OrderSplitGroup, Door, StagingLane)
             select TransferId from inventTransferTable
-                where inventTransferTable.TransferStatus == InventTransferStatus::Created
-                    && (!filterParms.parmFromWarehouse() 
+            where  (!filterParms.parmFromWarehouse() 
                         || inventTransferTable.InventLocationIdFrom == filterParms.parmFromWarehouse())
                     && (!filterParms.parmToWarehouse()
                         || inventTransferTable.InventLocationIdTo == filterParms.parmToWarehouse())

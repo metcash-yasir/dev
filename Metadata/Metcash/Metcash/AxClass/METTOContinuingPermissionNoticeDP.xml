@@ -76,14 +76,21 @@ class METTOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
 
         if (numberSequenceReference.RecId)
         {
-            METCPNumber num                         = NumberSeq::newGetNum(numberSequenceReference).num();
-            header.ContinuingPermissionNoticeNumber = num;
-
+            // Check if CP number already exists for the transfer
             InventTransferJour inventTransferJour;
+            select firstonly METCPNumber from inventTransferJour
+                where inventTransferJour.TransferId == inventTransferTable.TransferId &&
+                inventTransferJour.METCPNumber != '';
 
-            update_recordset inventTransferJour
+            if (!inventTransferJour.RecId)
+            {
+                METCPNumber num                         = NumberSeq::newGetNum(numberSequenceReference).num();
+                header.ContinuingPermissionNoticeNumber = num;
+            
+                update_recordset inventTransferJour
                 setting METCPNumber = num
-                where inventTransferJour.TransferId == inventTransferTable.TransferId;
+                    where inventTransferJour.TransferId == inventTransferTable.TransferId;
+            }
         }
 
         InventLocation inventLocationTo = InventLocation::find(inventTransferTable.InventLocationIdTo);
@@ -133,8 +140,16 @@ class METTOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
 				<Name>insertLineData</Name>
 				<Source><![CDATA[
     /// <summary>
-    ///  Inserts the report line data.
+    /// Inserts temporary line records for continuing permission notice based on transfer order lines and associated lodgement data.
     /// </summary>
+    /// <remarks>
+    /// This method processes each transfer line in the current transfer order:
+    /// - If lodgement records already exist, it uses them directly.
+    /// - If no lodgement exists, it calculates applicable lodgements using getMetLodgement(),
+    ///   which returns a list of [Lodgement ID, Available Quantity] pairs.
+    /// Each lodgement entry is passed to prepareRecordListTmp() to populate the temporary table.
+    /// Finally, all records are inserted into the database using a RecordInsertList.
+    /// </remarks>
     public void insertLineData()
     {
         InventTransferLine inventTransferLine;
@@ -143,9 +158,10 @@ class METTOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
         InventDim inventDim;
         METExciseInformationTable metExciseInformationTable;
         METTariffItemCodeBase tariffCodeBase;
-       
+
         insertList = new RecordInsertList(tableNum(METTOContinuingPermissionNoticeLineTmp), false, false, false, false, false, line);
 
+        // Loop through each transfer line in the current transfer order
         while select inventTransferLine
             where inventTransferLine.TransferId == inventTransferTable.TransferId
         join inventTable
@@ -159,29 +175,78 @@ class METTOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
         {
             InventTransferJourLine inventTransferJourLine;
             METTransferOrderLodgements toLodgements;
-            boolean lodgementExists;
-            METLodgement lodgement;
+            boolean lodgementExists = false;
 
-            while select Lodgement from toLodgements
+            // Check if lodgement records already exist for this transfer line
+            while select Lodgement, BottlesSupplied from toLodgements
             join inventTransferJourLine
-               where toLodgements.ReferenceId == inventTransferJourLine.RecId
-               && inventTransferJourLine.TransferId == inventTransferLine.TransferId
-               && inventTransferJourLine.LineNum == inventTransferLine.LineNum
-               && inventTransferJourLine.InventDimId == inventTransferLine.InventDimId
+                where toLodgements.ReferenceId == inventTransferJourLine.RecId &&
+                  inventTransferJourLine.TransferId == inventTransferLine.TransferId &&
+                  inventTransferJourLine.LineNum == inventTransferLine.LineNum &&
+                  inventTransferJourLine.InventDimId == inventTransferLine.InventDimId
             {
                 lodgementExists = true;
+                // Populate line with existing lodgement data
                 line.BondMark = toLodgements.Lodgement;
-                this.prepareRecordListTmp(inventTransferLine, inventTable, metInventTable, tariffCodeBase, toLodgements.Lodgement);
+                line.BottlesSupplied = toLodgements.BottlesSupplied;
+
+                // Wrap existing lodgement into a list of one container [Lodgement, Qty = 0]
+                List singleLodgementList = new List(Types::Container);
+                singleLodgementList.addEnd([toLodgements.Lodgement, toLodgements.BottlesSupplied]);
+
+                // Prepare and add the temporary record using existing lodgement
+                this.prepareRecordListTmp(
+                inventTransferLine,
+                inventTable,
+                metInventTable,
+                tariffCodeBase,
+                singleLodgementList,
+                true);
             }
 
+            // If no lodgement exists, calculate lodgements based on available excise inventory
             if (!lodgementExists)
             {
-                lodgement = this.getMetLodgement(inventTransferLine.ItemId, inventDim.InventSiteId, inventTransferLine.QtyTransfer);
+                List lodgementList = this.getMetLodgement(
+                inventTransferLine.ItemId,
+                inventDim.InventSiteId,
+                inventTransferLine.QtyTransfer);
 
-                this.prepareRecordListTmp(inventTransferLine, inventTable, metInventTable, tariffCodeBase, lodgement);
+                // If no lodgement could be calculated, fallback to default logic
+                if (lodgementList.empty())
+                {
+                    this.prepareRecordListTmp(
+                        inventTransferLine,
+                        inventTable,
+                        metInventTable,
+                        tariffCodeBase,
+                        lodgementList,
+                        false);
+                }
+                else
+                {
+                    ListEnumerator enumerator = lodgementList.getEnumerator();
+                    container entry;
+
+                    // Loop through each calculated lodgement and prepare a record
+                    while (enumerator.moveNext())
+                    {
+                        entry = enumerator.current();
+                        METLodgement lodgementId = conPeek(entry, 1);
+                        InventQty availableQty = conPeek(entry, 2);
+
+                        this.prepareRecordListTmp(
+                        inventTransferLine,
+                        inventTable,
+                        metInventTable,
+                        tariffCodeBase,
+                        lodgementList,
+                        true);
+                    }
+                }
             }
         }
-            
+
         insertList.insertDatabase();
     }
 
@@ -279,60 +344,60 @@ class METTOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
 				<Name>getMetLodgement</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Concatenated lodgement details.
+    /// Retrieves lodgement details for a given item and site based on the required transfer quantity.
     /// </summary>
-    /// <param name = "_itemId">Item Id</param>
-    /// <param name = "_siteId">Site Id</param>
-    /// <param name = "_purchLineQty">Purchase order line quantity</param>
-    /// <returns></returns>
-    private METLodgement getMetLodgement(ItemId _itemId, InventSiteId _siteId, Qty _TransferLineQty)
+    /// <param name="_itemId">Item ID for which lodgement entries are needed.</param>
+    /// <param name="_siteId">Site ID where the inventory is located.</param>
+    /// <param name="_TransferLineQty">Transfer line quantity to be fulfilled.</param>
+    /// <returns>
+    /// A List of containers, where each container holds a pair: [Lodgement ID, Available Quantity].
+    /// Entries are processed in chronological order and support duplicate lodgement IDs.
+    /// </returns>
+    private List getMetLodgement(ItemId _itemId, InventSiteId _siteId, Qty _TransferLineQty)
     {
+        List resultList = new List(Types::Container);
         METExciseInformationTable metExciseInformationTablePO;
-        METLodgement              metLodgement;
-        real                      remainingQty = abs(_TransferLineQty);
+        real remainingQty = abs(_TransferLineQty);
 
         ttsbegin;
         while select forupdate metExciseInformationTablePO
-            order by CreatedDateTime desc
-                where metExciseInformationTablePO.InventTransType == InventTransType::Purch &&
-                metExciseInformationTablePO.ItemId == _itemId &&
-                metExciseInformationTablePO.SiteId == _siteId &&
-                metExciseInformationTablePO.LodgementClosed == NoYes::No
+        order by CreatedDateTime asc
+        where metExciseInformationTablePO.InventTransType == InventTransType::Purch &&
+              metExciseInformationTablePO.ItemId == _itemId &&
+              metExciseInformationTablePO.SiteId == _siteId &&
+              metExciseInformationTablePO.LodgementClosed == NoYes::No
         {
-            if (remainingQty > 0)
+            if (remainingQty <= 0)
             {
-                // Subtract the available quantity from the remaining
-                remainingQty -= metExciseInformationTablePO.AvailableQty;
+                break;
+            }
 
-                if (remainingQty >= 0)
-                {
-                    metExciseInformationTablePO.AvailableQty = 0;
-                    metExciseInformationTablePO.LodgementClosed = NoYes::Yes;
-                }
-                else
-                {
-                    metExciseInformationTablePO.AvailableQty = abs(remainingQty);
-                }
-                metExciseInformationTablePO.update();
+            real availableQtyBefore = metExciseInformationTablePO.AvailableQty;
+            real bottlesSupplied = 0;
 
-                // Append Lodgement to result string
-                if (!metLodgement)
-                {
-                    metLodgement = metExciseInformationTablePO.Lodgement;
-                }
-                else
-                {
-                    metLodgement += ',' + metExciseInformationTablePO.Lodgement;
-                }
+            if (remainingQty >= availableQtyBefore)
+            {
+                bottlesSupplied = availableQtyBefore;
+                remainingQty -= availableQtyBefore;
+
+                metExciseInformationTablePO.AvailableQty = 0;
+                metExciseInformationTablePO.LodgementClosed = NoYes::Yes;
             }
             else
             {
-                break; // Exit if no more quantity is needed
+                bottlesSupplied = remainingQty;
+                metExciseInformationTablePO.AvailableQty = availableQtyBefore - remainingQty;
+                remainingQty = 0;
             }
+
+            metExciseInformationTablePO.update();
+
+            // Add [Lodgement, BottlesSupplied] to the result list
+            resultList.addEnd([metExciseInformationTablePO.Lodgement, bottlesSupplied]);
         }
         ttscommit;
 
-        return metLodgement;
+        return resultList;
     }
 
 ]]></Source>
@@ -340,77 +405,101 @@ class METTOContinuingPermissionNoticeDP extends SrsReportDataProviderPreProcessT
 			<Method>
 				<Name>prepareRecordListTmp</Name>
 				<Source><![CDATA[
-    private void prepareRecordListTmp(inventTransferLine _inventTransferLine, InventTable _inventTable, METInventTable _metInventTable,METTariffItemCodeBase _tariffCodeBase, MetLodgement _lodgement)
+    /// <summary>
+    /// Prepares and inserts temporary line records for continuing permission notice based on transfer line and lodgement details.
+    /// </summary>
+    /// <param name="_inventTransferLine">The transfer line being processed.</param>
+    /// <param name="_inventTable">The item master record associated with the transfer line.</param>
+    /// <param name="_metInventTable">Extended item metadata including bottle size, alcohol content, and pack quantity.</param>
+    /// <param name="_tariffCodeBase">Tariff item code details for customs and excise reporting.</param>
+    /// <param name="_lodgementList">A list of containers, each containing [Lodgement ID, Available Quantity].</param>
+    /// <param name="_isLodgement">Flag indicating whether lodgement logic is applied.</param>
+    /// <remarks>
+    /// This method performs the following:
+    /// - Ensures a matching transfer journal line exists.
+    /// - Creates or updates lodgement records as needed.
+    /// - Retrieves excise register data for each lodgement.
+    /// - Populates the temporary line record with item, excise, and tariff details.
+    /// - Triggers excise register creation for the receiving site if applicable.
+    /// Lodgements are processed individually to support accurate quantity tracking and reporting.
+    /// </remarks>
+    private void prepareRecordListTmp(InventTransferLine _inventTransferLine,
+                                      InventTable _inventTable,
+                                      METInventTable _metInventTable,
+                                      METTariffItemCodeBase _tariffCodeBase,
+                                      List _lodgementList, // List of containers: [Lodgement, AvailableQty]
+                                      boolean _isLodgement)
     {
         const str defaultUOM = 'EA';
-       
-        METExciseRegisterEntry exciseRegister;
+
         InventTransferJourLine inventTransferJourLine;
-        METTransferOrderLodgements toLodgements;
+        InventSiteId siteId = _inventTransferLine.inventDim().InventSiteId;
 
-        if (_lodgement)
+        // Retrieve the matching transfer journal line once for reuse
+        select firstonly inventTransferJourLine
+            where inventTransferJourLine.TransferId == _inventTransferLine.TransferId &&
+              inventTransferJourLine.LineNum == _inventTransferLine.LineNum &&
+              inventTransferJourLine.InventDimId == _inventTransferLine.InventDimId;
+
+        if (!inventTransferJourLine.RecId)
         {
-            List lodgementList = strSplit(_lodgement, ',');
-            ListEnumerator enum = lodgementList.getEnumerator();
+            return; // Skip if no matching journal line found
+        }
 
-            while (enum.moveNext())
+        ListEnumerator enum = _lodgementList.getEnumerator();
+        container entry;
+
+        while (enum.moveNext())
+        {
+            entry = enum.current();
+            METLodgement lodgementId = conPeek(entry, 1);
+            InventQty availableQty = conPeek(entry, 2);
+
+            METTransferOrderLodgements toLodgements;
+
+            // Check if a lodgement record already exists for this line and quantity
+            select firstonly forupdate toLodgements
+                where toLodgements.ReferenceId == inventTransferJourLine.RecId &&
+                  toLodgements.Lodgement == lodgementId &&
+                  toLodgements.BottlesSupplied == availableQty;
+
+            // If not found, create a new lodgement record
+            if (!toLodgements.RecId)
             {
-                // Find the matching transfer jour line
-                select firstonly inventTransferJourLine
-                   where inventTransferJourLine.TransferId == _inventTransferLine.TransferId
-                   && inventTransferJourLine.LineNum == _inventTransferLine.LineNum
-                   && inventTransferJourLine.InventDimId == _inventTransferLine.InventDimId;
-                
-                // Only proceed if matching line is found
-                if (inventTransferJourLine.RecId)
-                {
-                    // Try to find existing Lodgement record
-                    select firstonly forupdate toLodgements
-                    where toLodgements.ReferenceId == inventTransferJourLine.RecId
-                    && toLodgements.Lodgement == any2Str(enum.current());
+                toLodgements.ReferenceId = inventTransferJourLine.RecId;
+                toLodgements.Lodgement = lodgementId;
+                toLodgements.LodgmentDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+                toLodgements.BottlesSupplied = availableQty;
+                toLodgements.insert();
+            }
 
-                    if (!toLodgements.RecId)
-                    {
-                        // Insert new record
-                        toLodgements.ReferenceId  = inventTransferJourLine.RecId;
-                        toLodgements.Lodgement    = any2Str(enum.current());
-                        toLodgements.LodgmentDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
-                        toLodgements.insert();
-                    }
-                }
+            METExciseRegisterEntry exciseRegister = METExciseRegisterEntry::find(toLodgements.Lodgement,
+                                                                                 siteId,
+                                                                                 _inventTransferLine.ItemId);
 
-                InventSiteId siteId = _inventTransferLine.inventDim().InventSiteId;
+            line.BondMark = toLodgements.Lodgement;
+            line.BottlesSupplied = _isLodgement ? abs(availableQty) : abs(_inventTransferLine.QtyShipped);
+            line.ItemId = _inventTransferLine.ItemId;
+            line.ItemDescription = _inventTable.productName(SystemParameters::getSystemLanguageId());
+            line.BottleSize = _metInventTable.BottleSize;
+            line.PackQty = _metInventTable.ItemPack;
+            line.Strength = _metInventTable.AlcoholContent;
+            line.LitresOfAlcoholCalculated = abs(_metInventTable.BottleSize * _inventTransferLine.QtyShipped * (_metInventTable.AlcoholContent / 100));
+            line.ValueTIU = exciseRegister.TIUV;
+            line.TariffItem = _tariffCodeBase.TariffItem;
+            line.CountryOfOrigin = _metInventTable.CountryCode;
+            line.StatCode = _metInventTable.statcode();
+            line.ValueDuty = exciseRegister.DutyRateReceived;
+            line.TransferId = inventTransferTable.TransferId;
+            line.BundleReportHeaderGuidStr = bundleHeaderReportGuid;
+            line.ContinuingPermissionHeaderGuidStr = headerReportGuid;
 
-                exciseRegister = METExciseRegisterEntry::find(toLodgements.Lodgement,siteId,_inventTransferLine.ItemId);
+            insertList.add(line);
 
-                line.BondMark = toLodgements.Lodgement;
-                line.BottlesSupplied = abs(_inventTransferLine.QtyShipped);
-                line.ItemId = _inventTransferLine.ItemId;
-                line.ItemDescription = _inventTable.productName(SystemParameters::getSystemLanguageId());
-                line.BottleSize = _metInventTable.BottleSize;
-                line.PackQty = _metInventTable.ItemPack;
-                line.Strength = _metInventTable.AlcoholContent;
-                line.LitresOfAlcoholCalculated = abs(_metInventTable.BottleSize * _inventTransferLine.QtyShipped * (_metInventTable.AlcoholContent / 100));
-                line.ValueTIU = exciseRegister.TIUV;
-                line.TariffItem = _tariffCodeBase.TariffItem;
-                line.CountryOfOrigin = _metInventTable.CountryCode;
-                line.StatCode = _metInventTable.statcode();
-                line.ValueDuty = exciseRegister.DutyRateReceived;//METExciseSiteDutySetup::find(siteId, _inventTransferLine.ItemId).ValueForDuty;
-                line.TransferId = inventTransferTable.TransferId;
-                line.BundleReportHeaderGuidStr = bundleHeaderReportGuid;
-                line.ContinuingPermissionHeaderGuidStr = headerReportGuid;
-
-                insertList.add(line);
-
-                // CB233 - Auto create excise register entry for receiving site at the point of printing CP notices
-                // As of 15/07/2025, the only trigger point to create METTransferOrderLodgements is at the point of printing CP notices
-                // METTransferOrderLodgements is the prerequisite for creating excise register entry for receiving site
-                // This is to ensure that the excise register entry for receiving site is created only when the shipment transfer order lodgement exists
-                // If the desgin of METTransferOrderLodgements creation changes in the future, this logic may need to be revisited
-                if (METExciseRegisterEntry::shouldCreateExciseRegisterEntriyReceive(inventTransferJourLine))
-                {
-                    METExciseRegisterEntry::createExciseRegisterEntriyReceive(toLodgements);
-                }
+            // Auto-create excise register entry for receiving site
+            if (METExciseRegisterEntry::shouldCreateExciseRegisterEntriyReceive(inventTransferJourLine))
+            {
+                METExciseRegisterEntry::createExciseRegisterEntriyReceive(toLodgements);
             }
         }
     }

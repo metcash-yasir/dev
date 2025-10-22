@@ -33,7 +33,8 @@ class METPurchaseOrderService extends SysOperationServiceBase
     METPurchaseOrderServiceLinesContract        linesContract;
     METVersioningPurchaseOrder                  versioningPurchaseOrder;
     METChangeReasonCode                         changeReasonCode;
-
+    Boolean                                     requestChangeFlag;
+    Boolean                                     cancelWorkflowflag;
 
 }
 ]]></Declaration>
@@ -41,13 +42,15 @@ class METPurchaseOrderService extends SysOperationServiceBase
 			<Method>
 				<Name>updatePurchaseOrder</Name>
 				<Source><![CDATA[
-    /// <summary>
+        /// <summary>
     /// Update purchase order.
     /// </summary>
     /// <param name="_purchaseOrderContract">List of contracts</param>
     /// <returns>Container of Results</returns>
     public container updatePurchaseOrder(METPurchaseOrderServiceContract _purchaseOrderContract)
     {
+        boolean isErrorCaught;
+        int infoCnt = infologLine();
         this.initParams(_purchaseOrderContract);
 
         changecompany(dataAreaId)
@@ -55,7 +58,7 @@ class METPurchaseOrderService extends SysOperationServiceBase
             purchTable = PurchTable::find(purchaseOrderNumber, true);
 
             [processingStatus, processingMessage] = this.validate();
-
+             
             if (processingStatus == METProcessingStatus::Error)
             {
                 return [processingStatus, processingMessage];
@@ -66,556 +69,711 @@ class METPurchaseOrderService extends SysOperationServiceBase
                 ttsbegin;
 
                 metPurchTable = purchTable.metPurchTable();
-                //Create <c>MetPurchTable</c> record if not exists.
+                
                 if(!metPurchTable)
-                {
+                {   // check if metpurchtable does not exist then create new record.
                     metPurchTable = purchTable.metCreateMETPurchTable();
                 }
-
-                this.updatePurchaseOrderHeader();
-
-                if (poeDIPOAMsg == POEDIPOAMsg::Rejected)
+                //add if POEDI flag exist then just update a flag.
+                if (metPOEDIFAMsg)
                 {
-                    this.cancelPurchaseOrder();
+                    metPurchTable.selectForUpdate(true);
+                    metPurchTable.POEDIFAMsg = NoYes::Yes;
+                    metPurchTable.update();
                 }
-                else if (poeDIPOAMsg == POEDIPOAMsg::AcceptedWithChanges)
+                else
                 {
-                    this.processPurchaseOrderLines();
+                    if (poeDIPOAMsg == POEDIPOAMsg::AcceptedWithChanges)
+                    {
+                        this.cancelWorkflow();
+                        this.processforAcceptedwithChanges();
+                        this.poSubmitToWorkflow(purchTable);
+                    }
+                    else
+                    {
+                        if (poeDIPOAMsg == POEDIPOAMsg::Accepted)
+                        {
+                            this.cancelWorkflow();
+                            this.updatePurchaseOrderHeaderAccepted();
+                            this.poSubmitToWorkflow(purchTable);
+                        }
+                        if (poeDIPOAMsg == POEDIPOAMsg::Rejected)
+                        {
+                            this.cancelWorkflow();
+                            this.cancelPurchaseOrder();  
+                            this.updateMETPurchTable();
+                            this.poSubmitToWorkflow(purchTable);
+                        }
+                    }
                 }
-                this.confirmChanges();
-                METPurchPurchaseOrderHeaderV2Entity::poSubmitToWorkflow(purchTable);
-                this.checkUpdateProcessingStatus();//success or failure
+                this.checkUpdateProcessingStatus();//success or failure required for all scenarios to call
                 ttscommit;
-               
             }
-
-            catch (Exception::Deadlock)
-            {
-                if (appl.ttsLevel() == 0)
+                catch (Exception::Deadlock)
                 {
-                    if (xSession::currentRetryCount() >= #RetryNum)
+                    if (appl.ttsLevel() == 0)
+                    {
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            processingMessage = "@MET:PurchaseOrderUpdateFailedDatabaseDeadlock";
+                        }
+                        else
+                        {
+                            retry;
+                        }
+                    }
+                    else
                     {
                         processingMessage = "@MET:PurchaseOrderUpdateFailedDatabaseDeadlock";
                     }
-                    else
+                    isErrorCaught = true;
+                }
+                catch (Exception::UpdateConflict)
+                {
+                    if (appl.ttsLevel() == 0)
                     {
-                        retry;
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            processingMessage = "@MET:PurchaseOrderUpdateFailedDatabaseConflict";
+                        }
+                        else
+                        {
+                            retry;
+                        }
                     }
-                }
-                else
-                {
-                    processingMessage = "@MET:PurchaseOrderUpdateFailedDatabaseDeadlock";
-                }
-            }
-            catch (Exception::UpdateConflict)
-            {
-                if (appl.ttsLevel() == 0)
-                {
-                    if (xSession::currentRetryCount() >= #RetryNum)
+                    else
                     {
                         processingMessage = "@MET:PurchaseOrderUpdateFailedDatabaseConflict";
                     }
+                    isErrorCaught = true;
+                }
+                catch
+                {
+                    purchTable.reread();
+                    if (poeDIPOAMsg == POEDIPOAMsg::Rejected && !purchTable.isCanceled())
+                    {
+                        processingMessage = "@MET:PurchaseOrderNotCancelled";
+                    }
                     else
                     {
-                        retry;
+                        processingMessage = "@MET:PurchaseOrderNotUpdated";
+                    }
+                    isErrorCaught = true;
+                    processingStatus = METProcessingStatus::Error;
+                }
+
+                if (isErrorCaught)
+                {
+                    container taskInfolog;
+                    str       logTxt;
+                    if (infologLine() > infoCnt)
+                    {
+                        taskInfolog = infolog.copy(infoCnt + 1, infologLine());
+
+                        if (taskInfolog != conNull())
+                        {
+                            logTxt              = info::infoCon2Str(taskInfolog);
+                            processingMessage  += '\n'  + logTxt;
+                        }
                     }
                 }
-                else
-                {
-                    processingMessage = "@MET:PurchaseOrderUpdateFailedDatabaseConflict";
-                }
-            }
-            catch
-            {
-                purchTable.reread();
-                if (poeDIPOAMsg == POEDIPOAMsg::Rejected && !purchTable.isCanceled())
-                {
-                    processingMessage = "@MET:PurchaseOrderNotCancelled";
-                }
-                else
-                {
-                    processingMessage = "@MET:PurchaseOrderNotUpdated";
-                }
-                processingStatus = METProcessingStatus::Error;
+
             }
 
+            return [processingStatus, processingMessage];
         }
 
-        return [processingStatus, processingMessage];
+]]></Source>
+			</Method>
+			<Method>
+				<Name>poSubmitToWorkflow</Name>
+				<Source><![CDATA[
+    public void poSubmitToWorkflow(PurchTable _purchTable)
+    {
+        str	comment;
+
+        _purchTable.reread();
+
+        if (_purchTable.DocumentState == VersioningDocumentState::Draft && _purchTable.ChangeRequestRequired)
+        {
+            comment = strFmt("@MET:PoSubmittedService", _purchTable.PurchId);
+
+            if (_purchTable.checkFullyDistributedAndQualified() && _purchTable.canSubmitToWorkflow())
+            {
+                try
+                {
+                    ttsbegin;
+                    _purchTable.selectForUpdate(true);
+                    _purchTable.submitToWorkflow(workflowTypeStr(PurchTableTemplate), comment, false);
+                    ttscommit;
+
+                    if (_purchTable.DocumentState == VersioningDocumentState::InReview)
+                    {
+                        info(strFmt("@MET:POWorkflowSubmitted", _purchTable.PurchId));
+                    }
+                }
+                catch (Exception::CLRError)
+                {
+                    System.Exception interopException = CLRInterop::getLastException();
+                    error(strFmt("%1", interopException));
+                }
+                catch (Exception::Error)
+                {
+                    error(strFmt("@MET:POWorkFlowSubmissionFailed", _purchTable.PurchId));
+                }
+            }
+            else
+            {
+                this.confirmChanges();
+            }
+        }
     }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelWorkflow</Name>
+				<Source><![CDATA[
+        public void cancelWorkflow()
+        {
+            WorkflowTrackingStatusTable   WorkflowTrackingStatusTable;
+
+            if (!cancelWorkflowflag)
+            {
+                cancelWorkflowflag = true;
+                select CorrelationId from WorkflowTrackingStatusTable
+                    where WorkflowTrackingStatusTable.TrackingStatus == WorkflowTrackingStatus::Pending
+                       && WorkflowTrackingStatusTable.ContextRecId == purchTable.RecId
+                        && WorkflowTrackingStatusTable.ContextTableId == purchTable.TableId;
+             
+                if (WorkflowTrackingStatusTable.CorrelationId)
+                {
+                    VersioningPurchaseOrder versioningPurchaseOrderchk;
+
+                    if (purchTable.ChangeRequestRequired)
+                    {
+                        versioningPurchaseOrderchk = VersioningPurchaseOrder::newPurchaseOrder(purchTable);
+                        versioningPurchaseOrderchk.cancelChangeRequest();
+                    }
+                }
+            }
+        }
 
 ]]></Source>
 			</Method>
 			<Method>
 				<Name>processPurchaseOrderLines</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Update purchase order line details
-    /// </summary>
-    private void processPurchaseOrderLines()
-    {
-        if (!this.canUpdatePOLines() || processingMessage)
+        /// <summary>
+        /// Update purchase order line details
+        /// </summary>
+        private void processPurchaseOrderLines()
         {
-            return;
-        }
-
-        listEnum     =    linesContractList.getEnumerator();
-
-        this.requestChange();
-
-        while (listEnum.moveNext())
-        {
-            linesContract   =   listEnum.current();
-            select firstonly1 forupdate purchLine
-                where purchLine.PurchId == purchaseOrderNumber
-                && purchLine.LineNumber == linesContract.parmLineNumber();
-
-            select firstonly1 forupdate metpurchline
-                where purchLine.RecId == metpurchline.PurchLine;
-
-            if(purchLine && purchLine.validateWrite())
+            if (!this.canUpdatePOLines()) // check if there are lines to be updated.
             {
-                ttsbegin;
-                if(metpurchline)
-                {
-                    metpurchline.ChangeReasonCode = changeReasonCode;
-                    metpurchline.update();
-                }
-                if (linesContract.parmLineAction() == METConstants::LineRejected)
-                {
-                    this.cancelLine(purchLine);
-                }
-                else if (linesContract.parmPurchaseQty() != 0)
-                {
-                    purchLine.PurchQty    = linesContract.parmPurchaseQty();
-                    this.updateQuantities(purchLine);
-                    purchLine.ConfirmedDlv = linesContract.parmConfirmedDeliveryDate();
-                    purchLine.update();
-                }
-                ttscommit;
+                return;
             }
-        }
+
+            listEnum     =    linesContractList.getEnumerator();
+       
+            while (listEnum.moveNext())
+            {
+                boolean lineUpdate;
+                linesContract   =   listEnum.current();
+                select firstonly1 forupdate purchLine 
+                    where purchLine.PurchId == purchaseOrderNumber 
+                        && purchLine.LineNumber == linesContract.parmLineNumber();
+
+                metpurchline = purchline.metPurchLine();
+
+                if(purchLine)
+                { 
+                    if (linesContract.parmLineAction() == METConstants::LineRejected)
+                    {
+                        if (purchLine.PurchStatus != PurchStatus::Canceled)
+                        {
+                            this.requestChange();
+                            purchLine.reread();
+                            PurchCancel purchCancel = purchCancel::METconstruct();
+                            purchCancel.metCancelPurchLine(purchLine);
+                        }
+                    }
+                    else
+                    {
+                        if (linesContract.parmPurchaseQty() != 0) //purchase qty = 0 means it does not provide any value to update.
+                        {
+                            if (purchLine.PurchQty != linesContract.parmPurchaseQty())
+                            {
+                                this.requestChange();
+                                purchLine.reread();
+                                purchLine.PurchQty = linesContract.parmPurchaseQty();
+                                this.updateQuantities(purchLine);
+                                lineUpdate = true;
+                            }
+                        }
+                        purchLine.ConfirmedDlv = linesContract.parmConfirmedDeliveryDate() ? linesContract.parmConfirmedDeliveryDate():confirmedDeliveryDate;
+
+                        if (purchLine.orig().ConfirmedDlv != purchLine.ConfirmedDlv || purchLine.orig().PurchQty != purchLine.PurchQty)
+                        {
+                            this.requestChange();
+                            if (!lineUpdate) // this is done to reread only in case the record is not reread earlier.
+                            {
+                                purchLine.reread();
+                            }
+                            purchLine.ConfirmedDlv =linesContract.parmConfirmedDeliveryDate() ? linesContract.parmConfirmedDeliveryDate():confirmedDeliveryDate;
+                            purchLine.update();
+                        }
+                    }
+
+                    if (metpurchline.ChangeReasonCode != changeReasonCode)
+                    {
+                        metpurchline.selectForUpdate(true);
+                        metpurchline.ChangeReasonCode = changeReasonCode;
+                        metpurchline.update();
+                    } 
+                }
+                else
+                {
+                    throw error (strFmt("@MET:PolineValidation",linesContract.parmLineNumber()));
+                }
+            }
  
-    }
+        }
 
 ]]></Source>
 			</Method>
 			<Method>
 				<Name>updateQuantities</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Upate purchline quantities
-    /// </summary>
-    /// <param name = "_purchLine">purchline buffer</param>
-    protected void updateQuantities(PurchLine _purchLine)
-    {
-        if (_purchLine.PurchQty != _purchLine.orig().PurchQty)
+        /// <summary>
+        /// Upate purchline quantities
+        /// </summary>
+        /// <param name = "_purchLine">purchline buffer</param>
+        protected void updateQuantities(PurchLine _purchLine)
         {
-            InventMovement::bufferSetTransQtyUnit(_purchLine);
+            if (_purchLine.PurchQty != _purchLine.orig().PurchQty)
+            {
+                InventMovement::bufferSetTransQtyUnit(_purchLine);
+            }
+
+            PurchTableForm_DeliverySchedule     purchTableForm = new PurchTableForm_DeliverySchedule(_purchLine);
+            PurchLineWritePreSuperInputContract inputContractPre = PurchLineWritePreSuperInputContract::construct();
+
+            inputContractPre.parmPurchTable(PurchTable::find(_purchLine.PurchId));
+            inputContractPre.parmPurchLine(_purchLine);
+            purchTableForm.purchLine_WritePreSuper(inputContractPre);
+
+            if (_purchLine.LineDeliveryType == LineDeliveryType::OrderLineWithMultipleDeliveries)
+            {
+                purchTableForm.deliveryLinesSync(_purchLine, false);
+            }
+            PurchLine::modifyPurchQty(_purchLine, _purchLine.inventDim(), false);// not update the price
         }
-
-        PurchTableForm_DeliverySchedule     purchTableForm = new PurchTableForm_DeliverySchedule(_purchLine);
-        PurchLineWritePreSuperInputContract inputContractPre = PurchLineWritePreSuperInputContract::construct();
-
-        inputContractPre.parmPurchTable(PurchTable::find(_purchLine.PurchId));
-        inputContractPre.parmPurchLine(_purchLine);
-        purchTableForm.purchLine_WritePreSuper(inputContractPre);
-
-        if (_purchLine.LineDeliveryType == LineDeliveryType::OrderLineWithMultipleDeliveries)
-        {
-            purchTableForm.deliveryLinesSync(_purchLine, false);
-        }
-        PurchLine::modifyPurchQty(_purchLine, _purchLine.inventDim());
-    }
 
 ]]></Source>
 			</Method>
 			<Method>
 				<Name>cancelLine</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Cancel purchase line
-    /// </summary>
-    /// <param name = "_purchLine">purchline buffer</param>
-    protected void cancelLine(PurchLine     _purchLine)
-    {
-        /*
-        PurchCancel         purchCancel = purchCancel::METconstruct();  
-        purchCancel.metCancelPurchLine(_purchLine);//org   commented for Original code */
+        /// <summary>
+        /// Cancel purchase line
+        /// </summary>
+        /// <param name = "_purchLine">purchline buffer</param>
+        protected void cancelLine(PurchLine     _purchLine)
+        {
+            /*
+            PurchCancel         purchCancel = purchCancel::METconstruct();
+            purchCancel.metCancelPurchLine(_purchLine);//org   commented for Original code */
 
-        _purchLine.RemainInventPhysical = 0;
-        _purchLine.RemainPurchPhysical = 0;
-        _purchLine.PurchStatus = PurchStatus::Canceled;
-        _purchLine.update();
-        // This method will update the inventory transactions
-
-        InventMovement::bufferSetRemainQty(_purchLine);
-    }
+            _purchLine.RemainInventPhysical = 0;
+            _purchLine.RemainPurchPhysical = 0;
+            _purchLine.PurchStatus = PurchStatus::Canceled;
+            _purchLine.update(); 
+            InventMovement::bufferSetRemainQty(_purchLine);
+        }
 
 ]]></Source>
 			</Method>
 			<Method>
 				<Name>confirmChanges</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Confirm the purchase order changes
-    /// </summary>
-    private void confirmChanges()
-    {
-        if (purchTable.ChangeRequestRequired)
+        /// <summary>
+        /// Confirm the purchase order changes
+        /// </summary>
+        private void confirmChanges()
         {
-            versioningPurchaseOrder = METVersioningPurchaseOrder::newPurchaseOrder(PurchTable::find(purchTable.PurchId));
-            if (purchTable.canSubmitToWorkflow())
+            if (purchTable.ChangeRequestRequired)
             {
-                versioningPurchaseOrder.submitChangeRequest();
-                versioningPurchaseOrder.approveChangeRequest();
+                versioningPurchaseOrder = METVersioningPurchaseOrder::newPurchaseOrder(PurchTable::find(purchTable.PurchId));
+                if (purchTable.canSubmitToWorkflow())
+                {
+                    versioningPurchaseOrder.submitChangeRequest();
+                    versioningPurchaseOrder.approveChangeRequest();
+                }
             }
-
         }
-    }
 
 ]]></Source>
 			</Method>
 			<Method>
 				<Name>checkUpdateProcessingStatus</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Update the processing status.
-    /// </summary>
-    private void checkUpdateProcessingStatus()
-    {
-        purchTable.reread();
+        /// <summary>
+        /// Update the processing status.
+        /// </summary>
+        private void checkUpdateProcessingStatus()
+        {
+            purchTable.reread();
 
-        if (processingStatus == METProcessingStatus::Error)
-        {
-            return;
+            if (processingMessage)
+            {
+                processingStatus = METProcessingStatus::Error;
+                throw Exception::Error;
+            }
+            else
+            {
+                processingStatus = METProcessingStatus::Success;
+            }
         }
-
-        if (this.poeDIPOAMsg == POEDIPOAMsg::Rejected && !purchTable.isCanceled())
-        {
-            processingMessage = "@MET:PurchaseOrderNotCancelled";
-        }
-
-        if (processingMessage)
-        {
-            processingStatus = METProcessingStatus::Error;
-            throw Exception::Error;
-        }
-        else
-        {
-            processingStatus = METProcessingStatus::Success;
-        }
-    
-    }
 
 ]]></Source>
 			</Method>
 			<Method>
 				<Name>cancelPurchaseOrder</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Cancel purchase order
-    /// </summary>
-    private void cancelPurchaseOrder()
-    {
-        PurchCancel purchCancel = PurchCancel::METconstruct();
-        purchCancel.parmMETPurchTable(purchTable);
-        purchCancel.runOperation();
-    }
+        /// <summary>
+        /// Cancel purchase order
+        /// </summary>
+        private void cancelPurchaseOrder()
+        {
+            PurchCancel purchCancel = PurchCancel::METconstruct();
+            purchCancel.parmMETPurchTable(purchTable);
+            purchCancel.runOperation();
+        }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>updatePurchaseOrderHeader</Name>
+				<Name>updatePurchaseOrderHeaderAccepted</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Update purchase order header details
-    /// </summary>
-    private void updatePurchaseOrderHeader()
-    {
-        ttsbegin;
-        //Check & Update purchase order header.
-        if (this.canUpdatePOHeader() || metPOEDIFAMsg)
+        /// <summary>
+        /// Update purchase order header details
+        /// </summary>
+        private void updatePurchaseOrderHeaderAccepted()
         {
-            metPurchTable.selectForUpdate(true);
+            if (purchTable.ConfirmedDlv != confirmedDeliveryDate)
+            { 
+                purchTable.skipDataMethods(true);
+                this.requestChange(); // ADDED REQUEST change for cchangemanagement.
+                purchTable.reread();
+                purchTable.ConfirmedDlv = confirmedDeliveryDate;
+                purchTable.update();
+            }
+            this.updateMETPurchTable();
+        }
 
-            if (metPOEDIFAMsg == NoYes::Yes)
-            {
-                metPurchTable.POEDIFAMsg = NoYes::Yes;
-            }
-            else
-            {
-                switch (poeDIPOAMsg)
-                {
-                    case POEDIPOAMsg::Accepted :
-                        metPurchTable.POEDIPOAMsg = POEDIPOAMsg::Accepted;
-                        break;
-                    case POEDIPOAMsg::AcceptedWithChanges :
-                        metPurchTable.POEDIPOAMsg = POEDIPOAMsg::AcceptedWithChanges;
-                        break;
-                    case POEDIPOAMsg::Rejected :
-                        metPurchTable.POEDIPOAMsg = POEDIPOAMsg::Rejected;
-                        break;
-                }
-            }
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMETPurchTable</Name>
+				<Source><![CDATA[
+        private void updateMETPurchTable()
+        {
+            // update POEDIPOAMsg in metPurchTable with given status
+            metPurchTable = purchTable.metPurchTable();
+            metPurchTable.selectForUpdate(true);
+            metPurchTable.POEDIPOAMsg = poeDIPOAMsg;
             metPurchTable.update();
         }
 
-        if (confirmedDeliveryDate && (poeDIPOAMsg == POEDIPOAMsg::Accepted || poeDIPOAMsg == POEDIPOAMsg::AcceptedWithChanges)
-                                    && !metPOEDIFAMsg) //the update should only happen if poa is accepted or accepted with changes.
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processforAcceptedwithChanges</Name>
+				<Source><![CDATA[
+        private void processforAcceptedwithChanges()
         {
-            purchTable.reread();
-
-            if (poeDIPOAMsg == POEDIPOAMsg::Accepted)
+           // ttsbegin;
+            if (purchTable.ConfirmedDlv != confirmedDeliveryDate)
             {
-                purchTable.skipDataMethods(true); //In accepted scenario we need to update POEDIPOAMsg and avoid other data methods.
-            }
-            else 
-            {
-                this.requestChange();
+                this.requestChange();// call with only if request  chagen is enabled and decide what to do if workflow already started.
+                purchTable.reread();
+                purchTable.ConfirmedDlv = confirmedDeliveryDate;
+                purchTable.update();
             }
             
-            purchTable.ConfirmedDlv =  confirmedDeliveryDate;
-            purchTable.update();
+            this.processPurchaseOrderLines();
+            this.updateMETPurchTable();
+           // ttscommit;
         }
-        ttscommit;
-    }
 
 ]]></Source>
 			</Method>
 			<Method>
 				<Name>initParams</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Initialise parameters.
-    /// </summary>
-    /// <param name="_purchaseOrderContract">Instance of METPurchaseOrderServiceContract class</param>
-    private void initParams(METPurchaseOrderServiceContract _purchaseOrderContract)
-    {
-        processingStatus                        = METProcessingStatus::None;
-        dataAreaId                              = _purchaseOrderContract.parmDataAreaId();
-        purchaseOrderNumber                     = _purchaseOrderContract.parmPurchId();
-        if(_purchaseOrderContract.parmPOEDIPOAMsg())
+        /// <summary>
+        /// Initialise parameters.
+        /// </summary>
+        /// <param name="_purchaseOrderContract">Instance of METPurchaseOrderServiceContract class</param>
+        private void initParams(METPurchaseOrderServiceContract _purchaseOrderContract)
         {
-            poeDIPOAMsg                             = str2Enum(poeDIPOAMsg, _purchaseOrderContract.parmPOEDIPOAMsg());
+            processingStatus                        = METProcessingStatus::None;
+            dataAreaId                              = _purchaseOrderContract.parmDataAreaId();
+            purchaseOrderNumber                     = _purchaseOrderContract.parmPurchId();
+            if(_purchaseOrderContract.parmPOEDIPOAMsg())
+            {
+                poeDIPOAMsg                             = str2Enum(poeDIPOAMsg, _purchaseOrderContract.parmPOEDIPOAMsg());
+            }
+            // added as the users are sending 1 or 0 instead of Yes or No.
+            if (_purchaseOrderContract.parmMETPOEDIFAMsg() == METConstants::One)
+            {
+                metPOEDIFAMsg = NoYes::Yes;
+            }
+            else
+            {
+                metPOEDIFAMsg = NoYes::No;
+            }
+            confirmedDeliveryDate                   = _purchaseOrderContract.parmConfirmedDeliveryDate();
+            linesContractList                       = _purchaseOrderContract.parmLineContract();
         }
-        // added as the users are sending 1 or 0 instead of Yes or No.
-        if (_purchaseOrderContract.parmMETPOEDIFAMsg() == METConstants::One)
-        {
-            metPOEDIFAMsg = NoYes::Yes;
-        }
-        else 
-        {
-            metPOEDIFAMsg = NoYes::No;
-        }
-        confirmedDeliveryDate                   = _purchaseOrderContract.parmConfirmedDeliveryDate();
-        linesContractList                       = _purchaseOrderContract.parmLineContract();
-    }
 
 ]]></Source>
 			</Method>
 			<Method>
 				<Name>canUpdatePOHeader</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Update <c>PurchTable</c> only if header values are passed in the service contract.
-    /// </summary>
-    /// <returns>true if header to be updated;otherwise false.</returns>
-    public boolean canUpdatePOHeader()
-    {
-        return (poeDIPOAMsg != METConstants::InvalidEnumValue);//|| (metPOEDIFAMsg != METConstants::InvalidEnumValue) || metPOYardDAppointmentStartDateTime || metPOYardDAppointmentEndDateTime || metPOYardDAppointmentID);
-    }
+        /// <summary>
+        /// Update <c>PurchTable</c> only if header values are passed in the service contract.
+        /// </summary>
+        /// <returns>true if header to be updated;otherwise false.</returns>
+        public boolean canUpdatePOHeader()
+        {
+            return (poeDIPOAMsg != METConstants::InvalidEnumValue);//|| (metPOEDIFAMsg != METConstants::InvalidEnumValue) || metPOYardDAppointmentStartDateTime || metPOYardDAppointmentEndDateTime || metPOYardDAppointmentID);
+        }
 
 ]]></Source>
 			</Method>
 			<Method>
 				<Name>canUpdatePOLines</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Check if PO line details are passed in the service contract.
-    /// </summary>
-    /// <returns>true if PO line to be updated;otherwise false.</returns>
-    public boolean canUpdatePOLines()
-    {
-        return linesContractList && linesContractList.elements();
-    }
+        /// <summary>
+        /// Check if PO line details are passed in the service contract.
+        /// </summary>
+        /// <returns>true if PO line to be updated;otherwise false.</returns>
+        public boolean canUpdatePOLines()
+        {
+            return linesContractList && linesContractList.elements();
+        }
 
 ]]></Source>
 			</Method>
 			<Method>
 				<Name>validate</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Validate parameters
-    /// </summary>
-    /// <returns>container</returns>
-    private container validate()
-    { 
-        if (!dataAreaId)
+        /// <summary>
+        /// Validate parameters
+        /// </summary>
+        /// <returns>container</returns>
+        private container validate()
         {
-            processingMessage = strFmt("@SYS84753", "@SYS177726");
-        }
-        else if (!purchaseOrderNumber)
-        {
-            processingMessage = strFmt("@SYS84753", "@SYS23482");
-        }
+            if (!dataAreaId)
+            {
+                processingMessage = strFmt("@SYS84753", "@SYS177726");
+            }
+            else if (!purchaseOrderNumber)
+            {
+                processingMessage = strFmt("@SYS84753", "@SYS23482");
+            }
 
-        if (!processingMessage && !purchTable)
-        {
-            processingMessage = "@MET:PurchaseOrderNotFound";
-        }
-        if (!processingMessage && purchTable.ChangeRequestRequired)
-        {
-            boolean     canAffectNextYearBudgetSource;
-            Ledger ledger = Ledger::findByLegalEntity(CompanyInfo::findDataArea(dataAreaId).RecId);
+            if (!processingMessage && !purchTable)
+            {
+                processingMessage = "@MET:PurchaseOrderNotFound";
+            }
+            if (!processingMessage && purchTable.ChangeRequestRequired)
+            {
+                boolean     canAffectNextYearBudgetSource;
+                Ledger ledger = Ledger::findByLegalEntity(CompanyInfo::findDataArea(dataAreaId).RecId);
 
-            canAffectNextYearBudgetSource = Ledger::isLedgerBudgetControlEnabled(ledger.RecId)
+                canAffectNextYearBudgetSource = Ledger::isLedgerBudgetControlEnabled(ledger.RecId)
                 && BudgetControlConfiguration::isSourceIntegratorEnabled(ledger.RecId, BudgetControlSourceIntegrator::PurchaseOrder)
                 && LedgerFiscalCalendar::findFirstOpenPeriodInYear(ledger.FiscalCalendar, purchTable.AccountingDate).RecId == 0;
                 
-            if(canAffectNextYearBudgetSource && METPurchaseOrderService::IsBudgetTracked(purchTable.PurchId))
-            {
-                processingMessage = "@Budget:NotAllowRequestChangeOnPODueToPeriodOnHold";
+                if(canAffectNextYearBudgetSource && METPurchaseOrderService::IsBudgetTracked(purchTable.PurchId))
+                {
+                    processingMessage = "@Budget:NotAllowRequestChangeOnPODueToPeriodOnHold";
+                }
             }
-        }
 
-        if (!processingMessage && purchTable.PurchStatus == PurchStatus::Canceled) 
-        {
-            processingMessage = "@MET:PurchaseOrderCancelled";
-        }
+            if (!processingMessage && purchTable.PurchStatus == PurchStatus::Canceled)
+            {
+                processingMessage = "@MET:PurchaseOrderCancelled";
+            }
         
-        if (!processingMessage && purchTable.PurchStatus == PurchStatus::Invoiced) 
-        {
-            processingMessage = "@MET:POAlreadyInvoiced";
-        }
-
-        if (!processingMessage && purchTable.PurchStatus == PurchStatus::Received)
-        {
-            processingMessage = "@MET:POAlreadyReceived";
-        }
-
-        if (!processingMessage && purchTable)
-        {
-            METVendSiteSettingsSetup metVendSiteSettingsSetup;
-            select firstonly METVendSiteSettingsSetup where METVendSiteSettingsSetup.AssignedSite == purchTable.InventSiteId
-                && METVendSiteSettingsSetup.AssignedWH == purchTable.InventLocationId
-                && METVendSiteSettingsSetup.AssignedVendorAccount == purchTable.OrderAccount;
-            
-            if(!METVendSiteSettingsSetup.RecId)
-            { 
-                processingMessage = "@MET:VendSiteSettingErr";
-            }
-            else if (!METVendSiteSettingsSetup.POASetting)
+            if (!processingMessage && purchTable.PurchStatus == PurchStatus::Invoiced)
             {
-                processingMessage = "@MET:VendAuthPOA";
+                processingMessage = "@MET:POAlreadyInvoiced";
             }
-            else if (!METVendSiteSettingsSetup.FASetting && metPOEDIFAMsg)
+
+            if (!processingMessage && purchTable.PurchStatus == PurchStatus::Received)
             {
-                processingMessage = "@MET:VendorFAErr";
+                processingMessage = "@MET:POAlreadyReceived";
             }
-        } 
+        
+            if (!processingMessage && purchTable)
+            {
+                METVendSiteSettingsSetup metVendSiteSettingsSetup;
+                select firstonly METVendSiteSettingsSetup where METVendSiteSettingsSetup.AssignedSite == purchTable.InventSiteId
+                    && METVendSiteSettingsSetup.AssignedWH == purchTable.InventLocationId
+                    && METVendSiteSettingsSetup.AssignedVendorAccount == purchTable.OrderAccount;
+
+                if(!METVendSiteSettingsSetup.RecId)
+                {
+                    processingMessage = "@MET:VendSiteSettingErr";
+                }
+                else if (!METVendSiteSettingsSetup.POASetting)
+                {
+                    processingMessage = "@MET:VendAuthPOA";
+                }
+                else if (!METVendSiteSettingsSetup.FASetting && metPOEDIFAMsg)
+                {
+                    processingMessage = "@MET:VendorFAErr";
+                }
+            }
          
-        if (this.poeDIPOAMsg != POEDIPOAMsg::None && metPOEDIFAMsg && this.poeDIPOAMsg != METConstants::InvalidEnumValue)
-        {
-            processingMessage = "@MET:FAPOAErr";
-        }
+            if (this.poeDIPOAMsg != POEDIPOAMsg::None && metPOEDIFAMsg && this.poeDIPOAMsg != METConstants::InvalidEnumValue)
+            {
+                processingMessage = "@MET:FAPOAErr";
+            }
 
-        //cb711 end
-        if (!processingMessage && !purchTable.existPurchLine())
-        {
-            processingMessage = "@MET:Nopurchaselinesexist";
-        }
+            //cb711 end
+            if (!processingMessage && !purchTable.existPurchLine())
+            {
+                processingMessage = "@MET:Nopurchaselinesexist";
+            }
 
-        changeReasonCode = METPOChangeReasonCodeSetup::findPOChargeReasonCode();
-        if (!changeReasonCode)
-        {
-            processingMessage = "@MET:POAErrorMessage";
-        }
+            changeReasonCode = METPOChangeReasonCodeSetup::findPOChargeReasonCode();
+            if (!changeReasonCode)
+            {
+                processingMessage = "@MET:POAErrorMessage";
+            }
+         
+            if (poeDIPOAMsg == POEDIPOAMsg::AcceptedWithChanges && confirmedDeliveryDate == dateNull())
+            {
+                processingMessage = strFmt("@MET:ConfirmDelCheck");
+            }
 
-        if (processingMessage)
-        {
-            processingStatus = METProcessingStatus::Error;
-        }
+            //line level validation if line exist and accepted with changes.
+            if (linesContractList != null && poeDIPOAMsg == POEDIPOAMsg::AcceptedWithChanges)
+            {
+                ListEnumerator listEnumVal    =    linesContractList.getEnumerator();
+ 
+                while (listEnumVal.moveNext())
+                {
+                    linesContract   =   listEnumVal.current();
+                    select firstonly1 purchLine
+                    where purchLine.PurchId == purchaseOrderNumber && purchLine.LineNumber == linesContract.parmLineNumber();
+             
+                    if (!purchLine)
+                    {
+                        processingMessage = strFmt("@MET:POlineValid",linesContract.parmLineNumber(),purchaseOrderNumber);
+                    }
+                    else if (linesContract.parmPurchaseQty() > purchLine.PurchQty)
+                    {
+                        processingMessage = strFmt("@MET:POQtyValid",linesContract.parmLineNumber(),purchaseOrderNumber);
+                    }
+                }
+            }
         
-        return [processingStatus, processingMessage];
-    }
+            if (processingMessage)
+            {
+                processingStatus = METProcessingStatus::Error;
+            }
+
+            return [processingStatus, processingMessage];
+        }
 
 ]]></Source>
 			</Method>
 			<Method>
 				<Name>requestChange</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Create purchase order change request
-    /// </summary>
-    private void requestChange()
-    {
-        versioningPurchaseOrder = METVersioningPurchaseOrder::newPurchaseOrder(purchTable);
-        if (versioningPurchaseOrder.canChangeBeRequested())
+        /// <summary>
+        /// Create purchase order change request
+        /// </summary>
+        private void requestChange()
         {
-            versioningPurchaseOrder.createChangeRequest();
+            if (!requestChangeFlag)
+            {
+                this.cancelWorkflow();
+                versioningPurchaseOrder = METVersioningPurchaseOrder::newPurchaseOrder(purchTable);
+                if (versioningPurchaseOrder.canChangeBeRequested())
+                {
+                    versioningPurchaseOrder.createChangeRequest();
+                }
+            }
+            requestChangeFlag = true;
         }
-    }
 
 ]]></Source>
 			</Method>
 			<Method>
 				<Name>IsBudgetTracked</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// MPJ_23295_CustomOdataAPIPORequestChange on 12 Apr 2022 by chaminda
-    /// alternate method to following
-    /// BudgetSourceCollectionIntegrator::isDocumentBudgetTracked(purchTable)
-    /// </summary>
-    /// <param name="_purchId"> Get purchase order number</param>
-    /// <returns> boolean </returns>
-    public static boolean IsBudgetTracked(PurchId _purchId)
-    {
-        boolean     isTracked   = false;
-        PurchTable  purchTable  = PurchTable::find(_purchId);
-        SourceDocumentLine sourceDocumentLine = SourceDocumentLine::findBySourceDocumentHeader(purchTable.SourceDocumentHeader);
-        while (!isTracked && sourceDocumentLine)
+        /// <summary>
+        /// MPJ_23295_CustomOdataAPIPORequestChange on 12 Apr 2022 by chaminda
+        /// alternate method to following
+        /// BudgetSourceCollectionIntegrator::isDocumentBudgetTracked(purchTable)
+        /// </summary>
+        /// <param name="_purchId"> Get purchase order number</param>
+        /// <returns> boolean </returns>
+        public static boolean IsBudgetTracked(PurchId _purchId)
         {
-            // Is there a budget being tracked?
-            BudgetSourceInquiryDetails budgetDetails = BudgetSourceSourceDocumentLine::getBudgetSourceInquiryDetails(sourceDocumentLine);
-
-            if (budgetDetails)
+            boolean     isTracked   = false;
+            PurchTable  purchTable  = PurchTable::find(_purchId);
+            SourceDocumentLine sourceDocumentLine = SourceDocumentLine::findBySourceDocumentHeader(purchTable.SourceDocumentHeader);
+            while (!isTracked && sourceDocumentLine)
             {
-                while (!isTracked && budgetDetails.next())
+                // Is there a budget being tracked?
+                BudgetSourceInquiryDetails budgetDetails = BudgetSourceSourceDocumentLine::getBudgetSourceInquiryDetails(sourceDocumentLine);
+
+                if (budgetDetails)
                 {
-                    isTracked = budgetDetails.currentAmountTracked() != 0;
+                    while (!isTracked && budgetDetails.next())
+                    {
+                        isTracked = budgetDetails.currentAmountTracked() != 0;
+                    }
                 }
+
+                next sourceDocumentLine;
             }
 
-            next sourceDocumentLine;
+            return isTracked;
         }
-
-        return isTracked;
-    }
 
 ]]></Source>
 			</Method>
 			<Method>
 				<Name>changePurchaseOrder</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Service operation method to update the purchase order.
-    /// </summary>
-    /// <param name="_purchaseOrderContract">
-    /// The instance of <c>METPurchaseOrderServiceContract</c>
-    /// </param>
-    /// <returns>
-    /// The response <c>METPurchaseOrderContract</c>
-    /// </returns>
-    public METPurchaseOrderServiceResponseContract changePurchaseOrder(METPurchaseOrderServiceContract _purchaseOrderContract)
-    {
-        METProcessingStatus     result;
-        ErrorMessage            message;
+        /// <summary>
+        /// Service operation method to update the purchase order.
+        /// </summary>
+        /// <param name="_purchaseOrderContract">
+        /// The instance of <c>METPurchaseOrderServiceContract</c>
+        /// </param>
+        /// <returns>
+        /// The response <c>METPurchaseOrderContract</c>
+        /// </returns>
+        public METPurchaseOrderServiceResponseContract changePurchaseOrder(METPurchaseOrderServiceContract _purchaseOrderContract)
+        {
+            METProcessingStatus     result;
+            ErrorMessage            message;
 
-        [result, message] = this.updatePurchaseOrder(_purchaseOrderContract);
+            [result, message] = this.updatePurchaseOrder(_purchaseOrderContract);
 
-        return METPurchaseOrderServiceResponseContract::newFromParameters(result, message);
-    }
+            return METPurchaseOrderServiceResponseContract::newFromParameters(result, message);
+        }
 
 ]]></Source>
 			</Method>
