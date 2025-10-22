@@ -93,8 +93,6 @@ final class METFreeTextInvoiceDP_Extension
         
         CustInvoiceTable custInvoiceTable   = _custInvoiceJour.custInvoiceTable();
         CustAccount custAccount;
-        InventLocation inventLocation;
-        CustTable custTable;
 
         if (!custInvoiceTable || _custInvoiceJour.isProforma())
         {
@@ -146,16 +144,10 @@ final class METFreeTextInvoiceDP_Extension
         // Task 226480: Branding details update - Reports - End
         freeTextInvoiceHeaderFooterTmp.METInvoiceNumber = custInvoiceTable.InvoiceId;
         freeTextInvoiceHeaderFooterTmp.InvoiceDate      = custInvoiceTable.InvoiceDate;
-        
-        select firstonly Name from inventLocation
-            exists join custTable
-                where custTable.InventLocation == inventLocation.InventLocationId
-                    && custTable.AccountNum == custInvoiceTable.OrderAccount;
-
-        freeTextInvoiceHeaderFooterTmp.METBranch        = inventLocation.Name;
+        freeTextInvoiceHeaderFooterTmp.METBranch        = CustTable::find(custInvoiceTable.OrderAccount).InventLocation;
         freeTextInvoiceHeaderFooterTmp.METRebateName    = rebateDeal.Description;
-        freeTextInvoiceHeaderFooterTmp.METFromPeriod    = rebateDateTrans.RebateFromDate;
-        freeTextInvoiceHeaderFooterTmp.METToPeriod      = rebateDateTrans.RebateToDate;
+        freeTextInvoiceHeaderFooterTmp.METFromPeriod       = rebateDateTrans.RebateFromDate;
+        freeTextInvoiceHeaderFooterTmp.METToPeriod         = rebateDateTrans.RebateToDate;
 
         freeTextInvoiceHeaderFooterTmp.METInvoiceToName = custInvoiceTable.custTable_OrderAccount().DirPartyTable_FK().KnownAs;
 
@@ -260,6 +252,8 @@ final class METFreeTextInvoiceDP_Extension
         TAMRebateLine tamRebateLine;
         TAMRebateTable tamRebateTable;
 
+        Set descriptionItemTypeSet = new Set(Types::String);
+
         RecordInsertList rebateInvoiceLineTmpList = new RecordInsertList(tableNum(METRebateInvoiceDetailsTmp));
         
         CustInvoiceTable custInvoiceTable = _custInvoiceJour.custInvoiceTable();
@@ -283,47 +277,47 @@ final class METFreeTextInvoiceDP_Extension
                     && tamRebateLine.METTierLineType == METTierLineType::Rate;
         }
 
-        while select sum(AmountCur), Description, TaxItemGroup, TaxGroup from custInvoiceLine
-            group by Description, TaxItemGroup, TaxGroup
-                where custInvoiceLine.ParentRecId == custInvoiceTable.RecId
+        while select Description, TaxGroup, TaxItemGroup, CurrencyCode, AmountCur from custInvoiceLine
+            where custInvoiceLine.ParentRecId == custInvoiceTable.RecId
         {
-            //For Eligible sales value grouped as per Item type/ Invoice line description.
-            //Source transactions- 'Invoice Amount' to be summed based on Commodity group/Item types.
-            select firstonly sum(RebateRefAmount) from tamRebateTransSummed
-                group by RebateTransId , METTaxItemGroup, MetItemTypes, METItemTypeDescription
-                    where tamRebateTransSummed.RebateTransId == custInvoiceTable.TAMRebateTransId
-                        && tamRebateTransSummed.METItemTypeDescription == custInvoiceLine.Description //Not holding METItemTypes in CustInvoiceLine table, instead storing its description.
-                        && tamRebateTransSummed.METTaxItemGroup == custInvoiceLine.TaxItemGroup;
-
-            //For Total Rebate value grouped invoice lines as per Description and Parent record(CustInvoiceTable)
-            //Free text invoice lines -  Amount summed bases on Commodity group/Item types.
-            select firstonly sum(AmountCur), Description, TaxItemGroup, ParentRecId from custInvoiceLineSummed
-                group by Description, TaxItemGroup, ParentRecId
-                    where custInvoiceLineSummed.Description == custInvoiceLine.Description
-                        && custInvoiceLineSummed.TaxItemGroup == custInvoiceLine.TaxItemGroup
-                        && custInvoiceLineSummed.ParentRecId == custInvoiceTable.RecId;
-
-            metRebateInvoiceDetailsTmp.CommodityGroup = (custInvoiceLine.TaxItemGroup == METConstants::taxGroupGSTFree || custInvoiceLine.TaxItemGroup == METConstants::GSTFree)
-                                                        ? custInvoiceLine.Description + METConstants::space + custInvoiceLine.TaxItemGroup
-                                                        : custInvoiceLine.Description;
-            metRebateInvoiceDetailsTmp.EligibleSales  = tamRebateTransSummed.RebateRefAmount;
-            metRebateInvoiceDetailsTmp.TotalRebate    = trunc(custInvoiceLineSummed.AmountCur*100)/100;  //Truncating the value to 2 decimal places as requested in Bug_288237.
-            metRebateInvoiceDetailsTmp.GST            = this.getGSTAmountForCommodityGroup(custInvoiceLine.Description, custInvoiceLine.TaxItemGroup, custInvoiceTable);
-            metRebateInvoiceDetailsTmp.TotalIncGST    = metRebateInvoiceDetailsTmp.TotalRebate + metRebateInvoiceDetailsTmp.GST;
-
-            if (rebateDeal.METVolumetricTierDeal)
+            if (!descriptionItemTypeSet.in(custInvoiceLine.Description))
             {
-                metRebateInvoiceDetailsTmp.Rate                 = metTierRateTrans.EligibleRebate;
-                metRebateInvoiceDetailsTmp.AverageWeeklySales   = metTierRateTrans.WeeklyAverage;
-            }
-            else
-            {
-                metRebateInvoiceDetailsTmp.Rate                 = tamRebateLine.RebateAmount;
-            }
+                descriptionItemTypeSet.add(custInvoiceLine.Description);
 
-            rebateInvoiceLineTmpList.add(metRebateInvoiceDetailsTmp);
+                //For Eligible sales value grouped as per Item type/ Invoice line description.
+                //Source transactions- 'Invoice Amount' to be summed based on Commodity group/Item types.
+                select sum(RebateRefAmount) from tamRebateTransSummed
+                        group by RebateTransId , MetItemTypes
+                            where tamRebateTransSummed.RebateTransId == custInvoiceTable.TAMRebateTransId
+                                && tamRebateTransSummed.METItemTypeDescription == custInvoiceLine.Description;
+
+                //For Total Rebate value grouped invoice lines as per Description and Parent record(CustInvoiceTable)
+                //Free text invoice lines -  Amount summed bases on Commodity group/Item types.
+                select sum(AmountCur), Description, ParentRecId from custInvoiceLineSummed
+                        group by Description, ParentRecId
+                            where custInvoiceLineSummed.Description == custInvoiceLine.Description
+                                && custInvoiceLineSummed.ParentRecId == custInvoiceTable.RecId;
+
+                metRebateInvoiceDetailsTmp.CommodityGroup   = custInvoiceLine.Description;
+                metRebateInvoiceDetailsTmp.EligibleSales    = tamRebateTransSummed.RebateRefAmount;
+                metRebateInvoiceDetailsTmp.TotalRebate      = custInvoiceLineSummed.AmountCur;
+                metRebateInvoiceDetailsTmp.GST              = this.getGSTAmountForCommodityGroup(custInvoiceLine.Description,  custInvoiceTable);
+                metRebateInvoiceDetailsTmp.TotalIncGST      = metRebateInvoiceDetailsTmp.TotalRebate + metRebateInvoiceDetailsTmp.GST;
+
+                if (rebateDeal.METVolumetricTierDeal)
+                {                    
+                    metRebateInvoiceDetailsTmp.Rate                 = metTierRateTrans.EligibleRebate;
+                    metRebateInvoiceDetailsTmp.AverageWeeklySales   = metTierRateTrans.WeeklyAverage;
+                }
+                else
+                {
+                    metRebateInvoiceDetailsTmp.Rate                 = tamRebateLine.RebateAmount;
+                }
+
+                rebateInvoiceLineTmpList.add(metRebateInvoiceDetailsTmp);
+            }
         }
- 
+        
         rebateInvoiceLineTmpList.insertDatabase();
     }
 
@@ -416,18 +410,12 @@ final class METFreeTextInvoiceDP_Extension
     /// Method used to calculated the GST tax amount for free text invoice lines of similar description as Item types or commodity group for report lines.
     /// </summary>
     /// <param name = "_description">Invoice line description. At times could be a blank description too</param>
-    /// <param name = "_taxItemgroup">Item GST group from the Free text invoice line</param>
     /// <param name = "_custTableInvoice">CustInvoiceTable table buffer</param>
     /// <returns>A summed GST amount for similar Commodity group</returns>
-    public Amount getGSTAmountForCommodityGroup(Description _description, TaxItemGroup _taxItemgroup, CustInvoiceTable _custInvoiceTable)
+    public Amount getGSTAmountForCommodityGroup(Description _description, CustInvoiceTable _custInvoiceTable)
     {
         TaxAmountCur summedGSTTaxAmount;
         CustInvoiceLine custInvoiceLine;
-
-        if (_taxItemgroup== METConstants::taxGroupGSTFree || _taxItemgroup == METConstants::GSTFree)
-        {
-            return 0;
-        }
 
         while select custInvoiceLine
             where custInvoiceLine.Description == _description
