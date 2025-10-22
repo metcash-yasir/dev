@@ -16,7 +16,8 @@ class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
     boolean                                 filterItemSite;
     boolean                                 generateClaim;
     int                                     totalTasks;
-    
+    RefRecId                                batchJobId;
+
 }
 ]]></Declaration>
 		<Methods>
@@ -37,8 +38,7 @@ class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
         int                                    counter = 0;
         Int                                    numOfOrders = this.getTotalRecords();
         container                              conItems;
-        Set                                    tasks;
-
+        
         if (totalTasks <= 0)
         {
             totalTasks = 1;
@@ -50,8 +50,7 @@ class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
         Info(strFmt("BundleSize : %1", bundleSize));
 
         batchHeader  = this.getCurrentBatchHeader();
-        tasks = new Set(Types::Class);
-
+        
         if (batchHeader == null)
         {
             batchHeader = batchHeader::construct();
@@ -86,7 +85,6 @@ class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
                     taskContract.parmGenerateClaims(dataContract.parmGenerateClaims());
                    
                     batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
-                    tasks.add(controller);
 
                     counter = 0;
                 }
@@ -108,15 +106,12 @@ class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
                 taskContract.parmGenerateClaims(dataContract.parmGenerateClaims());
 
                 batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
-                tasks.add(controller);
             }
-
-            if (generateClaim)
-            {
-                this.scheduleFinalTaskToProcessClaims(batchHeader, tasks);
-            }
-              
+  
             batchHeader.save();
+           
+            batchJobId = batchHeader.parmBatchHeaderId();
+
         }
         catch(Exception::Deadlock)
         {
@@ -145,45 +140,6 @@ class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>scheduleFinalTaskToProcessClaims</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Schedules final task to process claims.
-    /// </summary>
-    /// <param name = "_batchHeader">Batch header.</param>
-    /// <param name = "_tasks">Tasks.</param>
-    private void scheduleFinalTaskToProcessClaims(BatchHeader _batchHeader, Set _tasks)
-    {
-        METDutyAdValorumClaimGenerateContract  contract;
-        SysOperationServiceController controller;
-        SetEnumerator tasksEnum;
-        int subTask;
-
-        controller  = new SysOperationServiceController(
-                                                    classStr(METDutyAdValorumClaimGenerateJob),
-                                                    methodStr(METDutyAdValorumClaimGenerateJob, processFinalClaims));
-
-        subTask = _tasks.elements() + 1;
-
-        controller.parmDialogCaption(strFmt("@MET:GenerateAdValorumClaimSubTask", subTask));
-        
-        contract = controller.getDataContractObject() as METDutyAdValorumClaimGenerateContract;
-
-        contract.parmPhysicalTableName(dutyAdValorumClaimTmp.getPhysicalTableName());
-        _batchHeader.addTask(controller);
-
-        tasksEnum =_tasks.getEnumerator();
-
-        while (tasksEnum && tasksEnum.moveNext())
-        {
-            SysOperationServiceController taskController = tasksEnum.current();
-            _batchHeader.addDependency(controller, taskController, BatchDependencyStatus::Finished);
-        }
-    }
-
-]]></Source>
-			</Method>
-			<Method>
 				<Name>generateDataInTmp</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -196,6 +152,8 @@ class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
         METDutyRollVariance         dutyRollVariance;
         METExciseSiteDutySetup      exciseSiteDutySetup;
         
+        ttsbegin;
+
         if (generateClaim)
         {
             this.deleteDutyRollVariance();
@@ -240,6 +198,8 @@ class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
                 }
             }
         }
+
+        ttscommit;
     }
 
 ]]></Source>
@@ -255,8 +215,6 @@ class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
     {
         try
         {
-            ttsbegin;
-
             filterItemSite = _dataContract.parmFilterItemSite(); 
             itemList       = _dataContract.parmItemList();
             siteList       = _dataContract.parmSiteList();
@@ -266,13 +224,19 @@ class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
 
             this.generateDataInTmp();
             this.scheduleTasks();
+            this.waitTasksFinished();
 
-            ttscommit;
+            if (generateClaim)
+            {
+                this.generateClaims();
+            }
+
         }
         catch
         {
             error ("@WAX:UpdateCancelled");
         }
+
     }
 
 ]]></Source>
@@ -350,6 +314,70 @@ class METDutyAdValorumClaimGenerateService extends SysOperationServiceBase
         select count(RecId) from dutyAdValorumClaimTmp;
         
         return int642int(dutyAdValorumClaimTmp.RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateClaims</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates claims.
+    /// </summary>
+    private void generateClaims()
+    {
+        METDutyAdValorumClaimGenerateJob::processFinalClaims(dutyAdValorumClaimTmp.getPhysicalTableName());
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>waitTasksFinished</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Waits for tasks scheduled to finish processing.
+    /// </summary>
+    public void waitTasksFinished()
+    {
+        Batch           batchTask;
+        RefRecId        currentBatchTask;
+        utcDateTime     startDateTime = DateTimeUtil::utcNow();
+        utcDateTime     nowDateTime;
+        METLargeSeconds seconds;
+        const Seconds   maxSeconds = 7200; //2 hours
+        METLargeCounter taskWaitingCount = -1;
+                
+        currentBatchTask = this.getCurrentBatchTask().RecId;
+
+        //wait on all tasks the end.
+        while (taskWaitingCount != 0)
+        {
+            // Fetch the batch records that have NOT finished or are NOT errored out.
+            select count(RecId)
+                from batchTask
+                where   batchTask.BatchJobId == batchJobId
+                &&      batchTask.RecId      != currentBatchTask      
+                &&      batchTask.Status     != BatchStatus::Error
+                &&      batchTask.Status     != BatchStatus::Finished;
+
+            taskWaitingCount = batchTask.RecId;
+
+            // If we still have tasks processing then wait
+            if (taskWaitingCount != 0)
+            {
+                System.Threading.Thread::Sleep(60000);  //60 seconds
+            }
+
+            //check maximum wait limit exceeded
+            nowDateTime = DateTimeUtil::utcNow();
+                    
+            Seconds = DateTimeUtil::getDifference(nowDateTime, startDateTime);
+
+            if (Seconds >= maxSeconds) //if wait time is longer than 2 hours break out of loop
+            {
+                break;
+            }
+        }
     }
 
 ]]></Source>
