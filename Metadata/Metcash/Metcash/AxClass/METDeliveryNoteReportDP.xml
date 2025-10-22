@@ -15,8 +15,10 @@ public class METDeliveryNoteReportDP extends SrsReportDataProviderPreProcessTemp
     RecordInsertList                    lineTableList;
     Qty                                 cartons;
     Qty                                 kegs;
-    METBundleGuid         bundleHeaderReportGuid;
-    METBundleGuid         headerReportGuid;
+    METBundleGuid                       bundleHeaderReportGuid;
+    METBundleGuid                       headerReportGuid;
+    int                                 conValue;
+    container                           conSalesId;
 
 }
 ]]></Declaration>
@@ -80,11 +82,9 @@ public class METDeliveryNoteReportDP extends SrsReportDataProviderPreProcessTemp
         METSalesOrderShipmentLoadHeader     soShipmentHeader;
         METSalesOrderShipmentLoadLines      soShipmentLine;
         SalesTable                          salesTable;
-        container                           conSalesId;
-
         METDeliveryNoteReportContract       contract = this.parmDataContract();
 
-        WHSShipmentId   shipmentId     = contract.parmShipmentID();
+        WHSShipmentId shipmentId = contract.parmShipmentID();
 
         headerTableList = new RecordInsertList(tableNum(METDeliveryNoteReportHeaderTmp), true, true, true, true, true, headerTableTmp);
 
@@ -95,6 +95,10 @@ public class METDeliveryNoteReportDP extends SrsReportDataProviderPreProcessTemp
                 join salesTable
                     where salesTable.SalesId == soShipmentLine.OrderNum;
         {
+            //Reset the container and counters.
+            conValue    = 0;
+            conSalesId  = conNull();
+
             headerTableTmp.clear();
                 
             InventLocation          inventLocationSO    = InventLocation::find(salesTable.InventLocationId);
@@ -117,21 +121,15 @@ public class METDeliveryNoteReportDP extends SrsReportDataProviderPreProcessTemp
             headerTableTmp.DlvInstruction       = metSalesTable.DeliveryInstructions;
             headerTableTmp.ShipConfirmDate      = soShipmentHeader.ConfirmedShipDate;
             headerTableTmp.CustAccount          = soShipmentHeader.CustAccount;
-
-            conSalesId = this.getReturnSO(soShipmentHeader.CustAccount);
-
-            headerTableTmp.SalesId              = conLen(conSalesId) > 1 ? METConstants::Multiple : salesTable.SalesId;
             headerTableTmp.RouteStop            = strFmt("@MET:METStringBackSlash",soShipmentHeader.Route,soShipmentHeader.RouteStopNum);
-            headerTableTmp.Pickup               = con2Str(conSalesId);
+            
             headerTableTmp.Phone                = docuBrandingDetails.Phone;
             headerTableTmp.Email                = docuBrandingDetails.Email;
                 
-            if(!conFind(conSalesId, salesTable.SalesId))
-            {
-                conSalesId  += salesTable.SalesId;
-            }
             this.initializeLine(shipmentId);
 
+            headerTableTmp.SalesId              = conLen(conSalesId) > 1 ? METConstants::Multiple : salesTable.SalesId;
+            headerTableTmp.Pickup               = con2Str(conSalesId);
             headerTableTmp.Cartons              = cartons;
             headerTableTmp.Kegs                 = kegs;
 
@@ -155,7 +153,7 @@ public class METDeliveryNoteReportDP extends SrsReportDataProviderPreProcessTemp
     /// <param name = "_shipmentId">WHSShipmentId</param>
     protected void initializeLine(WHSShipmentId _shipmentId)
     {
-        METSalesOrderShipmentLoadLines      soShipmentLineLoc;
+        METSalesOrderShipmentLoadLines soShipmentLineLoc;
 
         lineTableList = new RecordInsertList(tableNum(METDeliveryNoteReportLineTmp), true, true, true, true, true, lineTableTmp);
     
@@ -163,27 +161,39 @@ public class METDeliveryNoteReportDP extends SrsReportDataProviderPreProcessTemp
             where soShipmentLineLoc.ShipmentId == _shipmentId
         {
             InventTable     inventTableloc  = InventTable::find(soShipmentLineLoc.ItemId);
-            SalesLine       salesLineLoc = SalesLine::find(soShipmentLineLoc.OrderNum, soShipmentLineLoc.LineNum);
+            SalesLine       salesLineLoc    = SalesLine::find(soShipmentLineLoc.OrderNum, soShipmentLineLoc.LineNum);
                 
             lineTableTmp.SalesId            = soShipmentLineLoc.OrderNum;
             lineTableTmp.ItemId             = soShipmentLineLoc.ItemId;
             lineTableTmp.ItemDescription    = EcoResProductTranslation::findByProductLanguage(inventTableloc.Product,SystemParameters::getSystemLanguageId()).Description;
             lineTableTmp.UOM                = salesLineLoc.SalesUnit;
-            lineTableTmp.Qty                = soShipmentLineLoc.PickedQty;
 
-            if(this.isItemSubcomodityCodeExist(inventTableloc.Product))
+            // Use delivered qty (converted to shipped unit) for the line Qty (this was the existing behaviour)
+            InventQty deliveredQty  = this.getDeliveredQty(salesLineLoc, soShipmentLineLoc.PickedQty);
+            lineTableTmp.Qty        = deliveredQty;
+
+            if (this.isItemSubcomodityCodeExist(inventTableloc.Product))
             {
-                kegs    += soShipmentLineLoc.PickedQty;
+                kegs    += deliveredQty;
             }
-            else if(inventTableloc.salesUnitId() like METConstants::UOMOuterMultiple)
+            else if (inventTableloc.salesUnitId() like METConstants::UOMOuterMultiple)
             {
-                cartons += soShipmentLineLoc.PickedQty;
+                cartons += deliveredQty;
             }
 
             lineTableTmp.BundleReportHeaderGuidStr = bundleHeaderReportGuid;
             lineTableTmp.DeliveryNotesHeaderGuidStr = headerReportGuid;
 
             lineTableList.add(lineTableTmp);
+
+            // Prepare sales order container for header table
+            //NS-Bug 280175: CB731 - LaserNet - Sales order delivery note (Header and Body section Errors)
+            if (!conFind(conSalesId, conValue, soShipmentLineLoc.OrderNum))
+            {
+                conValue++;
+                conSalesId = conIns(conSalesId, conValue, soShipmentLineLoc.OrderNum);
+            }
+            //NE-Bug 280175: CB731 - LaserNet - Sales order delivery note (Header and Body section Errors)
         }
 
         lineTableList.insertDatabase();
@@ -221,26 +231,47 @@ public class METDeliveryNoteReportDP extends SrsReportDataProviderPreProcessTemp
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>getReturnSO</Name>
+				<Name>getDeliveredQty</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// method to get the list of sales return order for the customer
+    /// Get the delivered quantity in shipped unit.
     /// </summary>
-    /// <param name = "_custAccount">CustAccount</param>
-    /// <returns>container</returns>
-    protected container getReturnSO(CustAccount _custAccount)
+    /// <param name = "_salesLine"></param>
+    /// <param name = "_pickedQty"></param>
+    /// <returns></returns>
+    public InventQty getDeliveredQty(SalesLine _salesLine, InventQty _pickedQty)
     {
-        SalesTable      salesTableReturn;
-        container       conSalesId;
+        Factor                  factor;
+        InventQty               deliveryNoteQty;
+        InventDim               inventDim, inventDimDefaultSetting;
+        UnitOfMeasureSymbol     shippedUnitId;
+        InventItemSalesSetup    inventItemSalesSetup;
+        UnitOfMeasureFromRecId  fromUnit, toUnit;
 
-        while select salesTableReturn
-            where salesTableReturn.SalesType == SalesType::ReturnItem &&
-                salesTableReturn.CustAccount == _custAccount
-        {
-            conSalesId += salesTableReturn.SalesId;
-        }
+        inventDim       = InventDim::find(_salesLine.InventDimId);
+        shippedUnitId   = InventTableModule::find(_salesLine.ItemId, ModuleInventPurchSales::Invent).UnitId;
 
-        return conSalesId;
+        select firstonly METSalesUnit from inventItemSalesSetup
+            join inventDimDefaultSetting
+            where inventDimDefaultSetting.inventDimId == inventItemSalesSetup.InventDimId
+                && inventItemSalesSetup.ItemId == _salesLine.ItemId
+                && inventDimDefaultSetting.InventSiteId == inventDim.InventSiteId;
+
+        //Get the unit conversion rule and factor.
+        fromUnit    = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(inventItemSalesSetup.METSalesUnit);
+        toUnit      = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(shippedUnitId);
+        factor      = EcoResProductUnitConverter::convertForReleasedProduct(
+                                    _salesLine.ItemId,
+                                    _salesLine.inventDimId,
+                                    1,
+                                    fromUnit,
+                                    toUnit,
+                                    NoYes::No,
+                                    NoYes::No);
+
+        deliveryNoteQty = _pickedQty / factor;
+
+        return deliveryNoteQty;
     }
 
 ]]></Source>
