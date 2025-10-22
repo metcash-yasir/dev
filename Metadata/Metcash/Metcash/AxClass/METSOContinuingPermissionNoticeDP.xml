@@ -3,23 +3,10 @@
 	<Name>METSOContinuingPermissionNoticeDP</Name>
 	<SourceCode>
 		<Declaration><![CDATA[
-/// <summary>
-/// Data provider class for the Sales Order Continuing Permission Notice report.
-/// </summary>
-/// <remarks>
-/// This class extends <c>SrsReportDataProviderBase</c> and is responsible for preparing the data used in the SSRS report
-/// for Continuing Permission Notices related to sales orders.
-/// It is decorated with <c>SRSReportParameterAttribute</c>, linking it to the <c>METCommonContinuingPermissionNoticeContract</c>
-/// which defines the input parameters for the report.
-/// Key responsibilities:
-/// - Retrieve and transform sales order and excise-related data.
-/// - Populate temporary tables with enriched metadata for report rendering.
-/// - Support parameter-driven filtering and logic based on business rules.
-/// </remarks>
 [SRSReportParameterAttribute(classstr(METCommonContinuingPermissionNoticeContract))]
 class METSOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
 {
-    RecordInsertList insertList;
+    RecordInsertList recordInsertList;
     METSOContinuingPermissionNoticeHeaderTmp header;
     METSOContinuingPermissionNoticeLineTmp line;
     SalesTable salesTable;
@@ -55,18 +42,8 @@ class METSOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
 				<Name>processReport</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Executes the data preparation logic for the Sales Order Continuing Permission Notice report.
+    /// Process report
     /// </summary>
-    /// <remarks>
-    /// This method is triggered during SSRS report generation. It performs the following operations:
-    /// - Retrieves the sales order and associated metadata from <c>SalesTable</c> and <c>METSalesTable</c>.
-    /// - Identifies the latest invoice transaction linked to the original sales order.
-    /// - Extracts bond and excise numbers from <c>METCustTable</c>, handling fallback logic if excise number is missing.
-    /// - Generates a new Continuing Permission Notice number using the <c>METCPNumber</c> number sequence if one doesn't already exist.
-    /// - Validates the sales order data and inserts header-level information into the temporary reporting table.
-    /// This logic ensures that each sales order with valid bond and excise details is properly tracked and reported
-    /// under the Continuing Permission Notice framework.
-    /// </remarks>
     public void processReport()
     {
         METCommonContinuingPermissionNoticeContract contract = this.parmDataContract() as METCommonContinuingPermissionNoticeContract;
@@ -138,17 +115,10 @@ class METSOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
 				<Name>isValidData</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Validates whether the given SalesTable record has associated data required for excise processing.
+    /// If no SO line exists for C/E then don't print the reposrt / don't insert the data
     /// </summary>
-    /// <param name="_salesTable">The SalesTable record to validate.</param>
-    /// <returns>
-    /// True if the SalesLine exists and is linked to valid InventTable, METInventTable, METTariffItemCodeBase
-    /// with CustomsExcise type 'C' or 'E', and a corresponding InventDim; otherwise, false.
-    /// </returns>
-    /// <remarks>
-    /// This method ensures that the sales transaction is eligible for excise registration by checking
-    /// the existence of necessary master data relationships.
-    /// </remarks>
+    /// <param name = "_salesTable"></param>
+    /// <returns></returns>
     public boolean isValidData(SalesTable _salesTable)
     {
         salesLine salesLine;
@@ -270,114 +240,78 @@ class METSOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
 				<Name>insertLineData</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Prepares and inserts line-level data for the Sales Order Continuing Permission Notice report.
+    ///  Inserts the report line data.
     /// </summary>
     public void insertLineData()
     {
         const str defaultUOM = 'EA';
-
-        SalesLine salesLine;
+        salesLine salesLine;
         InventTable inventTable;
         METInventTable metInventTable;
         InventDim inventDim;
+        
         METExciseRegisterEntry exciseRegister;
         METTariffItemCodeBase tariffCodeBase;
+        METExciseInformationTable metExciseInformationTable;
         METSalesLine metSalesLine;
 
-        // Initialize batch insert list for temporary CP notice lines
-        insertList = new RecordInsertList(tableNum(METSOContinuingPermissionNoticeLineTmp), false, false, false, false, false, line);
+       recordInsertList = new RecordInsertList(tableNum(METSOContinuingPermissionNoticeLineTmp), false, false, false, false, false, line);
 
-        // Update excise information for the sales order
         ttsbegin;
         METExciseInformationTableUpdateService service = new METExciseInformationTableUpdateService();
         METExciseInformationTableUpdateContract contract = new METExciseInformationTableUpdateContract();
         contract.parmReferenceId(InventTransType::Sales);
+
         contract.parmTransactionType(METTransactionType::Negative);
+             
         service.runExciseInformationTableUpdateForOrder(contract, salesTable.SalesId);
         ttscommit;
 
-        // Loop through sales lines and join related metadata
-        while select salesLine
+       while select salesLine
             where salesLine.SalesId == salesTable.SalesId
-        join inventTable
+       join inventTable
             where salesLine.ItemId == inventTable.ItemId
-        outer join metInventTable
+       join metInventTable
             where metInventTable.ItemId == inventTable.ItemId
-        outer join TariffItem from tariffCodeBase
+       join TariffItem from tariffCodeBase
             where tariffCodeBase.RecId == metInventTable.METTariffItemCodeBaseRecid
-            && (tariffCodeBase.CustomsExcise == METCustomExcise::C || tariffCodeBase.CustomsExcise == METCustomExcise::E)
-        outer join RecId from inventDim
+            && (tariffCodeBase.CustomsExcise == METCustomExcise::C ||
+                 tariffCodeBase.CustomsExcise == METCustomExcise::E)
+       outer join RecId from inventDim
             where inventDim.inventDimId == salesLine.InventDimId
-        outer join RecId, Lodgement, BottleSupplied from metSalesLine
-            where metSalesLine.SalesLine == salesLine.RecId
+        outer join RecId, Lodgement from metSalesLine
+            where metSalesLine.SalesLine == salesline.RecId
         {
-            List lodgementList = new List(Types::Container);
+            METLodgement lodgement;
 
-            // If lodgement and bottle data exist, pair them into a container list
-            if (metSalesLine.Lodgement && metSalesLine.BottleSupplied)
+            if (metSalesLine.Lodgement)
             {
-                List lodgementSplit = strSplit(metSalesLine.Lodgement, ',');
-                List bottleSplit = strSplit(metSalesLine.BottleSupplied, ',');
-
-                ListEnumerator lodgementEnum = lodgementSplit.getEnumerator();
-                ListEnumerator bottleEnum = bottleSplit.getEnumerator();
-
-                while (lodgementEnum.moveNext() && bottleEnum.moveNext())
-                {
-                    METLodgement lodgementId = any2Str(lodgementEnum.current());
-                    real bottlesSupplied = str2num(any2Str(bottleEnum.current()));
-
-                    lodgementList.addEnd([lodgementId, bottlesSupplied]);
-                }
+                lodgement = metSalesLine.Lodgement;
             }
             else
             {
-                // If no data exists, calculate lodgement distribution dynamically
-                lodgementList = this.getMetLodgement(
-                salesLine.ItemId,
-                salesLine.inventDim().InventSiteId,
-                salesLine.QtyOrdered);
+                lodgement = this.getMetLodgement(salesLine.ItemId, salesLine.inventDim().InventSiteId, salesLine.QtyOrdered);
             }
 
-            // Iterate each lodgement entry and call prepareRecordListTmp
-            if (!lodgementList.empty())
+            if (lodgement)
             {
-                // Iterate each lodgement entry and call prepareRecordListTmp
+                List lodgementList = strSplit(lodgement, ',');
                 ListEnumerator enum = lodgementList.getEnumerator();
+
                 while (enum.moveNext())
                 {
-                    container pair = enum.current();
-                    METLodgement lodgementId = conPeek(pair, 1);
-                    NumberOf bottleQty = conPeek(pair, 2);
+                    line.BondMark = any2Str(enum.current());
 
-                    this.prepareRecordListTmp(salesLine,
-                                            inventTable,
-                                            metInventTable,
-                                            tariffCodeBase,
-                                            lodgementList,
-                                            lodgementId,
-                                            bottleQty,
-                                            true);
+                    this.prepareRecordListTmp(salesLine, inventTable, metInventTable, tariffCodeBase, line.BondMark);
                 }
             }
             else
             {
-                // Handle case when no lodgements are available
-                List emptyList = new List(Types::Container);
-                this.prepareRecordListTmp(salesLine,
-                                        inventTable,
-                                        metInventTable,
-                                        tariffCodeBase,
-                                        emptyList, // or an empty List if required
-                                        '',   // empty lodgementId
-                                        0,    // zero bottleQty
-                                        false);
+                this.prepareRecordListTmp(salesLine, inventTable, metInventTable, tariffCodeBase, lodgement);
             }
-
         }
 
-        // Finalize batch insert into temporary table
-        insertList.insertDatabase();
+        recordInsertList.insertDatabase();
     }
 
 ]]></Source>
@@ -477,27 +411,23 @@ class METSOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
     /// <summary>
     /// Gets the lodgement details for the updated excise information table.
     /// </summary>
-    /// <param name="_itemId">Item ID to allocate lodgements for.</param>
-    /// <param name="_siteId">Site ID where lodgements are stored.</param>
-    /// <param name="_salesLineQty">Quantity to be fulfilled from lodgements.</param>
-    /// <returns>
-    /// A List of containers, each containing [Lodgement ID, Bottles Supplied].
-    /// </returns>
-    private List getMetLodgement(ItemId _itemId, InventSiteId _siteId, Qty _salesLineQty)
+    /// <param name = "_metExciseInformationTable">_metExciseInformationTable buffer</param>
+    /// <returns>Returns the concatenated lodgement details.</returns>
+    private METLodgement getMetLodgement(ItemId _itemId, InventSiteId _siteId, Qty _salesLineQty)
     {
-        List lodgementList = new List(Types::Container);
+        METLodgement metLodgement;
 
         METExciseLodgementUpdateService service = new METExciseLodgementUpdateService();
         METExciseLodgementUpdateContract contract = new METExciseLodgementUpdateContract();
-
+ 
         contract.parmReferenceId(InventTransType::Sales);
         contract.parmItemId(_itemId);
         contract.parmSiteId(_siteId);
-
+ 
         service.runExciseLodgementUpdateActual(contract, salesTable.SalesId);
-        lodgementList = service.getMetLodgement();
+        metLodgement = service.getMetLodgement();
 
-        return lodgementList;
+        return metLodgement;
     }
 
 ]]></Source>
@@ -505,88 +435,43 @@ class METSOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
 			<Method>
 				<Name>prepareRecordListTmp</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Prepares and inserts a temporary line record for the sales order continuing permission notice.
-    /// </summary>
-    /// <param name="_salesLine">The sales line being processed.</param>
-    /// <param name="_inventTable">The item master record associated with the sales line.</param>
-    /// <param name="_metInventTable">Extended item metadata including bottle size, alcohol content, and pack quantity.</param>
-    /// <param name="_tariffCodeBase">Tariff item code details for customs and excise reporting.</param>
-    /// <param name="_lodgement">List of containers [Lodgement, BottlesSupplied].</param>
-    /// <param name="_metLodgement">The last lodgement used for excise lookup.</param>
-    /// <param name="_bottleQty">Bottle quantity associated with the last lodgement.</param>
-    /// <param name="_isLodgement">Flag indicating whether lodgement logic is applied.</param>
-    /// <param name="_availableQty">Total available quantity (used only if _isLodgement is true).</param>
-    private void prepareRecordListTmp(
-    SalesLine _salesLine,
-    InventTable _inventTable,
-    METInventTable _metInventTable,
-    METTariffItemCodeBase _tariffCodeBase,
-    List _lodgement,
-    METLodgement _metLodgement,
-    NumberOf _bottleQty,
-    boolean _isLodgement)
+    private void prepareRecordListTmp(SalesLine _salesLine, InventTable _inventTable, METInventTable _metInventTable, METTariffItemCodeBase _tariffCodeBase, METLodgement _lodgement)
     {
         const str defaultUOM = 'EA';
-
+       
         METExciseRegisterEntry exciseRegister;
         METSalesLine metSalesLine;
 
-        str lodgementStr = '';
-        str bottleStr = '';
-
-        // Build comma-separated strings from lodgement list
-        ListEnumerator enum = _lodgement.getEnumerator();
-        while (enum.moveNext())
+        if (_lodgement)
         {
-            container pair = enum.current();
-            METLodgement lodgementId = conPeek(pair, 1);
-            real bottleQty = conPeek(pair, 2);
-
-            lodgementStr = lodgementStr == '' ? lodgementId : strFmt('%1,%2', lodgementStr, lodgementId);
-            bottleStr = bottleStr == '' ? strFmt('%1', bottleQty) : strFmt('%1,%2', bottleStr, bottleQty);
-        }
-
-        // Update or insert METSalesLine with comma-separated values
-        if (!_lodgement.empty())
-        {
+            // Find the matching Sales line
             select firstonly metSalesLine
-            where metSalesLine.SalesLine == _salesLine.RecId;
+                where metSalesLine.SalesLine == _salesLine.RecId;
 
             if (metSalesLine.RecId)
             {
                 ttsbegin;
+                // Update existing record
                 metSalesLine.selectForUpdate(true);
-                metSalesLine.Lodgement = lodgementStr;
-                metSalesLine.BottleSupplied = bottleStr;
+                metSalesLine.Lodgement = _lodgement;
                 metSalesLine.update();
                 ttscommit;
             }
             else
             {
+                // Insert new record
                 metSalesLine.SalesLine = _salesLine.RecId;
-                metSalesLine.Lodgement = lodgementStr;
-                metSalesLine.BottleSupplied = bottleStr;
+                metSalesLine.Lodgement = _lodgement;
                 metSalesLine.insert();
             }
         }
 
-        // Use last lodgement for BondMark and excise lookup
-        line.BondMark = _metLodgement;
+        InventSiteId  siteId = _salesLine.inventDim().InventSiteId;
 
-        exciseRegister = METExciseRegisterEntry::find(
-        _metLodgement,
-        _salesLine.inventDim().InventSiteId,
-        _salesLine.ItemId);
+        exciseRegister = METExciseRegisterEntry::find(_lodgement,siteId,_salesLine.ItemId);
 
-        // Convert sales quantity to bottles using UOM conversion
-        METPurchaseWMSFactor purchaseWMSFactor = UnitOfMeasureConversion::findByConversion(
-        UnitOfMeasure::findBySymbol(_salesLine.SalesUnit).RecId,
-        UnitOfMeasure::findBySymbol(defaultUOM).RecId,
-        EcoResProduct::findByProductNumber(_salesLine.ItemId).RecId).Factor;
-
-        // Populate the temporary line record
-        line.BottlesSupplied = _isLodgement ? abs(_bottleQty) : abs(purchaseWMSFactor * _salesLine.SalesQty);
+        METPurchaseWMSFactor purchaseWMSFactor = UnitOfMeasureConversion::findByConversion(UnitOfMeasure::findBySymbol(_salesLine.SalesUnit).RecId, UnitOfMeasure::findBySymbol(defaultUOM).RecId, EcoResProduct::findByProductNumber(_salesLine.ItemId).RecId).Factor;
+        line.BottlesSupplied = abs(purchaseWMSFactor * _salesLine.SalesQty);
         line.ItemId = _salesLine.ItemId;
         line.ItemDescription = _inventTable.productName(SystemParameters::getSystemLanguageId());
         line.BottleSize = _metInventTable.BottleSize;
@@ -594,19 +479,18 @@ class METSOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
         line.Strength = _metInventTable.AlcoholContent;
         line.SalesUoM = _salesLine.SalesUnit;
         line.Quantity = _salesLine.SalesQty;
-        line.LitresOfAlcoholCalculated = abs(_metInventTable.BottleSize * line.BottlesSupplied * (_metInventTable.AlcoholContent / 100));
+        line.LitresOfAlcoholCalculated = _metInventTable.BottleSize * (_metInventTable.AlcoholContent/100) * _metInventTable.ItemPack;
+
         line.ValueTIU = exciseRegister.TIUV;
         line.TariffItem = _tariffCodeBase.TariffItem;
         line.CountryOfOrigin = _metInventTable.CountryCode;
         line.StatCode = _metInventTable.statcode();
-        line.ValueDuty = exciseRegister.DutyRateReceived;
+        line.ValueDuty = exciseRegister.DutyRateReceived;// METExciseSiteDutySetup::find(siteId, _salesLine.ItemId).DutyTotal;
         line.InvoiceAccount = salesTable.InvoiceAccount;
         line.SalesId = salesTable.SalesId;
         line.BundleReportHeaderGuidStr = bundleHeaderReportGuid;
         line.ContinuingPermissionHeaderGuidStr = headerReportGuid;
-
-        // Add the populated line to the insert list for batch processing
-        insertList.add(line);
+        recordInsertList.add(line);
     }
 
 ]]></Source>
