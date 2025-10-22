@@ -189,7 +189,7 @@ class METItemPackChangeHelper
 
             this.createPhysicalDim(metInventItemOrderSetupOrigItem, whsPhysDimUOMTempItem);
             this.unlinkTempItem();
-            this.updateItemStatus(metInventItemOrderSetupOrigItem, METConstants::Active);
+            //this.updateItemStatus(metInventItemOrderSetupOrigItem, METConstants::Active);
             this.updateItemStatus(metInventItemOrderSetupTempItem, METConstants::Discontinued, true);
             this.rePriceOpenSalesOrders();
             //Task110346_CB409-D365ToPIM Main site id - start
@@ -197,7 +197,7 @@ class METItemPackChangeHelper
             //Task110346_CB409-D365ToPIM Main site id - end
             this.processNDCDependentSites();
             this.processCDSDependentSites();
-
+            this.processCampbellsSubOrdinateSites();
             this.runVendorChangeRequest();        
 
             ttscommit;  
@@ -260,7 +260,7 @@ class METItemPackChangeHelper
                 inventItemSalesSetupOrigItem, inventItemSalesSetupTempItem,
                 metInventItemOrderSetupOrigItem, metInventItemOrderSetupTempItem);
         this.unlinkTempItem();
-        this.updateItemStatus(metInventItemOrderSetupOrigItem, METConstants::Active);
+        //this.updateItemStatus(metInventItemOrderSetupOrigItem, METConstants::Active);
         this.updateItemStatus(metInventItemOrderSetupTempItem, METConstants::Discontinued, true);
         this.rePriceOpenSalesOrders();
 
@@ -280,30 +280,53 @@ class METItemPackChangeHelper
     public boolean validate()
     {
         boolean ret = true;
+        boolean isControllingSite = false;
 
         if (!metInventItemOrderSetupOrigItem.RecId)
         {
             ret = checkFailed("@MET:METTempItemForPackChangeError");
         }
+
         if (!metInventItemOrderSetupOrigItem.TempItemPackChg)
         {
             ret = checkFailed(strFmt("@MET:TempItemNotLinked", metInventItemOrderSetupOrigItem.ItemId)) && ret;
-        }        
-        
-        ret = this.checkNDCSite() && ret;
+        }
 
+        ret = this.checkNDCSite() && ret;
         ret = this.checkCDSSite() && ret;
 
-        ret = this.checkSourceSiteIsPendingPackChange() && ret;
+        // Determine controlling site
+        METSiteControllingAndSubOrdinateSetup metSiteControllingAndSubOrdinateSetup = this.getCampbellsControllingSite();
 
-        ret = this.checkSourceSiteIsPendingPackChange_IntComp() && ret;
-
-        ret = this.checkStock() && ret;
-
-        if (ret)
+        if (metSiteControllingAndSubOrdinateSetup)
         {
-            ret = this.checkItemSubRange() && ret;
+            if (!metSiteControllingAndSubOrdinateSetup.IsControllingSite)
+            {
+                error(strFmt("@MET:ValidationCDSSite", metInventItemOrderSetupOrigItem.SiteId));
+                ret = false;
+                isControllingSite = false;
+            }
+            else
+            {
+                isControllingSite = true;
+            }
         }
+
+        //Validate for noncampbells sites or campbells controlling site
+        if (!metSiteControllingAndSubOrdinateSetup || isControllingSite)
+        {
+            ret = this.checkSourceSiteIsPendingPackChange() && ret;
+            ret = this.checkSourceSiteIsPendingPackChange_IntComp() && ret;
+        }
+
+        //Ignore validating for campbells controlling site
+        if (!metSiteControllingAndSubOrdinateSetup)
+        {
+            // Only check stock if NOT a controlling site
+            ret = this.checkStock() && ret;
+        }
+
+        ret = this.checkItemSubRange() && ret;
 
         return ret;
     }
@@ -1130,17 +1153,21 @@ class METItemPackChangeHelper
     private void updateItemStatus(METInventItemOrderSetup _metInventItemOrderSetup, METItemStatus _itemStatus, boolean _updateDiscontinued = false)
     {
         utcdatetime currentDateTime = DateTimeUtil::getSystemDateTime();
-        _metInventItemOrderSetup.selectForUpdate(true);
-        _metInventItemOrderSetup.ItemStatus = _itemStatus;
 
-        if (_updateDiscontinued)
+        if (_metInventItemOrderSetup)
         {
-            _metInventItemOrderSetup.DiscontinueDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(currentDateTime, DateTimeUtil::getUserPreferredTimeZone())); 
-        
-            this.updateItemStopped(_metInventItemOrderSetup.ItemId, _metInventItemOrderSetup.InventDimId);
-        }
+            _metInventItemOrderSetup.selectForUpdate(true);
+            _metInventItemOrderSetup.ItemStatus = _itemStatus;
 
-        _metInventItemOrderSetup.update();
+            if (_updateDiscontinued)
+            {
+                _metInventItemOrderSetup.DiscontinueDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(currentDateTime, DateTimeUtil::getUserPreferredTimeZone()));
+        
+                this.updateItemStopped(_metInventItemOrderSetup.ItemId, _metInventItemOrderSetup.InventDimId);
+            }
+
+            _metInventItemOrderSetup.update();
+        }
     }
 
 ]]></Source>
@@ -1705,6 +1732,68 @@ class METItemPackChangeHelper
         {
             METItemPackChangeCompletedBusinessEvent::newFromItemPackChangeCompleted(_itemId, _tempItemPackChg, _inventSiteId).send();
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCampbellsSubOrdinateSites</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process Campbells subordinate Sites
+    /// </summary>
+    private void processCampbellsSubOrdinateSites()
+    {
+        METReqItemTableInventDimView metReqItemTableInventDimView;
+        METSiteControllingAndSubOrdinateSetup metSiteControllingAndSubOrdinateSetup;
+
+        while select metReqItemTableInventDimView
+            where metReqItemTableInventDimView.ItemId == metInventItemOrderSetupOrigItem.ItemId
+            && metReqItemTableInventDimView.ReqPOType == ReqPOType::Transfer
+            exists join metSiteControllingAndSubOrdinateSetup
+            where metSiteControllingAndSubOrdinateSetup.SiteId == metReqItemTableInventDimView.InventSiteId
+            && metSiteControllingAndSubOrdinateSetup.ControllingSiteId == metInventItemOrderSetupOrigItem.SiteId
+            && metSiteControllingAndSubOrdinateSetup.IsControllingSite ==  NoYes::No
+        {
+            ItemId mainItem = metInventItemOrderSetupOrigItem.ItemId;
+            ItemId tmpItem = METInventItemOrderSetup::findByItemAndSite(metInventItemOrderSetupOrigItem.ItemId, metReqItemTableInventDimView.InventSiteId).TempItemPackChg;
+
+            if (tmpItem)
+            {
+
+                METItemPackChangeHelper metItemPackChangeHelperDependentSites = new METItemPackChangeHelper();
+
+                metItemPackChangeHelperDependentSites.parmMETInventItemOrderSetup(METInventItemOrderSetup::findByItemAndSite(mainItem, metReqItemTableInventDimView.InventSiteId));
+                metItemPackChangeHelperDependentSites.parmMETInventItemOrderSetupTempItem(METInventItemOrderSetup::findByItemAndSite(tmpItem, metReqItemTableInventDimView.InventSiteId));
+
+                metItemPackChangeHelperDependentSites.parmInventItemPurchSetupOrigItem(InventItemPurchSetup::find(metInventItemOrderSetupOrigItem.ItemId, metReqItemTableInventDimView.CovInventDimId));
+                metItemPackChangeHelperDependentSites.parmInventItemPurchSetupTempItem(InventItemPurchSetup::find(tmpItem, metReqItemTableInventDimView.CovInventDimId));
+
+                metItemPackChangeHelperDependentSites.parmInventItemSalesSetupOrigItem(InventItemSalesSetup::find(metInventItemOrderSetupOrigItem.ItemId, metReqItemTableInventDimView.CovInventDimId));
+                metItemPackChangeHelperDependentSites.parmInventItemSalesSetupTempItem(InventItemSalesSetup::find(tmpItem, metReqItemTableInventDimView.CovInventDimId));
+
+                metItemPackChangeHelperDependentSites.parmWHSPhysDimUOMOrigItem(METItemPackChangeHelper::getWhsPhysDimOUM(metInventItemOrderSetupOrigItem.ItemId));
+                metItemPackChangeHelperDependentSites.parmWHSPhysDimUOMTempItem(METItemPackChangeHelper::getWhsPhysDimOUM(tmpItem));
+
+                metItemPackChangeHelperDependentSites.startOperation_DependentSites();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCampbellsControllingSite</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check CDS site
+    /// </summary>
+    /// <returns>METSiteControllingAndSubOrdinateSetup buffer</returns>
+    private METSiteControllingAndSubOrdinateSetup getCampbellsControllingSite()
+    {
+        METSiteControllingAndSubOrdinateSetup metSiteControllingAndSubOrdinateSetup = METSiteControllingAndSubOrdinateSetup::findBySite(metInventItemOrderSetupOrigItem.SiteId);        
+        
+        return metSiteControllingAndSubOrdinateSetup;
     }
 
 ]]></Source>
