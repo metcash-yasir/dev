@@ -287,15 +287,6 @@ class METSOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
         // Initialize batch insert list for temporary CP notice lines
         insertList = new RecordInsertList(tableNum(METSOContinuingPermissionNoticeLineTmp), false, false, false, false, false, line);
 
-        // Update excise information for the sales order
-        ttsbegin;
-        METExciseInformationTableUpdateService service = new METExciseInformationTableUpdateService();
-        METExciseInformationTableUpdateContract contract = new METExciseInformationTableUpdateContract();
-        contract.parmReferenceId(InventTransType::Sales);
-        contract.parmTransactionType(METTransactionType::Negative);
-        service.runExciseInformationTableUpdateForOrder(contract, salesTable.SalesId);
-        ttscommit;
-
         // Loop through sales lines and join related metadata
         while select salesLine
             where salesLine.SalesId == salesTable.SalesId
@@ -475,7 +466,8 @@ class METSOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
 				<Name>getMetLodgement</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Gets the lodgement details for the updated excise information table.
+    /// Allocates sales line quantity across open lodgements in chronological order.
+    /// Updates available quantity and lodgement status, and returns a list of [Lodgement ID, Bottles Supplied].
     /// </summary>
     /// <param name="_itemId">Item ID to allocate lodgements for.</param>
     /// <param name="_siteId">Site ID where lodgements are stored.</param>
@@ -485,19 +477,53 @@ class METSOContinuingPermissionNoticeDP extends SrsReportDataProviderBase
     /// </returns>
     private List getMetLodgement(ItemId _itemId, InventSiteId _siteId, Qty _salesLineQty)
     {
-        List lodgementList = new List(Types::Container);
+        List resultList = new List(Types::Container);
+        METExciseInformationTable metExciseInformationTablePO;
+        real remainingQty = abs(_salesLineQty);
 
-        METExciseLodgementUpdateService service = new METExciseLodgementUpdateService();
-        METExciseLodgementUpdateContract contract = new METExciseLodgementUpdateContract();
+        ttsbegin;
 
-        contract.parmReferenceId(InventTransType::Sales);
-        contract.parmItemId(_itemId);
-        contract.parmSiteId(_siteId);
+        // Select open lodgements in chronological order
+        while select forupdate metExciseInformationTablePO
+            order by CreatedDateTime asc
+                where (metExciseInformationTablePO.InventTransType == InventTransType::Purch ||
+                    metExciseInformationTablePO.InventTransType == InventTransType::TransferOrderReceive) &&
+                    metExciseInformationTablePO.ItemId == _itemId &&
+                    metExciseInformationTablePO.SiteId == _siteId &&
+                    metExciseInformationTablePO.AvailableQty > 0 &&
+                    metExciseInformationTablePO.LodgementClosed == NoYes::No
+        {
+            if (remainingQty <= 0)
+            {
+                break; // Stop if required quantity is fulfilled
+            }
 
-        service.runExciseLodgementUpdateActual(contract, salesTable.SalesId);
-        lodgementList = service.getMetLodgement();
+            real availableQtyBefore = metExciseInformationTablePO.AvailableQty;
+            real bottlesSupplied = 0;
 
-        return lodgementList;
+            if (remainingQty >= availableQtyBefore)
+            {
+                bottlesSupplied = availableQtyBefore;
+                remainingQty -= availableQtyBefore;
+
+                metExciseInformationTablePO.AvailableQty = 0;
+                metExciseInformationTablePO.LodgementClosed = NoYes::Yes;
+            }
+            else
+            {
+                bottlesSupplied = remainingQty;
+                metExciseInformationTablePO.AvailableQty = availableQtyBefore - remainingQty;
+                remainingQty = 0;
+            }
+
+            metExciseInformationTablePO.update();
+
+            resultList.addEnd([metExciseInformationTablePO.Lodgement, bottlesSupplied]);
+        }
+
+        ttscommit;
+
+        return resultList;
     }
 
 ]]></Source>
