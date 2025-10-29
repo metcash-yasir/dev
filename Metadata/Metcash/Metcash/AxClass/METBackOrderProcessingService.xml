@@ -28,11 +28,18 @@ class METBackOrderProcessingService extends SysOperationServiceBase
         int totalDays;
 
         Query query = _contract.getQuery();
+        PurchId purchId = _contract.parmPurchId();
         
         QueryBuildDataSource qbdsPurchTable = query.dataSourceTable(tableNum(InventSite)).addDataSource(tableNum(PurchTable));
         qbdsPurchTable.relations(true);
         qbdsPurchTable.joinMode(JoinMode::InnerJoin);
         qbdsPurchTable.addRange(fieldNum(PurchTable, PurchStatus)).value(queryValue(PurchStatus::Backorder));
+        
+        if (strLen(purchId) > 0
+            && PurchTable::find(purchId).RecId)
+        {
+            qbdsPurchTable.addRange(fieldNum(PurchTable, PurchId)).value(queryValue(purchId));
+        }
        
         QueryBuildDataSource qbdsMetPurchTable = qbdsPurchTable.addDataSource(tableNum(MetPurchTable));
         qbdsMetPurchTable.relations(true);
@@ -45,36 +52,51 @@ class METBackOrderProcessingService extends SysOperationServiceBase
             InventSite inventSite = queryRun.get(tableNum(InventSite));
             PurchTable purchTable = queryRun.get(tableNum(PurchTable));
             METPurchTable metPurchTable = queryRun.get(tableNum(MetPurchTable));
-            
-            VendPackingSlipJour vendPackingSlipJour;
-            boolean dateGreaterThanTolerance;
 
-            select firstonly RecId, DeliveryDate from vendPackingSlipJour
-                order by DeliveryDate desc
-                where vendPackingSlipJour.PurchId == purchTable.PurchId;
-
-            if (metPurchTable.POBackOrderSetting == noyes::Yes && vendPackingSlipJour.RecId != 0)
+            if (metPurchTable.ProcessingErrorCount <= METVendParameters::find().POBackOrderProcessingRetryCount)
             {
-                startDate = vendPackingSlipJour.DeliveryDate;
-                totalDays = endDate - startDate; //Calculate number of days from today to last posted product receipt including weekends.
+                try
+                {
+                    VendPackingSlipJour vendPackingSlipJour;
+                    boolean dateGreaterThanTolerance;
 
-                dateGreaterThanTolerance = totalDays >= inventSite.METPOBackOrderBatchJobDays;
+                    select firstonly RecId, DeliveryDate from vendPackingSlipJour
+                    order by DeliveryDate desc
+                    where vendPackingSlipJour.PurchId == purchTable.PurchId;
+
+                    if (metPurchTable.POBackOrderSetting == noyes::Yes && vendPackingSlipJour.RecId != 0)
+                    {
+                        startDate = vendPackingSlipJour.DeliveryDate;
+                        totalDays = endDate - startDate; //Calculate number of days from today to last posted product receipt including weekends.
+
+                        dateGreaterThanTolerance = totalDays >= inventSite.METPOBackOrderBatchJobDays;
                 
-                if (dateGreaterThanTolerance && vendPackingSlipJour.DeliveryDate != DateTimeUtil::date(DateTimeUtil::minValue()))
-                {
-                    this.getPurchOrderLinesAndupdateDeliveryRemainder(purchTable.PurchId);
-                }
-            }
-            else if (vendPackingSlipJour.RecId == 0 && metPurchTable.POBackOrderSetting == noyes::Yes)
-            {
-                startDate = purchTable.DeliveryDate;
-                totalDays = endDate - startDate; //Calculate number of days from today to receipt date including weekends.
+                        if (dateGreaterThanTolerance && vendPackingSlipJour.DeliveryDate != DateTimeUtil::date(DateTimeUtil::minValue()))
+                        {
+                            this.getPurchOrderLinesAndupdateDeliveryRemainder(purchTable.PurchId);
+                        }
+                    }
+                    else if (vendPackingSlipJour.RecId == 0 && metPurchTable.POBackOrderSetting == noyes::Yes)
+                    {
+                        startDate = purchTable.DeliveryDate;
+                        totalDays = endDate - startDate; //Calculate number of days from today to receipt date including weekends.
 
-                dateGreaterThanTolerance = totalDays >= inventSite.METPOBackOrderBatchJobDays;
+                        dateGreaterThanTolerance = totalDays >= inventSite.METPOBackOrderBatchJobDays;
     
-                if (dateGreaterThanTolerance && purchTable.DeliveryDate != DateTimeUtil::date(DateTimeUtil::minValue()))
+                        if (dateGreaterThanTolerance && purchTable.DeliveryDate != DateTimeUtil::date(DateTimeUtil::minValue()))
+                        {
+                            this.getPurchOrderLinesAndupdateDeliveryRemainder(purchTable.PurchId, true);
+                        }
+                    }
+                }
+                catch (Exception::Error)
                 {
-                    this.getPurchOrderLinesAndupdateDeliveryRemainder(purchTable.PurchId, true);
+                    ttsbegin;
+                    metPurchTable.selectForUpdate(true);
+                    metPurchTable.ProcessingErrorCount += 1;
+                    metPurchTable.ProcessingErrorMessage = this.getException();
+                    metPurchTable.update();
+                    ttscommit;
                 }
             }
         }
@@ -291,9 +313,7 @@ class METBackOrderProcessingService extends SysOperationServiceBase
                             false,
                             SourceDocumentLineAccountingStatus::Draft);
             }
-
         }
-
     }
 
 ]]></Source>
@@ -318,7 +338,8 @@ class METBackOrderProcessingService extends SysOperationServiceBase
             boolean changeRequestSkip;
 
             // Auto request change for 208147 Task
-            if (!_nonPostJournalPO)
+            if (!_nonPostJournalPO
+                    && purchTable.DocumentState != VersioningDocumentState::Draft)
             {
                 this.autoRequestChange(_purchId);
             }
@@ -389,6 +410,30 @@ class METBackOrderProcessingService extends SysOperationServiceBase
         {
             throw error("@SYS93835");
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getException</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method will return the exception from the InfoLog
+    /// </summary>
+    /// <returns>Exception message</returns>
+    public Notes getException()
+    {
+        SysInfologEnumerator infologEnum;
+        SysInfologMessageStruct infoLogMessage;
+        Notes errorMsg;
+
+        infologEnum = SysInfologEnumerator::newData(infolog.infologData());
+        while (infologEnum.moveNext())
+        {
+            infoLogMessage = SysInfologMessageStruct::construct(infologEnum.currentMessage());
+            errorMsg = errorMsg + infoLogMessage.message() + '\n';
+        }
+        return errorMsg;
     }
 
 ]]></Source>
