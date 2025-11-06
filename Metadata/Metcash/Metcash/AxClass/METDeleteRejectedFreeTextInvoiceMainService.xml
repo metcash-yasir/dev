@@ -1,0 +1,285 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METDeleteRejectedFreeTextInvoiceMainService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>METDeleteRejectedFreeTextInvoiceMainService</c> class for recall and delete free text invoice batch job.
+/// </summary>
+/// Added for CFR4 bulk approval AR invoice.
+class METDeleteRejectedFreeTextInvoiceMainService extends SysOperationServiceBase
+{
+    Query           freeTextInvoiceQuery;
+    int             numberOfThreads;
+    BatchGroupId    batchGroupId;
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Starts processing the operation.
+    /// </summary>
+    /// <param name="_contract">The contract containing the parameters for the operation.</param>
+    public void processOperation(METDeleteRejectedFreeTextInvoiceMainContract _contract)
+    {
+        container   queryData;
+        QueryRun    queryRun;
+
+        if (!_contract.parmPackedQuery())
+        {
+            throw error("@SYS342993");
+        }
+
+        numberOfThreads      = _contract.parmNoOfThreads();
+        freeTextInvoiceQuery = new Query(SysOperationHelper::base64Decode(_contract.parmPackedQuery()));
+
+        if (this.isExecutingInBatch())
+        {
+            if (numberOfThreads != 0)
+            {
+                this.splitRecordsPerTask();
+            }
+            else
+            {
+                throw error("@MET:METFTIThreadsValid");
+            }
+        }
+        else
+        {
+            queryRun  = new QueryRun(freeTextInvoiceQuery);
+            queryData = queryRun.pack();
+
+            // Start delete
+            METTmpStagingRecords tmpStagingRecords = METBulkWFFreeTextInvoiceHelper::insertTempStagingTable(queryData);
+
+            SysOperationServiceController subTask  = new SysOperationServiceController(
+                                                            classStr(METDeleteRejectedFreeTextInvoiceSubTaskService),
+                                                            methodStr(METDeleteRejectedFreeTextInvoiceSubTaskService, processOperation),
+                                                            SysOperationExecutionMode::Synchronous);
+            
+            METDeleteRejectedFreeTextInvoiceSubTaskContract subTaskData = subTask.getDataContractObject() as METDeleteRejectedFreeTextInvoiceSubTaskContract;
+            subTaskData.parmQueryFilter(queryData);
+
+            select minof(StagingRecordRecId) from tmpStagingRecords;
+            subTaskData.parmStartRefRecId(tmpStagingRecords.StagingRecordRecId);
+
+            select maxof(StagingRecordRecId) from tmpStagingRecords;
+            subTaskData.parmEndRefRecId(tmpStagingRecords.StagingRecordRecId);
+
+            subTask.runOperation();
+        }
+         
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>splitRecordsPerTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Splits the records based on the number of threads.
+    /// </summary>
+    public void splitRecordsPerTask()
+    {
+        QueryRun                        queryRun;
+        int                             i;
+        METTmpStagingRecords            tmpStagingRecords;
+        int                             numOfRecForLastThread;
+        int                             startIdx;
+        int                             endIdx;
+        BatchHeader                     batchHeader;
+        RefRecId                        startIndex,
+                                        endIndex;
+        int                             numOfRecForThread;
+        Container                       queryData;
+       
+       
+        queryRun  = new QueryRun(freeTextInvoiceQuery);
+        queryData = queryRun.pack();
+
+        // Start insert
+        tmpStagingRecords = METBulkWFFreeTextInvoiceHelper::insertTempStagingTable(queryData);
+        
+        select count(RecId) from tmpStagingRecords;
+        
+        if (tmpStagingRecords.RecId < numberOfThreads)
+        {
+            numberOfThreads = int642int(tmpStagingRecords.RecId);
+        }
+
+        numOfRecForThread     = real2int(tmpStagingRecords.RecId/numberOfThreads);
+        numOfRecForLastThread = int642int(tmpStagingRecords.RecId) - (numOfRecForThread * numberOfThreads);
+
+
+        batchHeader = BatchHeader::getCurrentBatchHeader();
+
+        if (batchHeader == null)
+        {
+            batchHeader = BatchHeader::construct();
+        }
+
+        batchGroupId = BatchHeader::getCurrentBatchTask().GroupId;
+
+        startIdx = 1;
+        endIdx   = numOfRecForThread;
+
+        //Batch budling based on the number of threads.
+        for (i = 1; i <= numberOfThreads; i++)
+        {
+            startIndex  = METBulkWFFreeTextInvoiceHelper::getIndex(tmpStagingRecords, startIdx);
+            endIndex    = METBulkWFFreeTextInvoiceHelper::getIndex(tmpStagingRecords, endIdx);
+
+            if (i == numberOfThreads)
+            {
+                endIndex = METBulkWFFreeTextInvoiceHelper::getIndex(tmpStagingRecords, endIdx + numOfRecForLastThread);
+            }
+
+            this.createSubJobs(batchHeader, startIndex, endIndex, queryData);
+
+            startIdx = startIdx + numOfRecForThread;
+            endIdx   = endIdx + numOfRecForThread;
+        }
+
+        batchHeader.save();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSubJobs</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the subjobs based on the number of threads.
+    /// </summary>
+    /// <param name = "_batchHeader">The batch header containing the batch job information.</param>
+    /// <param name = "_startRecId">The starting record ID for the subjob.</param>
+    /// <param name = "_endRecId">The ending record ID for the subjob.</param>
+    /// <param name = "_querData">The query data for the subjob</param>
+    public void createSubJobs(BatchHeader _batchHeader, RefRecId _startRecId, RefRecId _endRecId, Container _querData)
+    {
+        METDeleteRejectedFreeTextInvoiceSubTaskContract   subTaskData;
+        METDeleteRejectedFreeTextInvoiceSubTaskController controller = METDeleteRejectedFreeTextInvoiceSubTaskController::newFromArgs();
+        controller.parmDialogCaption(strFmt("@MET:METDeleteRejectedSubTaskCaption", _startRecId, _endRecId));
+          
+        subTaskData = controller.getDataContractObject();
+        subTaskData.parmStartRefRecId(_startRecId);
+        subTaskData.parmEndRefRecId(_endRecId);
+        subTaskData.parmQueryFilter(_querData);
+
+        controller.batchInfo().parmGroupId(batchGroupId);
+        _batchHeader.addRuntimeTask(controller,this.getCurrentBatchTask().RecId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertTempStagingTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts records into the temporary staging table.
+    /// </summary>
+    /// <param name="_queryData">The query data containing the filter values for the free text invoices.</param>
+    /// <returns>The temporary staging records buffer.</returns>
+    public Static METTmpStagingRecords insertTempStagingTable(container _queryData)
+    {
+        METTmpStagingRecords            tmpStagingRecords;
+        Query                           query;
+        CustInvoiceTable                custInvoiceTable;
+        QueryBuildDataSource            qbds;
+        QueryBuildDataSource            qbdsCustInvoiceTable;
+        int                             maxRetries = 5;
+
+        if (_queryData !=  conNull())
+        {
+            query = new query(_queryData);
+
+            for (int i = 1; i <= query.dataSourceCount(); i ++)
+            {
+                qbds = query.dataSourceNo(i);
+                qbds.fields().dynamic(NoYes::No);
+                qbds.fields().clearFieldList();
+                    
+                if (qbds.joinMode() == JoinMode::InnerJoin && qbds.embedded())
+                {
+                    qbds.joinMode(JoinMode::ExistsJoin);
+                }
+                else if (qbds.joinMode() == JoinMode::OuterJoin)
+                {
+                    qbds.enabled(false);
+                }
+            }
+
+            qbdsCustInvoiceTable = query.dataSourceTable(tableNum(CustInvoiceTable));
+
+            qbdsCustInvoiceTable.addGroupByField(fieldNum(CustInvoiceTable, RecId));
+            qbdsCustInvoiceTable.addOrderByField(fieldNum(CustInvoiceTable, RecId), SortOrder::Ascending);
+
+            qbdsCustInvoiceTable.addSelectionField(fieldNum(CustInvoiceTable, RecId));
+
+            Map fieldMap = new Map(Types::String, Types::Container);
+            fieldMap.insert(fieldStr(METTmpStagingRecords, StagingRecordRecId), [qbdsCustInvoiceTable.uniqueId(), fieldStr(CustInvoiceTable, RecId)]);
+
+            try
+            {
+                ttsbegin;
+
+                Query::insert_recordset(tmpStagingRecords, fieldMap, query);
+
+                // Set the BulkWorkflowSelected checkbox to "Yes" to ensure that this record is not selected for processing by other batch job recurrences.
+                custInvoiceTable.skipDataMethods(true);
+                custInvoiceTable.skipEvents(true);
+                custInvoiceTable.skipBusinessEvents(true);
+
+                update_recordset custInvoiceTable
+                    Setting METBulkWorkflowSelected = NoYes::Yes
+                    exists join tmpStagingRecords
+                        where tmpStagingRecords.StagingRecordRecId == custInvoiceTable.RecId;
+                
+                ttscommit;
+            }
+            catch (Exception::Deadlock)
+            {
+                if (xSession::currentRetryCount() >= maxRetries)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= maxRetries)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+            catch (Exception::Error)
+            {
+                throw Exception::Error;
+            }
+        }
+
+        return tmpStagingRecords;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
