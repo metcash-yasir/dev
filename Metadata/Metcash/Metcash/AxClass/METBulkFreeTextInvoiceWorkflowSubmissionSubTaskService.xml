@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METBulkFreeTextInvoiceWorkflowSubmissionSubTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Service class for submit free text invoice batch job.
+/// </summary>
+/// Added for CFR4 bulk approval AR invoice.
+class METBulkFreeTextInvoiceWorkflowSubmissionSubTaskService extends SysOperationServiceBase
+{
+    RefRecId                    startRecId;
+    RefRecId                    endRecId;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Starts processing the operation to submit free text invoices to workflow.
+    /// </summary>
+    /// <param name="_contract">The contract containing the parameters for the subtask operation.</param>
+    public void processOperation(METBulkFreeTextInvoiceWorkflowSubmissionSubTaskContract _contract)
+    {
+        if (!_contract.parmStartRefRecId() || !_contract.parmEndRefRecId())
+        {
+            throw error("@SYS4205");
+        }
+        else
+        {
+            startRecId      = _contract.parmStartRefRecId();
+            endRecId        = _contract.parmEndRefRecId();
+
+            this.PerformWorkflowAction();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>PerformWorkflowAction</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Approve or reject or delegate the workflow.
+    /// </summary>
+    public void PerformWorkflowAction()
+    {
+        CustInvoiceTable            custInvoiceTable;
+        QueryBuildDataSource        qbds;
+        int                         maxRetries = 5;
+        boolean                     hasError = false, isError = false;
+        Line                        fromLine;
+        str                         logMessage; 
+        SysInfologEnumerator        enumerator;
+        SysInfologMessageStruct     msgStruct;
+
+
+        Query query = new Query();
+        qbds = query.addDataSource(tableNum(CustInvoiceTable));
+        qbds.addRange(fieldNum(CustInvoiceTable, RecId)).value(SysQuery::range(startRecId,endRecId));
+        qbds.clearRange(fieldNum(CustInvoiceTable, METBulkWorkflowSelected));
+        qbds.addRange(fieldNum(CustInvoiceTable, METBulkWorkflowSelected)).value(queryValue(NoYes::Yes));
+
+        QueryRun qRun = new QueryRun(query);
+        
+        while (qRun.next())
+        {
+            custInvoiceTable = qRun.get(tableNum(CustInvoiceTable));
+            fromLine         = infologLine() + 1;
+            hasError         = false;
+            logMessage       = '';
+
+            try
+            {
+                ttsbegin;
+
+                // Validate the accounting distributions are valid and required dimensions were provided for each line.
+                if (this.validateAccountingDistributions(custInvoiceTable))
+                {
+                    //activate Workflow
+                    Workflow::activateFromWorkflowType(
+                                workFlowTypeStr(CustFreeTextInvoiceTemplate),
+                                custInvoiceTable.RecId,
+                                '',
+                                false);
+
+                    info("@MET:METFTIWFSubmissionInfo");
+                }
+                else
+                {
+                    throw error(strFmt("@MET:METFTIWFDimensionValid", custInvoiceTable.RecId));
+                }
+
+                ttscommit;
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= maxRetries)
+                    {
+                        error(strFmt("@MET:METFTIWFUpdateConflictError", custInvoiceTable.METDMFImportFileName));
+                        hasError = true;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    error(strFmt("@MET:METFTIWFUpdateConflictError", custInvoiceTable.METDMFImportFileName));
+                    hasError = true;
+                }
+            }
+            catch (Exception::deadlock)
+            {
+                if (xSession::currentRetryCount() >= maxRetries)
+                {
+                    error(strFmt("@MET:METFTIWFDeadLockError", custInvoiceTable.METDMFImportFileName));
+                    hasError = true;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::Error)
+            {
+                error(strFmt("@MET:METFTIWFError", custInvoiceTable.METDMFImportFileName));
+                hasError = true;
+            }
+            finally
+            {
+                if (hasError)
+                {
+                    enumerator = SysInfologEnumerator::newData(infolog.copy(fromLine, infologline()));
+                    
+                    while (enumerator.moveNext())
+                    {
+                        msgStruct   = new SysInfologMessageStruct(enumerator.currentMessage());
+                        logMessage += msgStruct.message() + ' ';
+                    }
+
+                    isError = true;
+                }
+                
+                custInvoiceTable.reread();
+                if (custInvoiceTable.RecId)
+                {
+                    ttsbegin;
+                    custInvoiceTable.selectForUpdate(true);
+                    custInvoiceTable.METBulkWorkflowSelected = NoYes::No;
+                    custInvoiceTable.Log = logMessage;
+                    custInvoiceTable.update();
+                    ttscommit;
+                }
+            }
+        }
+
+        if (isError)
+        {
+            //ensure batch status is "Error"
+            throw Exception::Error;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateAccountingDistributions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the accounting distributions for the <c>CustInvoiceTable</c> transaction.
+    /// </summary>
+    /// <param name = "_custInvoiceTable">Contains custInvoiceTable buffer.</param>
+    /// <returns>true if the distributions are valid; otherwise false.</returns>
+    public boolean validateAccountingDistributions(CustInvoiceTable _custInvoiceTable)
+    {
+        SourceDocumentProcessorFacade::submitSourceDocumentLinesForHeader(_custInvoiceTable, SourceDocumentLineAccountingStatus::FullyDistributed);
+        
+        return SourceDocumentProvider::areSourceDocAccDistAccountValid(SourceDocumentHeader::find(_custInvoiceTable.SourceDocumentHeader), true, true);
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

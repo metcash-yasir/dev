@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METDeleteRejectedFreeTextInvoiceSubTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Service class for recall and delete free text invocie batch job.
+/// </summary>
+/// Added for CFR4 bulk approval AR invoice.
+class METDeleteRejectedFreeTextInvoiceSubTaskService extends SysOperationServiceBase
+{
+    Query       freeTextInvoiceQuery;
+    RefRecId    startRecId;
+    RefRecId    endRecId;
+    container   queryData;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processOperation</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Starts processing the operation to recall and delete rejected free text invoices.
+    /// </summary>
+    /// <param name="_contract">The contract containing the parameters for the subtask operation.</param>
+    public void processOperation(METDeleteRejectedFreeTextInvoiceSubTaskContract _contract)
+    {
+        if (!_contract.parmQueryFilter())
+        {
+            throw error("@SYS342993");
+        }
+        else
+        {
+            startRecId = _contract.parmStartRefRecId();
+            endRecId   = _contract.parmEndRefRecId();
+            queryData  = _contract.parmQueryFilter();
+
+            this.recallAndDelete();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>recallAndDelete</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Recall and delete the free text invoice.
+    /// </summary>
+    public void recallAndDelete()
+    {
+        CustInvoiceTable            custInvoiceTable;
+        QueryBuildDataSource        qbds;
+        WorkflowWorkItemTable       workItemTable;
+        int                         maxRetries = 5;
+        boolean                     hasError = true;
+        Line                        fromLine;
+        str                         logMessage; 
+        SysInfologEnumerator        enumerator;
+        SysInfologMessageStruct     msgStruct;
+
+
+        Query query = new Query(queryData);
+        qbds = query.dataSourceTable(tableNum(CustInvoiceTable));
+        qbds.addRange(fieldNum(CustInvoiceTable, RecId)).value(SysQuery::range(startRecId,endRecId));
+        qbds.clearRange(fieldNum(CustInvoiceTable, METBulkWorkflowSelected));
+        qbds.addRange(fieldNum(CustInvoiceTable, METBulkWorkflowSelected)).value(queryValue(NoYes::Yes));
+
+        QueryRun qRun = new QueryRun(query);
+
+        while (qRun.next())
+        {
+            custInvoiceTable = qRun.get(tableNum(CustInvoiceTable));    
+            fromLine         = infologLine() + 1;
+            hasError         = false;
+            logMessage       = '';
+
+            try
+            {
+                ttsbegin;
+
+                select firstonly RecId, CorrelationId from workItemTable
+                    where workItemTable.RefTableId == tableNum(CustInvoiceTable)
+                        && workItemTable.RefRecId == custInvoiceTable.RecId;
+
+                if (workItemTable.RecId != 0)
+                {
+                    // Recall the workflow
+                    Workflow::cancelWorkflow(workItemTable.CorrelationId, "@SYS303429");
+                    
+                    if (custInvoiceTable.validateDelete())
+                    {
+                        info(strFmt("@MET:METDeleteRejectedFTISubTaskInfo", custInvoiceTable.METDMFImportFileName, custInvoiceTable.METRecipientEmail, custInvoiceTable.CustomerInvoiceOriginId, custInvoiceTable.OrderAccount, custInvoiceTable.InvoiceDate, custInvoiceTable.displayInvoiceAmount()));
+                
+                        custInvoiceTable.selectForUpdate(true);
+                        custInvoiceTable.delete();
+                    }
+                }
+                
+                ttscommit;
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= maxRetries)
+                    {
+                        error(strFmt("@MET:METDeleteRejectedFTISubTaskUpdateConflictInfo", custInvoiceTable.METDMFImportFileName));
+                        hasError = true;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    error(strFmt("@MET:METDeleteRejectedFTISubTaskUpdateConflictInfo", custInvoiceTable.METDMFImportFileName));
+                    hasError = true;
+                }
+            }
+            catch (Exception::deadlock)
+            {
+                if (xSession::currentRetryCount() >= maxRetries)
+                {
+                    error(strFmt("@MET:METDeleteRejectedFTISubTaskDeadLockInfo", custInvoiceTable.METDMFImportFileName));
+                    hasError = true;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch (Exception::Error)
+            {
+                error(strFmt("@MET:METDeleteRejectedFTISubTaskErrorInfo", custInvoiceTable.METDMFImportFileName));
+                hasError = true;
+            }
+            finally
+            {
+                if (hasError)
+                {
+                    enumerator = SysInfologEnumerator::newData(infolog.cut(fromLine, infologLine()));
+
+                    while (enumerator.moveNext())
+                    {
+                        msgStruct   = new SysInfologMessageStruct(enumerator.currentMessage());
+                        logMessage += msgStruct.message() + ' ';
+                    }
+                }
+                
+                custInvoiceTable.reread();
+                if (custInvoiceTable.RecId && custInvoiceTable.METBulkWorkflowSelected)
+                {
+                    ttsbegin;
+                    custInvoiceTable.selectForUpdate(true);
+                    custInvoiceTable.METBulkWorkflowSelected = NoYes::No;
+                    custInvoiceTable.Log = logMessage;
+                    custInvoiceTable.update();
+                    ttscommit;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
