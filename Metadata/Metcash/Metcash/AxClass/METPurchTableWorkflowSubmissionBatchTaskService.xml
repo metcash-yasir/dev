@@ -1,0 +1,229 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METPurchTableWorkflowSubmissionBatchTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Task service class for managing purchase order workflow work items in batch.
+/// </summary>
+class METPurchTableWorkflowSubmissionBatchTaskService extends METSysOperationTaskService
+{
+    guid topPickingProcessId;
+    METPurchTableWorkflowSubmissionBatchJobQueue submissionBatchJobQueue;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///  Initializes the object.
+    /// </summary>
+    protected void initialise()
+    {
+        METPurchTableWorkflowSubmissionBatchContract contract;
+        
+        super();
+
+        // get the topPickingProcessId from the contract
+        contract            = dataContract as METPurchTableWorkflowSubmissionBatchContract;
+        topPickingProcessId = contract.parmTopPickingProcessId(); 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Execution starts from here 
+    /// </summary>
+    /// <param name = "_readPast">boolean</param>
+    protected void processTask(boolean _readPast)
+    {
+        while (this.getDataFromTopPickingQueue(topPickingProcessId, _readPast))
+        {
+            try
+            {
+                if (submissionBatchJobQueue.RecId != 0)
+                {
+                    ttsbegin;
+                    this.execute();
+                    ttscommit;
+                }
+            }
+            catch (Exception::Error)
+            {
+                // Catch any exception so that any one error won't bring down
+                // the entire process of sales order substitution.
+                Global::exceptionTextFallThrough();
+            }
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process method
+    /// </summary>
+    /// <param name = "_contract">METPurchTableWorkflowSubmissionBatchContract</param>
+    public void process(METPurchTableWorkflowSubmissionBatchContract _contract)
+    {
+        this.processInternal(_contract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDataFromTopPickingQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Read data from Queue table
+    /// </summary>
+    /// <param name = "_processId">GUID</param>
+    /// <param name = "_readPast">boolean</param>
+    /// <returns>boolean</returns>
+    private boolean getDataFromTopPickingQueue(guid _processId, boolean _readPast)
+    {
+        #OCCRetryCount
+    
+        METPurchTableWorkflowSubmissionBatchJobQueue topPickingQueue;
+        int backOffWait;
+    
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockException;
+        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
+        Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
+        
+        topPickingQueue.readPast(_readPast);
+
+        try
+        {
+            ttsbegin;
+    
+            select firstonly pessimisticlock topPickingQueue
+                where topPickingQueue.ProcessId == _processId;
+
+            if (topPickingQueue.RecId)
+            {
+                //Copies data in METPurchTableWorkflowSubmissionBatchJobQueue from topPickingQueue buffer.
+                submissionBatchJobQueue.data(topPickingQueue);
+
+                topPickingQueue.delete();
+            }
+            else
+            {
+                ///Empties the table buffer of METPurchTableWorkflowSubmissionBatchJobQueue.
+                DictTable submissionBatchJobQueueDictTable = new DictTable(tableNum(METPurchTableWorkflowSubmissionBatchJobQueue));
+                submissionBatchJobQueue = submissionBatchJobQueueDictTable.makeRecord();
+            }
+           
+            ttscommit;
+        }
+        catch (deadLockException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw deadLockException;
+                }
+            }
+            else
+            {
+                throw deadLockException;
+            }
+        }
+        catch (updateConflictException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+            }
+            else
+            {
+                throw updateConflictException;
+            }
+        }
+        catch (transientSqlConnectionError)
+        {
+            if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw transientSqlConnectionError;
+            }
+        }
+
+        return (submissionBatchJobQueue.RecId != 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Execute processing
+    /// </summary>
+    private void execute()
+    {
+        PurchTable	purchTable = PurchTable::find(submissionBatchJobQueue.PurchId);
+
+        if (purchTable.DocumentState == VersioningDocumentState::Draft && purchTable.ChangeRequestRequired)
+        {
+            str comment = strFmt("@MET:METPOFlowSubmited", purchTable.PurchId);
+
+            if (purchTable.checkFullyDistributedAndQualified() && purchTable.canSubmitToWorkflow())
+            {
+                try
+                {
+                    ttsbegin;
+                    purchTable.selectForUpdate(true);
+                    purchTable.submitToWorkflow(workflowTypeStr(PurchTableTemplate), comment, false);
+                    ttscommit;
+
+                    if (purchTable.DocumentState == VersioningDocumentState::InReview)
+                    {
+                        info(comment);
+                    }
+                }
+                catch (Exception::CLRError)
+                {
+                    System.Exception interopException = CLRInterop::getLastException();
+                    error(strFmt("%1", interopException));
+                }
+                catch (Exception::Error)
+                {
+                    error(strFmt("@MET:POWorkFlowSubmissionFailed", purchTable.PurchId));
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
