@@ -23,6 +23,21 @@ class METExciseLodgementUpdateService extends SysOperationServiceBase
     /// <param name = "_contract">Contract class reference</param>
     public void process(METExciseLodgementUpdateContract     _contract)
     {
+        this.processOriginal(_contract);
+        this.processCP(_contract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processOriginal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process method to initiate the multi thread for business logic
+    /// </summary>
+    /// <param name = "_contract">Contract class reference</param>
+    public void processOriginal(METExciseLodgementUpdateContract     _contract)
+    {
         BatchHeader                     batchHeader;
         SysOperationServiceController   runTaskController;
         METExciseInformationTable       metExciseInformationTable;
@@ -69,6 +84,126 @@ class METExciseLodgementUpdateService extends SysOperationServiceBase
         {
             batchHeader.save();
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCP</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes catch weight excise lodgement updates by grouping unlodged excise records
+    /// and updating them with corresponding lodgement values.
+    /// </summary>
+    /// <param name="_contract">The contract containing context for the lodgement update process.</param>
+    public void processCP(METExciseLodgementUpdateContract     _contract)
+    {
+        METExciseInformationTable metExciseInformationTable, metExciseInformationTableSource;
+        METExciseRegisterOriginTypes metExciseRegisterOriginTypes;
+
+        while select InventTransType, ItemId, SiteId from metExciseInformationTable
+            group by ItemId, SiteId, InventTransType
+                where metExciseInformationTable.Lodgement == ''
+            exists join metExciseRegisterOriginTypes
+                where metExciseRegisterOriginTypes.ReferenceId == metExciseInformationTable.InventTransType &&
+                        metExciseRegisterOriginTypes.UpdateCPLodgement == NoYes::Yes
+        {
+            ttsbegin;
+            this.processMatchingExciseLines(metExciseInformationTable.InventTransType, metExciseInformationTable.ItemId, metExciseInformationTable.SiteId);
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processMatchingExciseLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates excise information records with concatenated lodgement values
+    /// based on matching transfer journal lines for a given item, site, and transaction type.
+    /// </summary>
+    /// <param name="_inventTransType">The inventory transaction type to filter records.</param>
+    /// <param name="_itemId">The item ID to filter records.</param>
+    /// <param name="_siteId">The site ID to filter records.</param>
+    private void processMatchingExciseLines(InventTransType _inventTransType, ItemId _itemId, InventSiteId _siteId)
+    {
+        METExciseInformationTable metExciseInformationTableSource;
+
+        if (_inventTransType == InventTransType::TransferOrderShip)
+        {
+            InventTransferJourLine inventTransferJourLine;
+
+            while select forupdate metExciseInformationTableSource
+                where metExciseInformationTableSource.InventTransType == _inventTransType &&
+                  metExciseInformationTableSource.ItemId == _itemId &&
+                  metExciseInformationTableSource.SiteId == _siteId &&
+                  metExciseInformationTableSource.Lodgement == ''
+            join RecId from inventTransferJourLine
+                where inventTransferJourLine.InventTransId == metExciseInformationTableSource.InventTransId
+            {
+                METLodgementExt concatenatedLodgement = this.getConcatenatedLodgements(inventTransferJourLine.RecId);
+
+                if (concatenatedLodgement)
+                {
+                    metExciseInformationTableSource.Lodgement = concatenatedLodgement;
+                    metExciseInformationTableSource.update();
+                    info(strFmt("@MET:LodgmentUpdate", _itemId, _siteId));
+                }
+            }
+        }
+        else if (_inventTransType == InventTransType::Purch)
+        {
+            PurchLine purchLine;
+            METPurchLine metPurchLine;
+
+            while select forupdate metExciseInformationTableSource
+                where metExciseInformationTableSource.InventTransType == _inventTransType &&
+                  metExciseInformationTableSource.ItemId == _itemId &&
+                  metExciseInformationTableSource.SiteId == _siteId &&
+                  metExciseInformationTableSource.Lodgement == ''
+            join RecId from purchLine
+                where purchLine.InventTransId == metExciseInformationTableSource.InventTransId
+            join Lodgement from metPurchLine
+                where metPurchLine.PurchLine == purchLine.RecId
+            {
+                if (metPurchLine.Lodgement)
+                {
+                    metExciseInformationTableSource.Lodgement = metPurchLine.Lodgement;
+                    metExciseInformationTableSource.update();
+                    info(strFmt("@MET:LodgmentUpdate", _itemId, _siteId));
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getConcatenatedLodgements</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves and concatenates all lodgement values associated with a given transfer journal line.
+    /// </summary>
+    /// <param name="_inventTransferJourLineRecId">The RecId of the transfer journal line.</param>
+    /// <returns>A comma-separated string of lodgement values.</returns>
+    private str getConcatenatedLodgements(RecId _inventTransferJourLineRecId)
+    {
+        METTransferOrderLodgements transferOrderLodgements;
+        str result = "";
+
+        while select Lodgement from transferOrderLodgements
+            where transferOrderLodgements.ReferenceId == _inventTransferJourLineRecId
+        {
+            if (transferOrderLodgements.Lodgement)
+            {
+                result += result == ""
+                ? transferOrderLodgements.Lodgement
+                : strFmt(", %1", transferOrderLodgements.Lodgement);
+            }
+        }
+
+        return result;
     }
 
 ]]></Source>
