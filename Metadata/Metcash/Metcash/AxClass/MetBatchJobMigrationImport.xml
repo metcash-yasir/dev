@@ -1,0 +1,1989 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>MetBatchJobMigrationImport</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Complete batch job import for cross-environment migration - REFACTORED
+/// Uses METFileReaderExcel framework for cleaner, more maintainable code
+/// Imports ALL fields that BatchJobCopy uses - 100% compatible
+/// </summary>
+using System.IO;
+public class METBatchJobMigrationImport extends RunBaseBatch
+{
+    FileUploadTemporaryStorageResult    fileUploadResult;
+    DialogRunbase                       dialog;
+    DialogField                         dlgOverrideStatus;
+    DialogField                         dlgAllowDuplicates;
+    DialogField                         dlgCreateForFutureDate;
+    METBatchJobStatusOverride           overrideStatus;
+    NoYes                               allowDuplicates;
+    NoYes                               createForFutureDate;
+
+    private const str FileUploadName = 'FileUpload';
+    private const str OkButtonName   = 'OkButton';
+
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        overrideStatus,
+        allowDuplicates,
+        createForFutureDate
+    #endmacro
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Dialog construction with file upload
+    /// </summary>
+    public Object dialog()
+    {
+        DialogGroup         dialogGroup;
+        FormBuildControl    formBuildControl;
+        FileUploadBuild     dialogFileUpload;
+
+        dialog = super();
+
+        dialogGroup = dialog.addGroup("Excel File");
+        formBuildControl = dialog.formBuildDesign().control(dialogGroup.name());
+        dialogFileUpload = formBuildControl.addControlEx(classstr(FileUpload), FileUploadName);
+        dialogFileUpload.style(FileUploadStyle::MinimalWithFilename);
+        dialogFileUpload.baseFileUploadStrategyClassName(classstr(FileUploadTemporaryStorageStrategy));
+        dialogFileUpload.fileTypesAccepted('.xlsx');
+        dialogFileUpload.fileNameLabel("Select batch job migration file");
+
+        // Add Override Status parameter
+        dlgOverrideStatus = dialog.addFieldValue(enumStr(METBatchJobStatusOverride), overrideStatus, "Override Status");
+        dlgOverrideStatus.helpText("Choose how to set batch job status during import");
+
+        // Add Allow Duplicates parameter
+        dlgAllowDuplicates = dialog.addFieldValue(extendedTypeStr(NoYesId), allowDuplicates, "Allow duplicates");
+        dlgAllowDuplicates.helpText("If unchecked, jobs with the same Company + Job Caption will be skipped");
+
+        // Add Create for future date parameter
+        dlgCreateForFutureDate = dialog.addFieldValue(extendedTypeStr(NoYesId), createForFutureDate, "Create for future date");
+        dlgCreateForFutureDate.helpText("If checked, scheduled date/time will be calculated as the next future occurrence based on recurrence");
+
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get values from dialog
+    /// </summary>
+    public boolean getFromDialog()
+    {
+        FileUpload fileUploadControl = this.getFormControl(dialog, FileUploadName);
+        fileUploadResult = fileUploadControl.getFileUploadResult();
+
+        overrideStatus = dlgOverrideStatus.value();
+        allowDuplicates = dlgAllowDuplicates.value();
+        createForFutureDate = dlgCreateForFutureDate.value();
+
+        return super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmDefault</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialize default parameters
+    /// </summary>
+    public void initParmDefault()
+    {
+        super();
+        overrideStatus = METBatchJobStatusOverride::Withhold;  // Default to Withhold
+        allowDuplicates = NoYes::No;  // Default to not allowing duplicates
+        createForFutureDate = NoYes::No;  // Default to not calculating future date
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Pack for serialization
+    /// </summary>
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Unpack from serialization
+    /// </summary>
+    public boolean unpack(container _packedClass)
+    {
+        Version version = RunBase::getVersion(_packedClass);
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList] = _packedClass;
+                break;
+
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Main execution logic
+    /// </summary>
+    public void run()
+    {
+        System.IO.MemoryStream          memoryStream;
+        Map                             jobDataMap;
+        Map                             jobLineNumbers;  // Track line number for each job
+        int                             importedJobs, importedTasks, skippedJobs;
+        METFileReaderExcel             reader;
+
+        try
+        {
+            if (!fileUploadResult)
+            {
+                throw error("No file was uploaded");
+            }
+
+            memoryStream = fileUploadResult.openResult();
+
+            // Initialize reader
+            reader = new METFileReaderExcel();
+            jobLineNumbers = new Map(Types::String, Types::Integer);
+            jobDataMap = this.readExcelFile(memoryStream, reader, jobLineNumbers);
+
+            if (!jobDataMap || jobDataMap.elements() == 0)
+            {
+                throw warning("No valid data found in the Excel file");
+            }
+
+            MapEnumerator jobEnumerator = jobDataMap.getEnumerator();
+            while (jobEnumerator.moveNext())
+            {
+                str jobCaption = jobEnumerator.currentKey();
+                List taskList = jobEnumerator.currentValue();
+                int lineNumber = jobLineNumbers.exists(jobCaption) ? jobLineNumbers.lookup(jobCaption) : 0;
+
+                RefRecId newJobId = this.createBatchJob(jobCaption, taskList, reader, lineNumber);
+
+                if (newJobId > 0)
+                {
+                    importedJobs++;
+                    importedTasks += taskList.elements();
+                }
+                else if (newJobId == -1)  // -1 indicates skipped due to duplicate
+                {
+                    skippedJobs++;
+                }
+            }
+
+            // Show summary with framework tracking
+            info(strFmt("Import completed in %1 seconds", reader.getTimeSec()));
+            info(strFmt("Successfully imported %1 batch jobs with %2 tasks", importedJobs, importedTasks));
+            if (skippedJobs > 0)
+            {
+                info(strFmt("Skipped %1 batch jobs (duplicates not allowed)", skippedJobs));
+            }
+            info(strFmt("Tasks created: %1, Tasks skipped: %2",
+            reader.getInsertedRecords(),
+            reader.getSkippedRecords()));
+
+            info("Task parameters imported - review individual task messages for any parameter import failures");
+            info("Recurrence built from Excel Recur_* columns - start date/time copied from Scheduled Start DateTime");
+            if (createForFutureDate == NoYes::Yes)
+            {
+                info("Future date calculation enabled - scheduled date/time updated to next occurrence after current date/time");
+            }
+        }
+        catch (Exception::Error)
+        {
+            error("Import failed. Please check the error messages and file format.");
+        }
+        finally
+        {
+            if (fileUploadResult)
+            {
+                fileUploadResult.deleteResult();
+            }
+            if (memoryStream)
+            {
+                memoryStream.Dispose();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>readExcelFile</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Read Excel file and organize data by job - REFACTORED using framework
+    /// Returns Map: JobCaption -> List of tmp table records
+    /// </summary>
+    private Map readExcelFile(System.IO.MemoryStream _memoryStream, METFileReaderExcel _reader, Map _jobLineNumbers)
+    {
+        Map                         jobDataMap = new Map(Types::String, Types::Class);
+        METBatchJobMigrationTmp     tmpRecord;
+        str                         currentJobCaption;
+        List                        taskList;
+
+        try
+        {
+            // Open file using framework
+            _reader.openFile(_memoryStream);
+
+            // Read header row
+            if (!_reader.readHeaderRow())
+            {
+                throw error("Failed to read header row");
+            }
+
+            info(strFmt("Excel file opened successfully. Total rows: %1", _reader.getRowsCount()));
+
+            // Read data rows
+            while (_reader.readNextRow())
+            {
+                tmpRecord = this.readExcelRow(_reader);
+
+                if (tmpRecord.JobCaption)
+                {
+                    currentJobCaption = tmpRecord.JobCaption;
+
+                    if (!jobDataMap.exists(currentJobCaption))
+                    {
+                        taskList = new List(Types::Record);
+                        jobDataMap.insert(currentJobCaption, taskList);
+
+                        // Track line number for first occurrence of this job
+                        _jobLineNumbers.insert(currentJobCaption, _reader.getCurRow());
+                    }
+                    else
+                    {
+                        taskList = jobDataMap.lookup(currentJobCaption);
+                    }
+
+                    taskList.addEnd(tmpRecord);
+                }
+            }
+        }
+        catch
+        {
+            throw error("Failed to read Excel file. Please verify the file format.");
+        }
+
+        return jobDataMap;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>readExcelRow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Read a single row from Excel - Returns tmp table record
+    /// </summary>
+    private METBatchJobMigrationTmp readExcelRow(METFileReaderExcel _reader)
+    {
+        METBatchJobMigrationTmp tmpRecord;
+        str concatenatedParameters = '';
+        int chunkNum = 1;
+        str columnName;
+        str chunk;
+
+        try
+        {
+            tmpRecord.clear();
+
+            // Read basic job fields
+            tmpRecord.JobCaption = _reader.getStringByName('Job Caption');
+            tmpRecord.Company = _reader.getStringByName('Company');
+            tmpRecord.BatchGroup = _reader.getStringByName('Batch Group');
+            tmpRecord.RunBy = _reader.getStringByName('Run By');
+            tmpRecord.ScheduledStartDateTime = _reader.getStringByName('Scheduled Start DateTime');
+            tmpRecord.JobStatus = _reader.getStringByName('Job Status');
+
+            // Read 18 recurrence breakdown columns
+            tmpRecord.RecurTimezone = _reader.getStringByName('Recur_Timezone');
+            tmpRecord.RecurEndType = _reader.getStringByName('Recur_EndType');
+            tmpRecord.RecurEndAfterCount = _reader.getStringByName('Recur_EndAfterCount');
+            tmpRecord.RecurEndByDate = _reader.getStringByName('Recur_EndByDate');
+            tmpRecord.RecurUnit = _reader.getStringByName('Recur_Unit');
+            tmpRecord.RecurInterval = _reader.getStringByName('Recur_Interval');
+            tmpRecord.RecurDayType = _reader.getStringByName('Recur_DayType');
+            tmpRecord.RecurWeekInterval = _reader.getStringByName('Recur_WeekInterval');
+            tmpRecord.RecurWeekDays = _reader.getStringByName('Recur_WeekDays');
+            tmpRecord.RecurMonthType = _reader.getStringByName('Recur_MonthType');
+            tmpRecord.RecurMonthDay = _reader.getStringByName('Recur_MonthDay');
+            tmpRecord.RecurMonthInterval = _reader.getStringByName('Recur_MonthInterval');
+            tmpRecord.RecurMonthWeek = _reader.getStringByName('Recur_MonthWeek');
+            tmpRecord.RecurMonthWeekday = _reader.getStringByName('Recur_MonthWeekday');
+            tmpRecord.RecurYearType = _reader.getStringByName('Recur_YearType');
+            tmpRecord.RecurYearWeek = _reader.getStringByName('Recur_YearWeek');
+            tmpRecord.RecurYearWeekday = _reader.getStringByName('Recur_YearWeekday');
+            tmpRecord.RecurYearMonth = _reader.getStringByName('Recur_YearMonth');
+
+            // Read additional job fields
+            tmpRecord.SchedulingPriority = _reader.getStringByName('Scheduling Priority');
+            tmpRecord.PriorityOverridden = _reader.getStringByName('Priority Overridden');
+            tmpRecord.LogLevel = _reader.getStringByName('Log Level');
+            tmpRecord.Critical = _reader.getStringByName('Critical');
+            tmpRecord.MonitoringCategory = _reader.getStringByName('Monitoring Category');
+            tmpRecord.Managed = _reader.getStringByName('Managed');
+            tmpRecord.ActivePeriod = _reader.getStringByName('Active Period');
+            tmpRecord.Alerts = _reader.getStringByName('Alerts');
+
+            // Read task fields
+            tmpRecord.TaskSequence = _reader.getIntByName('Task Sequence');
+            tmpRecord.TaskCaption = _reader.getStringByName('Task Caption');
+            tmpRecord.ClassName = _reader.getStringByName('Class Name');
+            tmpRecord.RunType = _reader.getStringByName('Run Type');
+            tmpRecord.ConstraintType = _reader.getStringByName('Constraint Type');
+            tmpRecord.DependsOnTasks = _reader.getStringByName('Depends On Tasks');
+            tmpRecord.ExpectedStatus = _reader.getStringByName('Expected Status');
+            tmpRecord.MaximumRetries = _reader.getIntByName('Maximum Retries');
+
+            // Read and concatenate parameter chunks dynamically
+            // Export creates: "Parameters", "Parameters2", "Parameters3", etc.
+            while (true)
+            {
+                // First chunk is "Parameters", subsequent chunks are "Parameters2", "Parameters3", etc.
+                if (chunkNum == 1)
+                {
+                    columnName = 'Parameters';
+                }
+                else
+                {
+                    columnName = strFmt('Parameters%1', chunkNum);
+                }
+
+                if (!_reader.isColumnExists(columnName))
+                {
+                    // No more chunks to read
+                    break;
+                }
+
+                chunk = _reader.getStringByName(columnName);
+                if (chunk)
+                {
+                    concatenatedParameters += chunk;
+                }
+
+                chunkNum++;
+
+                // Safety limit to prevent infinite loops
+                if (chunkNum > 100)
+                {
+                    warning(strFmt("Row %1: Stopped reading parameters after 100 chunks", _reader.getCurRow()));
+                    break;
+                }
+            }
+            tmpRecord.Parameters = concatenatedParameters;
+        }
+        catch
+        {
+            warning(strFmt("Error reading row %1. Skipping this row.", _reader.getCurRow()));
+            // Return cleared tmpRecord (JobCaption will be empty, so calling code will skip it)
+            tmpRecord.clear();
+        }
+
+        return tmpRecord;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBatchJob</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create batch job with all tasks, alerts, and constraints
+    /// Mirrors BatchJobCopy.createCopy() logic
+    /// Returns: RecId if created, -1 if skipped (duplicate), 0 if error
+    /// </summary>
+    private RefRecId createBatchJob(str _jobCaption, List _taskList, METFileReaderExcel _reader, int _lineNumber)
+    {
+        BatchJob                batchJob;
+        METBatchJobMigrationTmp firstTaskTmp;
+        Map                     taskSequenceMap;
+        RefRecId                newJobRecId;
+        str                     company;
+
+        if (!_taskList || _taskList.elements() == 0)
+        {
+            return 0;
+        }
+
+        // Get first task tmp record from list
+        ListIterator iterator = new ListIterator(_taskList);
+        iterator.begin();
+        firstTaskTmp = iterator.value();
+
+        // Get company (use current if not specified)
+        company = firstTaskTmp.Company;
+        if (!company)
+        {
+            company = curext();
+        }
+
+        // Check for duplicate if not allowing duplicates
+        if (allowDuplicates == NoYes::No)
+        {
+            if (this.isDuplicateBatchJob(company, _jobCaption))
+            {
+                warning(strFmt("Line %1: Skipped duplicate batch job - Company: %2, Job Caption: %3",
+                    _lineNumber,
+                    company,
+                    _jobCaption));
+                return -1;  // Return -1 to indicate skipped due to duplicate
+            }
+        }
+
+        ttsbegin;
+
+        try
+        {
+            // Create batch job header (mirrors BatchJobCopy.copyHeader)
+            batchJob.clear();
+            batchJob.Caption = _jobCaption;
+            batchJob.Company = company;
+            batchJob.BatchGroup = firstTaskTmp.BatchGroup;
+            batchJob.ExecutingBy = firstTaskTmp.RunBy;
+            if (!batchJob.ExecutingBy)
+            {
+                batchJob.ExecutingBy = curUserId();
+            }
+
+            // Apply override status
+            batchJob.Status = this.getOverriddenStatus(firstTaskTmp.JobStatus);
+
+            // Build recurrence data first - always build from Excel breakdown columns
+            container recurrenceData = this.buildRecurrenceFromExcelColumns(firstTaskTmp);
+            batchJob.recurrenceData = recurrenceData;
+
+            // Set scheduled start date (with future date calculation if enabled)
+            if (firstTaskTmp.ScheduledStartDateTime)
+            {
+                utcDateTime scheduledDateTime = this.parseDateTime(firstTaskTmp.ScheduledStartDateTime);
+                if (scheduledDateTime != DateTimeUtil::minValue())
+                {
+                    // Calculate future date if checkbox is checked
+                    if (createForFutureDate == NoYes::Yes && recurrenceData != conNull())
+                    {
+                        scheduledDateTime = this.calculateNextFutureDate(scheduledDateTime, recurrenceData);
+                    }
+
+                    batchJob.OrigStartDateTime = scheduledDateTime;
+                }
+            }
+
+            // Set scheduling priority
+            if (firstTaskTmp.SchedulingPriority)
+            {
+                batchJob.SchedulingPriority = str2Int(firstTaskTmp.SchedulingPriority);
+            }
+
+            // Set priority override
+            if (firstTaskTmp.PriorityOverridden)
+            {
+                batchJob.SchedulingPriorityIsOverridden = str2Int(firstTaskTmp.PriorityOverridden);
+            }
+
+            // Set log level
+            if (firstTaskTmp.LogLevel)
+            {
+                batchJob.LogLevel = str2Int(firstTaskTmp.LogLevel);
+            }
+
+            // Set critical flag
+            if (firstTaskTmp.Critical)
+            {
+                batchJob.Critical = str2Int(firstTaskTmp.Critical);
+            }
+
+            // Set monitoring category
+            if (firstTaskTmp.MonitoringCategory)
+            {
+                batchJob.MonitoringCategory = str2Int(firstTaskTmp.MonitoringCategory);
+            }
+
+            // Set managed flag
+            if (firstTaskTmp.Managed)
+            {
+                batchJob.Managed = str2Int(firstTaskTmp.Managed);
+            }
+
+            // Set active period
+            batchJob.ActivePeriod = firstTaskTmp.ActivePeriod;
+
+            batchJob.insert();
+            newJobRecId = batchJob.RecId;
+
+            // Create alerts (mirrors BatchJobCopy.copyAlerts)
+            if (firstTaskTmp.Alerts)
+            {
+                this.createBatchJobAlerts(newJobRecId, firstTaskTmp.Alerts);
+            }
+
+            // Create tasks (mirrors BatchJobCopy.copyTasks)
+            taskSequenceMap = new Map(Types::Integer, Types::Int64);
+            this.createBatchTasks(newJobRecId, _taskList, taskSequenceMap, _reader);
+
+            // Create constraints (mirrors BatchJobCopy.copyConstraints)
+            this.createBatchConstraints(_taskList, taskSequenceMap);
+
+            ttscommit;
+
+            info(strFmt("Created batch job: %1 (RecId: %2)", batchJob.Caption, newJobRecId));
+        }
+        catch
+        {
+            ttsabort;
+            error(strFmt("Failed to create batch job: %1", _jobCaption));
+            return 0;
+        }
+
+        return newJobRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBatchJobAlerts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create batch job alerts
+    /// Parses structured alert string: userid1:ended,error,popup;userid2:error,email
+    /// </summary>
+    private void createBatchJobAlerts(RefRecId _batchJobRecId, str _alertsStr)
+    {
+        container           userAlertParts;
+        int                 i;
+        str                 userAlertStr;
+        container           userAndFlags;
+        str                 userId;
+        str                 flagsStr;
+        container           flags;
+        int                 j;
+        str                 flag;
+        BatchJobAlerts      alert;
+
+        if (!_alertsStr)
+        {
+            return;
+        }
+
+        // Split by semicolon to get each user's alerts
+        userAlertParts = str2con(_alertsStr, ';');
+
+        for (i = 1; i <= conLen(userAlertParts); i++)
+        {
+            userAlertStr = conPeek(userAlertParts, i);
+
+            // Split by colon to separate userId from flags
+            userAndFlags = str2con(userAlertStr, ':');
+
+            if (conLen(userAndFlags) == 2)
+            {
+                userId = conPeek(userAndFlags, 1);
+                flagsStr = conPeek(userAndFlags, 2);
+
+                // Split flags by comma
+                flags = str2con(flagsStr, ',');
+
+                alert.clear();
+                alert.BatchJobId = _batchJobRecId;
+                alert.UserId = userId;
+
+                // Parse flags
+                for (j = 1; j <= conLen(flags); j++)
+                {
+                    flag = conPeek(flags, j);
+
+                    switch (flag)
+                    {
+                        case 'ended':
+                            alert.BatchJobEnded = NoYes::Yes;
+                            break;
+                        case 'error':
+                            alert.BatchJobError = NoYes::Yes;
+                            break;
+                        case 'canceled':
+                            alert.BatchJobCanceled = NoYes::Yes;
+                            break;
+                        case 'popup':
+                            alert.Popup = NoYes::Yes;
+                            break;
+                        case 'email':
+                            alert.Email = NoYes::Yes;
+                            break;
+                    }
+                }
+
+                if (alert.BatchJobEnded || alert.BatchJobError || alert.BatchJobCanceled)
+                {
+                    alert.insert();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBatchTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create batch tasks - REFACTORED with framework tracking
+    /// </summary>
+    private void createBatchTasks(
+    RefRecId            _batchJobRecId,
+    List                _taskList,
+    Map                 _taskSequenceMap,
+    METFileReaderExcel  _reader)
+    {
+        ListEnumerator          enumerator = _taskList.getEnumerator();
+        METBatchJobMigrationTmp tmpRecord;
+        Batch                   batch;
+        ClassId                 classId;
+        str                     company;
+
+        while (enumerator.moveNext())
+        {
+            tmpRecord = enumerator.current();
+
+            // Validate task data
+            if (tmpRecord.TaskSequence == 0)
+            {
+                warning(strFmt("Invalid task sequence (0) - Excel file may be from old export format or columns misaligned. Task Caption: '%1'",
+                tmpRecord.TaskCaption));
+                _reader.incSkippedRecords();
+                continue;
+            }
+
+            if (!tmpRecord.ClassName)
+            {
+                warning(strFmt("Task '%1' (Seq: %2): Class name is empty - Excel file may be from old export format or columns misaligned.",
+                tmpRecord.TaskCaption,
+                tmpRecord.TaskSequence));
+                _reader.incSkippedRecords();
+                continue;
+            }
+
+            classId = className2Id(tmpRecord.ClassName);
+            if (classId == 0)
+            {
+                warning(strFmt("Task '%1' (Seq: %2): Class '%3' not found in this environment. Skipping task.",
+                tmpRecord.TaskCaption,
+                tmpRecord.TaskSequence,
+                tmpRecord.ClassName));
+                _reader.incSkippedRecords();
+                continue;
+            }
+
+            // Get company
+            company = tmpRecord.Company;
+            if (!company)
+            {
+                company = curext();
+            }
+
+            // Create batch task (mirrors BatchJobCopy task creation)
+            batch.clear();
+            batch.BatchJobId = _batchJobRecId;
+            batch.Caption = tmpRecord.TaskCaption;
+            batch.ClassNumber = classId;
+            batch.Company = company;
+            batch.GroupId = tmpRecord.BatchGroup;
+            batch.Status = BatchStatus::Hold;
+            batch.retriesOnFailure = tmpRecord.MaximumRetries;
+
+            // Set Run Type
+            if (tmpRecord.RunType)
+            {
+                batch.RunType = str2Int(tmpRecord.RunType);
+            }
+
+            // Set constraint type
+            if (tmpRecord.ConstraintType)
+            {
+                batch.ConstraintType = str2Int(tmpRecord.ConstraintType);
+            }
+
+            // Set parameters - always import with validation and error handling
+            if (tmpRecord.Parameters)
+            {
+                container paramContainer = this.base64stringToContainer(
+                tmpRecord.Parameters,
+                tmpRecord.TaskCaption,
+                tmpRecord.TaskSequence
+            );
+
+                if (paramContainer != conNull())
+                {
+                    batch.Parameters = paramContainer;
+                }
+            }
+
+            batch.insert();
+
+            // Track using framework
+            _reader.incInsertedRecords();
+
+            _taskSequenceMap.insert(tmpRecord.TaskSequence, batch.RecId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBatchConstraints</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create batch constraints
+    /// </summary>
+    private void createBatchConstraints(List _taskList, Map _taskSequenceMap)
+    {
+        ListEnumerator          enumerator = _taskList.getEnumerator();
+        METBatchJobMigrationTmp tmpRecord;
+        BatchConstraints        constraint;
+        container               dependsOnSequences;
+        int                     i;
+        int                     dependsOnSequence;
+        RefRecId                batchRecId;
+        RefRecId                dependsOnBatchRecId;
+
+        while (enumerator.moveNext())
+        {
+            tmpRecord = enumerator.current();
+
+            if (!tmpRecord.DependsOnTasks)
+            {
+                continue;
+            }
+
+            batchRecId = _taskSequenceMap.lookup(tmpRecord.TaskSequence);
+            if (!batchRecId)
+            {
+                continue;
+            }
+
+            dependsOnSequences = str2con(tmpRecord.DependsOnTasks, ',');
+
+            for (i = 1; i <= conLen(dependsOnSequences); i++)
+            {
+                dependsOnSequence = str2Int(conPeek(dependsOnSequences, i));
+                dependsOnBatchRecId = _taskSequenceMap.lookup(dependsOnSequence);
+
+                if (dependsOnBatchRecId)
+                {
+                    constraint.clear();
+                    constraint.BatchId = batchRecId;
+                    constraint.DependsOnBatchId = dependsOnBatchRecId;
+
+                    if (tmpRecord.ExpectedStatus)
+                    {
+                        constraint.ExpectedStatus = str2Int(tmpRecord.ExpectedStatus);
+                    }
+                    else
+                    {
+                        constraint.ExpectedStatus = BatchDependencyStatus::Finished;
+                    }
+
+                    constraint.insert();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parseBatchStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Parse batch status string to enum value
+    /// </summary>
+    private BatchStatus parseBatchStatus(str _statusStr)
+    {
+        BatchStatus status = BatchStatus::Hold;  // Default
+
+        // Map string to enum value
+        switch (_statusStr)
+        {
+            case 'Hold':
+                status = BatchStatus::Hold;
+                break;
+            case 'Waiting':
+                status = BatchStatus::Waiting;
+                break;
+            case 'Executing':
+                status = BatchStatus::Executing;
+                break;
+            case 'Ready':
+                status = BatchStatus::Ready;
+                break;
+            case 'Finished':
+                status = BatchStatus::Finished;
+                break;
+            case 'Error':
+                status = BatchStatus::Error;
+                break;
+            case 'Canceled':
+                status = BatchStatus::Canceled;
+                break;
+            default:
+                warning(strFmt("Unknown batch status '%1', defaulting to Hold", _statusStr));
+                status = BatchStatus::Hold;
+                break;
+        }
+
+        return status;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getOverriddenStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the overridden batch job status based on user selection
+    /// </summary>
+    private BatchStatus getOverriddenStatus(str _fileStatus)
+    {
+        BatchStatus status;
+
+        switch (overrideStatus)
+        {
+            case METBatchJobStatusOverride::FromFile:
+                // Use status from file
+                if (_fileStatus)
+                {
+                    status = this.parseBatchStatus(_fileStatus);
+                }
+                else
+                {
+                    status = BatchStatus::Hold;  // Default if file status is empty
+                }
+                break;
+
+            case METBatchJobStatusOverride::Withhold:
+                status = BatchStatus::Hold;
+                break;
+
+            case METBatchJobStatusOverride::Waiting:
+                status = BatchStatus::Waiting;
+                break;
+
+            default:
+                status = BatchStatus::Hold;
+                break;
+        }
+
+        return status;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isDuplicateBatchJob</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if batch job with same Company + Caption already exists
+    /// </summary>
+    private boolean isDuplicateBatchJob(str _company, str _caption)
+    {
+        BatchJob batchJob;
+
+        select firstonly RecId from batchJob
+            where batchJob.Company == _company
+               && batchJob.Caption == _caption;
+
+        return batchJob.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateNextFutureDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate next future date/time based on recurrence
+    /// Mimics batch framework logic for calculating next occurrence
+    /// Container structure: [version, startTime, startDate, endDateRadio, endDateInt, endDateDate, unit, pattern, timezone]
+    /// </summary>
+    private utcDateTime calculateNextFutureDate(utcDateTime _scheduledStartDateTime, container _recurrenceData)
+    {
+        utcDateTime         nextDateTime;
+        utcDateTime         currentDateTime;
+        int                 maxIterations = 10000;  // Safety limit to prevent infinite loops
+        int                 iterations = 0;
+        int                 unit;
+        container           pattern;
+
+        if (!_recurrenceData || _recurrenceData == conNull() || conLen(_recurrenceData) < 9)
+        {
+            // No recurrence or invalid container, return original date
+            return _scheduledStartDateTime;
+        }
+
+        try
+        {
+            currentDateTime = DateTimeUtil::utcNow();
+
+            // If scheduled start is already in the future, return it as-is
+            if (_scheduledStartDateTime > currentDateTime)
+            {
+                return _scheduledStartDateTime;
+            }
+
+            // Extract unit and pattern from container
+            // Container: [version, startTime, startDate, endDateRadio, endDateInt, endDateDate, unit, pattern, timezone]
+            unit = conPeek(_recurrenceData, 7);      // Position 7: unit
+            pattern = conPeek(_recurrenceData, 8);   // Position 8: pattern
+
+            // Start with the scheduled start date/time
+            nextDateTime = _scheduledStartDateTime;
+
+            // Keep calculating next occurrence until we find a future date
+            while (nextDateTime <= currentDateTime && iterations < maxIterations)
+            {
+                // Calculate next occurrence based on unit type
+                nextDateTime = this.calculateNextOccurrenceByUnit(nextDateTime, unit, pattern);
+
+                // If calculation returns invalid date, break to avoid infinite loop
+                if (nextDateTime == DateTimeUtil::minValue() || nextDateTime <= _scheduledStartDateTime)
+                {
+                    // Recurrence might be invalid, return current date/time
+                    return currentDateTime;
+                }
+
+                iterations++;
+            }
+
+            if (iterations >= maxIterations)
+            {
+                warning(strFmt("Recurrence calculation exceeded maximum iterations (%1). Using current date/time.", maxIterations));
+                return currentDateTime;
+            }
+
+            info(strFmt("Calculated next future date: %1 (from original: %2, iterations: %3)",
+                DateTimeUtil::toStr(nextDateTime),
+                DateTimeUtil::toStr(_scheduledStartDateTime),
+                iterations));
+
+            return nextDateTime;
+        }
+        catch
+        {
+            error("Failed to calculate next future date from recurrence. Using original scheduled date/time.");
+            return _scheduledStartDateTime;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateNextOccurrenceByUnit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate next occurrence based on recurrence unit type
+    /// </summary>
+    private utcDateTime calculateNextOccurrenceByUnit(utcDateTime _currentDateTime, int _unit, container _pattern)
+    {
+        utcDateTime nextDateTime;
+        date        currentDate;
+        int         currentTime;
+        int         interval;
+
+        currentDate = DateTimeUtil::date(_currentDateTime);
+        currentTime = DateTimeUtil::time(_currentDateTime);
+
+        // Unit values: Minute=0, Hour=1, Day=2, Week=3, Month=4, Year=5
+        switch (_unit)
+        {
+            case 0: // Minute
+                interval = conPeek(_pattern, 1);
+                if (interval <= 0) interval = 1;
+                nextDateTime = DateTimeUtil::addSeconds(_currentDateTime, interval * 60);
+                break;
+
+            case 1: // Hour
+                interval = conPeek(_pattern, 1);
+                if (interval <= 0) interval = 1;
+                nextDateTime = DateTimeUtil::addHours(_currentDateTime, interval);
+                break;
+
+            case 2: // Day
+                nextDateTime = this.calculateNextDayOccurrence(_currentDateTime, _pattern);
+                break;
+
+            case 3: // Week
+                nextDateTime = this.calculateNextWeekOccurrence(_currentDateTime, _pattern);
+                break;
+
+            case 4: // Month
+                nextDateTime = this.calculateNextMonthOccurrence(_currentDateTime, _pattern);
+                break;
+
+            case 5: // Year
+                nextDateTime = this.calculateNextYearOccurrence(_currentDateTime, _pattern);
+                break;
+
+            default:
+                nextDateTime = DateTimeUtil::addDays(_currentDateTime, 1); // Default to next day
+                break;
+        }
+
+        return nextDateTime;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateNextDayOccurrence</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate next occurrence for Day recurrence
+    /// Pattern: [type, interval] where type: 1=Every X days, 2=Every weekday
+    /// </summary>
+    private utcDateTime calculateNextDayOccurrence(utcDateTime _currentDateTime, container _pattern)
+    {
+        int         type;
+        int         interval;
+        utcDateTime nextDateTime;
+        date        nextDate;
+        int         time;
+        int         dayOfWeek;
+
+        type = conPeek(_pattern, 1);
+        interval = conPeek(_pattern, 2);
+        time = DateTimeUtil::time(_currentDateTime);
+
+        if (type == 2) // Every weekday
+        {
+            nextDate = DateTimeUtil::date(_currentDateTime);
+            nextDate = nextDate + 1; // Start with next day
+
+            // Keep adding days until we find a weekday (Mon-Fri)
+            dayOfWeek = dayOfWk(nextDate);
+            while (dayOfWeek == 6 || dayOfWeek == 7) // 6=Saturday, 7=Sunday
+            {
+                nextDate = nextDate + 1;
+                dayOfWeek = dayOfWk(nextDate);
+            }
+
+            nextDateTime = DateTimeUtil::newDateTime(nextDate, time);
+        }
+        else // Every X days
+        {
+            if (interval <= 0) interval = 1;
+            nextDateTime = DateTimeUtil::addDays(_currentDateTime, interval);
+        }
+
+        return nextDateTime;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateNextWeekOccurrence</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate next occurrence for Week recurrence
+    /// Pattern: [weekInterval, daysBitPattern]
+    /// daysBitPattern: Mon=0x1, Tue=0x2, Wed=0x4, Thu=0x8, Fri=0x10, Sat=0x20, Sun=0x40
+    /// </summary>
+    private utcDateTime calculateNextWeekOccurrence(utcDateTime _currentDateTime, container _pattern)
+    {
+        int         weekInterval;
+        int         daysBitPattern;
+        date        currentDate;
+        int         time;
+        date        nextDate;
+        int         dayOfWeek;
+        int         daysChecked = 0;
+
+        weekInterval = conPeek(_pattern, 1);
+        daysBitPattern = conPeek(_pattern, 2);
+
+        if (weekInterval <= 0) weekInterval = 1;
+        if (daysBitPattern <= 0) daysBitPattern = 0x1F; // Default Mon-Fri
+
+        currentDate = DateTimeUtil::date(_currentDateTime);
+        time = DateTimeUtil::time(_currentDateTime);
+        nextDate = currentDate + 1; // Start with next day
+
+        // Find next matching day within max 7 * weekInterval days
+        while (daysChecked < (7 * weekInterval + 7))
+        {
+            dayOfWeek = dayOfWk(nextDate);
+
+            // Check if this day matches the bit pattern
+            if (this.isDayInWeekPattern(dayOfWeek, daysBitPattern))
+            {
+                return DateTimeUtil::newDateTime(nextDate, time);
+            }
+
+            nextDate = nextDate + 1;
+            daysChecked++;
+        }
+
+        // Fallback: add weekInterval weeks
+        return DateTimeUtil::addDays(_currentDateTime, weekInterval * 7);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isDayInWeekPattern</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if a day of week matches the bit pattern
+    /// </summary>
+    private boolean isDayInWeekPattern(int _dayOfWeek, int _bitPattern)
+    {
+        // dayOfWeek: 1=Monday, 2=Tuesday, ..., 7=Sunday
+        // bitPattern: Mon=0x1, Tue=0x2, Wed=0x4, Thu=0x8, Fri=0x10, Sat=0x20, Sun=0x40
+        switch (_dayOfWeek)
+        {
+            case 1: return (_bitPattern & 0x1) != 0;  // Monday
+            case 2: return (_bitPattern & 0x2) != 0;  // Tuesday
+            case 3: return (_bitPattern & 0x4) != 0;  // Wednesday
+            case 4: return (_bitPattern & 0x8) != 0;  // Thursday
+            case 5: return (_bitPattern & 0x10) != 0; // Friday
+            case 6: return (_bitPattern & 0x20) != 0; // Saturday
+            case 7: return (_bitPattern & 0x40) != 0; // Sunday
+        }
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateNextMonthOccurrence</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate next occurrence for Month recurrence
+    /// Pattern: [type, day, perMonth1, weekOfMonth, dayValue, perMonth2]
+    /// Type 1: Specific day of month
+    /// Type 2: Specific weekday (e.g., 2nd Tuesday)
+    /// </summary>
+    private utcDateTime calculateNextMonthOccurrence(utcDateTime _currentDateTime, container _pattern)
+    {
+        int         type;
+        int         day;
+        int         perMonth;
+        int         weekOfMonth;
+        int         dayValue;
+        date        currentDate;
+        int         time;
+        date        nextDate;
+        int         currentYear, currentMonth;
+
+        type = conPeek(_pattern, 1);
+        currentDate = DateTimeUtil::date(_currentDateTime);
+        time = DateTimeUtil::time(_currentDateTime);
+        currentYear = year(currentDate);
+        currentMonth = mthOfYr(currentDate);
+
+        if (type == 1) // Specific day of month
+        {
+            day = conPeek(_pattern, 2);
+            perMonth = conPeek(_pattern, 3);
+            if (perMonth <= 0) perMonth = 1;
+            if (day <= 0) day = 1;
+            if (day > 31) day = 31;
+
+            // Try current month first
+            nextDate = mkDate(day, currentMonth, currentYear);
+            if (nextDate <= currentDate)
+            {
+                // Move to next month
+                currentMonth += perMonth;
+                if (currentMonth > 12)
+                {
+                    currentYear += (currentMonth - 1) div 12;
+                    currentMonth = ((currentMonth - 1) mod 12) + 1;
+                }
+                nextDate = mkDate(day, currentMonth, currentYear);
+            }
+
+            return DateTimeUtil::newDateTime(nextDate, time);
+        }
+        else // Type 2: Specific weekday
+        {
+            weekOfMonth = conPeek(_pattern, 4);
+            dayValue = conPeek(_pattern, 5);
+            perMonth = conPeek(_pattern, 6);
+            if (perMonth <= 0) perMonth = 1;
+
+            // For now, add perMonth months and use same day - simplified logic
+            nextDate = DateTimeUtil::date(DateTimeUtil::addMonths(_currentDateTime, perMonth));
+            return DateTimeUtil::newDateTime(nextDate, time);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateNextYearOccurrence</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate next occurrence for Year recurrence
+    /// Pattern: [type, weekOfMonth, dayValue, monthValue]
+    /// Type 1: Once a year on start date
+    /// Type 2: Specific weekday in specific month
+    /// </summary>
+    private utcDateTime calculateNextYearOccurrence(utcDateTime _currentDateTime, container _pattern)
+    {
+        int         type;
+        date        currentDate;
+        int         time;
+        date        nextDate;
+        int         currentYear;
+
+        type = conPeek(_pattern, 1);
+        currentDate = DateTimeUtil::date(_currentDateTime);
+        time = DateTimeUtil::time(_currentDateTime);
+        currentYear = year(currentDate);
+
+        if (type == 1) // Once a year on start date (same month/day)
+        {
+            // Try next year with same month and day
+            nextDate = mkDate(dayOfMth(currentDate), mthOfYr(currentDate), currentYear + 1);
+            return DateTimeUtil::newDateTime(nextDate, time);
+        }
+        else // Type 2: Specific weekday in specific month - simplified to add 1 year
+        {
+            return DateTimeUtil::addYears(_currentDateTime, 1);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parseDateTime</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Parse date time string
+    /// </summary>
+    private utcDateTime parseDateTime(str _dateTimeStr)
+    {
+        utcDateTime result;
+
+        try
+        {
+            if (!_dateTimeStr)
+            {
+                return DateTimeUtil::minValue();
+            }
+
+            // Try DateTimeUtil::parse() first (handles ISO format from DateTimeUtil::toStr())
+            result = DateTimeUtil::parse(_dateTimeStr);
+            if (result != DateTimeUtil::minValue())
+            {
+                return result;
+            }
+
+            // Fallback to str2Datetime with format 321
+            result = str2Datetime(_dateTimeStr, 321);
+            return result;
+        }
+        catch
+        {
+            return DateTimeUtil::minValue();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>base64stringToContainer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Convert string to container with validation and error handling
+    /// Safe version for parameter import with logging
+    /// </summary>
+    private container base64stringToContainer(str _str, str _taskCaption, int _taskSequence)
+    {
+        container   result = conNull();
+
+        // Check for empty or whitespace-only strings
+        if (!_str || strLen(strRTrim(strLTrim(_str))) == 0)
+        {
+            return result;
+        }
+
+        try
+        {
+            result = base64Str2Con(_str);
+
+            // Validate that the container was properly deserialized
+            if (result == conNull())
+            {
+                warning(strFmt("Task '%1' (Seq: %2): Parameters could not be deserialized - task created without parameters",
+                _taskCaption, _taskSequence));
+            }
+            else
+            {
+                info(strFmt("Task '%1' (Seq: %2): Parameters successfully imported",
+                _taskCaption, _taskSequence));
+            }
+        }
+        catch (Exception::Error)
+        {
+            warning(strFmt("Task '%1' (Seq: %2): Parameter import failed - task created without parameters. String length: %3, First 50 chars: '%4'",
+            _taskCaption,
+            _taskSequence,
+            strLen(_str),
+            subStr(_str, 1, 50)));
+            result = conNull();
+        }
+        catch
+        {
+            warning(strFmt("Task '%1' (Seq: %2): Unexpected error during parameter import - task created without parameters. String length: %3",
+            _taskCaption, _taskSequence, strLen(_str)));
+            result = conNull();
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildRecurrenceFromExcelColumns</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build SysRecurrenceData container from Excel breakdown columns
+    /// </summary>
+    private container buildRecurrenceFromExcelColumns(METBatchJobMigrationTmp _tmpRecord)
+    {
+        try
+        {
+            // Check if recurrence unit is specified
+            if (!_tmpRecord.RecurUnit)
+            {
+                return conNull();
+            }
+
+            // Parse common fields - use Scheduled Start DateTime (copied from job level)
+            utcDateTime startDateTime = this.parseDateTime(_tmpRecord.ScheduledStartDateTime);
+            if (startDateTime == DateTimeUtil::minValue())
+            {
+                warning(strFmt("Invalid recurrence start date/time for job '%1'. Using Scheduled Start DateTime. Recurrence not created.", _tmpRecord.JobCaption));
+                return conNull();
+            }
+
+            date startDate = DateTimeUtil::date(startDateTime);
+            int startTime = DateTimeUtil::time(startDateTime);
+
+            // Parse timezone
+            int timezone = this.parseTimezone(_tmpRecord.RecurTimezone);
+
+            // Parse end condition
+            int endDateRadio;
+            int endDateInt = 0;
+            date endDateDate = DateTimeUtil::getToday(timezone);
+
+            switch (_tmpRecord.RecurEndType)
+            {
+                case 'NoEnd':
+                    endDateRadio = 1;
+                    break;
+                case 'EndAfter':
+                    endDateRadio = 2;
+                    endDateInt = str2Int(_tmpRecord.RecurEndAfterCount);
+                    break;
+                case 'EndBy':
+                    endDateRadio = 3;
+                    endDateDate = this.parseDate(_tmpRecord.RecurEndByDate);
+                    break;
+                default:
+                    endDateRadio = 1; // Default to no end
+                    break;
+            }
+
+            // Parse unit
+            int unit = this.parseRecurrenceUnit(_tmpRecord.RecurUnit);
+            // Validate that the parsed unit is within valid range (0=Minute to 5=Year)
+            if (unit < 0 || unit > 5)
+            {
+                warning(strFmt("Invalid recurrence unit '%1' for job '%2'. Recurrence not created.", _tmpRecord.RecurUnit, _tmpRecord.JobCaption));
+                return conNull();
+            }
+
+            // Build pattern based on unit
+            container pattern = this.buildRecurrencePattern(unit, _tmpRecord);
+            if (pattern == conNull())
+            {
+                warning(strFmt("Failed to build recurrence pattern for job '%1'. Recurrence not created.", _tmpRecord.JobCaption));
+                return conNull();
+            }
+
+            // Build final container
+            int version = SysRecurrence::recurrenceVersion();
+            container recurrenceData = [version, startTime, startDate, endDateRadio, endDateInt, endDateDate, unit, pattern, timezone];
+
+            info(strFmt("Built recurrence from Excel columns for job '%1': %2", _tmpRecord.JobCaption, _tmpRecord.RecurUnit));
+
+            return recurrenceData;
+        }
+        catch
+        {
+            error(strFmt("Exception building recurrence for job '%1'. Recurrence not created.", _tmpRecord.JobCaption));
+            return conNull();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildRecurrencePattern</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build pattern container based on unit type
+    /// </summary>
+    private container buildRecurrencePattern(int _unit, METBatchJobMigrationTmp _tmpRecord)
+    {
+        // Use numeric enum values (SysRecurrenceUnit: Minute=0, Hour=1, Day=2, Week=3, Month=4, Year=5)
+        switch (_unit)
+        {
+            case 0: // Minute
+            case 1: // Hour
+                return this.buildMinuteHourPattern(_tmpRecord);
+
+            case 2: // Day
+                return this.buildDayPattern(_tmpRecord);
+
+            case 3: // Week
+                return this.buildWeekPattern(_tmpRecord);
+
+            case 4: // Month
+                return this.buildMonthPattern(_tmpRecord);
+
+            case 5: // Year
+                return this.buildYearPattern(_tmpRecord);
+
+            default:
+                return conNull();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildMinuteHourPattern</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build Minute/Hour pattern: [interval]
+    /// </summary>
+    private container buildMinuteHourPattern(METBatchJobMigrationTmp _tmpRecord)
+    {
+        int interval = str2Int(_tmpRecord.RecurInterval);
+        if (interval <= 0)
+        {
+            interval = 1; // Default to 1
+        }
+
+        return [interval];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildDayPattern</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build Day pattern: [type, interval]
+    /// </summary>
+    private container buildDayPattern(METBatchJobMigrationTmp _tmpRecord)
+    {
+        int type;
+        int interval = str2Int(_tmpRecord.RecurInterval);
+
+        if (_tmpRecord.RecurDayType == 'EveryWeekday')
+        {
+            type = 2; // Every weekday
+            interval = 0;
+        }
+        else
+        {
+            type = 1; // Every X days
+            if (interval <= 0)
+            {
+                interval = 1;
+            }
+        }
+
+        return [type, interval];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildWeekPattern</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build Week pattern: [weekInterval, daysBitPattern]
+    /// </summary>
+    private container buildWeekPattern(METBatchJobMigrationTmp _tmpRecord)
+    {
+        int weekInterval = str2Int(_tmpRecord.RecurWeekInterval);
+        if (weekInterval <= 0)
+        {
+            weekInterval = 1;
+        }
+
+        // Parse days: MON,TUE,WED format
+        str daysStr = _tmpRecord.RecurWeekDays;
+        int daysBitPattern = 0;
+
+        if (strScan(daysStr, 'MON', 1, strLen(daysStr)) > 0)  daysBitPattern += 0x1;
+        if (strScan(daysStr, 'TUE', 1, strLen(daysStr)) > 0)  daysBitPattern += 0x2;
+        if (strScan(daysStr, 'WED', 1, strLen(daysStr)) > 0)  daysBitPattern += 0x4;
+        if (strScan(daysStr, 'THU', 1, strLen(daysStr)) > 0)  daysBitPattern += 0x8;
+        if (strScan(daysStr, 'FRI', 1, strLen(daysStr)) > 0)  daysBitPattern += 0x10;
+        if (strScan(daysStr, 'SAT', 1, strLen(daysStr)) > 0)  daysBitPattern += 0x20;
+        if (strScan(daysStr, 'SUN', 1, strLen(daysStr)) > 0)  daysBitPattern += 0x40;
+
+        if (daysBitPattern == 0)
+        {
+            daysBitPattern = 0x1F; // Default to Mon-Fri
+        }
+
+        return [weekInterval, daysBitPattern];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildMonthPattern</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build Month pattern: [type, day, perMonth1, weekOfMonth, dayValue, perMonth2]
+    /// </summary>
+    private container buildMonthPattern(METBatchJobMigrationTmp _tmpRecord)
+    {
+        if (_tmpRecord.RecurMonthType == 'SpecificDay')
+        {
+            // Type 1: Specific day of month
+            int day = str2Int(_tmpRecord.RecurMonthDay);
+            int perMonth = str2Int(_tmpRecord.RecurMonthInterval);
+
+            if (day <= 0) day = 1;
+            if (day > 31) day = 31;
+            if (perMonth <= 0) perMonth = 1;
+
+            return [1, day, perMonth, 0, 0, 0];
+        }
+        else
+        {
+            // Type 2: Specific weekday
+            int weekOfMonth = this.parseWeekOfMonth(_tmpRecord.RecurMonthWeek);
+            int dayValue = this.parseWeekDays(_tmpRecord.RecurMonthWeekday);
+            int perMonth = str2Int(_tmpRecord.RecurMonthInterval);
+
+            if (perMonth <= 0) perMonth = 1;
+
+            return [2, 0, 0, weekOfMonth, dayValue, perMonth];
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildYearPattern</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build Year pattern: [type, weekOfMonth, dayValue, monthValue]
+    /// </summary>
+    private container buildYearPattern(METBatchJobMigrationTmp _tmpRecord)
+    {
+        if (_tmpRecord.RecurYearType == 'OnceAYear')
+        {
+            // Type 1: Once a year on start date
+            return [1, 0, 0, 0];
+        }
+        else
+        {
+            // Type 2: Specific weekday in specific month
+            int weekOfMonth = this.parseWeekOfMonth(_tmpRecord.RecurYearWeek);
+            int dayValue = this.parseWeekDays(_tmpRecord.RecurYearWeekday);
+            int monthValue = this.parseMonthsOfYear(_tmpRecord.RecurYearMonth);
+
+            return [2, weekOfMonth, dayValue, monthValue];
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parseTimezone</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Parse timezone from string (handles both enum name and label)
+    /// </summary>
+    private int parseTimezone(str _timezoneStr)
+    {
+        int tz;
+        DictEnum dictEnum;
+        int i;
+
+        try
+        {
+            if (!_timezoneStr)
+            {
+                return DateTimeUtil::getUserPreferredTimeZone();
+            }
+
+            // Try matching by label (e.g., "(GMT+10:00) Canberra, Melbourne, Sydney")
+            dictEnum = new DictEnum(enumNum(Timezone));
+            for (i = 0; i < dictEnum.values(); i++)
+            {
+                if (dictEnum.index2Label(i) == _timezoneStr || dictEnum.index2Name(i) == _timezoneStr)
+                {
+                    return dictEnum.index2Value(i);
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        // Default to user's preferred timezone
+        return DateTimeUtil::getUserPreferredTimeZone();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parseRecurrenceUnit</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Parse recurrence unit from string (handles both name and label)
+    /// </summary>
+    private int parseRecurrenceUnit(str _unitStr)
+    {
+        int result;
+
+        // First try generic enum parsing
+        result = this.parseEnumValue(enumNum(SysRecurrenceUnit), _unitStr, -1);
+
+        if (result != -1)
+        {
+            return result;
+        }
+
+        // Fallback: Manual mapping to match export format (lines 416-424 in export)
+        switch (_unitStr)
+        {
+            case 'Minute':
+                return 0;
+            case 'Hour':
+                return 1;
+            case 'Day':
+                return 2;
+            case 'Week':
+                return 3;
+            case 'Month':
+                return 4;
+            case 'Year':
+                return 5;
+            default:
+                return 0; // Default: Minute
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parseEnumValue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generic enum parser - handles both enum name and label
+    /// </summary>
+    private int parseEnumValue(int _enumTypeId, str _enumStr, int _defaultValue = 0)
+    {
+        DictEnum dictEnum;
+        int i;
+
+        try
+        {
+            if (!_enumStr)
+            {
+                return _defaultValue;
+            }
+
+            // Match by label or name using DictEnum
+            dictEnum = new DictEnum(_enumTypeId);
+            for (i = 0; i < dictEnum.values(); i++)
+            {
+                // Check both label and name (case-insensitive for better compatibility)
+                if (strLwr(dictEnum.index2Label(i)) == strLwr(_enumStr) ||
+                    strLwr(dictEnum.index2Name(i)) == strLwr(_enumStr))
+                {
+                    return dictEnum.index2Value(i);
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return _defaultValue;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parseWeekOfMonth</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Parse WeekOfMonth enum from string (handles both name and label)
+    /// </summary>
+    private int parseWeekOfMonth(str _weekStr)
+    {
+        return this.parseEnumValue(enumNum(WeekOfMonth), _weekStr, 0); // Default: First
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parseWeekDays</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Parse WeekDays enum from string (handles both name and label)
+    /// </summary>
+    private int parseWeekDays(str _dayStr)
+    {
+        return this.parseEnumValue(enumNum(WeekDays), _dayStr, 1); // Default: Monday
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parseMonthsOfYear</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Parse MonthsOfYear enum from string (handles both name and label)
+    /// </summary>
+    private int parseMonthsOfYear(str _monthStr)
+    {
+        return this.parseEnumValue(enumNum(MonthsOfYear), _monthStr, 1); // Default: January
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parseDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Parse date from string (MM/DD/YYYY format)
+    /// </summary>
+    private date parseDate(str _dateStr)
+    {
+        try
+        {
+            if (!_dateStr)
+            {
+                return dateNull();
+            }
+
+            return str2Date(_dateStr, 321);
+        }
+        catch
+        {
+            return dateNull();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFormControl</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get form control helper
+    /// </summary>
+    protected FormControl getFormControl(DialogRunbase _dialog, str _controlName)
+    {
+        return _dialog.formRun().control(_dialog.formRun().controlId(_controlName));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>uploadCompleted</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Handle file upload completion
+    /// </summary>
+    protected void uploadCompleted()
+    {
+        FileUpload fileUpload = this.getFormControl(dialog, FileUploadName);
+        fileUpload.notifyUploadCompleted -= eventhandler(this.uploadCompleted);
+        this.setDialogOkButtonEnabled(dialog, true);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setDialogOkButtonEnabled</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Set dialog OK button enabled state
+    /// </summary>
+    protected void setDialogOkButtonEnabled(DialogRunbase _dialog, boolean _isEnabled)
+    {
+        FormControl okButtonControl = this.getFormControl(_dialog, OkButtonName);
+        if (okButtonControl)
+        {
+            okButtonControl.enabled(_isEnabled);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialogPostRun</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Dialog post run - setup event handlers
+    /// </summary>
+    public void dialogPostRun(DialogRunbase _dialog)
+    {
+        FileUpload fileUpload = this.getFormControl(_dialog, FileUploadName);
+        fileUpload.notifyUploadCompleted += eventhandler(this.uploadCompleted);
+        this.setDialogOkButtonEnabled(_dialog, false);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showQueryValues</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Show query values in dialog
+    /// </summary>
+    public boolean showQueryValues()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Can run in new session
+    /// </summary>
+    public boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canGoBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Can go to batch - DISABLED
+    /// </summary>
+    public boolean canGoBatch()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validate before run
+    /// </summary>
+    public boolean validate(Object _calledFrom = null)
+    {
+        if (!fileUploadResult)
+        {
+            error("Please select a file to import");
+            return false;
+        }
+
+        return super(_calledFrom);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Factory method
+    /// </summary>
+    public static METBatchJobMigrationImport construct()
+    {
+        return new METBatchJobMigrationImport();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Class description
+    /// </summary>
+    static ClassDescription description()
+    {
+        return "Import batch jobs for cross-environment migration";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Main entry point
+    /// </summary>
+    public static void main(Args _args)
+    {
+        METBatchJobMigrationImport runObject = METBatchJobMigrationImport::construct();
+
+        if (runObject.prompt())
+        {
+            runObject.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
