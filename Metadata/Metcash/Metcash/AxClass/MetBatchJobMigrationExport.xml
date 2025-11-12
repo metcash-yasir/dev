@@ -1,0 +1,1117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>MetBatchJobMigrationExport</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Complete batch job export for cross-environment migration
+/// </summary>
+using System.IO;
+public class METBatchJobMigrationExport extends RunBaseBatch
+{
+    QueryRun                queryRun;
+    boolean                 onlyWithRecurrence;
+    METFileWriterExcel      writer;  // Framework!
+
+    DialogField dlgOnlyWithRecurrence;
+
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        onlyWithRecurrence
+    #endmacro
+
+    #define.ExcelFileName('BatchJobMigration')
+    #define.MaxChunkSize(32000)
+    #define.MaxParameterChunks(10)
+    #define.MaxRecurrenceChunks(5)
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Dialog construction
+    /// </summary>
+    public Object dialog()
+    {
+        DialogRunbase dialog = super();
+
+        dlgOnlyWithRecurrence = dialog.addFieldValue(
+            extendedTypeStr(NoYesId),
+            onlyWithRecurrence,
+            "Only with Recurrence",
+            "Export only batch jobs that have recurrence configured"
+        );
+
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get values from dialog
+    /// </summary>
+    public boolean getFromDialog()
+    {
+        onlyWithRecurrence = dlgOnlyWithRecurrence.value();
+
+        // Call super to get query modifications from dialog
+        return super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmDefault</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialize default parameters
+    /// </summary>
+    public void initParmDefault()
+    {
+        super();
+        this.initQuery();
+        onlyWithRecurrence = NoYes::No;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initialize query
+    /// </summary>
+    public void initQuery()
+    {
+        Query                   query;
+        QueryBuildDataSource    qbdsBatchJob, qbdsBatch;
+        QueryBuildRange         qbrJobDate, qbrJobStatus;
+        QueryBuildRange         qbrBatchStatus, qbrClassName, qbrRunTimeTask;
+        utcDateTime             oneMonthAgo;
+
+        query = new Query();
+        qbdsBatchJob = query.addDataSource(tableNum(BatchJob));
+
+        // Add sorting: Status, Company, Caption
+        qbdsBatchJob.addSortField(fieldNum(BatchJob, Status));
+        qbdsBatchJob.addSortField(fieldNum(BatchJob, Company));
+        qbdsBatchJob.addSortField(fieldNum(BatchJob, Caption));
+
+        // Range 1: BatchJob OrigStartDateTime >= 1 month ago (user can modify)
+        oneMonthAgo = DateTimeUtil::addMonths(DateTimeUtil::utcNow(), -1);
+        qbrJobDate = qbdsBatchJob.addRange(fieldNum(BatchJob, OrigStartDateTime));
+        qbrJobDate.value(SysQueryRangeUtil::greaterThanUtcDate(-30));
+
+        // Range 2: BatchJob Status = HOLD, WAITING, EXECUTING, READY (user can modify)
+        qbrJobStatus = qbdsBatchJob.addRange(fieldNum(BatchJob, Status));
+        qbrJobStatus.value(
+            strFmt('%1,%2,%3,%4',
+                enum2Str(BatchStatus::Hold) ,
+                enum2Str(BatchStatus::Waiting),
+                enum2Str(BatchStatus::Executing),
+                enum2Str(BatchStatus::Ready)));
+
+        // Add Batch table datasource with pre-configured ranges
+        qbdsBatch = qbdsBatchJob.addDataSource(tableNum(Batch));
+        qbdsBatch.joinMode(JoinMode::InnerJoin);
+        qbdsBatch.relations(true);
+
+        // Range 1: BatchJob Status != ENDED, ERROR, CANCELLED (user can modify)
+        qbrRunTimeTask = qbdsBatch.addRange(fieldNum(Batch, RunTimeTask));
+        qbrRunTimeTask.value(SysQuery::value(boolean::false)); // Exclude RunTimeTask = Yes
+
+        queryRun = new QueryRun(query);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryRun</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get query run object
+    /// </summary>
+    public QueryRun queryRun()
+    {
+        return queryRun;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateFileName</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generate file name with timestamp
+    /// </summary>
+    private str generateFileName()
+    {
+        utcDateTime currentDateTime = DateTimeUtil::getSystemDateTime();
+        date        currentDate = DateTimeUtil::date(currentDateTime);
+        timeOfDay   currentTime = DateTimeUtil::time(currentDateTime);
+        str         year, month, day, hour, minute;
+
+        year    = int2Str(year(currentDate));
+        month   = strLFix(int2Str(mthOfYr(currentDate)), 2, '0');
+        day     = strLFix(int2Str(dayOfMth(currentDate)), 2, '0');
+        hour    = strRFix(int2Str(currentTime div 3600), 2, '0');
+        minute  = strRFix(int2Str((currentTime mod 3600) div 60), 2, '0');
+
+        return strFmt('%1_%2_%3_%4_%5%6',
+            #ExcelFileName,
+        year,
+            month,
+            day,
+            hour,
+            minute
+        );
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasRecurrence</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if job has recurrence
+    /// </summary>
+    private boolean hasRecurrence(BatchJob _batchJob)
+    {
+        return _batchJob.recurrenceData ? true : false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Main execution
+    /// </summary>
+    public void run()
+    {
+        super();
+
+        // Reset query for actual export - preserve user's query filters from dialog
+        queryRun = new QueryRun(queryRun.query());
+
+        // Initialize framework writer
+        writer = new METFileWriterExcel();
+        writer.parmWorkSheetNameStr(this.generateFileName());
+
+        // Write header
+        this.writeHeaderRow();
+
+        // Write data
+        this.writeDataRows();
+
+        // Finalize and download
+        this.finalizeExport();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>writeHeaderRow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Write header row
+    /// </summary>
+    private void writeHeaderRow()
+    {
+        container header = conNull();
+        int recurrenceChunk, paramChunk;
+
+        // Basic job fields
+        header += 'Job Id';
+        header += 'Job Status';
+        header += 'Job Caption';
+        header += 'Company';
+        header += 'Batch Group';
+        header += 'Run By';
+        header += 'Scheduled Start DateTime';
+
+        // Additional job fields
+        header += 'Scheduling Priority';
+        header += 'Priority Overridden';
+        header += 'Log Level';
+        header += 'Critical';
+        header += 'Monitoring Category';
+        header += 'Managed';
+        header += 'Active Period';
+        header += 'Alerts';
+
+        // Task fields
+        header += 'Task Sequence';
+        header += 'Task Caption';
+        header += 'Class Name';
+        header += 'Run Type';
+        header += 'Constraint Type';
+        header += 'Depends On Tasks';
+        header += 'Expected Status';
+        header += 'Maximum Retries';
+
+        // Recurrence breakdown columns (18 columns - moved to end, removed Recur_StartDateTime)
+        header += 'Recur_Timezone';
+        header += 'Recur_EndType';
+        header += 'Recur_EndAfterCount';
+        header += 'Recur_EndByDate';
+        header += 'Recur_Unit';
+        header += 'Recur_Interval';
+        header += 'Recur_DayType';
+        header += 'Recur_WeekInterval';
+        header += 'Recur_WeekDays';
+        header += 'Recur_MonthType';
+        header += 'Recur_MonthDay';
+        header += 'Recur_MonthInterval';
+        header += 'Recur_MonthWeek';
+        header += 'Recur_MonthWeekday';
+        header += 'Recur_YearType';
+        header += 'Recur_YearWeek';
+        header += 'Recur_YearWeekday';
+        header += 'Recur_YearMonth';
+
+        // Parameters chunks
+        for (paramChunk = 1; paramChunk <= #MaxParameterChunks; paramChunk++)
+        {
+            if (paramChunk == 1)
+            {
+                header += 'Parameters';
+            }
+            else
+            {
+                header += strFmt('Parameters%1', paramChunk);
+            }
+        }
+
+        writer.addContainerLine(header);
+        writer.markRowAsBold();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>writeDataRows</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Write all data rows
+    /// </summary>
+    private void writeDataRows()
+    {
+        BatchJob        batchJob;
+        Batch           batchTask;
+        RecId           currentBatchJobRecId = 0;
+        int             taskSequence = 0;
+
+        while (queryRun.next())
+        {
+            batchJob = queryRun.get(tableNum(BatchJob));
+            batchTask = queryRun.get(tableNum(Batch));
+
+            // Check if we moved to a new BatchJob
+            if (batchJob.RecId != currentBatchJobRecId)
+            {
+                currentBatchJobRecId = batchJob.RecId;
+                taskSequence = 0;
+
+                // Skip jobs without recurrence if filter is enabled
+                if (onlyWithRecurrence && !this.hasRecurrence(batchJob))
+                {
+                    continue;
+                }
+            }
+
+            // Skip task if it uses excluded classes
+            if (batchTask.ClassNumber == classNum(CustAccountStatementExtController)
+            // || batchTask.ClassNumber == classNum(METSalesPickingListGenerationTaskController)
+            || batchTask.ClassNumber == classNum(SysIntegrationActivityBatch)
+             || batchTask.ClassNumber == classNum(SysOperationController))
+            {
+                continue;
+            }
+
+            taskSequence++;
+
+            // Build complete row as container
+            container dataRow = this.buildDataRow(batchJob, batchTask, taskSequence);
+
+            writer.addContainerLine(dataRow);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildDataRow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build complete data row as container
+    /// </summary>
+    private container buildDataRow(BatchJob _batchJob, Batch _batchTask, int _taskSequence)
+    {
+        container row = conNull();
+        int i;
+
+        // Basic job fields
+        row += _batchJob.RecId;
+        row += enum2Str(_batchJob.Status);
+        row += _batchJob.Caption;
+        row += _batchJob.Company;
+        row += _batchJob.BatchGroup;
+        row += _batchJob.ExecutingBy;
+        row += DateTimeUtil::toStr(_batchJob.OrigStartDateTime);
+
+        // Additional job fields
+        row += enum2Str(_batchJob.SchedulingPriority);
+        row += enum2Str(_batchJob.SchedulingPriorityIsOverridden);
+        row += enum2Str(_batchJob.LogLevel);
+        row += enum2Str(_batchJob.Critical);
+        row += enum2Str(_batchJob.MonitoringCategory);
+        row += enum2Str(_batchJob.Managed);
+        row += _batchJob.ActivePeriod;
+        row += this.getAlertsString(_batchJob.RecId);
+
+        // Task fields
+        row += int2Str(_taskSequence);
+        row += _batchTask.Caption;
+        row += classId2Name(_batchTask.ClassNumber);
+        row += enum2Str(_batchTask.RunType);
+        row += enum2Str(_batchTask.ConstraintType);
+        row += this.getDependsOnTasks(_batchTask.RecId);
+        row += this.getExpectedStatus(_batchTask.RecId);
+        row += int2Str(_batchTask.retriesOnFailure);
+
+        // Recurrence breakdown columns (18 columns - moved to end, removed Recur_StartDateTime)
+        if (_taskSequence == 1 && _batchJob.recurrenceData)
+        {
+            row += this.buildRecurrenceBreakdownContainer(_batchJob.recurrenceData, _batchJob.OrigStartDateTime);
+        }
+        else
+        {
+            // Empty recurrence breakdown (18 empty values)
+            for (i = 1; i <= 18; i++)
+            {
+                row += '';
+            }
+        }
+
+        // Parameters chunks
+        if (_batchTask.Parameters)
+        {
+            str paramBase64 = this.containerToBase64String(_batchTask.Parameters);
+            container paramChunks = this.splitIntoChunks(paramBase64, #MaxParameterChunks);
+
+            for (i = 1; i <= conLen(paramChunks); i++)
+            {
+                row += conPeek(paramChunks, i);
+            }
+
+            // Fill remaining empty chunks
+            for (i = conLen(paramChunks) + 1; i <= #MaxParameterChunks; i++)
+            {
+                row += '';
+            }
+        }
+        else
+        {
+            // No parameters - empty chunks
+            for (i = 1; i <= #MaxParameterChunks; i++)
+            {
+                row += '';
+            }
+        }
+
+        return row;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildRecurrenceBreakdownContainer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build recurrence breakdown as container (19 values)
+    /// </summary>
+    private container buildRecurrenceBreakdownContainer(container _recurrenceData, utcDateTime _origStartDateTime)
+    {
+        container breakdown = conNull();
+
+        if (!_recurrenceData)
+        {
+            // Return 18 empty values (removed Recur_StartDateTime)
+            int i;
+            for (i = 1; i <= 18; i++)
+            {
+                breakdown += '';
+            }
+            return breakdown;
+        }
+
+        // Parse recurrence container
+        int version, startTime, endDateRadio, endDateInt;
+        date startDate, endDateDate;
+        int unit;
+        container pattern;
+        int timezone;
+
+        [version, startTime, startDate, endDateRadio, endDateInt, endDateDate, unit, pattern, timezone] = _recurrenceData;
+
+        // Removed: StartDateTime (will be copied from Scheduled Start DateTime during import)
+
+        // Timezone - use the timezone from OrigStartDateTime instead of recurrence data
+        Timezone tz = DateTimeUtil::getOriginatingTimeZone(_origStartDateTime);
+        breakdown += enum2Str(tz);
+
+        // EndType
+        breakdown += (endDateRadio == 1 ? 'NoEnd' : (endDateRadio == 2 ? 'EndAfter' : 'EndBy'));
+
+        // EndAfterCount
+        breakdown += (endDateRadio == 2 ? int2Str(endDateInt) : '');
+
+        // EndByDate
+        breakdown += (endDateRadio == 3 ? date2Str(endDateDate, 321, DateDay::Digits2, DateSeparator::Slash, DateMonth::Digits2, DateSeparator::Slash, DateYear::Digits4) : '');
+
+        // Unit - convert int to string
+        str unitStr = '';
+        switch (unit)
+        {
+            case 0: unitStr = 'Minute'; break;
+            case 1: unitStr = 'Hour'; break;
+            case 2: unitStr = 'Day'; break;
+            case 3: unitStr = 'Week'; break;
+            case 4: unitStr = 'Month'; break;
+            case 5: unitStr = 'Year'; break;
+        }
+        breakdown += unitStr;
+
+        // Pattern-specific fields (13 values)
+        breakdown += this.buildPatternBreakdownContainer(unit, pattern);
+
+        return breakdown;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildPatternBreakdownContainer</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build pattern-specific breakdown (13 values)
+    /// </summary>
+    private container buildPatternBreakdownContainer(int _unit, container _pattern)
+    {
+        container patternBreakdown = conNull();
+
+        switch (_unit)
+        {
+            case 0: // Minute
+            case 1: // Hour
+                patternBreakdown = this.buildMinuteHourBreakdown(_pattern);
+                break;
+
+            case 2: // Day
+                patternBreakdown = this.buildDayBreakdown(_pattern);
+                break;
+
+            case 3: // Week
+                patternBreakdown = this.buildWeekBreakdown(_pattern);
+                break;
+
+            case 4: // Month
+                patternBreakdown = this.buildMonthBreakdown(_pattern);
+                break;
+
+            case 5: // Year
+                patternBreakdown = this.buildYearBreakdown(_pattern);
+                break;
+
+            default:
+                // Empty 13 values
+                int i;
+                for (i = 1; i <= 13; i++)
+                {
+                    patternBreakdown += '';
+                }
+                break;
+        }
+
+        return patternBreakdown;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildMinuteHourBreakdown</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Minute/Hour pattern breakdown (13 values: 1 + 12 empty)
+    /// </summary>
+    private container buildMinuteHourBreakdown(container _pattern)
+    {
+        container breakdown = conNull();
+        int interval;
+        int i;
+
+        [interval] = _pattern;
+
+        breakdown += int2Str(interval);  // Interval
+        breakdown += '';                 // DayType (empty)
+
+        // 11 empty values for Week/Month/Year fields
+        for (i = 1; i <= 11; i++)
+        {
+            breakdown += '';
+        }
+
+        return breakdown;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildDayBreakdown</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Day pattern breakdown (13 values: 2 + 11 empty)
+    /// </summary>
+    private container buildDayBreakdown(container _pattern)
+    {
+        container breakdown = conNull();
+        int type, interval;
+        int i;
+
+        [type, interval] = _pattern;
+
+        breakdown += int2Str(interval);                              // Interval
+        breakdown += (type == 1 ? 'PerDays' : 'EveryWeekday');      // DayType
+
+        // 11 empty values for Week/Month/Year fields
+        for (i = 1; i <= 11; i++)
+        {
+            breakdown += '';
+        }
+
+        return breakdown;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildWeekBreakdown</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Week pattern breakdown (13 values: 2 + 11, but skip first 2)
+    /// </summary>
+    private container buildWeekBreakdown(container _pattern)
+    {
+        container breakdown = conNull();
+        int weekInterval, weekDaysPattern;
+        str daysList;
+        int i;
+
+        [weekInterval, weekDaysPattern] = _pattern;
+
+        // Skip Interval and DayType (2 empty)
+        breakdown += '';
+        breakdown += '';
+
+        // WeekInterval
+        breakdown += int2Str(weekInterval);
+
+        // WeekDays - decode bit pattern
+        daysList = '';
+        if (weekDaysPattern & 2) daysList += 'MON,';
+        if (weekDaysPattern & 4) daysList += 'TUE,';
+        if (weekDaysPattern & 8) daysList += 'WED,';
+        if (weekDaysPattern & 16) daysList += 'THU,';
+        if (weekDaysPattern & 32) daysList += 'FRI,';
+        if (weekDaysPattern & 64) daysList += 'SAT,';
+        if (weekDaysPattern & 1) daysList += 'SUN,';
+        if (daysList) daysList = subStr(daysList, 1, strLen(daysList) - 1);
+
+        breakdown += daysList;
+
+        // 9 empty values for Month/Year fields
+        for (i = 1; i <= 9; i++)
+        {
+            breakdown += '';
+        }
+
+        return breakdown;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildMonthBreakdown</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Month pattern breakdown (13 values)
+    /// </summary>
+    private container buildMonthBreakdown(container _pattern)
+    {
+        container breakdown = conNull();
+        int type, day, perMonth1, perMonth2;
+        int weekOfMonth, dayValue;
+        int i;
+
+        [type, day, perMonth1, weekOfMonth, dayValue, perMonth2] = _pattern;
+
+        // Skip first 4 columns (Interval, DayType, WeekInterval, WeekDays)
+        for (i = 1; i <= 4; i++)
+        {
+            breakdown += '';
+        }
+
+        // MonthType
+        breakdown += (type == 1 ? 'SpecificDay' : 'SpecificWeekday');
+
+        if (type == 1) // Specific day
+        {
+            breakdown += int2Str(day);          // MonthDay
+            breakdown += int2Str(perMonth1);    // MonthInterval
+            breakdown += '';                     // MonthWeek (empty)
+            breakdown += '';                     // MonthWeekday (empty)
+        }
+        else // Specific weekday
+        {
+            breakdown += '';                     // MonthDay (empty)
+            breakdown += int2Str(perMonth2);    // MonthInterval
+
+            // MonthWeek
+            WeekOfMonth weekEnum = weekOfMonth;
+            breakdown += enum2Str(weekEnum);
+
+            // MonthWeekday
+            WeekDays dayEnum = dayValue;
+            breakdown += enum2Str(dayEnum);
+        }
+
+        // 4 empty values for Year fields (not 5!)
+        for (i = 1; i <= 4; i++)
+        {
+            breakdown += '';
+        }
+
+        return breakdown;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildYearBreakdown</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Year pattern breakdown (13 values)
+    /// </summary>
+    private container buildYearBreakdown(container _pattern)
+    {
+        container breakdown = conNull();
+        int type, weekOfMonth, dayValue, monthValue;
+        int i;
+
+        [type, weekOfMonth, dayValue, monthValue] = _pattern;
+
+        // Skip first 9 columns (not 10!)
+        for (i = 1; i <= 9; i++)
+        {
+            breakdown += '';
+        }
+
+        // YearType
+        breakdown += (type == 1 ? 'OnceAYear' : 'SpecificWeekday');
+
+        if (type == 1) // Once a year
+        {
+            breakdown += '';  // YearWeek (empty)
+            breakdown += '';  // YearWeekday (empty)
+            breakdown += '';  // YearMonth (empty)
+        }
+        else // Specific weekday
+        {
+            // YearWeek
+            WeekOfMonth weekEnum = weekOfMonth;
+            breakdown += enum2Str(weekEnum);
+
+            // YearWeekday
+            WeekDays dayEnum = dayValue;
+            breakdown += enum2Str(dayEnum);
+
+            // YearMonth
+            MonthsOfYear monthEnum = monthValue;
+            breakdown += enum2Str(monthEnum);
+        }
+
+        return breakdown;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDependsOnTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get depends on tasks as comma-separated task sequence list
+    /// </summary>
+    private str getDependsOnTasks(RefRecId _batchTaskRecId)
+    {
+        BatchConstraints    constraint;
+        Batch               dependsOnBatch;
+        Map                 batchRecIdToSequenceMap;
+        str                 result = '';
+        int                 taskSequence;
+        boolean             first = true;
+
+        // Build map of RecId to TaskSequence
+        batchRecIdToSequenceMap = this.getBatchRecIdToSequenceMap(_batchTaskRecId);
+
+        while select constraint
+            where constraint.BatchId == _batchTaskRecId
+        {
+            if (batchRecIdToSequenceMap.exists(constraint.DependsOnBatchId))
+            {
+                taskSequence = batchRecIdToSequenceMap.lookup(constraint.DependsOnBatchId);
+
+                if (!first)
+                {
+                    result += ',';
+                }
+                result += int2Str(taskSequence);
+                first = false;
+            }
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBatchRecIdToSequenceMap</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Build map of Batch RecId to Task Sequence for current job
+    /// </summary>
+    private Map getBatchRecIdToSequenceMap(RefRecId _batchTaskRecId)
+    {
+        Batch           batchTask;
+        Batch           targetTask;
+        Map             sequenceMap = new Map(Types::Int64, Types::Integer);
+        RefRecId        batchJobRecId;
+        int             sequence;
+
+        // Get the job RecId from the task
+        select firstonly batchTask
+            where batchTask.RecId == _batchTaskRecId;
+
+        batchJobRecId = batchTask.BatchJobId;
+
+        // Build sequence map for all tasks in this job
+        sequence = 0;
+        while select targetTask
+            order by CreatedDateTime
+            where targetTask.BatchJobId == batchJobRecId
+        {
+            sequence++;
+            sequenceMap.insert(targetTask.RecId, sequence);
+        }
+
+        return sequenceMap;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getExpectedStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get expected status
+    /// </summary>
+    private str getExpectedStatus(RefRecId _batchTaskRecId)
+    {
+        BatchConstraints constraint;
+
+        select firstonly constraint
+            where constraint.BatchId == _batchTaskRecId;
+
+        return constraint.RecId ? enum2Str(constraint.ExpectedStatus) : '';
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getAlertsString</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get alerts string for batch job
+    /// Format: userid1:ended,error,popup;userid2:error,email
+    /// </summary>
+    private str getAlertsString(RefRecId _batchJobRecId)
+    {
+        BatchJobAlerts  alert;
+        str             result = '';
+        str             userAlerts;
+        boolean         firstUser = true;
+
+        while select alert
+            where alert.BatchJobId == _batchJobRecId
+        {
+            if (!firstUser)
+            {
+                result += ';';
+            }
+
+            userAlerts = alert.UserId + ':';
+            boolean firstFlag = true;
+
+            if (alert.BatchJobEnded)
+            {
+                if (!firstFlag) userAlerts += ',';
+                userAlerts += 'ended';
+                firstFlag = false;
+            }
+            if (alert.BatchJobError)
+            {
+                if (!firstFlag) userAlerts += ',';
+                userAlerts += 'error';
+                firstFlag = false;
+            }
+            if (alert.BatchJobCanceled)
+            {
+                if (!firstFlag) userAlerts += ',';
+                userAlerts += 'canceled';
+                firstFlag = false;
+            }
+            if (alert.Popup)
+            {
+                if (!firstFlag) userAlerts += ',';
+                userAlerts += 'popup';
+                firstFlag = false;
+            }
+            if (alert.Email)
+            {
+                if (!firstFlag) userAlerts += ',';
+                userAlerts += 'email';
+                firstFlag = false;
+            }
+
+            result += userAlerts;
+            firstUser = false;
+        }
+
+        return result;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>containerToBase64String</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Convert container to base64 string
+    /// </summary>
+    private str containerToBase64String(container _con)
+    {
+        return con2Base64Str(_con);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calculateChunkCount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Calculate chunk count needed
+    /// </summary>
+    private int calculateChunkCount(str _data)
+    {
+        return (_data ? ((strLen(_data) - 1) div #MaxChunkSize) + 1 : 0);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>splitIntoChunks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Split string into chunks and return as container
+    /// </summary>
+    private container splitIntoChunks(str _data, int _maxChunks)
+    {
+        container chunks = conNull();
+        int chunkCount = this.calculateChunkCount(_data);
+        int i, startPos, chunkLength;
+
+        chunkCount = min(chunkCount, _maxChunks);
+
+        for (i = 1; i <= chunkCount; i++)
+        {
+            startPos = ((i - 1) * #MaxChunkSize) + 1;
+            chunkLength = min(#MaxChunkSize, strLen(_data) - startPos + 1);
+            chunks += subStr(_data, startPos, chunkLength);
+        }
+
+        return chunks;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>finalizeExport</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finalize export and download
+    /// </summary>
+    private void finalizeExport()
+    {
+        writer.createExcelDocument();
+        writer.doExcelOutput('A1');
+        writer.excelMarkAsBorderAll();
+        writer.formatColumWidth();
+        writer.finishOutput();
+
+        info(strFmt('Export completed: %1 rows exported', writer.getRowsCount()));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Pack/unpack
+    /// </summary>
+    public container pack()
+    {
+        return [#CurrentVersion] + [#CurrentList] + [queryRun.pack()];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Unpack from serialization
+    /// </summary>
+    public boolean unpack(container _packedClass)
+    {
+        Version     version = RunBase::getVersion(_packedClass);
+        container   queryCon;
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList, queryCon] = _packedClass;
+
+                if (SysQuery::isPackedOk(queryCon))
+                {
+                    queryRun = new QueryRun(queryCon);
+                }
+                else
+                {
+                    this.initQuery();
+                }
+                break;
+
+            default:
+                return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showQueryValues</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Show query values in dialog
+    /// </summary>
+    public boolean showQueryValues()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Can run in new session
+    /// </summary>
+    public boolean canRunInNewSession()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canGoBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Disable batch functionality
+    /// </summary>
+    public boolean canGoBatch()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>allowSaveLast</Name>
+				<Source><![CDATA[
+    /// <summary>
+    // Override to prevent saving dialog values to SysLastValue
+    /// </summary>
+    public boolean allowSaveLast()
+    {
+        return false; // This disables SysLastValue persistence
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Class description
+    /// </summary>
+    static ClassDescription description()
+    {
+        return "Export batch jobs for cross-environment migration";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Entry point
+    /// </summary>
+    public static void main(Args _args)
+    {
+        METBatchJobMigrationExport export = new METBatchJobMigrationExport();
+
+        if (export.prompt())
+        {
+            export.run();
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
