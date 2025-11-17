@@ -4,9 +4,7 @@
 	<SourceCode>
 		<Declaration><![CDATA[
 /// <summary>
-/// Complete batch job import for cross-environment migration - REFACTORED
-/// Uses METFileReaderExcel framework for cleaner, more maintainable code
-/// Imports ALL fields that BatchJobCopy uses - 100% compatible
+/// Complete batch job import for cross-environment migration
 /// </summary>
 using System.IO;
 public class METBatchJobMigrationImport extends RunBaseBatch
@@ -19,6 +17,8 @@ public class METBatchJobMigrationImport extends RunBaseBatch
     METBatchJobStatusOverride           overrideStatus;
     NoYes                               allowDuplicates;
     NoYes                               createForFutureDate;
+    str                                 currentRecurStartDateTime; // Temp storage for Recur_StartDateTime during import
+    str                                 currentOriginalJobId;      // Temp storage for original Job Id during import
 
     private const str FileUploadName = 'FileUpload';
     private const str OkButtonName   = 'OkButton';
@@ -209,13 +209,6 @@ public class METBatchJobMigrationImport extends RunBaseBatch
             info(strFmt("Tasks created: %1, Tasks skipped: %2",
             reader.getInsertedRecords(),
             reader.getSkippedRecords()));
-
-            info("Task parameters imported - review individual task messages for any parameter import failures");
-            info("Recurrence built from Excel Recur_* columns - start date/time copied from Scheduled Start DateTime");
-            if (createForFutureDate == NoYes::Yes)
-            {
-                info("Future date calculation enabled - scheduled date/time updated to next occurrence after current date/time");
-            }
         }
         catch (Exception::Error)
         {
@@ -318,14 +311,37 @@ public class METBatchJobMigrationImport extends RunBaseBatch
             tmpRecord.clear();
 
             // Read basic job fields
+            this.currentOriginalJobId = _reader.getStringByName('Job Id');
             tmpRecord.JobCaption = _reader.getStringByName('Job Caption');
-            tmpRecord.Company = _reader.getStringByName('Company');
+            tmpRecord.Company = _reader.getStringByName('Job Company');
             tmpRecord.BatchGroup = _reader.getStringByName('Batch Group');
             tmpRecord.RunBy = _reader.getStringByName('Run By');
-            tmpRecord.ScheduledStartDateTime = _reader.getStringByName('Scheduled Start DateTime');
+            tmpRecord.ScheduledStartDateTime = _reader.getStringByName('Scheduled Start DateTime(UserTZ)');
             tmpRecord.JobStatus = _reader.getStringByName('Job Status');
 
-            // Read 18 recurrence breakdown columns
+            // Read UserTZ and Recur_StartDateTime
+            str userTZ = _reader.getStringByName('UserTZ');
+            this.currentRecurStartDateTime = _reader.getStringByName('Recur_StartDateTime');
+
+            // Convert Scheduled Start DateTime from user timezone to UTC
+            if (tmpRecord.ScheduledStartDateTime && userTZ)
+            {
+                int userTimezone = this.parseTimezone(userTZ);
+                utcDateTime scheduledDTString = this.parseDateTime(tmpRecord.ScheduledStartDateTime);
+                if (scheduledDTString != DateTimeUtil::minValue())
+                {
+                    // Extract date and time components (currently parsed as if UTC)
+                    date schedDate = DateTimeUtil::date(scheduledDTString);
+                    int schedTime = DateTimeUtil::time(scheduledDTString);
+
+                    // Create UTC datetime from date/time in user timezone
+                    // This interprets "10:00 in GMT+10" and converts to proper UTC
+                    utcDateTime scheduledDTInUTC = DateTimeUtil::newDateTime(schedDate, schedTime, userTimezone);
+                    tmpRecord.ScheduledStartDateTime = DateTimeUtil::toStr(scheduledDTInUTC);
+                }
+            }
+
+            // Read 19 recurrence breakdown columns
             tmpRecord.RecurTimezone = _reader.getStringByName('Recur_Timezone');
             tmpRecord.RecurEndType = _reader.getStringByName('Recur_EndType');
             tmpRecord.RecurEndAfterCount = _reader.getStringByName('Recur_EndAfterCount');
@@ -355,13 +371,14 @@ public class METBatchJobMigrationImport extends RunBaseBatch
             tmpRecord.ActivePeriod = _reader.getStringByName('Active Period');
             tmpRecord.Alerts = _reader.getStringByName('Alerts');
 
-            // Read task fields
-            tmpRecord.TaskSequence = _reader.getIntByName('Task Sequence');
+            // Read task fields (in new order)
             tmpRecord.TaskCaption = _reader.getStringByName('Task Caption');
+            tmpRecord.TaskCompany = _reader.getStringByName('Task Company');
             tmpRecord.ClassName = _reader.getStringByName('Class Name');
+            tmpRecord.RecurYearMonth = _reader.getStringByName('Task Sequence'); // Store RecId as string in RecurYearMonth field
+            tmpRecord.DependsOnTasks = _reader.getStringByName('Depends On Tasks');
             tmpRecord.RunType = _reader.getStringByName('Run Type');
             tmpRecord.ConstraintType = _reader.getStringByName('Constraint Type');
-            tmpRecord.DependsOnTasks = _reader.getStringByName('Depends On Tasks');
             tmpRecord.ExpectedStatus = _reader.getStringByName('Expected Status');
             tmpRecord.MaximumRetries = _reader.getIntByName('Maximum Retries');
 
@@ -494,7 +511,28 @@ public class METBatchJobMigrationImport extends RunBaseBatch
                         scheduledDateTime = this.calculateNextFutureDate(scheduledDateTime, recurrenceData);
                     }
 
-                    batchJob.OrigStartDateTime = scheduledDateTime;
+                    // Always parse timezone from Excel and apply it to OrigStartDateTime
+                    int timezone;
+                    if (firstTaskTmp.RecurTimezone)
+                    {
+                        timezone = this.parseTimezone(firstTaskTmp.RecurTimezone);
+                    }
+                    else if (recurrenceData != conNull())
+                    {
+                        timezone = conPeek(recurrenceData, 9); // Fallback to recurrence data
+                    }
+                    else
+                    {
+                        timezone = DateTimeUtil::getUserPreferredTimeZone(); // Last resort
+                    }
+
+                    // scheduledDateTime is in UTC - convert to target timezone to get date/time components
+                    utcDateTime scheduledDateTimeInTZ = DateTimeUtil::applyTimeZoneOffset(scheduledDateTime, timezone);
+                    date schedDate = DateTimeUtil::date(scheduledDateTimeInTZ);
+                    int schedTime = DateTimeUtil::time(scheduledDateTimeInTZ);
+
+                    // Create OrigStartDateTime with timezone context
+                    batchJob.OrigStartDateTime = DateTimeUtil::newDateTime(schedDate, schedTime, timezone);
                 }
             }
 
@@ -540,6 +578,9 @@ public class METBatchJobMigrationImport extends RunBaseBatch
             batchJob.insert();
             newJobRecId = batchJob.RecId;
 
+            // Log job creation
+            info(strFmt("For job %1, Caption %2 the following job created %3", this.currentOriginalJobId, _jobCaption, newJobRecId));
+
             // Create alerts (mirrors BatchJobCopy.copyAlerts)
             if (firstTaskTmp.Alerts)
             {
@@ -547,7 +588,8 @@ public class METBatchJobMigrationImport extends RunBaseBatch
             }
 
             // Create tasks (mirrors BatchJobCopy.copyTasks)
-            taskSequenceMap = new Map(Types::Integer, Types::Int64);
+            // Map: old RecId (from source environment) -> new RecId (in target environment)
+            taskSequenceMap = new Map(Types::Int64, Types::Int64);
             this.createBatchTasks(newJobRecId, _taskList, taskSequenceMap, _reader);
 
             // Create constraints (mirrors BatchJobCopy.copyConstraints)
@@ -674,9 +716,9 @@ public class METBatchJobMigrationImport extends RunBaseBatch
             tmpRecord = enumerator.current();
 
             // Validate task data
-            if (tmpRecord.TaskSequence == 0)
+            if (!tmpRecord.RecurYearMonth)
             {
-                warning(strFmt("Invalid task sequence (0) - Excel file may be from old export format or columns misaligned. Task Caption: '%1'",
+                warning(strFmt("Invalid task sequence (empty) - Excel file may be from old export format or columns misaligned. Task Caption: '%1'",
                 tmpRecord.TaskCaption));
                 _reader.incSkippedRecords();
                 continue;
@@ -686,7 +728,7 @@ public class METBatchJobMigrationImport extends RunBaseBatch
             {
                 warning(strFmt("Task '%1' (Seq: %2): Class name is empty - Excel file may be from old export format or columns misaligned.",
                 tmpRecord.TaskCaption,
-                tmpRecord.TaskSequence));
+                tmpRecord.RecurYearMonth));
                 _reader.incSkippedRecords();
                 continue;
             }
@@ -696,7 +738,7 @@ public class METBatchJobMigrationImport extends RunBaseBatch
             {
                 warning(strFmt("Task '%1' (Seq: %2): Class '%3' not found in this environment. Skipping task.",
                 tmpRecord.TaskCaption,
-                tmpRecord.TaskSequence,
+                tmpRecord.RecurYearMonth,
                 tmpRecord.ClassName));
                 _reader.incSkippedRecords();
                 continue;
@@ -709,12 +751,19 @@ public class METBatchJobMigrationImport extends RunBaseBatch
                 company = curext();
             }
 
+            // Get task company (fallback to job company if not specified)
+            str taskCompany = tmpRecord.TaskCompany;
+            if (!taskCompany)
+            {
+                taskCompany = company;
+            }
+
             // Create batch task (mirrors BatchJobCopy task creation)
             batch.clear();
             batch.BatchJobId = _batchJobRecId;
             batch.Caption = tmpRecord.TaskCaption;
             batch.ClassNumber = classId;
-            batch.Company = company;
+            batch.Company = taskCompany;  // Use task-specific company
             batch.GroupId = tmpRecord.BatchGroup;
             batch.Status = BatchStatus::Hold;
             batch.retriesOnFailure = tmpRecord.MaximumRetries;
@@ -722,13 +771,13 @@ public class METBatchJobMigrationImport extends RunBaseBatch
             // Set Run Type
             if (tmpRecord.RunType)
             {
-                batch.RunType = str2Int(tmpRecord.RunType);
+                batch.RunType = this.parseEnumValue(enumNum(BatchRunType), tmpRecord.RunType, BatchRunType::Server);
             }
 
             // Set constraint type
             if (tmpRecord.ConstraintType)
             {
-                batch.ConstraintType = str2Int(tmpRecord.ConstraintType);
+                batch.ConstraintType = this.parseEnumValue(enumNum(BatchConstraintType), tmpRecord.ConstraintType, BatchConstraintType::And);
             }
 
             // Set parameters - always import with validation and error handling
@@ -737,7 +786,7 @@ public class METBatchJobMigrationImport extends RunBaseBatch
                 container paramContainer = this.base64stringToContainer(
                 tmpRecord.Parameters,
                 tmpRecord.TaskCaption,
-                tmpRecord.TaskSequence
+                tmpRecord.RecurYearMonth
             );
 
                 if (paramContainer != conNull())
@@ -751,7 +800,9 @@ public class METBatchJobMigrationImport extends RunBaseBatch
             // Track using framework
             _reader.incInsertedRecords();
 
-            _taskSequenceMap.insert(tmpRecord.TaskSequence, batch.RecId);
+            // Map old RecId (from source) to new RecId (in target)
+            RefRecId oldRecId = str2Int64(tmpRecord.RecurYearMonth);
+            _taskSequenceMap.insert(oldRecId, batch.RecId);
         }
     }
 
@@ -770,7 +821,6 @@ public class METBatchJobMigrationImport extends RunBaseBatch
         BatchConstraints        constraint;
         container               dependsOnSequences;
         int                     i;
-        int                     dependsOnSequence;
         RefRecId                batchRecId;
         RefRecId                dependsOnBatchRecId;
 
@@ -783,18 +833,22 @@ public class METBatchJobMigrationImport extends RunBaseBatch
                 continue;
             }
 
-            batchRecId = _taskSequenceMap.lookup(tmpRecord.TaskSequence);
+            // Get new RecId for current task using old RecId from Excel
+            RefRecId oldRecId = str2Int64(tmpRecord.RecurYearMonth);
+            batchRecId = _taskSequenceMap.lookup(oldRecId);
             if (!batchRecId)
             {
                 continue;
             }
 
             dependsOnSequences = str2con(tmpRecord.DependsOnTasks, ',');
+            container expectedStatuses = str2con(tmpRecord.ExpectedStatus, ',');
 
             for (i = 1; i <= conLen(dependsOnSequences); i++)
             {
-                dependsOnSequence = str2Int(conPeek(dependsOnSequences, i));
-                dependsOnBatchRecId = _taskSequenceMap.lookup(dependsOnSequence);
+                // Parse depends-on old RecId and lookup new RecId
+                RefRecId oldDependsOnRecId = str2Int64(conPeek(dependsOnSequences, i));
+                dependsOnBatchRecId = _taskSequenceMap.lookup(oldDependsOnRecId);
 
                 if (dependsOnBatchRecId)
                 {
@@ -802,9 +856,18 @@ public class METBatchJobMigrationImport extends RunBaseBatch
                     constraint.BatchId = batchRecId;
                     constraint.DependsOnBatchId = dependsOnBatchRecId;
 
-                    if (tmpRecord.ExpectedStatus)
+                    // Get expected status for this dependency (use index i, or default if not enough statuses)
+                    if (i <= conLen(expectedStatuses))
                     {
-                        constraint.ExpectedStatus = str2Int(tmpRecord.ExpectedStatus);
+                        str statusStr = conPeek(expectedStatuses, i);
+                        if (statusStr)
+                        {
+                            constraint.ExpectedStatus = this.parseEnumValue(enumNum(BatchDependencyStatus), statusStr, BatchDependencyStatus::Finished);
+                        }
+                        else
+                        {
+                            constraint.ExpectedStatus = BatchDependencyStatus::Finished;
+                        }
                     }
                     else
                     {
@@ -1326,7 +1389,7 @@ public class METBatchJobMigrationImport extends RunBaseBatch
     /// Convert string to container with validation and error handling
     /// Safe version for parameter import with logging
     /// </summary>
-    private container base64stringToContainer(str _str, str _taskCaption, int _taskSequence)
+    private container base64stringToContainer(str _str, str _taskCaption, str _taskSequence)
     {
         container   result = conNull();
 
@@ -1389,19 +1452,44 @@ public class METBatchJobMigrationImport extends RunBaseBatch
                 return conNull();
             }
 
-            // Parse common fields - use Scheduled Start DateTime (copied from job level)
-            utcDateTime startDateTime = this.parseDateTime(_tmpRecord.ScheduledStartDateTime);
+            // Parse timezone first (needed for datetime conversion)
+            int timezone = this.parseTimezone(_tmpRecord.RecurTimezone);
+
+            // Parse recurrence start datetime from Recur_StartDateTime if available, otherwise use ScheduledStartDateTime
+            utcDateTime startDateTime;
+
+            if (this.currentRecurStartDateTime)
+            {
+                // Recur_StartDateTime is in recurrence timezone - need to convert to UTC
+                utcDateTime recurStartDTParsed = this.parseDateTime(this.currentRecurStartDateTime);
+                if (recurStartDTParsed != DateTimeUtil::minValue())
+                {
+                    // Extract date/time components
+                    date recurStartDate = DateTimeUtil::date(recurStartDTParsed);
+                    int recurStartTime = DateTimeUtil::time(recurStartDTParsed);
+
+                    // Create UTC datetime from date/time in recurrence timezone
+                    startDateTime = DateTimeUtil::newDateTime(recurStartDate, recurStartTime, timezone);
+                }
+                else
+                {
+                    startDateTime = DateTimeUtil::minValue();
+                }
+            }
+            else
+            {
+                // Fall back to ScheduledStartDateTime (already converted to UTC earlier)
+                startDateTime = this.parseDateTime(_tmpRecord.ScheduledStartDateTime);
+            }
+
             if (startDateTime == DateTimeUtil::minValue())
             {
-                warning(strFmt("Invalid recurrence start date/time for job '%1'. Using Scheduled Start DateTime. Recurrence not created.", _tmpRecord.JobCaption));
+                warning(strFmt("Invalid recurrence start date/time for job '%1'. Recurrence not created.", _tmpRecord.JobCaption));
                 return conNull();
             }
 
             date startDate = DateTimeUtil::date(startDateTime);
             int startTime = DateTimeUtil::time(startDateTime);
-
-            // Parse timezone
-            int timezone = this.parseTimezone(_tmpRecord.RecurTimezone);
 
             // Parse end condition
             int endDateRadio;
@@ -1446,8 +1534,6 @@ public class METBatchJobMigrationImport extends RunBaseBatch
             // Build final container
             int version = SysRecurrence::recurrenceVersion();
             container recurrenceData = [version, startTime, startDate, endDateRadio, endDateInt, endDateDate, unit, pattern, timezone];
-
-            info(strFmt("Built recurrence from Excel columns for job '%1': %2", _tmpRecord.JobCaption, _tmpRecord.RecurUnit));
 
             return recurrenceData;
         }
@@ -1561,17 +1647,22 @@ public class METBatchJobMigrationImport extends RunBaseBatch
         str daysStr = _tmpRecord.RecurWeekDays;
         int daysBitPattern = 0;
 
-        if (strScan(daysStr, 'MON', 1, strLen(daysStr)) > 0)  daysBitPattern += 0x1;
-        if (strScan(daysStr, 'TUE', 1, strLen(daysStr)) > 0)  daysBitPattern += 0x2;
-        if (strScan(daysStr, 'WED', 1, strLen(daysStr)) > 0)  daysBitPattern += 0x4;
-        if (strScan(daysStr, 'THU', 1, strLen(daysStr)) > 0)  daysBitPattern += 0x8;
-        if (strScan(daysStr, 'FRI', 1, strLen(daysStr)) > 0)  daysBitPattern += 0x10;
-        if (strScan(daysStr, 'SAT', 1, strLen(daysStr)) > 0)  daysBitPattern += 0x20;
-        if (strScan(daysStr, 'SUN', 1, strLen(daysStr)) > 0)  daysBitPattern += 0x40;
+        // Use correct WeekDays enum bit flags
+        if (strScan(daysStr, 'SUN', 1, strLen(daysStr)) > 0)  daysBitPattern += 1;   // Sunday = 1
+        if (strScan(daysStr, 'MON', 1, strLen(daysStr)) > 0)  daysBitPattern += 2;   // Monday = 2
+        if (strScan(daysStr, 'TUE', 1, strLen(daysStr)) > 0)  daysBitPattern += 4;   // Tuesday = 4
+        if (strScan(daysStr, 'WED', 1, strLen(daysStr)) > 0)  daysBitPattern += 8;   // Wednesday = 8
+        if (strScan(daysStr, 'THU', 1, strLen(daysStr)) > 0)  daysBitPattern += 16;  // Thursday = 16
+        if (strScan(daysStr, 'FRI', 1, strLen(daysStr)) > 0)  daysBitPattern += 32;  // Friday = 32
+        if (strScan(daysStr, 'SAT', 1, strLen(daysStr)) > 0)  daysBitPattern += 64;  // Saturday = 64
 
         if (daysBitPattern == 0)
         {
-            daysBitPattern = 0x1F; // Default to Mon-Fri
+            daysBitPattern = 31; // Default to Mon-Fri (D365 uses 31 for weekdays)
+        }
+        else if (daysBitPattern == 62) // Mon+Tue+Wed+Thu+Fri = 2+4+8+16+32
+        {
+            daysBitPattern = 31; // Convert to D365's weekdays constant
         }
 
         return [weekInterval, daysBitPattern];
@@ -1651,6 +1742,7 @@ public class METBatchJobMigrationImport extends RunBaseBatch
         int tz;
         DictEnum dictEnum;
         int i;
+        str trimmedStr;
 
         try
         {
@@ -1659,11 +1751,14 @@ public class METBatchJobMigrationImport extends RunBaseBatch
                 return DateTimeUtil::getUserPreferredTimeZone();
             }
 
+            // Trim whitespace for better matching
+            trimmedStr = strRTrim(strLTrim(_timezoneStr));
+
             // Try matching by label (e.g., "(GMT+10:00) Canberra, Melbourne, Sydney")
             dictEnum = new DictEnum(enumNum(Timezone));
             for (i = 0; i < dictEnum.values(); i++)
             {
-                if (dictEnum.index2Label(i) == _timezoneStr || dictEnum.index2Name(i) == _timezoneStr)
+                if (dictEnum.index2Label(i) == trimmedStr || dictEnum.index2Name(i) == trimmedStr)
                 {
                     return dictEnum.index2Value(i);
                 }
