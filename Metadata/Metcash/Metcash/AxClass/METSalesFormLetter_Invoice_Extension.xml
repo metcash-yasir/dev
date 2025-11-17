@@ -26,7 +26,208 @@ final class METSalesFormLetter_Invoice_Extension
             throw warning(strFmt("@SYS18389", salesTableLocal.CustAccount, enum2Str(blockStatus)));
         }
 
-        next run();
+        if (this.shouldSplitCreditInvoice(salesTableLocal)
+                && this.isChargeExist(salesTableLocal, false)
+                && this.isChargeExist(salesTableLocal, true))
+        {            
+            // Create and post credit note
+            this.createAndPostCreditNote(salesTableLocal);     
+        }   
+       
+        next run(); 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldSplitCreditInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines if the sales invoice should be split into credit and tax invoices based on sales type, original invoice, and order type settings.    
+    /// </summary>
+    /// <param name = "_salesTable"></param>
+    /// <returns>True if the invoice should be split; otherwise, false.</returns>
+    public boolean shouldSplitCreditInvoice(SalesTable _salesTable)
+    {
+        METSalesTable       metSalesTable =  METSalesTable::findByRefRecId(_salesTable.RecId);
+        METSalesOrderTypes  metSalesOrderTypes = METSalesOrderTypes::find(_salesTable.METSalesOrderType);
+      
+        return _salesTable.SalesType == SalesType::Sales
+                && strLen(metSalesTable.OriginalInvoice) > 0
+                && metSalesOrderTypes.SplitCreditInvoice == NoYes::Yes;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isChargeExist</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if any charge exists for the specified sales table record.
+    /// </summary>
+    /// <param name = "_salesTable"></param>
+    /// <param name = "_isPositive">True to check for positive charges; false for negative charges.</param>
+    /// <returns>True if a charge exists based on the flag; otherwise, false.</returns>
+    public boolean isChargeExist(SalesTable _salesTable, boolean _isPositive)
+    {
+        MarkupTrans markupTransLocal;
+        int valueComparison = _isPositive ? 1 : -1;
+
+        select firstonly RecId from markupTransLocal
+        where markupTransLocal.TransTableId == tableNum(SalesTable)
+            && markupTransLocal.TransRecId == _salesTable.RecId
+            && ((_isPositive && markupTransLocal.Value > 0) || (!_isPositive && markupTransLocal.Value < 0));
+
+        return markupTransLocal.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createAndPostCreditNote</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates and posts a credit note for the specified sales table record by processing all negative quantity sales lines.
+    /// </summary>
+    /// <param name = "_salesTable"></param>
+    private void createAndPostCreditNote(SalesTable _salesTableLocal)
+    {
+        salesFormLetter         salesFormLetter;
+        salesFormletterParmData salesFormLetterParmData;
+        salesParmUpdate         salesParmUpdate;
+        salesParmTable          salesParmTable;
+        salesParmLine           salesParmLine;
+        SalesLine               saleslineLocal;
+        MarkupTrans             markupTransHeader;  
+        List                    taxInvoiceHeaderCharges = new List(Types::Record);
+
+        try
+        {
+            taxInvoiceHeaderCharges = this.prepareTaxInvoiceData(_salesTableLocal);
+     
+            ttsbegin;
+            salesFormLetterParmData = salesFormletterParmData::newData(DocumentStatus::Invoice, VersioningUpdateType::Initial);
+
+            salesFormLetterParmData.parmOnlyCreateParmUpdate(true);
+            salesFormLetterParmData.createData(false);
+            salesParmUpdate = salesFormLetterParmData.parmParmUpdate();
+
+            // Prepare parameter data for invoice posting
+            salesParmTable.clear();
+            salesParmTable.initFromSalesTable(_salesTableLocal);
+            salesParmTable.TransDate                = SystemDateGet();
+            salesParmTable.Ordering                 = DocumentStatus::Invoice;
+            salesParmTable.ParmJobStatus            = ParmJobStatus::Waiting;
+            salesParmTable.ParmId                   = salesParmUpdate.ParmId;
+            salesParmTable.insert();
+       
+    
+            // Filter and add only negative quantity lines
+            while select saleslineLocal
+                where saleslineLocal.SalesId == _salesTableLocal.SalesId
+                && saleslineLocal.SalesQty < 0
+            {
+                salesParmLine.InitFromsalesLine(saleslineLocal);
+                salesParmLine.DeliverNow    = saleslineLocal.SalesQty;
+                salesParmLine.ParmId        = salesParmTable.ParmId;
+                salesParmLine.TableRefId    = salesParmTable.TableRefId;
+                salesParmLine.setQty(DocumentStatus::Invoice, true, true); 
+                salesParmLine.setLineAmount(saleslineLocal);
+                salesParmLine.insert();
+            }  
+            ttscommit;
+
+            // Post the credit note
+            salesFormLetter = salesFormLetter::construct(DocumentStatus::Invoice);
+            salesFormLetter.transDate(SystemDateGet());
+            salesFormLetter.proforma(false);
+            salesFormLetter.specQty(salesUpdate::DeliverNow);
+            salesFormLetter.salesTable(_salesTableLocal);
+            salesFormLetter.parmId(salesParmTable.ParmId);
+        
+            salesFormLetter.salesParmUpdate(salesFormLetterParmData.parmParmUpdate());
+            salesFormLetter.run();
+         
+            this.addTaxInvoiceHeaderCharges(taxInvoiceHeaderCharges);        
+        }
+        catch (Exception::Error)
+        {
+            ttsabort;
+            throw error("@MET:FailedToCreateCN" + _salesTableLocal.SalesId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>prepareTaxInvoiceData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Prepares tax invoice header charges for the specified sales table by collecting positive MarkupTrans records, unlinks them, and removes negative lines from the parameter table. Returns a list of MarkupTrans records for later processing.  
+    /// </summary>
+    /// <param name = "_salesTable"></param>
+    /// <returns></returns>
+    public list prepareTaxInvoiceData(SalesTable _salesTable)
+    {
+        MarkupTrans     markupTransHeader;
+        salesParmTable  salesParmTable;
+        salesParmLine   salesParmLine;
+        List            taxInvoiceHeaderCharges = new List(Types::Record);
+
+        // Select records into the list
+        while select markupTransHeader
+            where markupTransHeader.TransTableId == tableNum(SalesTable)
+            && markupTransHeader.TransRecId == _salesTable.RecId
+            && markupTransHeader.Value > 0
+        {
+            taxInvoiceHeaderCharges.addEnd(markupTransHeader);
+        }
+     
+        ttsbegin;
+        // Unlink positive markup transaction.
+        delete_from markupTransHeader
+            where markupTransHeader.TransTableId == tableNum(SalesTable)
+                && markupTransHeader.TransRecId == _salesTable.RecId
+                && markupTransHeader.Value > 0;
+
+        select firstonly salesParmTable
+            where salesParmTable.ParmId == this.parmId()
+                && salesParmTable.SalesId == _salesTable.SalesId;
+
+        if (salesParmTable.RecId)
+        {
+            // Remove negative lines from original parameter table.
+            delete_from salesParmLine
+                where salesParmLine.ParmId == salesParmTable.ParmId
+                    && salesParmLine.TableRefId == salesParmTable.TableRefId
+                    && salesParmLine.LineAmount < 0;
+        }
+        ttscommit;
+
+        return taxInvoiceHeaderCharges;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addTaxInvoiceHeaderCharges</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Adds tax invoice header charges by inserting each MarkupTrans record from the provided list.
+    /// </summary>
+    /// <param name = "_taxInvoiceHeaderCharges"></param>
+    public void addTaxInvoiceHeaderCharges(List _taxInvoiceHeaderCharges)
+    {
+        MarkupTrans     markupTransHeader;
+        ListEnumerator  enumerator = _taxInvoiceHeaderCharges.getEnumerator();
+       
+        ttsbegin;
+        while (enumerator.moveNext())
+        {
+            markupTransHeader = enumerator.current();
+            markupTransHeader.insert();
+        }
+        ttscommit;    
     }
 
 ]]></Source>
