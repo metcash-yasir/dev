@@ -189,6 +189,39 @@ public class METBatchJobMigrationExport extends RunBaseBatch
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>hasEndAfterRecurrence</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if job has EndAfter recurrence type (TEMPORARY - remove when ready to support EndAfter)
+    /// </summary>
+    private boolean hasEndAfterRecurrence(BatchJob _batchJob)
+    {
+        if (!_batchJob.recurrenceData)
+        {
+            return false;
+        }
+
+        // Parse recurrence container to check endDateRadio
+        // Container format: [version, startTime, startDate, endDateRadio, endDateInt, endDateDate, unit, pattern, timezone]
+        // endDateRadio: 1 = NoEnd, 2 = EndAfter, 3 = EndBy
+        int version, startTime, endDateRadio, endDateInt, unit, timezone;
+        date startDate, endDateDate;
+        container pattern;
+
+        try
+        {
+            [version, startTime, startDate, endDateRadio, endDateInt, endDateDate, unit, pattern, timezone] = _batchJob.recurrenceData;
+            return (endDateRadio == 2); // 2 = EndAfter
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>run</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -232,10 +265,11 @@ public class METBatchJobMigrationExport extends RunBaseBatch
         header += 'Job Id';
         header += 'Job Status';
         header += 'Job Caption';
-        header += 'Company';
+        header += 'Job Company';
         header += 'Batch Group';
         header += 'Run By';
-        header += 'Scheduled Start DateTime';
+        header += 'Scheduled Start DateTime(UserTZ)';
+        header += 'UserTZ';
 
         // Additional job fields
         header += 'Scheduling Priority';
@@ -248,16 +282,18 @@ public class METBatchJobMigrationExport extends RunBaseBatch
         header += 'Alerts';
 
         // Task fields
-        header += 'Task Sequence';
         header += 'Task Caption';
+        header += 'Task Company';
         header += 'Class Name';
+        header += 'Task Sequence';
+        header += 'Depends On Tasks';
         header += 'Run Type';
         header += 'Constraint Type';
-        header += 'Depends On Tasks';
         header += 'Expected Status';
         header += 'Maximum Retries';
 
-        // Recurrence breakdown columns (18 columns - moved to end, removed Recur_StartDateTime)
+        // Recurrence breakdown columns (19 columns - includes Recur_StartDateTime)
+        header += 'Recur_StartDateTime';
         header += 'Recur_Timezone';
         header += 'Recur_EndType';
         header += 'Recur_EndAfterCount';
@@ -325,6 +361,12 @@ public class METBatchJobMigrationExport extends RunBaseBatch
                 {
                     continue;
                 }
+
+                // TEMPORARY: Skip jobs with EndAfter recurrence (remove this block when ready to support EndAfter)
+                if (this.hasEndAfterRecurrence(batchJob))
+                {
+                    continue;
+                }
             }
 
             // Skip task if it uses excluded classes
@@ -362,10 +404,16 @@ public class METBatchJobMigrationExport extends RunBaseBatch
         row += _batchJob.RecId;
         row += enum2Str(_batchJob.Status);
         row += _batchJob.Caption;
-        row += _batchJob.Company;
+        row += _batchJob.Company;  // Job Company from BatchJob table
         row += _batchJob.BatchGroup;
         row += _batchJob.ExecutingBy;
-        row += DateTimeUtil::toStr(_batchJob.OrigStartDateTime);
+
+        // Convert OrigStartDateTime to user timezone
+        Timezone userTz = DateTimeUtil::getUserPreferredTimeZone();
+        utcDateTime scheduledDateTime = _batchJob.OrigStartDateTime;
+        utcDateTime scheduledDateTimeUserTz = DateTimeUtil::applyTimeZoneOffset(scheduledDateTime, userTz);
+        row += DateTimeUtil::toStr(scheduledDateTimeUserTz);
+        row += enum2Str(userTz);
 
         // Additional job fields
         row += enum2Str(_batchJob.SchedulingPriority);
@@ -378,24 +426,25 @@ public class METBatchJobMigrationExport extends RunBaseBatch
         row += this.getAlertsString(_batchJob.RecId);
 
         // Task fields
-        row += int2Str(_taskSequence);
         row += _batchTask.Caption;
+        row += _batchTask.Company;  // Task Company from Batch table
         row += classId2Name(_batchTask.ClassNumber);
+        row += int642Str(_batchTask.RecId); // Task Sequence = Batch table RecId
+        row += this.getDependsOnTasks(_batchTask.RecId);
         row += enum2Str(_batchTask.RunType);
         row += enum2Str(_batchTask.ConstraintType);
-        row += this.getDependsOnTasks(_batchTask.RecId);
         row += this.getExpectedStatus(_batchTask.RecId);
         row += int2Str(_batchTask.retriesOnFailure);
 
-        // Recurrence breakdown columns (18 columns - moved to end, removed Recur_StartDateTime)
+        // Recurrence breakdown columns (19 columns - includes Recur_StartDateTime)
         if (_taskSequence == 1 && _batchJob.recurrenceData)
         {
             row += this.buildRecurrenceBreakdownContainer(_batchJob.recurrenceData, _batchJob.OrigStartDateTime);
         }
         else
         {
-            // Empty recurrence breakdown (18 empty values)
-            for (i = 1; i <= 18; i++)
+            // Empty recurrence breakdown (19 empty values)
+            for (i = 1; i <= 19; i++)
             {
                 row += '';
             }
@@ -462,10 +511,13 @@ public class METBatchJobMigrationExport extends RunBaseBatch
 
         [version, startTime, startDate, endDateRadio, endDateInt, endDateDate, unit, pattern, timezone] = _recurrenceData;
 
-        // Removed: StartDateTime (will be copied from Scheduled Start DateTime during import)
+        // StartDateTime - export from recurrence data converted to recurrence timezone
+        utcDateTime recurrenceStartDateTimeUTC = DateTimeUtil::newDateTime(startDate, startTime);
+        utcDateTime recurrenceStartDateTimeInTZ = DateTimeUtil::applyTimeZoneOffset(recurrenceStartDateTimeUTC, timezone);
+        breakdown += DateTimeUtil::toStr(recurrenceStartDateTimeInTZ);
 
-        // Timezone - use the timezone from OrigStartDateTime instead of recurrence data
-        Timezone tz = DateTimeUtil::getOriginatingTimeZone(_origStartDateTime);
+        // Timezone - use the timezone from recurrence data (cast int to Timezone enum)
+        Timezone tz = timezone;
         breakdown += enum2Str(tz);
 
         // EndType
@@ -625,6 +677,12 @@ public class METBatchJobMigrationExport extends RunBaseBatch
         breakdown += int2Str(weekInterval);
 
         // WeekDays - decode bit pattern
+        // Note: D365 uses 31 to represent "Weekdays" (Mon-Fri), need to convert to proper bit flags
+        if (weekDaysPattern == 31) // D365's constant for Weekdays (Mon-Fri)
+        {
+            weekDaysPattern = 62; // Convert to proper bit flags (2+4+8+16+32)
+        }
+
         daysList = '';
         if (weekDaysPattern & 2) daysList += 'MON,';
         if (weekDaysPattern & 4) daysList += 'TUE,';
@@ -757,34 +815,24 @@ public class METBatchJobMigrationExport extends RunBaseBatch
 				<Name>getDependsOnTasks</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Get depends on tasks as comma-separated task sequence list
+    /// Get depends on tasks as comma-separated RecId list
     /// </summary>
     private str getDependsOnTasks(RefRecId _batchTaskRecId)
     {
         BatchConstraints    constraint;
-        Batch               dependsOnBatch;
-        Map                 batchRecIdToSequenceMap;
         str                 result = '';
-        int                 taskSequence;
         boolean             first = true;
 
-        // Build map of RecId to TaskSequence
-        batchRecIdToSequenceMap = this.getBatchRecIdToSequenceMap(_batchTaskRecId);
-
         while select constraint
+            order by constraint.DependsOnBatchId
             where constraint.BatchId == _batchTaskRecId
         {
-            if (batchRecIdToSequenceMap.exists(constraint.DependsOnBatchId))
+            if (!first)
             {
-                taskSequence = batchRecIdToSequenceMap.lookup(constraint.DependsOnBatchId);
-
-                if (!first)
-                {
-                    result += ',';
-                }
-                result += int2Str(taskSequence);
-                first = false;
+                result += ',';
             }
+            result += int642Str(constraint.DependsOnBatchId);
+            first = false;
         }
 
         return result;
@@ -793,54 +841,30 @@ public class METBatchJobMigrationExport extends RunBaseBatch
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>getBatchRecIdToSequenceMap</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Build map of Batch RecId to Task Sequence for current job
-    /// </summary>
-    private Map getBatchRecIdToSequenceMap(RefRecId _batchTaskRecId)
-    {
-        Batch           batchTask;
-        Batch           targetTask;
-        Map             sequenceMap = new Map(Types::Int64, Types::Integer);
-        RefRecId        batchJobRecId;
-        int             sequence;
-
-        // Get the job RecId from the task
-        select firstonly batchTask
-            where batchTask.RecId == _batchTaskRecId;
-
-        batchJobRecId = batchTask.BatchJobId;
-
-        // Build sequence map for all tasks in this job
-        sequence = 0;
-        while select targetTask
-            order by CreatedDateTime
-            where targetTask.BatchJobId == batchJobRecId
-        {
-            sequence++;
-            sequenceMap.insert(targetTask.RecId, sequence);
-        }
-
-        return sequenceMap;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
 				<Name>getExpectedStatus</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Get expected status
+    /// Get expected status as comma-separated list (matching order of depends-on tasks)
     /// </summary>
     private str getExpectedStatus(RefRecId _batchTaskRecId)
     {
-        BatchConstraints constraint;
+        BatchConstraints    constraint;
+        str                 result = '';
+        boolean             first = true;
 
-        select firstonly constraint
-            where constraint.BatchId == _batchTaskRecId;
+        while select constraint
+            order by constraint.DependsOnBatchId
+            where constraint.BatchId == _batchTaskRecId
+        {
+            if (!first)
+            {
+                result += ',';
+            }
+            result += enum2Str(constraint.ExpectedStatus);
+            first = false;
+        }
 
-        return constraint.RecId ? enum2Str(constraint.ExpectedStatus) : '';
+        return result;
     }
 
 ]]></Source>
@@ -1064,19 +1088,6 @@ public class METBatchJobMigrationExport extends RunBaseBatch
     public boolean canGoBatch()
     {
         return false;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>allowSaveLast</Name>
-				<Source><![CDATA[
-    /// <summary>
-    // Override to prevent saving dialog values to SysLastValue
-    /// </summary>
-    public boolean allowSaveLast()
-    {
-        return false; // This disables SysLastValue persistence
     }
 
 ]]></Source>
