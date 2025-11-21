@@ -32,22 +32,52 @@ public class METUpdateOrderProcessingStatusService extends SysOperationServiceBa
         {
             try
             {
-                SalesTable      salesTable  = queryRun.get(tableNum(SalesTable));
-                METSalesTable   metSalesTable;
+                SalesTable          salesTable, salesTableInput, salesTableOrig;
+                METSalesTable       metSalesTable;
+                METSalesLine        metSalesLine;
+                METSalesOrderTypeID chargeOnlySOType = CustParameters::find().METChargeOnlySOType;
+
+                salesTable = queryRun.get(tableNum(SalesTable));
             
-                select forupdate metSalesTable
-                    where metSalesTable.SalesTable == salesTable.RecId
-                    && metSalesTable.OrderProcessingStatus == fromPocessingStatus;
-
-                if (metSalesTable.RecId)
+                if (fromPocessingStatus != METSalesOrderProcessingStatus::PricingCompleted && toPocessingStatus != METSalesOrderProcessingStatus::ReadyForReview)
                 {
-                    ttsbegin;
-                    metSalesTable.OrderProcessingStatus = toPocessingStatus;
-                    metSalesTable.update();
-                    ttscommit;
+                    select forupdate metSalesTable
+                        where metSalesTable.SalesTable == salesTable.RecId
+                        && metSalesTable.OrderProcessingStatus == fromPocessingStatus;
 
-                    info(strFmt("@MET:SalesOrderProcStatusUpdated",
-                        salesTable.SalesId, _contract.parmFromOrderProcessingStatus(), _contract.parmToOrderProcessingStatus()));
+                    if (metSalesTable.RecId)
+                    {
+                        ttsbegin;
+                        metSalesTable.OrderProcessingStatus = toPocessingStatus;
+                        metSalesTable.update();
+                        ttscommit;
+
+                        info(strFmt("@MET:SalesOrderProcStatusUpdated",
+                            salesTable.SalesId, _contract.parmFromOrderProcessingStatus(), _contract.parmToOrderProcessingStatus()));
+                    }
+                }
+                else if (fromPocessingStatus == METSalesOrderProcessingStatus::PricingCompleted 
+                    && toPocessingStatus == METSalesOrderProcessingStatus::ReadyForReview 
+                    && salesTable.METSalesOrderType == chargeOnlySOType && METSalesOrderTypes::find(chargeOnlySOType).SplitCreditInvoice)
+                {
+                    while select forupdate OriginalInvoice, OrderProcessingStatus from metSalesTable
+                        where metSalesTable.SalesTable == salesTable.RecId
+                        && metSalesTable.OrderProcessingStatus == METSalesOrderProcessingStatus::PricingCompleted
+                    {
+                        if (metSalesTable.OriginalInvoice)
+                        {
+                            this.copySOHeaderAndLineCharges(salesTable, SalesTable::find(metSalesTable.OriginalInvoice));
+                        }
+
+                        metSalesTable.OrderProcessingStatus = METSalesOrderProcessingStatus::ReadyForReview;
+
+                        ttsbegin;
+                        metSalesTable.update();
+                        ttscommit;
+
+                        info(strFmt("@MET:SalesOrderProcStatusUpdated",
+                            salesTable.SalesId, _contract.parmFromOrderProcessingStatus(), _contract.parmToOrderProcessingStatus()));
+                    }
                 }
             }
             catch (Exception::Deadlock)
@@ -86,6 +116,149 @@ public class METUpdateOrderProcessingStatusService extends SysOperationServiceBa
             }
         }
     
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copySOHeaderAndLineCharges</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copy the original sales order charges into charge only SO
+    /// </summary>
+    /// <param name = "_salesTable"> current SalesTable buffer </param>
+    /// <param name = "_salesTableOrig"> original SalesTable buffer </param>
+    public void copySOHeaderAndLineCharges(SalesTable _salesTable, SalesTable _salesTableOrig)
+    {
+        MarkupTrans         markupTrans, markupTransOrig;
+        CustInvoiceJour     custInvoiceJour;
+        CustInvoiceTrans    custInvoiceTrans;
+        SalesLine           salesLine, salesLineOrig;
+
+        // Copy the original SO invoiced header charges to charge only SO
+        while select markupTransOrig
+            exists join custInvoiceJour
+                where markupTransOrig.TransTableId == custInvoiceJour.TableId
+                && markupTransOrig.TransRecId == custInvoiceJour.RecId
+                && custInvoiceJour.SalesId == _salesTableOrig.SalesId
+        {
+
+            markupTrans.clear();            
+            markupTrans = markupTrans.data(markupTransOrig);
+            markupTrans.RecId = 0;
+            markupTrans.Value = markupTrans.Value * -1;
+            markupTrans.Voucher = '';
+            markupTrans.MarkupCategory = MarkupCategory::Fixed;
+            markupTrans.TransTableId = _salesTable.TableId;
+            markupTrans.TransRecId = _salesTable.RecId;
+            markupTrans.LineNum = MarkupTrans::lastLineNum(markupTrans.TransTableId, markupTrans.TransRecId) + 1;
+            markupTrans.insert();
+        }
+        
+        // Updates original SO lines details to charge only SO lines 
+        while select RecId, ItemId, SalesPrice, SalesQty, LineDisc, LinePercent, LineAmount from salesLineOrig
+            where salesLineOrig.SalesId == _salesTableOrig.SalesId
+        {
+            select forupdate salesLine
+                where salesLine.ItemId == salesLineOrig.ItemId
+                && salesLine.SalesId == _salesTable.SalesId
+                && salesLine.SalesQty < 0;
+
+            if (salesLine.RecId)
+            {
+                salesLine.SalesPrice = salesLineOrig.SalesPrice * -1;
+                salesLine.SalesQty = salesLineOrig.SalesQty * -1;
+                salesLine.LineDisc = salesLineOrig.LineDisc * -1;
+                salesLine.LinePercent = salesLineOrig.LinePercent * -1;
+                salesLine.LineAmount = salesLineOrig.LineAmount * -1;
+
+                ttsbegin;
+                salesLine.update();
+                ttscommit;
+            }
+        }
+
+        // Copy the original SO invoiced lines charges to charge only SO lines
+        while select ItemId from salesLineOrig
+            join TableId, RecId, SalesId from custInvoiceTrans
+                where custInvoiceTrans.SalesId == salesLineOrig.SalesId
+                && custInvoiceTrans.ItemId == salesLineOrig.ItemId
+            join markupTransOrig
+                where custInvoiceTrans.TableId == markupTransOrig.TransTableId
+                && custInvoiceTrans.RecId == markupTransOrig.TransRecId
+                && custInvoiceTrans.SalesId == _salesTableOrig.SalesId
+        {
+            select RecId, ItemId from salesLine
+                where salesLine.ItemId == salesLineOrig.ItemId
+                && salesLine.SalesId == _salesTable.SalesId
+                && salesLine.SalesQty < 0;
+
+            if (salesLine.RecId)
+            {                
+                markupTrans = markupTrans.data(markupTransOrig);
+                markupTrans.RecId = 0;
+                markupTrans.Value = markupTrans.Value * -1 ;
+                markupTrans.Voucher = '';
+                markupTrans.MarkupCategory = MarkupCategory::Fixed;
+                markupTrans.TransTableId = salesLine.TableId;
+                markupTrans.TransRecId = salesLine.RecId;
+                markupTrans.LineNum = MarkupTrans::lastLineNum(markupTrans.TransTableId, markupTrans.TransRecId) + 1;
+                markupTrans.insert();
+            }
+        }
+
+        // Copy the original SO line price components to charge only SO lines
+        while select ItemId, InventTransId from salesLineOrig
+            join SalesId, ItemId from custInvoiceTrans
+                where custInvoiceTrans.SalesId == salesLineOrig.SalesId
+                && custInvoiceTrans.ItemId == salesLineOrig.ItemId
+                && salesLineOrig.SalesId == _salesTableOrig.SalesId
+        {
+            METSalesLinePriceComponent          salesLinePriceComponentOrig, salesLinePriceComponent;
+            METSalesLinePriceComponentDetail    salesLinePriceComponentDetailOrig, salesLinePriceComponentDetail;
+
+            select InventTransId from salesLine
+                where salesLine.ItemId == salesLineOrig.ItemId
+                && salesLine.SalesId == _salesTable.SalesId
+                && salesLine.SalesQty < 0;
+
+            while select salesLinePriceComponentOrig
+                where salesLinePriceComponentOrig.InventTransId == salesLineOrig.InventTransId
+            {
+                salesLinePriceComponent = METSalesLinePriceComponent::find(salesLine.InventTransId, salesLinePriceComponentOrig.Component, salesLinePriceComponentOrig.PriceCodeRef);
+
+                if (salesLinePriceComponent.RecId == 0)
+                {
+                    salesLinePriceComponent.clear();
+                    salesLinePriceComponent = salesLinePriceComponent.data(salesLinePriceComponentOrig);
+                    salesLinePriceComponent.RecId = 0;
+                    salesLinePriceComponent.InventTransId = salesLine.InventTransId;
+                    salesLinePriceComponent.insert();
+                }
+            }
+
+            select count(RecId) from salesLinePriceComponentDetailOrig
+                where salesLinePriceComponentDetailOrig.InventTransId == salesLineOrig.InventTransId;
+            
+            select count(RecId) from salesLinePriceComponentDetail
+                where salesLinePriceComponentDetail.InventTransId == SalesLine.InventTransId;
+
+            if (salesLinePriceComponentDetailOrig.RecId != salesLinePriceComponentDetail.RecId)
+            {
+                delete_from salesLinePriceComponentDetail
+                    where salesLinePriceComponentDetail.InventTransId == salesLine.InventTransId;
+
+                while select salesLinePriceComponentDetailOrig
+                    where salesLinePriceComponentDetailOrig.InventTransId == salesLineOrig.InventTransId
+                {
+                    salesLinePriceComponentDetail.clear();
+                    salesLinePriceComponentDetail = salesLinePriceComponentDetail.data(salesLinePriceComponentDetailOrig);
+                    salesLinePriceComponentDetail.RecId = 0;
+                    salesLinePriceComponentDetail.InventTransId = salesLine.InventTransId;
+                    salesLinePriceComponentDetail.insert();
+                }
+            }
+        }   
     }
 
 ]]></Source>
