@@ -53,13 +53,68 @@ public class METNature3040ReportCombineDP extends SRSReportDataProviderBase
         RecordInsertList                recordInsertListTmp = new RecordInsertList(tableNum(METNature3040ReportsTmp), false, false, false, false, false, metNature3040ReportsTmp);
         TransDateTime                   transDateTime = DateTimeUtil::utcNow();
 
-        while select metExciseInformationTable
-            group by ItemId
-            where metExciseInformationTable.Nat3040ReportNumber == contract.parmNat30Number()
+        METExciseRegisterOriginTypes    originTypes;
+
+        Query                           query = new Query();
+        query.addDataSource(tableNum(METExciseInformationTable));
+
+        QueryBuildDataSource            qbds = query.dataSourceTable(tableNum(METExciseInformationTable));
+
+        QueryBuildDataSource            qbdsMetItemTable = qbds.addDataSource(tableNum(METInventTable));
+        qbdsMetItemTable.relations(false);
+        qbdsMetItemTable.addLink(fieldNum(METExciseInformationTable, ItemId), fieldNum(METInventTable, ItemId));
+        qbdsMetItemTable.joinMode(JoinMode::ExistsJoin);
+
+        QueryBuildDataSource            qbdsTariffCode = qbdsMetItemTable.addDataSource(tableNum(METTariffItemCodeBase));
+        qbdsTariffCode.relations(false);
+        qbdsTariffCode.addLink(fieldNum(METInventTable, METTariffItemCodeBaseRecid), fieldNum(METTariffItemCodeBase, RecId));
+        qbdsTariffCode.joinMode(JoinMode::ExistsJoin);
+
+        qbdsTariffCode.addRange(fieldNum(METTariffItemCodeBase, NAT3040)).value(queryValue(contract.parmMETNat3040()));
+
+        qbds.addGroupByAndSelectionField(fieldNum(METExciseInformationTable, ItemId));
+
+        if (contract.parmNat30Number())
         {
+            qbds.addRange(fieldNum(METExciseInformationTable, Nat3040ReportNumber)).value(queryValue(contract.parmNat30Number()));
+        }
+        else
+        {
+            UtcDateTime toDateTime = DateTimeUtil::newDateTime(contract.parmToDate(), 86399);
+            utcdatetime fromDateTime = DateTimeUtil::newDateTime(contract.parmFromDate(), 0);
+            qbds.addRange(fieldNum(METExciseInformationTable, CreatedDateTime)).value(SysQuery::range(fromDateTime, toDateTime));
+
+            if (contract.parmSite())
+            {
+                qbds.addRange(fieldNum(METExciseInformationTable, SiteId)).value(SysQuery::value(contract.parmSite()));
+            }
+
+            while select originTypes
+                where originTypes.UpdateNAT3040 == NoYes::Yes
+            {
+                qbds.addRange(fieldNum(METExciseInformationTable, InventTransType)).value(queryValue(originTypes.ReferenceId));
+
+               switch (originTypes.TransactionType)
+                {
+                    case METTransactionType::Negative :
+                        qbds.addRange(fieldNum(METExciseInformationTable, InventoryQty)).value('<0');
+                        break;
+                    case METTransactionType::Positive:
+                        qbds.addRange(fieldNum(METExciseInformationTable, InventoryQty)).value('>0');
+                        break;
+                }
+            }
+        }
+
+        QueryRun                         queryRun = new QueryRun(query);
+
+        while (queryRun.next())
+        {
+            metExciseInformationTable = queryRun.get(tableNum(METExciseInformationTable));
             metNature3040ReportsTmp.clear();
 
             metNature3040ReportsTmp.ItemId = metExciseInformationTable.ItemId;
+            metNature3040ReportsTmp.ItemDescription = InventTable::find(metExciseInformationTable.ItemId).itemName();
 
             select firstonly metTariffItemCodeBase
                 exists join metInventTable
@@ -70,21 +125,32 @@ public class METNature3040ReportCombineDP extends SRSReportDataProviderBase
             metNature3040ReportsTmp.TariffItemDescription = metTariffItemCodeBase.Description;
             metNature3040ReportsTmp.StatCode    = metTariffItemCodeBase.StatCode;
             metNature3040ReportsTmp.DutyLAL     = METTariffItemCode::findRecId(metTariffItemCodeBase.RecId).DutyLAL;
-            metNature3040ReportsTmp.LALSQuantity = this.getLALSQty(metExciseInformationTable.ItemId, contract.parmNat30Number(), metTariffItemCodeBase, contract.parmMETNat3040());
+
+            if (contract.parmNat30Number())
+            {
+                metNature3040ReportsTmp.CasesSold = this.getCasesSoldByReportNumber(metExciseInformationTable.ItemId, contract.parmNat30Number());
+            }
+            else
+            {
+                metNature3040ReportsTmp.CasesSold = this.getCasesSoldByDate(metExciseInformationTable.ItemId, DateTimeUtil::newDateTime(contract.parmFromDate(), 0), DateTimeUtil::newDateTime(contract.parmToDate(), 86399), contract.parmSite());
+            }
+
+            metNature3040ReportsTmp.LALSQuantity = this.getLALSQty(metExciseInformationTable.ItemId, metTariffItemCodeBase, contract.parmMETNat3040(), metNature3040ReportsTmp);
+           
            
             InventQty originalQty;
 
             if (contract.parmMETNat3040() == METNAT3040::NAT30)
             {
-                select reverse firstonly validtimestate(transDateTime) metExciseRegisterEntry
-                    exists join metExciseInformationTablePurch
-                        where metExciseInformationTablePurch.ItemId == metNature3040ReportsTmp.ItemId &&
-                            metExciseRegisterEntry.ItemId           == metExciseInformationTablePurch.ItemId &&
-                            metExciseRegisterEntry.OrderNumber      == metExciseInformationTablePurch.ReferenceNumber &&
-                            metExciseRegisterEntry.Lodgement        == metExciseInformationTablePurch.Lodgement &&
-                            metExciseInformationTablePurch.InventTransType == InventTransType::Purch;
-
-                metNature3040ReportsTmp.TIUV = metExciseRegisterEntry.TIUV;
+                if (contract.parmNat30Number())
+                {
+                    metNature3040ReportsTmp.TIUV = this.getTUIVByReferenceNumber(metNature3040ReportsTmp.ItemId, contract.parmNat30Number(), metNature3040ReportsTmp.CasesSold);
+                }
+                else
+                {
+                    metNature3040ReportsTmp.TIUV = this.getTUIVByDate(metNature3040ReportsTmp.ItemId, DateTimeUtil::newDateTime(contract.parmFromDate(), 0), DateTimeUtil::newDateTime(contract.parmToDate(), 86399), metNature3040ReportsTmp.CasesSold, contract.parmSite());
+                }
+                
                 metNature3040ReportsTmp.TariffRate = #Tariff;
 
                 metInventTableLoc =  METInventTable::find(metNature3040ReportsTmp.ItemId);
@@ -96,18 +162,20 @@ public class METNature3040ReportCombineDP extends SRSReportDataProviderBase
                 metNature3040ReportsTmp.LALSUnit = #LALSUnit;
                 metNature3040ReportsTmp.CustomsValue = metNature3040ReportsTmp.LALSQuantity * metNature3040ReportsTmp.DutyLAL;
 
-                select sum(InventoryQty) from metExciseInformationTableSum
-                    where metExciseInformationTableSum.ItemId == metExciseInformationTable.ItemId   &&
-                        metExciseInformationTableSum.Nat3040ReportNumber == contract.parmNat30Number();
+                if (metInventTableLoc.beerallowance())
+                {
+                    metNature3040ReportsTmp.LQuantity = metInventTableLoc.ItemPack * metInventTableLoc.BottleSize * metNature3040ReportsTmp.CasesSold;
+                }
 
-                metNature3040ReportsTmp.LQuantity = metExciseInformationTableSum.InventoryQty;
-                
+                metNature3040ReportsTmp.ExciseAmount = metNature3040ReportsTmp.LALSQuantity * metNature3040ReportsTmp.DutyLAL + (metNature3040ReportsTmp.CustomsValue * metInventTableLoc.metGetAdValoremRate());
+
                 metNature3040ReportsTmp.LUnit = #LUnit;
-                originalQty = metExciseInformationTableSum.InventoryQty;
+                originalQty = metNature3040ReportsTmp.LALSQuantity;
             }
             else
             {
                 metNature3040ReportsTmp.LALSUnit = #LALSUnit30;
+                metNature3040ReportsTmp.LUnit = #LUnit;
                 originalQty = metNature3040ReportsTmp.LALSQuantity;
                 metNature3040ReportsTmp.ExciseAmount = metNature3040ReportsTmp.LALSQuantity * metNature3040ReportsTmp.DutyLAL;
             }
@@ -118,12 +186,10 @@ public class METNature3040ReportCombineDP extends SRSReportDataProviderBase
                                         abs(originalQty));
             if (qtyToReport > 0)
             {
-                metNature3040ReportsTmp.LQuantity = qtyToReport;
-                metNature3040ReportsTmp.ExciseAmount = qtyToReport * metNature3040ReportsTmp.DutyLAL;
-                recordInsertListTmp.add(metNature3040ReportsTmp);   
+                recordInsertListTmp.add(metNature3040ReportsTmp);
             }
         }
-        
+
         recordInsertListTmp.insertDatabase();
     }
 
@@ -184,36 +250,153 @@ public class METNature3040ReportCombineDP extends SRSReportDataProviderBase
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>getTUIVByReferenceNumber</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// TUIV by reference number
+    /// </summary>
+    /// <param name = "_itemId">itemid</param>
+    /// <param name = "_reportNumber">reportNum</param>
+    /// <returns>TUIV</returns>
+    public METTransportInsurance getTUIVByReferenceNumber(ItemId              _itemId,
+                                                         METNat3040ReportNumber _reportNumber,
+                                                         InventQty              _casesSold)
+    {
+        METExciseRegisterEntry          metExciseRegisterEntry;
+        METExciseInformationTable       metExciseInformationTable;
+        InventTable                     inventTableLoc;
+        InventQty                       casesSoldEntry = _casesSold;
+        METTransportInsurance           TUIV;
+        TransDateTime                   transDateTime = DateTimeUtil::utcNow();
+       
+        while select validtimestate(transDateTime) metExciseRegisterEntry
+                exists join metExciseInformationTable
+                where metExciseInformationTable.ItemId == _itemId &&
+                    metExciseInformationTable.Nat3040ReportNumber == _reportNumber &&
+                    metExciseRegisterEntry.ItemId           == metExciseInformationTable.ItemId &&
+                    metExciseRegisterEntry.OrderNumber      == metExciseInformationTable.ReferenceNumber &&
+                    metExciseRegisterEntry.Lodgement        == metExciseInformationTable.Lodgement &&
+                    metExciseInformationTable.InventTransType == InventTransType::Purch
+        {
+            inventTableLoc = InventTable::find(metExciseRegisterEntry.ItemId);
+            casesSoldEntry = UnitOfMeasureConverter::convert(metExciseRegisterEntry.ReceiptQuantity,
+                UnitOfMeasure::unitOfMeasureIdBySymbol(inventTableLoc.inventUnitId()),
+                UnitOfMeasure::unitOfMeasureIdBySymbol(inventTableLoc.salesUnitId()),
+                NoYes::Yes,
+                inventTableLoc.Product,
+                NoYes::Yes);
+
+            TUIV = TUIV + (metExciseRegisterEntry.TIUV * casesSoldEntry);
+        }
+
+        return TUIV;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTUIVByDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// TUIV by date
+    /// </summary>
+    /// <param name = "_itemId">Itemid</param>
+    /// <param name = "_fromDateTime">fromDate</param>
+    /// <param name = "_toDateTime">ToDate</param>
+    /// <param name = "_site">site</param>
+    /// <returns>TUIV</returns>
+    public METTransportInsurance getTUIVByDate(ItemId               _itemId,
+                                               ValidFromDateTime    _fromDateTime,
+                                               ValidToDateTime      _toDateTime,
+                                               InventQty            _casesSold,
+                                               InventSiteId         _site = "")
+    {
+        METExciseRegisterEntry          metExciseRegisterEntry;
+        METExciseInformationTable       metExciseInformationTable;
+        InventTable                     inventTableLoc;
+        InventQty                       casesSoldEntry = _casesSold;
+        METTransportInsurance           TUIV;
+
+        TransDateTime                   transDateTime = DateTimeUtil::utcNow();
+
+        if (_site)
+        {
+            while select validtimestate(transDateTime) metExciseRegisterEntry
+                exists join metExciseInformationTable
+                where metExciseInformationTable.ItemId == _itemId &&
+                    metExciseInformationTable.SiteId == _site &&
+                    metExciseInformationTable.CreatedDateTime >= _fromDateTime &&
+                    metExciseInformationTable.CreatedDateTime <= _toDateTime &&
+                    metExciseRegisterEntry.ItemId           == metExciseInformationTable.ItemId &&
+                    metExciseRegisterEntry.OrderNumber      == metExciseInformationTable.ReferenceNumber &&
+                    metExciseRegisterEntry.Lodgement        == metExciseInformationTable.Lodgement &&
+                    metExciseInformationTable.InventTransType == InventTransType::Purch
+            {
+                inventTableLoc = InventTable::find(metExciseRegisterEntry.ItemId);
+                casesSoldEntry = UnitOfMeasureConverter::convert(metExciseRegisterEntry.ReceiptQuantity,
+                UnitOfMeasure::unitOfMeasureIdBySymbol(inventTableLoc.inventUnitId()),
+                UnitOfMeasure::unitOfMeasureIdBySymbol(inventTableLoc.salesUnitId()),
+                NoYes::Yes,
+                inventTableLoc.Product,
+                NoYes::Yes);
+
+                TUIV = TUIV + (metExciseRegisterEntry.TIUV * casesSoldEntry);
+            }
+        }
+        else
+        {
+            while select validtimestate(transDateTime) metExciseRegisterEntry
+                exists join metExciseInformationTable
+                where metExciseInformationTable.ItemId == _itemId &&
+                    metExciseInformationTable.CreatedDateTime >= _fromDateTime &&
+                    metExciseInformationTable.CreatedDateTime <= _toDateTime &&
+                    metExciseRegisterEntry.ItemId           == metExciseInformationTable.ItemId &&
+                    metExciseRegisterEntry.OrderNumber      == metExciseInformationTable.ReferenceNumber &&
+                    metExciseRegisterEntry.Lodgement        == metExciseInformationTable.Lodgement &&
+                    metExciseInformationTable.InventTransType == InventTransType::Purch
+            {
+                inventTableLoc = InventTable::find(metExciseRegisterEntry.ItemId);
+                casesSoldEntry = UnitOfMeasureConverter::convert(metExciseRegisterEntry.ReceiptQuantity,
+                UnitOfMeasure::unitOfMeasureIdBySymbol(inventTableLoc.inventUnitId()),
+                UnitOfMeasure::unitOfMeasureIdBySymbol(inventTableLoc.salesUnitId()),
+                NoYes::Yes,
+                inventTableLoc.Product,
+                NoYes::Yes);
+
+
+                TUIV = TUIV + (metExciseRegisterEntry.TIUV * casesSoldEntry);
+            }
+        }
+        return TUIV;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>getLALSQty</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Method to get calculated LALS qty for Nat3040
+    /// get LALS Qty
     /// </summary>
-    /// <param name = "_itemId">ItemId reference</param>
-    /// <param name = "_reportNumber">Nat3040Report number</param>
-    /// <param name = "_metTariffItemCodeBase">METTariffItemCodeBase reference</param>
-    /// <param name = "_nat3040">Nat3040 enum</param>
-    /// <returns>InventQty</returns>
+    /// <param name = "_itemId">item</param>
+    /// <param name = "_metTariffItemCodeBase">TariffCode</param>
+    /// <param name = "_nat3040">nat3040</param>
+    /// <param name = "_nature3040ReportsTmp">nature3040</param>
+    /// <returns>lals</returns>
     public InventQty getLALSQty(ItemId                      _itemId, 
-                                METNat3040ReportNumber      _reportNumber,
                                 METTariffItemCodeBase       _metTariffItemCodeBase,
-                                MetNat3040                  _nat3040)
+                                MetNat3040                  _nat3040,
+                                METNature3040ReportsTmp     _nature3040ReportsTmp)
     {
-        METExciseInformationTable           metexciseInformationTable;
         InventQty                           itemPackQty;
         InventQty                           lalsQty;
         InventQty                           lalqty;
         InventQty                           totalVFD;
-        METDutyCountryOfOrigin              metDutyCountryOfOrigin;
         METExciseSiteDutySetup              metExciseSiteDutySetup;
         METTariffItemCode                   metTariffItemCode = METTariffItemCode::findRecId(_metTariffItemCodeBase.recId);
         METInventTable                      metInventTable = METInventTable::find(_itemId);
 
-        select sum(InventoryQty) from metexciseInformationTable
-            where metexciseInformationTable.Nat3040ReportNumber == _reportNumber       &&
-                metexciseInformationTable.ItemId == _itemId;
-
-        itemPackQty = metexciseInformationTable.InventoryQty;
+        itemPackQty = _nature3040ReportsTmp.CasesSold;
 
         if (metTariffItemCode.BeerAllowance) //Calculation is same for Nat30 and Nat40
         {
@@ -241,6 +424,90 @@ public class METNature3040ReportCombineDP extends SRSReportDataProviderBase
 
         }
         return abs(lalsQty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCasesSoldByDate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get cases sold by date
+    /// </summary>
+    /// <param name = "_itemId">itemid</param>
+    /// <param name = "_fromDateTime">fromdate</param>
+    /// <param name = "_toDateTime">toDate</param>
+    /// <param name = "_siteId">site</param>
+    /// <returns>cases</returns>
+    public InventQty getCasesSoldByDate(ItemId                      _itemId, 
+                                        ValidFromDateTime           _fromDateTime,
+                                        ValidToDateTime             _toDateTime,
+                                        InventSiteId                _siteId = '')
+    {
+        METExciseInformationTable           metexciseInformationTable;
+        InventQty                           itemPackQty;
+        InventTable                         inventTable = InventTable::find(_itemId);
+
+        if (_siteId)
+        {
+                select sum(InventoryQty) from metexciseInformationTable
+                where metexciseInformationTable.CreatedDateTime >= _fromDateTime &&
+                      metexciseInformationTable.CreatedDateTime <= _toDateTime && 
+                      metexciseInformationTable.ItemId == _itemId &&
+                      metexciseInformationTable.SiteId == _siteId;
+        }
+        else
+        {
+            select sum(InventoryQty) from metexciseInformationTable
+                where metexciseInformationTable.CreatedDateTime >= _fromDateTime &&
+                      metexciseInformationTable.CreatedDateTime <= _toDateTime &&
+                      metexciseInformationTable.ItemId == _itemId;
+        }
+        
+        itemPackQty = metexciseInformationTable.InventoryQty;
+
+        itemPackQty = UnitOfMeasureConverter::convert(itemPackQty,
+                            UnitOfMeasure::unitOfMeasureIdBySymbol(inventTable.inventUnitId()),
+                            UnitOfMeasure::unitOfMeasureIdBySymbol(inventTable.salesUnitId()), 
+                            NoYes::Yes, 
+                            inventTable.Product,
+                            NoYes::Yes);
+
+        return abs(itemPackQty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCasesSoldByReportNumber</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// get Cases Sold by Report Number
+    /// </summary>
+    /// <param name = "_itemId">itemid</param>
+    /// <param name = "_reportNumber">reportNumber</param>
+    /// <returns>cases</returns>
+    public InventQty getCasesSoldByReportNumber(ItemId                      _itemId, 
+                                            METNat3040ReportNumber      _reportNumber)
+    {
+        METExciseInformationTable           metexciseInformationTable;
+        InventQty                           itemPackQty;
+        InventTable                         inventTable = InventTable::find(_itemId);
+
+        select sum(InventoryQty) from metexciseInformationTable
+            where metexciseInformationTable.Nat3040ReportNumber == _reportNumber &&
+                metexciseInformationTable.ItemId == _itemId;
+
+        itemPackQty = metexciseInformationTable.InventoryQty;
+
+        itemPackQty = UnitOfMeasureConverter::convert(itemPackQty,
+                            UnitOfMeasure::unitOfMeasureIdBySymbol(inventTable.inventUnitId()),
+                            UnitOfMeasure::unitOfMeasureIdBySymbol(inventTable.salesUnitId()), 
+                            NoYes::Yes, 
+                            inventTable.Product,
+                            NoYes::Yes);
+
+        return abs(itemPackQty);
     }
 
 ]]></Source>
