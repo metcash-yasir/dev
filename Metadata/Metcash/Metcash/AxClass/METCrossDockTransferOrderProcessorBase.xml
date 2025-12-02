@@ -1,0 +1,482 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METCrossDockTransferOrderProcessorBase</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+abstract class METCrossDockTransferOrderProcessorBase
+{
+    InventParameters inventParameter;
+    InventTransferTable transferTable;
+    METInventTransferTableExt metTransferTable;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>isUnderBondItem</Name>
+				<Source><![CDATA[
+    public NoYes isUnderBondItem()
+    {
+        return NoYes::No;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static METCrossDockTransferOrderProcessorBase construct(Common _sourceTable)
+    {
+        METCrossDockTransferOrderProcessorBase processor;
+
+        if(tableNum(SalesTable) == _sourceTable.TableId)
+        {
+            processor = new METCrossDockTransferOrderProcessor_SalesOrder();
+        }
+        else if(tableNum(InventTransferTable) == _sourceTable.TableId)
+        {
+            //processor = new METCrossDockTransferOrderProcessor_TransferOrder();
+        }
+
+        return processor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromWareHouse</Name>
+				<Source><![CDATA[
+    abstract InventLocationId getFromWareHouse()
+    {
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getToWarehouse</Name>
+				<Source><![CDATA[
+    abstract InventLocationId getToWarehouse()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSoruceId</Name>
+				<Source><![CDATA[
+    abstract str getSoruceId()
+    {
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getShippingDate</Name>
+				<Source><![CDATA[
+    abstract TransDate getShippingDate()
+    {
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getConfirmedShipDate</Name>
+				<Source><![CDATA[
+    abstract TransDate getConfirmedShipDate()
+    {
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shouldAutoReserve</Name>
+				<Source><![CDATA[
+    abstract boolean shouldAutoReserve()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCarrierCode</Name>
+				<Source><![CDATA[
+    abstract METCarrierCode getCarrierCode()
+    {
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCarriedServiceCode</Name>
+				<Source><![CDATA[
+    abstract METCarrierServiceCode getCarriedServiceCode()
+    {
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTMSData</Name>
+				<Source><![CDATA[
+    public void updateTMSData()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRouteDetails</Name>
+				<Source><![CDATA[
+    abstract container getRouteDetails()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findOrCreateTransferHeader</Name>
+				<Source><![CDATA[
+    public void findOrCreateTransferHeader()
+    {
+        //InventTransferTable transferTable;
+        //METInventTransferTableExt metTransferTable;
+
+        NoYes underBond = this.isUnderBondItem();
+
+        InventLocationId fromWh = this.getFromWareHouse();
+        InventLocationId toWh = this.getToWarehouse();
+
+        select firstonly RecId from metTransferTable
+            where metTransferTable.SalesId == this.getSoruceId()
+            && metTransferTable.UnderBond == underBond
+            join transferTable
+            where transferTable.RecId == metTransferTable.InventTransferTable
+            // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+            // For allow backorders scenario, the previous TO will be received so need to create a new TO as per scenario
+            && transferTable.TransferStatus == InventTransferStatus::Created
+            && transferTable.InventLocationIdFrom == fromWh
+            && transferTable.InventLocationIdTo == toWh;
+
+        if(!metTransferTable)
+        {
+            transferTable.clear();
+            transferTable.initValue();
+            transferTable.TransferId = InventTransferTable::numberSeq().num();
+            transferTable.InventLocationIdFrom = fromWh;
+            transferTable.modifiedField(fieldNum(InventTransferTable, InventLocationIdFrom));
+            transferTable.InventLocationIdTo = toWh;
+            transferTable.modifiedField(fieldNum(InventTransferTable, InventLocationIdTo));
+            transferTable.initFromAddress();
+            transferTable.initToAddress();
+            transferTable.ShipDate = this.getShippingDate();
+            transferTable.ReceiveDate = this.getConfirmedShipDate();
+            //Mark the Auto reservation to true if the Reserve items automatically flag is enabled or the sales order is an event order.
+            transferTable.AutoReservation = this.shouldAutoReserve();
+            
+            if (transferTable.validateWrite())
+            {
+                transferTable.insert();
+
+                info(strFmt("@MET:ToCreated", transferTable.TransferId));
+                this.updateTMSData();
+            }
+            else
+            {
+                throw error("@SCM:FailTransferOrder");
+            }
+
+            if (transferTable.RecId != 0)
+            {
+                metTransferTable.clear();
+                metTransferTable.InventTransferTable = transferTable.RecId;
+
+                [metTransferTable.Route, metTransferTable.RouteStopNum, 
+                    metTransferTable.RouteIdentifier, metTransferTable.RouteStopIdentifier] = this.getRouteDetails();
+
+                metTransferTable.WMSOrderType = this.getWmsOrderType();
+
+                metTransferTable.OrderSplitGroup = this.getOrderSplitGroup();
+                metTransferTable.DeliveryInstructions = this.getDeliveryInstructions();
+                metTransferTable.SalesId = this.getSoruceId();
+                metTransferTable.UnderBond = underBond;
+                metTransferTable.TransferType = this.getTransferType();
+
+                // 218457 - CB238 - Bug - Liquor extraction Internal Customer not getting updated - Start
+                metTransferTable.InternalCustomer = this.getCustomerNumber();
+                // 218457 - CB238 - Bug - Liquor extraction Internal Customer not getting updated - End
+
+                [metTransferTable.Door, metTransferTable.StagingLane] = this.getDoorAndLane();
+
+
+                metTransferTable.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getOrderSplitGroup</Name>
+				<Source><![CDATA[
+    abstract METOrderSplitGroup getOrderSplitGroup()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getWmsOrderType</Name>
+				<Source><![CDATA[
+    abstract METWMSOrderType getWmsOrderType()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCustomerNumber</Name>
+				<Source><![CDATA[
+    abstract CustAccount getCustomerNumber()
+    {
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDeliveryInstructions</Name>
+				<Source><![CDATA[
+    abstract METDeliveryInstructions getDeliveryInstructions()
+    {
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTransferType</Name>
+				<Source><![CDATA[
+    abstract METCrossDockTransferType getTransferType()
+    {}
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDoorAndLane</Name>
+				<Source><![CDATA[
+    abstract container getDoorAndLane()
+    {
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTransferOrderQty</Name>
+				<Source><![CDATA[
+    protected InventQty getTransferOrderQty()
+    {
+        return 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSourceTransId</Name>
+				<Source><![CDATA[
+    abstract InventTransId getSourceTransId()
+    {
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReservedQty</Name>
+				<Source><![CDATA[
+    public InventQty getReservedQty()
+    {
+        return 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRemainQty</Name>
+				<Source><![CDATA[
+    abstract InventQty getRemainQty()
+    {
+         
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTransferOrderLine</Name>
+				<Source><![CDATA[
+    abstract void initTransferOrderLine(InventTransferLine _transLine)
+    {
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePDSQuantity</Name>
+				<Source><![CDATA[
+    public void updatePDSQuantity(InventTransferLine _transferLine)
+    {
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLocationId</Name>
+				<Source><![CDATA[
+    abstract WMSLocationId getLocationId()
+    {
+        
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLineNumber</Name>
+				<Source><![CDATA[
+    abstract LineNum getLineNumber()
+    {
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateTransferOrderLine</Name>
+				<Source><![CDATA[
+    protected void CreateTransferOrderLine()
+    {
+        //// Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+        //// get qtyReserved in inventory unit instead of sales unit then no conversion required
+        ////SalesQty qtyReserved = _salesLine.mcrSalesQtyReserved();
+        //InventQty qtyReserved = this.getReservedQty();
+
+        //// Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+        //// Need to look at deliver remainder for back orders
+        ////if (qtyReserved < _salesLine.QtyOrdered)
+        //if (qtyReserved < this.getRemainQty())
+        //{
+        //    InventTransferLine transferLine;
+        //    METInventTransferLine metTransferLine;
+
+        //    this.findOrCreateTransferHeader();
+
+        //    if(metTransferTable)
+        //    {
+        //        if(!METInventTransferLine::existsForSalesLine(this.getSourceTransId()))
+        //        {
+        //            this.initTransferOrderLine(transferLine);
+
+        //            transferLine.initFromInventTransferTable(transferTable, true);
+
+        //            // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+        //            // Need to look at deliver remainder for backorders scenario
+        //            transferLine.QtyTransfer = this.getTransferOrderQty();// (this.getRemainQty() - this.getReservedQty());
+        //            this.updatePDSQuantity(transferLine);
+
+        //            transferLine.QtyRemainReceive = transferLine.QtyTransfer;
+        //            transferLine.QtyRemainShip = transferLine.QtyTransfer;
+
+        //            // Bug 222516: CB238 - TO creation missing Location dimension
+        //            // Copy the SO line wMSLocationId into the transfer order line. Site/WH already set from the supplying WH in initFromInventTransferTable
+        //            InventDim inventDim = transferLine.inventDim();
+        //            inventDim.wMSLocationId = this.getLocationId();
+
+        //            transferLine.LineNum = this.getLineNumber();
+        //            transferLine.InventDimId = inventDim::findOrCreate(inventDim).inventDimId;
+
+        //            if(transferLine.validateWrite())
+        //            {
+        //                transferLine.insert();
+        //            }
+
+        //            // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+        //            // Commented FC confirmed not to use preview feature
+        //            //this.insertSupplyRelation(_salesLine, transferLine);                    
+        //            transferLine.metCheckAndUpdateMarking(_salesLine.InventTransId);
+
+        //            metTransferLine.clear();
+        //            metTransferLine.initValue();
+        //            metTransferLine.InventTransferLine = transferLine.RecId;
+        //            metTransferLine.SalesLineTransId = _salesLine.InventTransId;
+
+        //            // 218457 - CB238 - Bug - Liquor extraction Internal Customer not getting updated - Start
+        //            metTransferLine.SalesId = this.getSoruceId();
+        //            // 218457 - CB238 - Bug - Liquor extraction Internal Customer not getting updated - End
+
+        //            // Allow substitution only when,
+        //            // 1. Metcash sales order type allows substitution
+        //            // 2. No quantity is reserved on the origin sales line
+        //            METSalesOrderTypes metOrderType = _salesTable.METSalesOrderTypes();
+        //            if(metOrderType && metOrderType.SubstitutesAllowed == NoYes::Yes)
+        //            {
+        //                metTransferLine.AllowSubstitution = qtyReserved == 0 ? NoYes::Yes : NoYes::No;
+        //            }
+        //            else
+        //            {
+        //                metTransferLine.AllowSubstitution = NoYes::No;
+        //            }
+
+        //            InventMovement::bufferSetRemainQty(transferLine, InventMovSubType::None);
+        //            InventMovement::bufferSetRemainQty(transferLine, InventMovSubType::TransferOrderTransitFrom);
+        //            //If the Salesline order extraction status is already extracted means the transfer order line is being created as an effect of a substitution process.
+        //            //In that case we need to set the transfer line extraction status to Ready to Extract, so the line is picked in the second pick list attempt.
+        //            if(_metSalesLine.OrderExtractStatus == METOrderExtractStatus::Extracted)
+        //            {
+        //                metTransferLine.OrderExtractStatus = METOrderExtractStatus::ReadyForExtract;
+        //            }
+
+        //            metTransferLine.insert();
+        //            metTransferLine.updateUnitFields();
+
+        //            if(metTransferLine)
+        //            {
+        //                this.updateSourceRecord();
+        //            }
+
+        //        }
+        //    }
+        //}
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSourceRecord</Name>
+				<Source><![CDATA[
+    abstract void updateSourceRecord()
+    {
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>CreateTransferOrder</Name>
+				<Source><![CDATA[
+    public void CreateTransferOrder(Common _salesTable)
+    {
+
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
