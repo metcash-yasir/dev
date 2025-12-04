@@ -19,7 +19,8 @@ class METShipmentUpdateRoutesDialog extends RunBase
     METOrderTransactionType orderTransactionType;
     container       conShipmentIds;
 
-    
+    // Bug 307324: CB626 TMS Engine step 7 remove orders issue
+    container conProcessedLoadLines;
 
 }
 ]]></Declaration>
@@ -192,10 +193,14 @@ class METShipmentUpdateRoutesDialog extends RunBase
         Set                                 orderNumCombineSet = new Set(Types::String);
         Set                                 orderNumSet;
         Set                                 loadSet = new Set(Types::String);
+        container                           conTMSUpdate;
+        int                                 i;  
+
         if (args.dataset() == tableNum(METSalesOrderShipmentLoadHeader))
         {
             try
             {
+                ttsbegin;
                 map = formRun.getFinalizationHeaderMap();
 
                 mapIterator = new MapIterator (map);
@@ -210,6 +215,21 @@ class METShipmentUpdateRoutesDialog extends RunBase
                     
                     if (metSalesOrderShipmentLoadHeader.ShipmentStatus == MetShipmentStatus::Open)
                     {
+                        // Bug 307324: CB626 TMS Engine step 7 remove orders issue
+                        // add all load lines related to this shipment to the container for TMS update 
+                        // if only route stop updated skip this part as TMS not affected
+                        if (orderTransactionType == METOrderTransactionType::SalesOrder
+                        && (metRouteValue || confirmedShipDateValue))
+                        {
+                            METSalesOrderShipmentLoadLines loadlines;
+                            while select OrderNum, PickingListNum from loadlines
+                                   where loadlines.ShipmentId == metSalesOrderShipmentLoadHeader.ShipmentId
+                            {
+                                i++;
+                                conTMSUpdate = conIns(conTMSUpdate, i, [loadlines.OrderNum, loadlines.PickingListNum]);
+                            }
+                        }
+
                         orderNumCombineSet = Set::union(orderNumCombineSet, metSalesOrderShipmentLoadHeader.updateRouteInformation(confirmedShipDateValue, metRouteValue, metRouteStopNumValue));
 
                         if (conFind(conShipmentIds, metSalesOrderShipmentLoadHeader.ShipmentId) == 0)
@@ -240,20 +260,24 @@ class METShipmentUpdateRoutesDialog extends RunBase
                     this.processLoadStatusUpdate(loadSet);
                 }
 
-                info("@MET:UpdateShipment");
+                ttscommit;
+                info("@MET:UpdateShipment");                
             }
             catch
             {
                 exceptionTextFallThrough();
             }
-
         }
         else if (args.dataset() == tableNum(METSalesOrderShipmentLoadLines))
         {
             try
             {
+                MetShipmentId shipmentId;
+                WMSPickingRouteID pickingListNum;
+                
+                ttsbegin;
                 map = formRun.getFinalizationLineMap();
-                orderTransactionType = formRun.getOrderTranscationType();
+                //orderTransactionType = formRun.getOrderTranscationType();
                 mapIterator = new MapIterator(map);
    
                 while (mapIterator.more())
@@ -267,6 +291,19 @@ class METShipmentUpdateRoutesDialog extends RunBase
                         if (orderTransactionType == METOrderTransactionType::SalesOrder)
                         {
                             METSalesOrderShipmentLoadHeader::updateSalesTableAndShipment(mapIterator.key(), confirmedShipDateValue, metRouteValue, metRouteStopNumValue);
+                        
+                            // Bug 307324: CB626 TMS Engine step 7 remove orders issue
+                            // reselect load line as it's grouped by order num and shipment id in workbench form
+                            METSalesOrderShipmentLoadLines loadLines;
+                            select firstonly OrderNum, PickingListNum from loadLines
+                                       where loadLines.ShipmentId == mapIterator.value() &&
+                                             loadLines.OrderNum == mapIterator.key();
+                            
+                            if (loadLines && (metRouteValue || confirmedShipDateValue))
+                            {
+                                i++;
+                                conTMSUpdate = conIns(conTMSUpdate, i, [loadLines.OrderNum, loadLines.PickingListNum]);
+                            }
                         }
                         else
                         {
@@ -299,8 +336,19 @@ class METShipmentUpdateRoutesDialog extends RunBase
                 {
                     this.processLoadStatusUpdate(loadSet);
                 }
-
+                
+                ttscommit;
                 info("@MET:UpdateShipment");
+            }
+            catch
+            {
+                exceptionTextFallThrough();
+            }
+
+            try
+            {
+                // Bug 307324: CB626 TMS Engine step 7 remove orders issue
+                this.updateTMSEngine(conTMSUpdate);
             }
             catch
             {
@@ -378,6 +426,44 @@ class METShipmentUpdateRoutesDialog extends RunBase
         while (setEnumerator.moveNext())
         {
             METSalesOrderShipmentLoadHeader::updateLoadStatus(setEnumerator.current());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateTMSEngine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Bug 307324: CB626 TMS Engine step 7 remove orders issue
+    /// Delete old TSO and retrigger TMS engine pick list
+    /// </summary>
+    protected void updateTMSEngine(container _conTSMUpdate)
+    {
+        METOrderNumber      orderNumber;
+        WMSPickingRouteID   pickingRouteID;
+        
+        for (int i = 1; i <= conLen(_conTSMUpdate); i++)
+        {
+            [orderNumber, pickingRouteID]= conPeek(_conTSMUpdate, i);
+
+            WMSPickingRoute    wmsPickingRoute = WMSPickingRoute::find(pickingRouteID);
+        
+            if (wmsPickingRoute)
+            {
+                // For the load or lines, delete the corresponding TMS shipment orders using orderNum and picking list number combination
+                METTMSShipmentID TMSShipmentId = METTMSEngineOrderProccess::deleteTMSShipmentOrderTable(orderNumber, pickingRouteID);
+
+                ttsbegin;
+                METTMSEngineOrderProccess  metTMSEngineOrderProccess = METTMSEngineOrderProccess::construct(METTMSEngineExecutionMode::SalesOrderPickingList, wmsPickingRoute, wmsPickingRoute.PickingRouteID);
+                
+                // retrigger the pallet calculation for the TMS shipment where an order was deleted
+                metTMSEngineOrderProccess.updateTMSShipment(TMSShipmentId);
+
+                // retrigger the TMS engine for the order/picking list to recreate a new TMS shipment or add the order/picklist to an existing TMS shipment.
+                metTMSEngineOrderProccess.run();
+                ttscommit;
+            }
         }
     }
 
