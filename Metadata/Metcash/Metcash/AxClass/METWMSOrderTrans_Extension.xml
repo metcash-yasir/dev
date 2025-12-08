@@ -76,6 +76,14 @@ final class METWMSOrderTrans_Extension
         }
         /*Bug 303922 - CB797 - CW Weight not calculating Pricing and sales order line not updated with weight - end*/
 
+        //BUG 298479 - CB238 - NDC & Int xDock warehouse processing; Canceclled transfer order lines are showing in the transfer order finalisation screen.
+        if(wmsOrderTrans.qty == 0.00
+            && InventTransferTable::find(wmsOrderTrans.inventTransRefId).RecId)
+        {
+            this.propcessCancelledTOLines(wmsOrderTrans);
+        }
+        //BUG 298479 - CB238 - NDC & Int xDock warehouse processing; Canceclled transfer order lines are showing in the transfer order finalisation screen.
+
         this.SysExtensionSerializerMap::postUpdate();
     }
 
@@ -389,6 +397,159 @@ final class METWMSOrderTrans_Extension
                 where salesLine.RecId == metSalesLine.SalesLine
                     &&    salesLine.InventTransId == this.inventTransId;
 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>propcessCancelledTOLines</Name>
+				<Source><![CDATA[
+    public void propcessCancelledTOLines(WMSOrderTrans  _orderTrans)
+    {
+        #OCCRetryCount
+
+        InventTransferTable             inventTransferTable;
+        METInventTransferTableExt       metInventTransferTableExt;
+        InventTransferLine              inventTransferLine;
+        METInventTransferLine           metInventTransferLine;
+        SalesTable                      salesTable;
+        SalesLine                       salesLine;
+        METSalesLine                    metSalesLine;
+
+        try
+        {
+            ttsbegin;
+
+            this.removeLineFromShipmentAndLoad(_orderTrans);
+
+            metInventTransferTableExt = METInventTransferTableExt::findByTransferId(_orderTrans.inventTransRefId);
+
+            select firstonly * from metInventTransferLine
+                exists join inventTransferLine
+                    where inventTransferLine.InventTransId == _orderTrans.inventTransId
+                        && inventTransferLine.TransferId == _orderTrans.inventTransRefId
+                        && metInventTransferLine.InventTransferLine == inventTransferLine.RecId;
+
+            if (metInventTransferLine.SalesId != ''
+                    && (metInventTransferTableExt.TransferType == MetCrossdocKTransferType::CrossDock
+                    || metInventTransferTableExt.TransferType == MetCrossdocKTransferType::CSD))
+            {
+                salesLine = salesLine::findInventTransId(metInventTransferLine.SalesLineTransId,true);
+
+                if(SalesTable::find(metInventTransferLine.SalesId).METAllowBackOrders == NoYes::Yes)
+                {
+                    if (salesLine.inventTable().pdsCWItem())
+                    {
+                        SalesUpdateRemain::construct().updateCatchWeightDeliverRemainder(salesLine, 0);
+                    }
+                    else
+                    {
+                        SalesUpdateRemain::construct().updateDeliverRemainder(salesLine, 0, 0);
+                    }
+                }
+                else
+                {
+                    metSalesLine = METSalesLine::find(salesLine.RecId, true);
+                    metSalesLine.OrderExtractStatus = METOrderExtractStatus::Open;
+                    metSalesLine.update();
+                }
+            }
+            else
+            {
+                if(metInventTransferTableExt.TransferType == MetCrossdocKTransferType::None
+                    || metInventTransferTableExt.TransferType == MetCrossdocKTransferType::CSD)
+                {
+                    if(metInventTransferTableExt.AllowBackorder == NoYes::Yes)
+                    {
+                        metInventTransferLine.selectForUpdate(true);
+                        metInventTransferLine.OrderExtractStatus = METOrderExtractStatus::Open;
+                        metInventTransferLine.update();
+                    }
+                }
+            }
+        
+            ttscommit;  
+        }
+        catch(Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>removeLineFromShipmentAndLoad</Name>
+				<Source><![CDATA[
+    public void removeLineFromShipmentAndLoad(WMSOrderTrans _orderTrans)
+    {
+        METSalesOrderShipmentLoadHeader TOShipmentLoadHeader, otherShipmentInLoadExist;
+        METSalesOrderShipmentLoadLines  TOShipmentLoadLine, otherTOInShipmentExist;
+        WMSOrderTrans                   wmsOrderTransLocal;
+        MetShipmentId                   shipmentId;
+        MetLoadId                       loadId;
+
+        select firstonly RecId from wmsOrderTransLocal
+            where wmsOrderTransLocal.inventTransRefId == _orderTrans.inventTransRefId
+                && wmsOrderTransLocal.qty != 0.00;
+
+        if (wmsOrderTransLocal.RecId)
+        {
+            // Remove only the current line with zero qty
+            delete_from TOShipmentLoadLine
+                where TOShipmentLoadLine.WMSOrderTransRecId == _orderTrans.RecId;
+
+            return;
+        }
+
+        select firstonly forupdate TOShipmentLoadHeader
+            join TOShipmentLoadLine
+            where TOShipmentLoadHeader.ShipmentId == TOShipmentLoadLine.ShipmentId
+                && TOShipmentLoadLine.WMSOrderTransRecId == _orderTrans.RecId;
+
+        shipmentId = TOShipmentLoadHeader.ShipmentId;
+        loadId = TOShipmentLoadHeader.LoadId;
+
+        if (strLen(shipmentId) == 0 || strLen(loadId) == 0)
+        {
+            return;
+        }
+
+        // Delete all lines for this TO with qty == 0.00
+        delete_from TOShipmentLoadLine
+            exists join wmsOrderTransLocal
+            where TOShipmentLoadLine.OrderNum == wmsOrderTransLocal.inventTransRefId
+                && wmsOrderTransLocal.inventTransRefId == _orderTrans.inventTransRefId
+                && wmsOrderTransLocal.qty == 0.00;
+
+        // Check for other TOs in the same shipment
+        select firstonly RecId from otherTOInShipmentExist
+            where otherTOInShipmentExist.ShipmentId == shipmentId
+                && otherTOInShipmentExist.OrderNum != _orderTrans.inventTransRefId;
+
+        // Delete header if no other TOs in shipment.
+        if (!otherTOInShipmentExist.RecId)
+        {
+            TOShipmentLoadHeader.delete();
+        }
     }
 
 ]]></Source>
