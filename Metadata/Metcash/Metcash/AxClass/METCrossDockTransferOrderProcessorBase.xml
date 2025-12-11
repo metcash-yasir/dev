@@ -6,8 +6,8 @@
 abstract class METCrossDockTransferOrderProcessorBase
 {
     InventParameters inventParameter;
-    InventTransferTable transferTable;
-    METInventTransferTableExt metTransferTable;
+    InventTransferTable finalLegTransferTable;
+    METInventTransferTableExt finalLegTransferTableExt;
 
 }
 ]]></Declaration>
@@ -194,13 +194,31 @@ abstract class METCrossDockTransferOrderProcessorBase
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>isCrossDockTO</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determine the source of this TO is a Transfer order or sales order
+    /// </summary>
+    /// <returns>Yes, if the TO is for a transfer order otherwise, No</returns>
+    protected NoYes isCrossDockTO()
+    {
+        return NoYes::No;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>findOrCreateTransferHeader</Name>
 				<Source><![CDATA[
     /// <summary>
     /// Finds or creates a new transfer order header
     /// </summary>
-    public void findOrCreateTransferHeader()
+    /// <returns>Container with newly created <t>InventTransferTable</t> and <t>METInventTransferTableExt</t> buffer</returns>
+    public container findOrCreateTransferHeader()
     {
+        InventTransferTable transferTable;
+        METInventTransferTableExt metTransferTable;
+
         NoYes underBond = this.isUnderBondItem();
 
         InventLocationId fromWh = this.getFromWareHouse();
@@ -262,7 +280,6 @@ abstract class METCrossDockTransferOrderProcessorBase
                 metTransferTable.SalesId = this.getSoruceId();
                 metTransferTable.UnderBond = underBond;
                 metTransferTable.TransferType = this.getTransferType();
-
                 // 218457 - CB238 - Bug - Liquor extraction Internal Customer not getting updated - Start
                 metTransferTable.InternalCustomer = this.getCustomerNumber();
                 // 218457 - CB238 - Bug - Liquor extraction Internal Customer not getting updated - End
@@ -273,6 +290,8 @@ abstract class METCrossDockTransferOrderProcessorBase
                 metTransferTable.insert();
             }
         }
+
+        return [transferTable, metTransferTable];
     }
 
 ]]></Source>
@@ -420,9 +439,9 @@ abstract class METCrossDockTransferOrderProcessorBase
     /// Initializes the transfer order line
     /// </summary>
     /// <param name = "_transLine">Transfer order line to be initialized</param>
-    abstract void initTransferOrderLine(InventTransferLine _transLine)
+    public void initTransferOrderLine(InventTransferLine _transLine)
     {
-
+        _transLine.initFromInventTransferTable(finalLegTransferTable, true);
     }
 
 ]]></Source>
@@ -483,6 +502,48 @@ abstract class METCrossDockTransferOrderProcessorBase
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>setSourceLineReference</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets the reference data
+    /// </summary>
+    /// <param name = "_transLineExt"><t>METInventTransferLine</t> table buffer</param>
+    protected void setSourceLineReference(METInventTransferLine _transLineExt)
+    {
+        // implemented in child classes.
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createOrUpdateTransferLineExt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// 
+    /// </summary>
+    /// <param name = "_transLineExt"></param>
+    /// <param name = "_transLine"></param>
+    /// <returns></returns>
+    protected METInventTransferLine createOrUpdateTransferLineExt(METInventTransferLine _transLineExt, InventTransferLine _transLine)
+    {
+        _transLineExt.clear();
+        _transLineExt.initValue();
+        _transLineExt.InventTransferLine = _transLine.RecId;
+
+        _transLineExt.AllowSubstitution = this.shouldAllowSubstitution();
+
+        //If the Salesline order extraction status is already extracted means the transfer order line is being created as an effect of a substitution process.
+        //In that case we need to set the transfer line extraction status to Ready to Extract, so the line is picked in the second pick list attempt.
+        _transLineExt.OrderExtractStatus = this.getExtractionStatus();
+        this.setSourceLineReference(_transLineExt);
+
+        return _transLineExt;
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>getExtractionStatus</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -504,6 +565,7 @@ abstract class METCrossDockTransferOrderProcessorBase
     /// </summary>
     protected void CreateTransferOrderLine()
     {
+ 
         // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
         // get qtyReserved in inventory unit instead of sales unit then no conversion required
         //SalesQty qtyReserved = _salesLine.mcrSalesQtyReserved();
@@ -516,15 +578,13 @@ abstract class METCrossDockTransferOrderProcessorBase
             InventTransferLine transferLine;
             METInventTransferLine metTransferLine;
 
-            this.findOrCreateTransferHeader();
+            [finalLegTransferTable, finalLegTransferTableExt] = this.findOrCreateTransferHeader();
 
-            if(metTransferTable)
+            if(finalLegTransferTable)
             {
                 if(!METInventTransferLine::existsForSalesLine(this.getSourceTransId()))
                 {
                     this.initTransferOrderLine(transferLine);
-
-                    transferLine.initFromInventTransferTable(transferTable, true);
 
                     // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
                     // Need to look at deliver remainder for backorders scenario
@@ -544,28 +604,41 @@ abstract class METCrossDockTransferOrderProcessorBase
 
                     if(transferLine.validateWrite())
                     {
-                        // 1. Metcash sales order type allows substitution
-                        // 2. No quantity is reserved on the origin sales line
-                        InventMovement::bufferSetRemainQty(transferLine, InventMovSubType::None);
-                        InventMovement::bufferSetRemainQty(transferLine, InventMovSubType::TransferOrderTransitFrom);
+                        transferLine.insert();
+                    }
 
-                        metTransferLine.AllowSubstitution = this.shouldAllowSubstitution();
+                    this.updateMarking(transferLine);
 
-                        //If the Salesline order extraction status is already extracted means the transfer order line is being created as an effect of a substitution process.
-                        //In that case we need to set the transfer line extraction status to Ready to Extract, so the line is picked in the second pick list attempt.
-                        metTransferLine.OrderExtractStatus = this.getExtractionStatus();
+                    // 1. Metcash sales order type allows substitution
+                    // 2. No quantity is reserved on the origin sales line
+                    InventMovement::bufferSetRemainQty(transferLine, InventMovSubType::None);
+                    InventMovement::bufferSetRemainQty(transferLine, InventMovSubType::TransferOrderTransitFrom);
 
-                        metTransferLine.insert();
-                        metTransferLine.updateUnitFields();
+                    metTransferLine = this.createOrUpdateTransferLineExt(metTransferLine, transferLine);
+                    metTransferLine.insert();
+                    metTransferLine.updateUnitFields();
 
-                        if(metTransferLine)
-                        {
-                            this.updateSourceRecord();
-                        }
+                    if(metTransferLine)
+                    {
+                        this.updateSourceRecord(transferLine);
                     }
                 }
             }
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMarking</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Mark the quantities against source and 
+    /// </summary>
+    /// <param name = "_transferLine"></param>
+    abstract void updateMarking(InventTransferLine _transferLine)
+    {
+    
     }
 
 ]]></Source>
@@ -576,7 +649,7 @@ abstract class METCrossDockTransferOrderProcessorBase
     /// <summary>
     /// Update the source records status
     /// </summary>
-    abstract void updateSourceRecord()
+    abstract void updateSourceRecord(InventTransferLine _transferLine)
     {
 
     }
