@@ -352,8 +352,16 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
 
         if (consolidatedCasesMap.exists(_whsCategory))
         {
-            cases       = consolidatedCasesMap.lookup(_whsCategory);
-            weight      = consolidatedWeightMap.lookup(_whsCategory);
+            cases = consolidatedCasesMap.lookup(_whsCategory);
+        }
+
+        if (consolidatedWeightMap.exists(_whsCategory))
+        {
+            weight = consolidatedWeightMap.lookup(_whsCategory);
+        }
+
+        if (consolidatedBrokenCasesMap.exists(_whsCategory))
+        {
             brokenCases = consolidatedBrokenCasesMap.lookup(_whsCategory);
         }
 
@@ -391,10 +399,9 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
     public void getProductTypesDetailsTO(InventTransferId _transferId, MetShipmentId _shipmentId)
     {
         Factor                          factor;
-        METCase                         cases,          existingCases,          totalCases;
-        METUnitWeight                   shippedWeight,  existingWeight,         totalWeight;
-        METUnitWeight                   productWeight,  existingProductWeight,  totalProductWeight;
-        METBrokenCase                   brokenCases,    existingBrokenCases,    totalBrokenCases;
+        METCase                         cases, existingCases;
+        METUnitWeight                   shippedWeight, existingWeight;
+        METBrokenCase                   brokenCases, existingBrokenCases;
         METFilterCodeone                filterCode;
         METLegalEntityType              legalEntityType = CompanyInfo::find().METLegalEntityType;
 
@@ -402,77 +409,82 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
         InventTransferLine              transferLine;
         InventItemSalesSetup            inventItemSalesSetup;
         METInventTransferLine           metTransferLine;
-        UnitOfMeasureFromRecId          fromUnit,toUnit;
+        UnitOfMeasureFromRecId          fromUnit, toUnit;
 
         while select transferLine
-            where transferLine.TransferId == _transferId
-            join metTransferLine where metTransferLine.InventTransferLine == transferLine.RecId
-            join inventDim where inventDim.inventDimId == transferLine.InventDimId
-            join METSalesUnit from inventItemSalesSetup
-            join inventDimDefaultSetting
+        where transferLine.TransferId == _transferId
+        join metTransferLine where metTransferLine.InventTransferLine == transferLine.RecId
+        join inventDim where inventDim.inventDimId == transferLine.InventDimId
+        join METSalesUnit from inventItemSalesSetup
+        join inventDimDefaultSetting
             where inventDimDefaultSetting.inventDimId == inventItemSalesSetup.InventDimId
-                && inventItemSalesSetup.ItemId == transferLine.ItemId
-                && inventDimDefaultSetting.InventSiteId == inventDim.InventSiteId
+               && inventItemSalesSetup.ItemId == transferLine.ItemId
+               && inventDimDefaultSetting.InventSiteId == inventDim.InventSiteId
         {
+            filterCode = metTransferLine.WarehouseCategory;
 
-            if (legalEntityType == METLegalEntityType::Liquor)
+            // 1. KEG HANDLING — must skip all further logic
+            if (legalEntityType == METLegalEntityType::Liquor &&
+                metTransferLine.IsKegItem)
             {
-                if (this.isKegItem(transferLine.ItemId))
-                {
-                    headerTmp.KegCount += transferLine.QtyShipped;
-                }
+                headerTmp.KegCount += transferLine.QtyShipped;
+                continue;   //  Skip case/broken-case logic
             }
 
-            //Get the unit conversion rule and factor.
-            fromUnit    = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(inventItemSalesSetup.METSalesUnit);
-            toUnit      = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(transferLine.UnitId);
-            factor      = EcoResProductUnitConverter::convertForReleasedProduct(
-                                    transferLine.ItemId,
-                                    transferLine.inventDimId,
-                                    1,
-                                    fromUnit,
-                                    toUnit,
-                                    NoYes::No,
-                                    NoYes::No);
+            // 2. Determine Sales Order Unit (case unit)
+            METSalesUnit salesOrderUnit = inventItemSalesSetup.METSalesUnit;
 
-            filterCode      = metTransferLine.WarehouseCategory;
-            shippedWeight   = metTransferLine.TOUnitWeight * transferLine.QtyShipped;
-            cases           = this.getCases(factor, transferLine.QtyShipped);
-            brokenCases     = real2int(transferLine.QtyShipped - (cases * factor));
-            productWeight   = metTransferLine.TOUnitWeight;
-            
-            //Weight
-            if (consolidatedWeightMap.exists(filterCode))
+            // 3. If TO line UOM = Sales Order Unit → full cases, no broken cases
+            if (transferLine.UnitId == salesOrderUnit)
             {
-                existingWeight = consolidatedWeightMap.lookup(filterCode);
-                consolidatedWeightMap.insert(filterCode, existingWeight + shippedWeight);
+                cases = transferLine.QtyShipped;
+                brokenCases = 0;
             }
             else
             {
-                consolidatedWeightMap.insert(filterCode, shippedWeight);
+                // 4. Get conversion factor (Inventory UOM → Sales Order Unit)
+                fromUnit = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(salesOrderUnit);
+                toUnit = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(transferLine.UnitId);
+
+                factor = EcoResProductUnitConverter::convertForReleasedProduct(
+                        transferLine.ItemId,
+                        transferLine.inventDimId,
+                        1,
+                        fromUnit,
+                        toUnit,
+                        NoYes::No,
+                        NoYes::No);
+
+                // 5. Calculate full cases
+                cases = this.getCases(factor, transferLine.QtyShipped);
+
+                // 6. Calculate broken cases
+                brokenCases = transferLine.QtyShipped - (cases * factor);
             }
 
-            //Cases
-            if (consolidatedCasesMap.exists(filterCode))
-            {
-                existingCases = consolidatedCasesMap.lookup(filterCode);
-                consolidatedCasesMap.insert(filterCode, existingCases + cases);
-            }
-            else
-            {
-                consolidatedCasesMap.insert(filterCode, cases);
-            }
+            // 7. Weight calculation
+            shippedWeight = metTransferLine.TOUnitWeight * transferLine.QtyShipped;
 
-            //Broken case
-            if (consolidatedBrokenCasesMap.exists(filterCode))
-            {
-                existingBrokenCases = consolidatedBrokenCasesMap.lookup(filterCode);
-                consolidatedBrokenCasesMap.insert(filterCode, existingBrokenCases + brokenCases);
-            }
-            else
-            {
-                consolidatedBrokenCasesMap.insert(filterCode, brokenCases);
-            }
+            // Consolidate WEIGHT
+            existingWeight = consolidatedWeightMap.exists(filterCode)
+            ? consolidatedWeightMap.lookup(filterCode)
+            : 0;
+
+            consolidatedWeightMap.insert(filterCode, existingWeight + shippedWeight);
+
+            // Consolidate CASES
+            existingCases = consolidatedCasesMap.exists(filterCode)
+            ? consolidatedCasesMap.lookup(filterCode)
+            : 0;
+
+            consolidatedCasesMap.insert(filterCode, existingCases + cases);
+
+            // Consolidate BROKEN CASES
+            existingBrokenCases = consolidatedBrokenCasesMap.exists(filterCode)
+            ? consolidatedBrokenCasesMap.lookup(filterCode)
+            : 0;
+
+            consolidatedBrokenCasesMap.insert(filterCode, existingBrokenCases + brokenCases);
         }
     }
 
@@ -507,19 +519,25 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
         CustPackingSlipTrans            custPackingSlipTrans;
         METInventItemOrderSetup         metInventItemOrderSetup;
         METSalesOrderShipmentLoadLines  shipmentLines;
-        
+        boolean                         containsE;
+        boolean                         isKeg;
 
         while select salesLine
             where salesLine.SalesId == _salesId
-            join SalesUnitWeight from metSalesLine where metSalesLine.SalesLine == salesLine.RecId
+            join SalesUnitWeight, Indicators, IsKegItem from metSalesLine
+                where metSalesLine.SalesLine == salesLine.RecId
             join inventDim where inventDim.inventDimId == salesLine.InventDimId
             join PickedQty, Quantity from shipmentLines
-            where shipmentLines.OrderNum == salesLine.SalesId
+                where shipmentLines.OrderNum == salesLine.SalesId
                 && shipmentLines.LineNum == salesLine.LineNum
             join FilterCode from metInventItemOrderSetup
                 where metInventItemOrderSetup.ItemId == salesLine.ItemId
                 && metInventItemOrderSetup.SiteId == inventDim.InventSiteId
         {
+            // Reset per-line values
+            cases = 0;
+            brokenCases = 0;
+
             shippedUnitId = InventTableModule::find(salesLine.ItemId, ModuleInventPurchSales::Invent).UnitId;
 
             InventItemSalesSetup itemSalesSetup = InventItemSalesSetup::find(salesLine.ItemId, salesLine.InventDimId);
@@ -542,31 +560,34 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
                                     NoYes::No,
                                     NoYes::No);
 
+            // Delivery note qty expressed in sales (case) unit
             deliveryNoteQty = shipmentLines.PickedQty / factor;
             filterCode      = metInventItemOrderSetup.FilterCode;
             shippedWeight   = metSalesLine.SalesUnitWeight * deliveryNoteQty;
-                        
-            if (inventItemSalesSetup.RecId &&
-                inventItemSalesSetup.METSalesUnit == salesLine.salesUnit &&
-                inventItemSalesSetup.METAltSalesUnit != salesLine.salesUnit)
-            {
-                cases = shipmentLines.Quantity;
-            }
-
-            if (inventItemSalesSetup.RecId &&
-                inventItemSalesSetup.METSalesUnit != salesLine.salesUnit &&
-                inventItemSalesSetup.METAltSalesUnit == salesLine.salesUnit)
-            {
-                brokenCases = shipmentLines.PickedQty;
-            }
             productWeight   = metSalesLine.SalesUnitWeight;
 
-            if (legalEntityType == METLegalEntityType::Liquor)
+            // Determine indicators and keg status
+            containsE = (metSalesLine.Indicators && strScan(metSalesLine.Indicators, 'E', 1, strLen(metSalesLine.Indicators)));
+            isKeg = (metSalesLine.IsKegItem == NoYes::Yes);
+
+            // Cases: only when line does NOT contain 'E' AND IsKegItem = No
+            if (!containsE && !isKeg)
             {
-                if (this.isKegItem(salesLine.ItemId))
-                {
-                    headerTmp.KegCount += deliveryNoteQty;
-                }
+                // Calculate cases from the picked quantity
+                cases = this.getCases(factor, shipmentLines.PickedQty);
+            }
+
+            // Broken cases: when line contains 'E' indicator — use delivery note qty
+            if (containsE)
+            {
+                // Consolidate broken cases according to delivery note quantity (rounded similarly to getCases)
+                brokenCases = any2Int(round(deliveryNoteQty, 1));
+            }
+
+            // Keg handling: preserve behaviour for header keg count (use METSalesLine.IsKegItem)
+            if (legalEntityType == METLegalEntityType::Liquor && isKeg)
+            {
+                headerTmp.KegCount += deliveryNoteQty;
             }
 
             //Weight
@@ -580,26 +601,32 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
                 consolidatedWeightMap.insert(filterCode, shippedWeight);
             }
 
-            //Cases
-            if (consolidatedCasesMap.exists(filterCode))
+            // Cases (only non-E and non-keg lines contribute)
+            if (cases)
             {
-                existingCases = consolidatedCasesMap.lookup(filterCode);
-                consolidatedCasesMap.insert(filterCode, existingCases + cases);
-            }
-            else
-            {
-                consolidatedCasesMap.insert(filterCode, cases);
+                if (consolidatedCasesMap.exists(filterCode))
+                {
+                    existingCases = consolidatedCasesMap.lookup(filterCode);
+                    consolidatedCasesMap.insert(filterCode, existingCases + cases);
+                }
+                else
+                {
+                    consolidatedCasesMap.insert(filterCode, cases);
+                }
             }
 
-            //Broken case
-            if (consolidatedBrokenCasesMap.exists(filterCode))
+            // Broken cases (only lines with 'E' contribute)
+            if (brokenCases)
             {
-                existingBrokenCases = consolidatedBrokenCasesMap.lookup(filterCode);
-                consolidatedBrokenCasesMap.insert(filterCode, existingBrokenCases + brokenCases);
-            }
-            else
-            {
-                consolidatedBrokenCasesMap.insert(filterCode, brokenCases);
+                if (consolidatedBrokenCasesMap.exists(filterCode))
+                {
+                    existingBrokenCases = consolidatedBrokenCasesMap.lookup(filterCode);
+                    consolidatedBrokenCasesMap.insert(filterCode, existingBrokenCases + brokenCases);
+                }
+                else
+                {
+                    consolidatedBrokenCasesMap.insert(filterCode, brokenCases);
+                }
             }
         }
     }
@@ -741,27 +768,13 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
     /// <returns></returns>
     public METCase getCases(Factor _factor, InventTransferQtyShipped _qtyShipped)
     {
-        int     value = 0;
-        METCase cases = 0;
-
-        if (_factor == 0)
+        if (_factor <= 0)
         {
-            cases = 0;
+            return 0;
         }
-        else
-        {
-            value = _qtyShipped / _factor;
 
-            if (value < 1)
-            {
-                cases = any2Int(round(_qtyShipped / _factor, 1));
-            }
-            else
-            {
-                cases = any2Int(_qtyShipped / _factor);
-            }
-        }
-        return cases;
+        // Full cases = floor(QtyShipped / EA per case)
+        return any2Int(_qtyShipped / _factor);
     }
 
 ]]></Source>
