@@ -352,8 +352,16 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
 
         if (consolidatedCasesMap.exists(_whsCategory))
         {
-            cases       = consolidatedCasesMap.lookup(_whsCategory);
-            weight      = consolidatedWeightMap.lookup(_whsCategory);
+            cases = consolidatedCasesMap.lookup(_whsCategory);
+        }
+
+        if (consolidatedWeightMap.exists(_whsCategory))
+        {
+            weight = consolidatedWeightMap.lookup(_whsCategory);
+        }
+
+        if (consolidatedBrokenCasesMap.exists(_whsCategory))
+        {
             brokenCases = consolidatedBrokenCasesMap.lookup(_whsCategory);
         }
 
@@ -511,19 +519,25 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
         CustPackingSlipTrans            custPackingSlipTrans;
         METInventItemOrderSetup         metInventItemOrderSetup;
         METSalesOrderShipmentLoadLines  shipmentLines;
-        
+        boolean                         containsE;
+        boolean                         isKeg;
 
         while select salesLine
             where salesLine.SalesId == _salesId
-            join SalesUnitWeight from metSalesLine where metSalesLine.SalesLine == salesLine.RecId
+            join SalesUnitWeight, Indicators, IsKegItem from metSalesLine
+                where metSalesLine.SalesLine == salesLine.RecId
             join inventDim where inventDim.inventDimId == salesLine.InventDimId
             join PickedQty, Quantity from shipmentLines
-            where shipmentLines.OrderNum == salesLine.SalesId
+                where shipmentLines.OrderNum == salesLine.SalesId
                 && shipmentLines.LineNum == salesLine.LineNum
             join FilterCode from metInventItemOrderSetup
                 where metInventItemOrderSetup.ItemId == salesLine.ItemId
                 && metInventItemOrderSetup.SiteId == inventDim.InventSiteId
         {
+            // Reset per-line values
+            cases = 0;
+            brokenCases = 0;
+
             shippedUnitId = InventTableModule::find(salesLine.ItemId, ModuleInventPurchSales::Invent).UnitId;
 
             InventItemSalesSetup itemSalesSetup = InventItemSalesSetup::find(salesLine.ItemId, salesLine.InventDimId);
@@ -546,31 +560,34 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
                                     NoYes::No,
                                     NoYes::No);
 
+            // Delivery note qty expressed in sales (case) unit
             deliveryNoteQty = shipmentLines.PickedQty / factor;
             filterCode      = metInventItemOrderSetup.FilterCode;
             shippedWeight   = metSalesLine.SalesUnitWeight * deliveryNoteQty;
-                        
-            if (inventItemSalesSetup.RecId &&
-                inventItemSalesSetup.METSalesUnit == salesLine.salesUnit &&
-                inventItemSalesSetup.METAltSalesUnit != salesLine.salesUnit)
-            {
-                cases = shipmentLines.Quantity;
-            }
-
-            if (inventItemSalesSetup.RecId &&
-                inventItemSalesSetup.METSalesUnit != salesLine.salesUnit &&
-                inventItemSalesSetup.METAltSalesUnit == salesLine.salesUnit)
-            {
-                brokenCases = shipmentLines.PickedQty;
-            }
             productWeight   = metSalesLine.SalesUnitWeight;
 
-            if (legalEntityType == METLegalEntityType::Liquor)
+            // Determine indicators and keg status
+            containsE = (metSalesLine.Indicators && strScan(metSalesLine.Indicators, 'E', 1, strLen(metSalesLine.Indicators)));
+            isKeg = (metSalesLine.IsKegItem == NoYes::Yes);
+
+            // Cases: only when line does NOT contain 'E' AND IsKegItem = No
+            if (!containsE && !isKeg)
             {
-                if (this.isKegItem(salesLine.ItemId))
-                {
-                    headerTmp.KegCount += deliveryNoteQty;
-                }
+                // Calculate cases from the picked quantity
+                cases = this.getCases(factor, shipmentLines.PickedQty);
+            }
+
+            // Broken cases: when line contains 'E' indicator — use delivery note qty
+            if (containsE)
+            {
+                // Consolidate broken cases according to delivery note quantity (rounded similarly to getCases)
+                brokenCases = any2Int(round(deliveryNoteQty, 1));
+            }
+
+            // Keg handling: preserve behaviour for header keg count (use METSalesLine.IsKegItem)
+            if (legalEntityType == METLegalEntityType::Liquor && isKeg)
+            {
+                headerTmp.KegCount += deliveryNoteQty;
             }
 
             //Weight
@@ -584,26 +601,32 @@ public class METCoverNoteDP extends SrsReportDataProviderPreProcessTempDB
                 consolidatedWeightMap.insert(filterCode, shippedWeight);
             }
 
-            //Cases
-            if (consolidatedCasesMap.exists(filterCode))
+            // Cases (only non-E and non-keg lines contribute)
+            if (cases)
             {
-                existingCases = consolidatedCasesMap.lookup(filterCode);
-                consolidatedCasesMap.insert(filterCode, existingCases + cases);
-            }
-            else
-            {
-                consolidatedCasesMap.insert(filterCode, cases);
+                if (consolidatedCasesMap.exists(filterCode))
+                {
+                    existingCases = consolidatedCasesMap.lookup(filterCode);
+                    consolidatedCasesMap.insert(filterCode, existingCases + cases);
+                }
+                else
+                {
+                    consolidatedCasesMap.insert(filterCode, cases);
+                }
             }
 
-            //Broken case
-            if (consolidatedBrokenCasesMap.exists(filterCode))
+            // Broken cases (only lines with 'E' contribute)
+            if (brokenCases)
             {
-                existingBrokenCases = consolidatedBrokenCasesMap.lookup(filterCode);
-                consolidatedBrokenCasesMap.insert(filterCode, existingBrokenCases + brokenCases);
-            }
-            else
-            {
-                consolidatedBrokenCasesMap.insert(filterCode, brokenCases);
+                if (consolidatedBrokenCasesMap.exists(filterCode))
+                {
+                    existingBrokenCases = consolidatedBrokenCasesMap.lookup(filterCode);
+                    consolidatedBrokenCasesMap.insert(filterCode, existingBrokenCases + brokenCases);
+                }
+                else
+                {
+                    consolidatedBrokenCasesMap.insert(filterCode, brokenCases);
+                }
             }
         }
     }
