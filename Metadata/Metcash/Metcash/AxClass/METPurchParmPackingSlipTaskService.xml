@@ -256,6 +256,17 @@ class METPurchParmPackingSlipTaskService extends METSysOperationTaskService
         //BUG 2783619 Set to post only registered quantity if any CW item line was processed.
         if (postRegisteredQuantity)
         {
+            // Set PurchParmUpdate to post only registered quantity
+            purchParmUpdate.SpecQty = PurchUpdate::Recorded;
+            purchParmUpdate.update();
+
+            // Re-select PurchParmUpdate to get the updated value
+            // This will reset PurchParmLine table with registered quantity
+            purchFormLetter.reSelect(purchParmUpdate);
+
+            // Update PurchParmLine with registered quantity
+            this.updatePurchParmLineWithRegisteredQty(purchParmTable.ParmId);
+
             purchFormLetter.specQty(PurchUpdate::Recorded);
         }
         else
@@ -567,6 +578,73 @@ class METPurchParmPackingSlipTaskService extends METSysOperationTaskService
         contractLoc.parmPurchId(purchTable.PurchId);
 
         return controller;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePurchParmLineWithRegisteredQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates PurchParmLine with registered quantity
+    /// This method works only for catch weight items. Do not call for non-CW items.
+    /// </summary>
+    public void updatePurchParmLineWithRegisteredQty(ParmId _parmId)
+    {
+        PurchParmLine       purchParmLine;
+        PurchLine           purchLine;
+        InventTrans         inventTrans;
+        InventTransOrigin   inventTransOrigin;
+        Map                 qtyMap = new Map(Types::String, Types::Real);
+
+        // First, collect all registered CW quantities
+        while select sum(PdsCWQty) from inventTrans
+          where inventTrans.StatusReceipt == StatusReceipt::Registered
+             && inventTrans.StatusIssue == StatusIssue::None
+          join inventTransOrigin
+              where inventTransOrigin.RecId == inventTrans.InventTransOrigin
+          join purchLine
+            group by purchLine.InventTransId
+              where purchLine.InventTransId == inventTransOrigin.InventTransId
+          join purchParmLine
+              where purchParmLine.ParmId == _parmId
+                 && purchParmLine.PurchLineRecId == purchLine.RecId
+        {
+            qtyMap.insert(purchLine.InventTransId, inventTrans.PdsCWQty);
+        }
+
+        // Update PurchParmLine records
+        ttsbegin;
+
+        while select forupdate purchParmLine
+          where purchParmLine.ParmId == _parmId
+          join purchLine
+              where purchLine.RecId == purchParmLine.PurchLineRecId
+        {
+            if (qtyMap.exists(purchLine.InventTransId))
+            {
+                Real registeredCWQty = qtyMap.lookup(purchLine.InventTransId);
+
+                // Check if this is a CW item
+                if (PdsGlobal::pdsIsCWItem(purchLine.ItemId))
+                {
+                    // Convert from CW unit to purchase unit
+                    Real registeredQtyPurchUnit = UnitOfMeasureConverter::convert(
+                                                      registeredCWQty,
+                                                      UnitOfMeasure::unitOfMeasureIdBySymbol(purchLine.pdsCWUnitId()),
+                                                      UnitOfMeasure::unitOfMeasureIdBySymbol(purchLine.PurchUnit),
+                                                      NoYes::Yes,
+                                                      purchLine.inventTable().Product);
+
+                    purchParmLine.ReceiveNow = registeredQtyPurchUnit;
+                    purchParmLine.RemainAfter = purchParmLine.RemainBefore - registeredQtyPurchUnit;
+                    purchParmLine.setLineAmount();
+                    purchParmLine.update();
+                }
+            }
+        }
+
+        ttscommit;
     }
 
 ]]></Source>
