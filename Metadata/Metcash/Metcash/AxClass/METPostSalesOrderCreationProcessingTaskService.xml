@@ -12,6 +12,8 @@ class METPostSalesOrderCreationProcessingTaskService extends METSysOperationTask
 {    
     guid    topPickingProcessId;
     SalesId salesId;
+    CustAccount      custAccount;  
+    InventLocationId inventLocationId;  
 
 }
 ]]></Declaration>
@@ -44,10 +46,10 @@ class METPostSalesOrderCreationProcessingTaskService extends METSysOperationTask
         while (this.getSalesIdFromTopPickingQueue(topPickingProcessId, _readPast))
         {
             try
-            {
-                if (this.salesId)
+            { 
+                if (this.custAccount && this.inventLocationId)
                 {
-                    this.execute(this.salesId);
+                    this.execute(this.custAccount, this.inventLocationId); 
                 }
             }
             catch (Exception::Error)
@@ -85,20 +87,38 @@ class METPostSalesOrderCreationProcessingTaskService extends METSysOperationTask
     /// Executes the main process.
     /// </summary>
     /// <param name = "_salesId">Sales order to substitute.</param>
-    private void execute(SalesId _salesId)
+    private void execute(CustAccount _custAccount, InventLocationId _inventLocationId) 
     {
         METPostSalesOrderCreationProcessingContract contract = dataContract as METPostSalesOrderCreationProcessingContract;
-        
-        ttsbegin;
-        // process sales order substitution
-        SalesTable salesTable = SalesTable::find(_salesId);
-        METSalesTableSubstituteProcess substituteProcess = METSalesTableSubstituteProcess::construct(salesTable, contract.parmExcludeLines());
-        substituteProcess.run();
-        ttscommit;
+        SalesTable salesTable;
 
-        // Step 4: Call TMS engine outside of the db transaction so it does not rollback substitutes
-        METTMSEngineOrderProccess metTMSEngineOrderProccess = METTMSEngineOrderProccess::construct(METTMSEngineExecutionMode::SalesOrderCreation, salesTable);
-        metTMSEngineOrderProccess.run();
+        // <--- FIX: Load the query from the contract to respect original user filters --->
+        Query query = contract.getQuery();
+        QueryBuildDataSource qbdsSalesTable;
+        QueryRun qr;
+        // Taking the original query from the contract and adding filters to it.
+        // This is required to respect user filters along with our additional filters. 
+        qbdsSalesTable = query.dataSourceTable(tableNum(SalesTable));
+
+        //  Apply the Task Grouping filters (Lock it to this specific Customer & Warehouse)
+        qbdsSalesTable.addRange(fieldNum(SalesTable, CustAccount)).value(queryValue(_custAccount));
+        qbdsSalesTable.addRange(fieldNum(SalesTable, InventLocationId)).value(queryValue(_inventLocationId));
+
+        qr = new QueryRun(query);
+
+        while (qr.next())
+        {
+            salesTable = qr.get(tableNum(SalesTable));
+            ttsbegin;
+            // Process sales order substitution
+            METSalesTableSubstituteProcess substituteProcess = METSalesTableSubstituteProcess::construct(salesTable, contract.parmExcludeLines());
+            substituteProcess.run();
+            ttscommit;
+
+            // Step 4: Call TMS engine outside of the db transaction so it does not rollback substitutes
+            METTMSEngineOrderProccess metTMSEngineOrderProccess = METTMSEngineOrderProccess::construct(METTMSEngineExecutionMode::SalesOrderCreation, salesTable);
+            metTMSEngineOrderProccess.run(); 
+        }  
     }
 
 ]]></Source>
@@ -128,22 +148,24 @@ class METPostSalesOrderCreationProcessingTaskService extends METSysOperationTask
         {
             ttsbegin;
     
-            select firstonly pessimisticlock SalesId
+            select firstonly pessimisticlock *
             from postQueue
             where postQueue.ProcessId == _processId;
 
             if (postQueue.RecId)
             {
-                this.salesId = postQueue.SalesId;
-
+                this.salesId          = postQueue.SalesId; 
+                this.custAccount      = postQueue.CustAccount;
+                this.inventLocationId = postQueue.InventLocationId; 
                 postQueue.delete();
             }
             else
             {
                 // no sales order id found from top picking queue
+                this.custAccount      = '';
+                this.inventLocationId = '';
                 this.salesId = '';
-            }
-
+            } 
             ttscommit;
         }
         catch (deadLockException)
@@ -198,9 +220,7 @@ class METPostSalesOrderCreationProcessingTaskService extends METSysOperationTask
             }
         }
 
-        return this.salesId;
-       
-
+        return this.salesId; 
     }
 
 ]]></Source>
