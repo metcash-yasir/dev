@@ -54,7 +54,8 @@ public class METNature3040ReportDataService
         METInventTable                  metInventTable, metInventTableLoc;
         RecordInsertList                recordInsertListTmp = new RecordInsertList(tableNum(metNature3040ReportsTable), false, false, false, false, false, metNature3040ReportsTable);
         TransDateTime                   transDateTime = DateTimeUtil::utcNow();
-        Counter                         noOfRecords = 0;        
+        Counter                         noOfRecords = 0;     
+        container                       calculatedValues;
 
         METExciseRegisterOriginTypes    originTypes;
 
@@ -67,6 +68,7 @@ public class METNature3040ReportDataService
         while (queryRun.next())
         {
             metExciseInformationTable = queryRun.get(tableNum(METExciseInformationTable));
+
             metNature3040ReportsTable.clear();
 
             metNature3040ReportsTable.ItemId = metExciseInformationTable.ItemId;
@@ -86,21 +88,20 @@ public class METNature3040ReportDataService
             metNature3040ReportsTable.StatCode    = metTariffItemCodeBase.StatCode;
             metNature3040ReportsTable.DutyLAL     = METTariffItemCode::findRecId(metTariffItemCodeBase.RecId).DutyLAL;
 
-            metNature3040ReportsTable.CasesSold = this.getCasesSold(metExciseInformationTable.ItemId);
+            calculatedValues = this.getCasesSold(metExciseInformationTable.ItemId);
+            metNature3040ReportsTable.CasesSold = conPeek(calculatedValues, 1);
 
             metNature3040ReportsTable.LALSQuantity = this.getLALSQty(metExciseInformationTable.ItemId, metTariffItemCodeBase, contract.parmMETNat3040(), metNature3040ReportsTable);
            
             InventQty originalQty;
 
+            metInventTableLoc =  METInventTable::find(metNature3040ReportsTable.ItemId);
+
             if (contract.parmMETNat3040() == METNAT3040::NAT30)
             {
-                container tuivAndVFD = this.getTUIVAndVFD(metNature3040ReportsTable.ItemId);
-
-                metNature3040ReportsTable.TIUV = conPeek(tuivAndVFD, 1);
+                metNature3040ReportsTable.TIUV = conPeek(calculatedValues, 2);
 
                 metNature3040ReportsTable.TariffRate = #Tariff;
-
-                metInventTableLoc =  METInventTable::find(metNature3040ReportsTable.ItemId);
 
                 metNature3040ReportsTable.OriginCountryCode   = metInventTableLoc.CountryCode;
                 metNature3040ReportsTable.PreferenceRule      = metInventTableLoc.PreferenceRule;
@@ -108,7 +109,7 @@ public class METNature3040ReportDataService
                 metNature3040ReportsTable.InvoiceAlcohol      = metInventTableLoc.AlcoholContent;
                 metNature3040ReportsTable.LALSUnit = #LALSUnit;
 
-                metNature3040ReportsTable.CustomsValue = conPeek(tuivAndVFD, 2); // VFD
+                metNature3040ReportsTable.CustomsValue = conPeek(calculatedValues, 3); // VFD
 
                 if (metInventTableLoc.beerallowance())
                 {
@@ -117,14 +118,15 @@ public class METNature3040ReportDataService
 
                 metNature3040ReportsTable.ExciseAmount = metNature3040ReportsTable.LALSQuantity * metNature3040ReportsTable.DutyLAL + (metNature3040ReportsTable.CustomsValue * metInventTableLoc.metGetAdValoremRate());
 
-                metNature3040ReportsTable.LUnit = #LUnit;
+                metNature3040ReportsTable.LUnit = #LALSUnit30;
                 originalQty = metNature3040ReportsTable.LALSQuantity;
             }
             else
             {
-                metNature3040ReportsTable.LALSUnit = #LALSUnit30;
-                metNature3040ReportsTable.LUnit = #LUnit;
+                metNature3040ReportsTable.LUnit = #LALSUnit30;
                 originalQty = metNature3040ReportsTable.LALSQuantity;
+                metNature3040ReportsTable.OriginCountryCode   = metInventTableLoc.CountryCode;
+                metNature3040ReportsTable.InvoiceAlcohol      = metInventTableLoc.AlcoholContent;
                 metNature3040ReportsTable.ExciseAmount = metNature3040ReportsTable.LALSQuantity * metNature3040ReportsTable.DutyLAL;
             }
             
@@ -203,120 +205,93 @@ public class METNature3040ReportDataService
 				<Name>getTUIVAndVFD</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// get TUIV and VFD values per lodgement and sum of all lodgements
+    /// Get cases sold, TUIV and VFD
     /// </summary>
-    /// <param name = "_itemId">itemid</param>
-    /// <returns>container tuiv and VFD</returns>
-    public container getTUIVAndVFD(ItemId              _itemId)
+    /// <param name = "_exciseInfoTable">exciseTable</param>
+    /// <returns>container</returns>
+
+    public container getTUIVAndVFD(METExciseInformationTable _exciseInfoTable)
     {
+        InventQty                       casesQtyLodgement, caseQty;
         METTransportInsurance           TUIVLodgement, TUIV;
         METValueForDuty                 VFDLodgement, VFD;
         METExciseRegisterEntry          metExciseRegisterEntry;
-        METExciseInformationTable       metExciseInformationTable;
         TransDateTime                   minDateTime = DateTimeUtil::minValue();
+        InventQty                       itemPackQtyPerLodgement, itemPackQty;
+        InventTable                     inventTable = InventTable::find(_exciseInfoTable.ItemId);
         
         METExciseRegisterReferenceId    exciseRegisterReferenceId;
 
-        InventTable                     inventTableLoc;
         METLodgement                    lodgement;
         ReferenceNumber                 referenceNumber;
         InventQty                       lodgementQty;
         TransDateTime                   transDateTime = DateTimeUtil::utcNow();
-        METExciseRegisterOriginTypes    originTypes;
 
-        Query                           query = new Query(reportQuery);
-        QueryBuildDataSource            qbds = query.dataSourceTable(tableNum(METExciseInformationTable));
-        qbds.addRange(fieldNum(METExciseInformationTable, ItemId)).value(queryValue(_itemId));
+        List    lodgements = new List(Types::String);
+        lodgements = strSplit(_exciseInfoTable.Lodgement, ',');
 
-        qbds.addSelectionField(fieldNum(METExciseInformationTable, ItemId));
-        qbds.addSelectionField(fieldNum(METExciseInformationTable, Lodgement));
-        qbds.addSelectionField(fieldNum(METExciseInformationTable, ReferenceNumber));
-        qbds.addSelectionField(fieldNum(METExciseInformationTable, InventoryQty));
-        qbds.addSelectionField(fieldNum(METExciseInformationTable, SiteId));
-        qbds.addSelectionField(fieldNum(METExciseInformationTable, LodgementAndQtyCon));
-        qbds.addSelectionField(fieldNum(METExciseInformationTable, InventTransType));
+        ListEnumerator    lodgementEnum = lodgements.getEnumerator();
 
-        QueryRun                        queryRun = new QueryRun(query);
-        
-        while (queryRun.next())
+        while (lodgementEnum.moveNext())
         {
-            metExciseInformationTable = queryRun.get(tableNum(METExciseInformationTable));
+            lodgement = lodgementEnum.current();
 
-            if (metExciseInformationTable.InventTransType == InventTransType::InventCounting)
-            {
-                if (InventCountingReasonCode::find(InventJournalTrans::findInventTransId(metExciseInformationTable.InventTransId).CountingReasonCode).METExemptFromDuty)
-                {
-                    //Skipping transaction if reason code for counting journal matches with the parameter
-                    continue;
-                }
-            }
-
-            select firstonly RecId from originTypes
-                where originTypes.ReferenceId == metExciseInformationTable.InventTransType &&
-                      originTypes.UpdateNAT3040 == NoYes::Yes &&
-                ((metexciseInformationTable.InventoryQty < 0 && originTypes.TransactionType == METTransactionType::Negative) ||
-                 (metexciseInformationTable.InventoryQty > 0 && originTypes.TransactionType == METTransactionType::Positive));
-
-            if (!originTypes.RecId)
-            {
-                continue;
-            }
-
-            List    lodgements = new List(Types::String);
-            lodgements = strSplit(metExciseInformationTable.Lodgement, ',');
-
-            ListEnumerator    lodgementEnum = lodgements.getEnumerator();
-
-            while (lodgementEnum.moveNext())
-            {
-                lodgement = lodgementEnum.current();
-
-                lodgementQty = this.getLodgementQty(metExciseInformationTable, lodgement);
-                referenceNumber = this.getReferenceNumber(metExciseInformationTable, lodgement);
+            lodgementQty = this.getLodgementQty(_exciseInfoTable, lodgement);
+            referenceNumber = this.getReferenceNumber(_exciseInfoTable, lodgement);
             
+            select firstonly validtimestate(transDateTime) metExciseRegisterEntry
+                where metExciseRegisterEntry.ItemId      == _exciseInfoTable.ItemId &&
+                        metExciseRegisterEntry.SiteId      == _exciseInfoTable.SiteId &&
+                        metExciseRegisterEntry.OrderNumber == referenceNumber &&
+                        metExciseRegisterEntry.Lodgement   == lodgement;
+
+            if (!metExciseRegisterEntry.RecId)
+            {
+                select firstonly validtimestate(minDateTime, transDateTime) metExciseRegisterEntry
+                    where metExciseRegisterEntry.ItemId      == _exciseInfoTable.ItemId &&
+                            metExciseRegisterEntry.SiteId      == _exciseInfoTable.SiteId &&
+                            metExciseRegisterEntry.OrderNumber == referenceNumber &&
+                            metExciseRegisterEntry.Lodgement   == lodgement;
+
+                exciseRegisterReferenceId = metExciseRegisterEntry.ReferenceId;
+
+                metExciseRegisterEntry = null;
+
                 select firstonly validtimestate(transDateTime) metExciseRegisterEntry
-                    where metExciseRegisterEntry.ItemId      == metExciseInformationTable.ItemId &&
-                          metExciseRegisterEntry.SiteId      == metExciseInformationTable.SiteId &&
-                          metExciseRegisterEntry.OrderNumber == referenceNumber &&
-                          metExciseRegisterEntry.Lodgement   == lodgement;
-
-                if (!metExciseRegisterEntry.RecId)
-                {
-                    select firstonly validtimestate(minDateTime, transDateTime) metExciseRegisterEntry
-                        where metExciseRegisterEntry.ItemId      == metExciseInformationTable.ItemId &&
-                              metExciseRegisterEntry.SiteId      == metExciseInformationTable.SiteId &&
-                              metExciseRegisterEntry.OrderNumber == referenceNumber &&
-                              metExciseRegisterEntry.Lodgement   == lodgement;
-
-                    exciseRegisterReferenceId = metExciseRegisterEntry.ReferenceId;
-
-                    metExciseRegisterEntry = null;
-
-                    select firstonly validtimestate(transDateTime) metExciseRegisterEntry
-                        where metExciseRegisterEntry.ReferenceId == exciseRegisterReferenceId;
-                }
-
-                if (metExciseRegisterEntry.RecId)
-                {
-                    inventTableLoc = InventTable::find(metExciseRegisterEntry.ItemId);
-
-                    InventQty casesSoldLodgement = UnitOfMeasureConverter::convert(lodgementQty,
-                        UnitOfMeasure::unitOfMeasureIdBySymbol(inventTableLoc.inventUnitId()),
-                        UnitOfMeasure::unitOfMeasureIdBySymbol(this.getSalesOrderUnit(_itemId)),
-                        NoYes::Yes,
-                        inventTableLoc.Product,
-                        NoYes::No);
-
-                    TUIVLodgement = metExciseRegisterEntry.TIUV * casesSoldLodgement;
-                    VFDLodgement  = metExciseRegisterEntry.DutyRateReceived * casesSoldLodgement;
-
-                    TUIV = TUIV + TUIVLodgement;
-                    VFD  = VFD + VFDLodgement;
-                }
+                    where metExciseRegisterEntry.ReferenceId == exciseRegisterReferenceId;
             }
+
+            itemPackQtyPerLodgement = lodgementQty;
+
+            if (itemPackQtyPerLodgement < 0)
+            {
+                itemPackQtyPerLodgement = METNature3040ReportDataService::consumeDutyCredit(_exciseInfoTable.ItemId,
+                                                                          _exciseInfoTable.SiteId,
+                                                                          abs(itemPackQtyPerLodgement));
+            }
+            else
+            {
+                itemPackQtyPerLodgement = -1 * itemPackQtyPerLodgement;
+            }
+
+            casesQtyLodgement = UnitOfMeasureConverter::convert(itemPackQtyPerLodgement,
+                            UnitOfMeasure::unitOfMeasureIdBySymbol(inventTable.inventUnitId()),
+                            UnitOfMeasure::unitOfMeasureIdBySymbol(this.getSalesOrderUnit(_exciseInfoTable.ItemId)),
+                            NoYes::Yes,
+                            inventTable.Product,
+                            NoYes::No);
+
+            if (metExciseRegisterEntry.RecId)
+            {
+                TUIVLodgement = metExciseRegisterEntry.TIUV * casesQtyLodgement;
+                VFDLodgement  = metExciseRegisterEntry.DutyRateReceived * casesQtyLodgement;
+            }
+            TUIV += TUIVLodgement;
+            VFD += VFDLodgement;
+            caseQty += casesQtyLodgement;
         }
 
-        return [TUIV, VFD];
+        return [caseQty, TUIV, VFD];
     }
 
 ]]></Source>
@@ -376,11 +351,11 @@ public class METNature3040ReportDataService
 
         if (metTariffItemCode.BeerAllowance) //Calculation is same for Nat30 and Nat40
         {
-            lalsQty = itemPackQty * metInventTable.ItemPack * metInventTable.BottleSize * (metInventTable.AlcoholContent - metInventTable.metGetAdValoremRate());
+            lalsQty = itemPackQty * metInventTable.ItemPack * metInventTable.BottleSize * (metInventTable.AlcoholContent - metInventTable.metGetAdValoremRate())/100;
         }
         else
         {
-            lalsQty = itemPackQty * metInventTable.ItemPack * metInventTable.BottleSize * metInventTable.AlcoholContent;
+            lalsQty = itemPackQty * metInventTable.ItemPack * metInventTable.BottleSize * metInventTable.AlcoholContent/100;
         }
         return abs(lalsQty);
     }
@@ -399,9 +374,31 @@ public class METNature3040ReportDataService
         Query           query = new Query(reportQuery);
         QueryRun        queryRun = new QueryRun(query);
 
+        METExciseRegisterOriginTypes    originTypes;
+
         while (queryRun.next())
         {
             METExciseInformationTable   metExciseInformationTable = queryRun.get(tableNum(METExciseInformationTable));
+
+            if (metExciseInformationTable.InventTransType == InventTransType::InventCounting)
+            {
+                if (InventCountingReasonCode::find(InventJournalTrans::findInventTransId(metExciseInformationTable.InventTransId).CountingReasonCode).METExemptFromDuty)
+                {
+                    //Skipping transaction if reason code for counting journal matches with the parameter
+                    continue;
+                }
+            }
+
+            select firstonly RecId from originTypes
+                where originTypes.ReferenceId == metExciseInformationTable.InventTransType &&
+                      originTypes.UpdateNAT3040 == NoYes::Yes &&
+                ((metexciseInformationTable.InventoryQty < 0 && originTypes.TransactionType == METTransactionType::Negative) ||
+                 (metexciseInformationTable.InventoryQty > 0 && originTypes.TransactionType == METTransactionType::Positive));
+
+            if (!originTypes.RecId)
+            {
+                continue;
+            }
 
             metExciseInformationTable.selectForUpdate(true);
             metExciseInformationTable.NAT3040 = _contract.parmMETNat3040();
@@ -418,25 +415,25 @@ public class METNature3040ReportDataService
     /// <summary>
     /// Get cases sold
     /// </summary>
-    /// <param name = "_itemId">_item id</param>
-    /// <returns>InventQty</returns>
-    public InventQty getCasesSold(ItemId                      _itemId)
+    /// <param name = "_itemId">item id</param>
+    /// <returns>CasesSold/TUIV/VFD</returns>
+    public container getCasesSold(ItemId                      _itemId)
     {
         METExciseInformationTable           metexciseInformationTable;
         METExciseRegisterOriginTypes        originTypes;
-        InventQty                           itemPackQtyPerLodgement, itemPackQty;
+        InventQty                           caseQtyPerItem;
         InventTable                         inventTable = InventTable::find(_itemId);
         Query                               query = new Query(reportQuery);
         QueryBuildDataSource                qbds = query.dataSourceTable(tableNum(METExciseInformationTable));
         boolean                             validRecord = true;
 
+        METTransportInsurance           TUIV;
+        METValueForDuty                 VFD;
+        container                       CASETUIVVFD;
+
         qbds.addRange(fieldNum(METExciseInformationTable, ItemId)).value(queryValue(_itemId));
 
-        qbds.addSelectionField(fieldNum(METExciseInformationTable, ItemId));
-        qbds.addSelectionField(fieldNum(METExciseInformationTable, SiteId));
-        qbds.addSelectionField(fieldNum(METExciseInformationTable, InventoryQty));
-        qbds.addSelectionField(fieldNum(METExciseInformationTable, InventTransType));
-        qbds.addSelectionField(fieldNum(METExciseInformationTable, InventTransId));
+        qbds.addAllFields(tableStr(METExciseInformationTable));
 
         QueryRun                            queryRun = new QueryRun(query);
 
@@ -463,35 +460,19 @@ public class METNature3040ReportDataService
             {
                 continue;
             }
-            
-            itemPackQtyPerLodgement = metexciseInformationTable.InventoryQty;
 
-            if (itemPackQtyPerLodgement < 0)
-            {
-                itemPackQtyPerLodgement = METNature3040ReportDataService::consumeDutyCredit(metexciseInformationTable.ItemId,
-                                                                          metexciseInformationTable.SiteId,
-                                                                          abs(itemPackQtyPerLodgement));
-            }
-            else
-            {
-                itemPackQtyPerLodgement = -1 * itemPackQtyPerLodgement;
-            }
-
-            itemPackQty += itemPackQtyPerLodgement;
+            CASETUIVVFD = this.getTUIVAndVFD(metExciseInformationTable);
+            caseQtyPerItem += conPeek(CASETUIVVFD, 1);
+            TUIV += conPeek(CASETUIVVFD,2);
+            VFD += conPeek(CASETUIVVFD, 3);
         }
 
-        itemPackQty = UnitOfMeasureConverter::convert(itemPackQty,
-                            UnitOfMeasure::unitOfMeasureIdBySymbol(inventTable.inventUnitId()),
-                            UnitOfMeasure::unitOfMeasureIdBySymbol(this.getSalesOrderUnit(_itemId)),
-                            NoYes::Yes,
-                            inventTable.Product,
-                            NoYes::No);
-        if (itemPackQty < 0)
+        if (caseQtyPerItem < 0)
         {
-            itemPackQty = 0;
+            caseQtyPerItem = 0;
         }
 
-        return itemPackQty;
+        return [caseQtyPerItem, TUIV, VFD];
     }
 
 ]]></Source>
