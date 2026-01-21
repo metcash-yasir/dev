@@ -673,28 +673,31 @@ final class METSalesLine_Extension
     [SysClientCacheDataMethodAttribute(true)]
     public display METGrossWeight displayMETActualWeight()
     {
-        
-        UnitOfMeasureSymbol     unitSales       = this.SalesUnit;
-        UnitOfMeasureSymbol     unitInvent      = InventTableModule::find(this.itemId, ModuleInventPurchSales::Invent).UnitId;
-        InventQty               actBrokenCase   = this.displayMETActualBrokenCase();
-        InventQty               actCase         = this.displayMETActualCases();
-        METSalesLine            metSalesLine    = METSalesLine::find(this.RecId);
+        // Cache frequently used values
+        InventDim inventDim = this.inventDim();
+        UnitOfMeasureSymbol unitSales = this.SalesUnit;
+        UnitOfMeasureSymbol unitInvent = InventTableModule::find(this.ItemId, ModuleInventPurchSales::Invent).UnitId;
+        METSalesLine metSalesLine = METSalesLine::find(this.RecId);
 
-        /*Bug 303922 - CB797 - CW Weight not calculating Pricing and sales order line not updated with weight - start*/
-        //CW actual weight will take precedence over others.
+        // Prefer actual/captured weights if available
         if (metSalesLine.CWActualWeight != 0.0)
         {
             return metSalesLine.CWActualWeight;
         }
-        /*Bug 303922 - CB797 - CW Weight not calculating Pricing and sales order line not updated with weight - end*/
-
-        // If AIS sent the actual weight ignore the below calculationa and the value from AIS field
         if (metSalesLine.AISWeight != 0.0)
         {
             return metSalesLine.AISWeight;
         }
-        return (METWHSPhysDimUOMSite::convertWeight(this.ItemId, actCase, unitSales, this.inventDim())
-                    + METWHSPhysDimUOMSite::convertWeight(this.ItemId, actBrokenCase, unitInvent, this.inventDim()));
+
+        // Cache actual case and broken case quantities
+        InventQty actCase = this.displayMETActualCases();
+        InventQty actBrokenCase = this.displayMETActualBrokenCase();
+
+        // Calculate and return total actual weight
+        METGrossWeight caseWeight = METWHSPhysDimUOMSite::convertWeight(this.ItemId, actCase, unitSales, inventDim);
+        METGrossWeight brokenCaseWeight = METWHSPhysDimUOMSite::convertWeight(this.ItemId, actBrokenCase, unitInvent, inventDim);
+
+        return caseWeight + brokenCaseWeight;
     }
 
 ]]></Source>
@@ -724,14 +727,18 @@ final class METSalesLine_Extension
     [SysClientCacheDataMethodAttribute(true)]
     public display METUOMVolume displayMETActualUnitVolume()
     {
-        
-        InventQty               actBrokenCase   = this.displayMETActualBrokenCase();
-        InventQty               actCase         = this.displayMETActualCases();
-        UnitOfMeasureSymbol     unitInvent      = InventTableModule::find(this.itemId, ModuleInventPurchSales::Invent).UnitId;
+        InventDim               inventDim       = this.inventDim();
+        ItemId                  itemId          = this.ItemId;
         UnitOfMeasureSymbol     unitSales       = this.SalesUnit;
+        UnitOfMeasureSymbol     unitInvent      = InventTableModule::find(itemId, ModuleInventPurchSales::Invent).UnitId;
 
-        return (METWHSPhysDimUOMSite::convertVolume(this.ItemId, actCase, unitSales, this.inventDim())
-                    + METWHSPhysDimUOMSite::convertVolume(this.ItemId, actBrokenCase, unitInvent, this.inventDim()));
+        InventQty               actCase         = this.displayMETActualCases();
+        InventQty               actBrokenCase   = this.displayMETActualBrokenCase();
+
+        METUOMVolume caseVolume = METWHSPhysDimUOMSite::convertVolume(itemId, actCase, unitSales, inventDim);
+        METUOMVolume brokenCaseVolume = METWHSPhysDimUOMSite::convertVolume(itemId, actBrokenCase, unitInvent, inventDim);
+
+        return caseVolume + brokenCaseVolume;
     }
 
 ]]></Source>
@@ -782,46 +789,48 @@ final class METSalesLine_Extension
     [SysClientCacheDataMethod(true)]
     public display InventQty metActualTotalcases()
     {
-        UnitOfMeasureSymbol     unitInvent          = InventTableModule::find(this.itemId, ModuleInventPurchSales::Invent).UnitId;
-        METInventTransView      views;
-        InventItemSalesSetup    inventItemSalesSetup;
-        InventDim               inventDim = this.inventDim();
-        InventDim               inventDimSetup;
+        UnitOfMeasureSymbol unitInvent = InventTableModule::find(this.itemId, ModuleInventPurchSales::Invent).UnitId;
+        METInventTransView views;
+        InventItemSalesSetup inventItemSalesSetup;
+        InventDim inventDim = this.inventDim();
+        InventDim inventDimSetup;
 
         select firstonly METSalesUnit, METAltSalesUnit, RecId from inventItemSalesSetup
-                where inventItemSalesSetup.ItemId == this.ItemId
-            exists join inventDimSetup
-                where inventDimSetup.InventDimId == inventItemSalesSetup.InventDimId
-                &&    inventDimSetup.InventSiteId == inventDim.InventSiteId;
+        where inventItemSalesSetup.ItemId == this.ItemId
+        exists join inventDimSetup
+            where inventDimSetup.InventDimId == inventItemSalesSetup.InventDimId
+            && inventDimSetup.InventSiteId == inventDim.InventSiteId;
 
         if (inventItemSalesSetup.RecId &&
-            inventItemSalesSetup.METSalesUnit == this.salesUnit &&
-            inventItemSalesSetup.METAltSalesUnit != this.salesUnit)
+        inventItemSalesSetup.METSalesUnit == this.salesUnit &&
+        inventItemSalesSetup.METAltSalesUnit != this.salesUnit)
         {
+            InventQty reservedQty = 0;
 
-            select sum(Qty) from views where views.ReferenceId == this.SalesId
-                    && views.inventTransId == this.InventTransId
-                    && (views.StatusIssue == StatusIssue::ReservPhysical
-                    || views.StatusIssue == StatusIssue::ReservOrdered);
+            // Combine both status checks in a single query using 'in' clause
+            select sum(Qty) from views
+            where views.ReferenceId == this.SalesId
+                && views.inventTransId == this.InventTransId
+                && (views.StatusIssue == StatusIssue::ReservPhysical
+                    || views.StatusIssue == StatusIssue::ReservOrdered
+                    || views.StatusIssue == StatusIssue::OnOrder);
 
-            inventqty  reservedQty = (abs(views.Qty));
+            reservedQty = abs(views.Qty);
 
-            if (abs(reservedQty) == 0)
+            if (reservedQty == 0)
             {
-                select sum(Qty) from views where views.ReferenceId == this.SalesId
-                    && views.inventTransId == this.InventTransId
-                    && views.StatusIssue == StatusIssue::OnOrder;
-
-                reservedQty = views.Qty;
+                return 0;
             }
 
-            InventQty actualCases = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(this.ItemId,
-                                                                                                          this.inventDimId, 
-                                                                                                          abs(reservedQty), 
-                                                                                                          unitInvent, 
-                                                                                                          this.SalesUnit,
-                                                                                                          NoYes::No,
-                                                                                                          NoYes::No);
+            InventQty actualCases = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+            this.ItemId,
+            this.inventDimId,
+            reservedQty,
+            unitInvent,
+            this.SalesUnit,
+            NoYes::No,
+            NoYes::No);
+
             return actualCases;
         }
 
@@ -895,44 +904,40 @@ final class METSalesLine_Extension
         //For any other sell units broken case=0
         //return this.SalesUnit == METConstants::unitEach ? this.SalesQty : 0;
 
-        UnitOfMeasureSymbol     unitInvent          = InventTableModule::find(this.itemId, ModuleInventPurchSales::Invent).UnitId;
-        METInventTransView      views;
-        InventItemSalesSetup    inventItemSalesSetup;
-        InventDim               inventDim = this.inventDim();
-        InventDim               inventDimSetup;
+        // Early exit if not alternate sales unit scenario
+        InventItemSalesSetup inventItemSalesSetup;
+        InventDim inventDim = this.inventDim();
+        InventDim inventDimSetup;
 
         select firstonly METSalesUnit, METAltSalesUnit, RecId from inventItemSalesSetup
-                where inventItemSalesSetup.ItemId == this.ItemId
-            exists join inventDimSetup
-                where inventDimSetup.InventDimId == inventItemSalesSetup.InventDimId
-                &&    inventDimSetup.InventSiteId == inventDim.InventSiteId;
+        where inventItemSalesSetup.ItemId == this.ItemId
+        exists join inventDimSetup
+            where inventDimSetup.InventDimId == inventItemSalesSetup.InventDimId
+            && inventDimSetup.InventSiteId == inventDim.InventSiteId;
 
-        if (inventItemSalesSetup.RecId &&
-            inventItemSalesSetup.METSalesUnit != this.salesUnit &&
-            inventItemSalesSetup.METAltSalesUnit == this.salesUnit)
+        if (!(inventItemSalesSetup.RecId &&
+        inventItemSalesSetup.METSalesUnit != this.salesUnit &&
+        inventItemSalesSetup.METAltSalesUnit == this.salesUnit))
         {
-
-            select sum(Qty) from views where views.ReferenceId == this.SalesId
-                    && views.inventTransId == this.InventTransId
-                    && (views.StatusIssue == StatusIssue::ReservPhysical
-                    || views.StatusIssue == StatusIssue::ReservOrdered);
-
-            inventqty  reservedQty = (abs(views.Qty));
-
-            if (abs(reservedQty) == 0)
-            {
-                select sum(Qty) from views where views.ReferenceId == this.SalesId
-                    && views.inventTransId == this.InventTransId
-                    && views.StatusIssue == StatusIssue::OnOrder;
-
-                reservedQty = abs(views.Qty);
-            }
-
-            return reservedQty;
+            return 0;
         }
 
-        return 0;
+        // Cache keys
+        SalesId salesId = this.SalesId;
+        InventTransId inventTransId = this.InventTransId;
 
+        // Combine all relevant StatusIssue values in a single query
+        METInventTransView views;
+        select sum(Qty) from views
+        where views.ReferenceId == salesId
+            && views.inventTransId == inventTransId
+            && (views.StatusIssue == StatusIssue::ReservPhysical
+                || views.StatusIssue == StatusIssue::ReservOrdered
+                || views.StatusIssue == StatusIssue::OnOrder);
+
+        InventQty reservedQty = abs(views.Qty);
+
+        return reservedQty;
     }
 
 ]]></Source>
@@ -1241,7 +1246,11 @@ final class METSalesLine_Extension
             metSalesLine.reread();
             metSalesLine.selectForUpdate(true);
 
-            metSalesLine.ReasonId = _reasonCode;
+            // Only update reason code if it is not already set to DEL
+            if (metSalesLine.ReasonId != METConstants::DEL)
+            {
+                metSalesLine.ReasonId = _reasonCode;
+            }
             metSalesLine.update();
 
             ttscommit;
@@ -1301,7 +1310,7 @@ final class METSalesLine_Extension
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>metFindBonusStock</Name>
+				<Name>metFindSalesLineToApplyRoundingPolicy</Name>
 				<Source><![CDATA[
     /// <summary>
     /// CB223_PalletRounding
@@ -1311,37 +1320,39 @@ final class METSalesLine_Extension
     /// <param name = "_custAccount">Customer account</param>
     /// <param name = "_salesUnit">Sales order line UOM</param>
     /// <param name = "_inventDimId">Inventory dimension id</param>
-    /// <param name = "_applyBonus">apply bonus yes or no</param>
     /// <param name = "_update">select record for update</param>
     /// <returns><c>SalesLine</c> record</returns>
-    public static SalesLine metFindBonusStock(SalesId       _salesId,
-                                              ItemId        _itemId,
-                                              CustAccount   _custAccount,
-                                              SalesUnit     _salesUnit,
-                                              InventDimId   _inventDimId,
-                                              METApplyBonus _applyBonus = NoYes::No,
-                                              boolean       _update      = false)
+    public static SalesLine metFindSalesLineToApplyRoundingPolicy(SalesId       _salesId,
+                                                                    ItemId      _itemId,
+                                                                    CustAccount _custAccount,
+                                                                    SalesUnit   _salesUnit,
+                                                                    InventDimId _inventDimId,
+                                                                    boolean     _update = false)
     {
         SalesLine salesLine;
-        METSalesLine metSalesLine;
+        METSalesInvoiceIndicatorView metSalesInvoiceIndicatorView;
 
-        if (_salesId && _itemId && _custAccount && _salesUnit && _inventDimId)
+        if (!_salesId || !_itemId || !_custAccount || !_salesUnit || !_inventDimId)
         {
-            if (_update)
-            {
-                salesLine.selectForUpdate(_update);
-            }
-            
-            select firstonly salesLine
-                where salesLine.SalesId == _salesId
-                    && salesLine.ItemId == _itemId
-                    && salesLine.CustAccount == _custAccount
-                    && salesLine.SalesUnit == _salesUnit
-                    && salesLine.InventDimId == _inventDimId
-                 exists join metSalesLine
-                       where metSalesLine.SalesLine == salesLine.RecId
-                          && metSalesLine.ApplyBonus == _applyBonus;
+            return salesLine;
         }
+
+        if (_update)
+        {
+            salesLine.selectForUpdate(_update);
+        }
+
+        select firstonly salesLine
+        order by salesLine.LineNum asc
+            where salesLine.SalesId     == _salesId
+               && salesLine.ItemId      == _itemId
+               && salesLine.CustAccount == _custAccount
+               && salesLine.SalesUnit   == _salesUnit
+               && salesLine.InventDimId == _inventDimId
+        notexists join metSalesInvoiceIndicatorView
+            where metSalesInvoiceIndicatorView.InventTransId   == salesLine.InventTransId
+                && (metSalesInvoiceIndicatorView.Indicators    == 'B'
+                    || metSalesInvoiceIndicatorView.Indicators == 'E');
 
         return salesLine;
     }
