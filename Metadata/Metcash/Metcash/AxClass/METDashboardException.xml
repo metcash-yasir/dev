@@ -9,11 +9,14 @@
 class METDashboardException extends RunBaseBatch
 {
     DialogField                dialogExceptionType;
+    DialogField                dialogReverseLockOrder;
     METDashboardExceptionType  exceptionType;
+    boolean                    reverseLockOrder;
 
     #define.CurrentVersion(1)
     #localmacro.CurrentList
-        exceptionType
+        exceptionType,
+        reverseLockOrder
     #endmacro
 }
 ]]></Declaration>
@@ -25,8 +28,8 @@ class METDashboardException extends RunBaseBatch
     {
         Dialog dialog = super();
 
-        dialog.caption("@SYS:ExceptionDemo");
         dialogExceptionType = dialog.addFieldValue(enumStr(METDashboardExceptionType), exceptionType, "Exception type", "Select the type of exception to generate");
+        dialogReverseLockOrder = dialog.addFieldValue(enumStr(NoYes), reverseLockOrder, "Deadlock exception tool", "Applicable for Deadlock exception type. Enable for Session 2 to create deadlock condition");
 
         return dialog;
     }
@@ -39,6 +42,7 @@ class METDashboardException extends RunBaseBatch
     public boolean getFromDialog()
     {
         exceptionType = dialogExceptionType.value();
+        reverseLockOrder = dialogReverseLockOrder.value();
         return super();
     }
 
@@ -71,6 +75,10 @@ class METDashboardException extends RunBaseBatch
                 this.generateDeadlockException();
                 break;
 
+            case METDashboardExceptionType::Duplicate:
+                this.generateDuplicateKeyException();
+                break;
+
             default:
                 info("No exception type selected.");
                 break;
@@ -84,7 +92,7 @@ class METDashboardException extends RunBaseBatch
 				<Source><![CDATA[
     private void generateErrorException()
     {
-        throw error("VALIDATE EXCEPTION: ERROR - This is a custom error exception");
+        throw error("VALIDATE EXCEPTION ERROR");
     }
 
 ]]></Source>
@@ -144,15 +152,16 @@ class METDashboardException extends RunBaseBatch
 
         if (custGroup)
         {
-            // Simulate another user updating the record by changing RecVersion
+            // Copy the record with current RecVersion
             custGroupCopy.data(custGroup);
 
-            // First update succeeds
-            custGroup.Name = custGroup.Name;
+            // First update - actually change the value so RecVersion increments
+            custGroup.Name = custGroup.Name + " ";
             custGroup.update();
 
             // Now try to update with the old RecVersion (simulating different user)
             // This causes "Update conflict" / "Update by different user" exception
+            custGroupCopy.Name = custGroupCopy.Name + "X";
             custGroupCopy.update();
         }
         else
@@ -160,7 +169,7 @@ class METDashboardException extends RunBaseBatch
             info("No CustGroup record found to update.");
         }
 
-        ttscommit;
+        ttsabort;
     }
 
 ]]></Source>
@@ -170,42 +179,97 @@ class METDashboardException extends RunBaseBatch
 				<Source><![CDATA[
     private void generateDeadlockException()
     {
-        CustGroup   custGroup;
-        CustTable   custTable;
+        CustGroup   custGroupA;
+        CustGroup   custGroupB;
+        CustGroup   lockFirst;
+        CustGroup   lockSecond;
+        CustGroupId custGroupIdFirst, custGroupIdSecond;
 
-        info("To generate a deadlock, you need to run two sessions simultaneously:");
-        info("Session 1: Lock CustGroup first, then try to lock CustTable");
-        info("Session 2: Lock CustTable first, then try to lock CustGroup");
-        info("");
-        info("Starting Session 1 behavior - locking CustGroup with pessimistic lock...");
-        info("Open another session and run this with Deadlock option to create the deadlock condition.");
+        // Get two different CustGroup records
+        select firstonly custGroupA order by CustGroup asc;
+        select firstonly custGroupB order by CustGroup desc
+            where custGroupB.CustGroup != custGroupA.CustGroup;
 
-        ttsbegin;
-
-        // Pessimistic lock on CustGroup
-        select firstonly pessimisticlock custGroup;
-
-        if (custGroup)
+        if (!custGroupA || !custGroupB)
         {
-            info(strFmt("Locked CustGroup: %1. Waiting 30 seconds for second session...", custGroup.CustGroup));
+            info("Need at least two CustGroup records to generate deadlock.");
+            return;
+        }
 
-            // Wait to allow second session to lock CustTable
-            sleep(30000);
-
-            // Now try to lock CustTable - this will deadlock if second session has it locked
-            select firstonly pessimisticlock custTable;
-
-            if (custTable)
-            {
-                info(strFmt("Also locked CustTable: %1", custTable.AccountNum));
-            }
+        // Determine lock order based on reverseLockOrder flag
+        if (reverseLockOrder)
+        {
+            custGroupIdFirst = custGroupB.CustGroup;
+            custGroupIdSecond = custGroupA.CustGroup;
         }
         else
         {
-            info("No CustGroup record found.");
+            custGroupIdFirst = custGroupA.CustGroup;
+            custGroupIdSecond = custGroupB.CustGroup;
         }
 
-        ttscommit;
+        info(strFmt("Will lock records in order: %1 -> %2", lockFirst.CustGroup, lockSecond.CustGroup));
+        info("");
+
+        ttsbegin;
+
+        lockFirst = null;
+
+        // Pessimistic lock on first record
+        info(strFmt("Locking first record: %1...", lockFirst.CustGroup));
+        select firstonly pessimisticlock lockFirst
+            where lockFirst.CustGroup == custGroupIdFirst;
+
+
+        info(strFmt("Locked: %1. Waiting 30 seconds for other session...", lockFirst.CustGroup));
+
+        // Wait to allow other session to lock its first record
+        if (!reverseLockOrder)
+        {
+            sleep(40000);
+        }
+
+        lockSecond = null;
+
+        // Now try to lock second record - this will deadlock if other session has it locked
+        info(strFmt("Now attempting to lock second record: %1...", lockSecond.CustGroup));
+        select firstonly pessimisticlock lockSecond
+            where lockSecond.CustGroup == custGroupIdSecond;
+
+        info("No deadlock occurred - other session may not be running.");
+
+        ttsabort;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateDuplicateKeyException</Name>
+				<Source><![CDATA[
+    private void generateDuplicateKeyException()
+    {
+        CustGroup custGroup;
+        CustGroup custGroupDuplicate;
+
+        // Get an existing CustGroup record
+        select firstonly custGroup;
+
+        if (custGroup)
+        {
+            ttsbegin;
+
+            // Try to insert a record with the same primary key
+            // This will cause a "Duplicate key" exception
+            custGroupDuplicate.CustGroup = custGroup.CustGroup;
+            custGroupDuplicate.Name = "Duplicate Test";
+            custGroupDuplicate.insert();
+
+            ttsabort;
+        }
+        else
+        {
+            info("No CustGroup record found to duplicate.");
+        }
     }
 
 ]]></Source>
