@@ -33,6 +33,24 @@ public class METCrossDockTransferOrderProcessor_TransferOrder extends METCrossDo
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>updateMarking</Name>
+				<Source><![CDATA[
+    /// <summary>
+    ///
+    /// </summary>
+    /// <param name = "_transferLine"></param>
+    public void updateMarking(InventTransferLine _transferLine)
+    {
+        InventDimParm inventDimParm;
+        InventDim     inventDim = inventTransferLine.inventDim();
+        inventDimParm.initFromInventDim(inventDim);
+
+        _transferLine.metUpdateMarking(InventTransOrigin::findByInventTransId(inventTransferLine.InventTransId).RecId, InventTransOrigin::findByInventTransId(_transferLine.InventTransIdReceive).RecId, - _transferLine.QtyTransfer, _transferLine.PdsCWQtyTransfer, inventDim, inventDimParm);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>init</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -73,9 +91,10 @@ public class METCrossDockTransferOrderProcessor_TransferOrder extends METCrossDo
         metInventTransferTable.OrderExtractStatus = METOrderExtractStatus::Extracted;
         metInventTransferTable.update();
 
+        //this.updateMarkingTO(finalLegTransferTable);
         ttscommit;
 
-        super();
+        //super();
     }
 
 ]]></Source>
@@ -281,7 +300,7 @@ public class METCrossDockTransferOrderProcessor_TransferOrder extends METCrossDo
     /// <returns>InventTransId of the source line</returns>
     public InventTransId getSourceTransId()
     {
-        InventTransId ret = inventTransferLine.InventTransId;
+        InventTransId ret = inventTransferLine.InventTransIdReceive;
 
         return ret;
     }
@@ -403,37 +422,88 @@ public class METCrossDockTransferOrderProcessor_TransferOrder extends METCrossDo
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>updateMarking</Name>
+				<Name>markInventoryTransaction</Name>
 				<Source><![CDATA[
-    /// <summary>
-    ///
-    /// </summary>
-    /// <param name = "_transferLine"></param>
-    public void updateMarking(InventTransferLine _transferLine)
+    public static void markInventoryTransaction(InventTransId _issueId, InventTransId _receiptId)
     {
-        if (!PdsGlobal::pdsIsCWItem(_transferLine.ItemId))
+        InventTransId         issueInventTransId   = _issueId;
+        InventTransId         receiptInventTransId = _receiptId;
+
+        InventTransOriginId receiptInventTransOriginId = InventTransOrigin::findByInventTransId(receiptInventTransId).RecId;
+        InventTrans         receiptInventTrans         = InventTrans::findByInventTransOrigin(receiptInventTransOriginId);
+
+        InventTransOriginId issueInventTransOriginId = InventTransOrigin::findByInventTransId(issueInventTransId).RecId;
+        InventTrans         issueInventTrans       = InventTrans::findByInventTransOrigin(issueInventTransOriginId);
+        tmpInventTransMark tmpInventTransMark;
+        InventTransMarkCollection collection = TmpInventTransMark::markingCollection(InventTransOrigin::find(receiptInventTransOriginId),receiptInventTrans.inventDim(), receiptInventTrans.Qty);
+
+        collection.insertCollectionToTmpTable(tmpInventTransMark);
+
+        select firstonly tmpInventTransMark
+                        where tmpInventTransMark.InventTransOrigin == issueInventTrans.InventTransOrigin
+                           && tmpInventTransMark.InventDimId       == issueInventTrans.InventDimId;
+
+        if (tmpInventTransMark.RecId != 0)
         {
-            ttsbegin;
+            Qty qtyToMark = issueInventTrans.Qty;
 
-            InventTransId transferLineTransId = this.getSourceTransId();
+            tmpInventTransMark.QtyMarkNow =  qtyToMark;
+            tmpInventTransMark.QtyRemain  -= tmpInventTransMark.QtyMarkNow;
 
-            InventTransferLine transLine = InventTransferLine::findTransIdReceive(transferLineTransId);
+            Map mapUpdated = new Map(Types::Int64, Types::Record);
+            mapUpdated.insert(tmpInventTransMark.RecId, tmpInventTransMark);
 
-            if (!transLine.RecId)
-            {
-                return;
-            }
+            TmpInventTransMark::updateTmpMark(receiptInventTransOriginId,receiptInventTrans.inventDim(),-qtyToMark, mapUpdated.pack());
+            METCrossDockTransferOrderProcessor_TransferOrder::reserveQty(issueInventTransOriginId, receiptInventTransOriginId, -qtyToMark, receiptInventTrans.PdsCWQty, receiptInventTrans.inventDim());
+        }
 
-            InventTransOriginId sourceTransferLineTransOriginId = InventTransOrigin::findByInventTransId(transferLineTransId).RecId;
-            InventTransOriginId transferLineTransOriginId = InventTransOrigin::findByInventTransId(_transferLine.InventTransIdReceive).RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reserveQty</Name>
+				<Source><![CDATA[
+    public static void reserveQty(RefRecId _issueTransOrigin, RefRecId _receiveTransOrigin, InventQty _markQty, PdsCWInventQty _pdsMarkedQty, InventDim _inventDim)
+    {
+        InventDimParm inventDimParm;
+        inventDimParm.initFromInventDim(_inventDim);
+
+        PmfQtyDataCarrier outQuantities = new PmfQtyDataCarrier();
  
-            InventDimParm inventDimParm;
-            InventDim     inventDim = _transferLine.inventDim();
-            inventDimParm.initFromInventDim(inventDim);
+        InventQty markedQty = InventTransOrigin::updateMarking(_issueTransOrigin, _receiveTransOrigin, _markQty, '', SortOrder::Descending, true, _inventDim, inventDimParm, _pdsMarkedQty, outQuantities);
  
-            _transferLine.metUpdateMarking(sourceTransferLineTransOriginId, transferLineTransOriginId, - _transferLine.QtyTransfer, - _transferLine.PdsCWQtyTransfer, inventDim, inventDimParm);
-            
-            ttscommit;
+        if (!markedQty)
+        {
+            return;
+        }
+ 
+        InventQty markedReverseQty = InventTransOrigin::updateMarking(_receiveTransOrigin, _issueTransOrigin, markedQty, '', SortOrder::Descending, true, _inventDim, inventDimParm, outQuantities.parmCwQty());
+ 
+        if (markedReverseQty)
+        {
+            // update reservation for the issue.
+            InventUpd_Reservation::updateReserveRefTransId(InventTransOrigin::find(_issueTransOrigin).inventMovement(InventDirection::Issue), true);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMarkingTO</Name>
+				<Source><![CDATA[
+    private void updateMarkingTO(InventTransferTable _transferTable)
+    {
+        InventTransferLine transLine;
+        METInventTransferLine metTransLine;
+
+        while select metTransLine
+            join transLine
+            where metTransLine.InventTransferLine == transLine.RecId
+            && transLine.TransferId == _transferTable.TransferId
+        {
+            InventTransferLine issueLine = InventTransferLine::findTransIdReceive(metTransLine.TransferLineTransId);
+            METCrossDockTransferOrderProcessor_TransferOrder::markInventoryTransaction(issueLine.InventTransIdReceive, transLine.InventTransId);
         }
     }
 
