@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METCPIRepricingTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// METCPIRepricingTaskService
+/// Task service class responsible for executing CPI-driven Sales Order repricing.
+/// Retrieves eligible orders from the repricing queue, applies pricing resets, and updates order statuses.
+/// </summary>
+class METCPIRepricingTaskService extends METSysOperationTaskService
+{
+    guid topPickingProcessId;
+    SalesId salesId;
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Entry point for processing CPI repricing using the provided contract.
+    /// </summary>
+    /// <param name="_contract">The CPI repricing data contract.</param>
+    public void process(METCPIRepricingContract _contract)
+    {
+        this.processInternal(_contract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the task service by retrieving the process identifier from the contract.
+    /// </summary>
+    protected void initialise()
+    {
+        METCPIRepricingContract contract;
+        
+        super();
+
+        // get the topPickingProcessId from the contract
+        contract            = dataContract as METCPIRepricingContract;
+        topPickingProcessId = contract.parmTopPickingProcessId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs the task service loop, retrieving Sales Orders from the repricing queue
+    /// and executing repricing logic until all eligible records are processed.
+    /// </summary>
+    /// <param name="_readPast">Boolean flag indicating whether past records should be read.</param>
+    protected void processTask(boolean _readPast)
+    {
+        while (this.getDataFromTopPickingQueue(topPickingProcessId, _readPast))
+        {
+            try
+            {
+                ttsbegin;
+                this.execute();
+                ttscommit;
+            }
+            catch (Exception::Error)
+            {
+                // Catch any exception so that one error won't stop the entire repricing process.
+                Global::exceptionTextFallThrough();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDataFromTopPickingQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the next Sales Order from the CPI repricing queue for processing.
+    /// Implements retry logic for deadlocks, update conflicts, and transient SQL errors.
+    /// </summary>
+    /// <param name="_processId">Process identifier created and added in the contract <c>METCPIRepricingContract</c>.</param>
+    /// <param name="_readPast">Boolean flag to determine if past records should be read.</param>
+    /// <returns>True if a Sales Order was retrieved from the queue; otherwise, false.</returns>
+    private boolean getDataFromTopPickingQueue(guid _processId, boolean _readPast)
+    {
+        #OCCRetryCount
+    
+        METCPIRepricingQueue topPickingQueue;
+        int backOffWait;
+    
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockException;
+        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
+        Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
+        
+        topPickingQueue.readPast(_readPast);
+
+        try
+        {
+            ttsbegin;
+    
+            select firstonly pessimisticlock topPickingQueue
+                where topPickingQueue.ProcessId == _processId;
+
+            if (topPickingQueue.RecId)
+            {
+                salesId = topPickingQueue.SalesId;
+                topPickingQueue.delete();
+            }
+            else
+            {
+                salesId = METConstants::emptyString;
+            }
+           
+            ttscommit;
+        }
+        catch (deadLockException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw deadLockException;
+                }
+            }
+            else
+            {
+                throw deadLockException;
+            }
+        }
+        catch (updateConflictException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+            }
+            else
+            {
+                throw updateConflictException;
+            }
+        }
+        catch (transientSqlConnectionError)
+        {
+            if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw transientSqlConnectionError;
+            }
+        }
+
+        return (salesId != METConstants::emptyString);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes CPI repricing logic for the current Sales Order.
+    /// Resets line-level pricing, cancels bonus lines, deletes price components,
+    /// and updates the Sales Order header to Ready for Pricing with CPIRepriced flag set.
+    /// </summary>
+    private void execute()
+    {
+        #OCCRetryCount
+        METInventTransReserveService reserveService;
+        SalesLine                    salesLine;
+        METSalesLine                 metSalesLine;
+
+        try
+        {
+            ttsbegin;
+
+            // Process SalesLines linked to the current SalesId
+            while select forupdate salesLine
+                where salesLine.SalesId == salesId
+            {
+                salesLine.SalesPrice = 0;
+                salesLine.update();
+                
+                // Delete the components after line is reserved for event orders
+                salesLine.metDeletePriceComponents();
+
+                select firstonly forupdate metSalesLine
+                    where metSalesLine.salesLine == salesLine.RecId;
+
+                if (metSalesLine.BonusType == METBonusType::Bonus)
+                {
+                    SalesUpdateRemain::updateDeliveryRemainder(salesLine, 0, 0);
+                }
+
+                if (metSalesLine.RecId && metSalesLine.OrderedQuantity < salesLine.SalesQty)
+                {
+                    metSalesLine.OrderedQuantity = salesLine.SalesQty;
+                    metSalesLine.update();
+                }
+            }
+
+            // Update SalesTable header
+            SalesTable salesTable = SalesTable::find(salesId);
+            METSalesTable metSalesTable = salesTable.metSalesTable();
+
+            metSalesTable.selectForUpdate(true);
+            metSalesTable.OrderProcessingStatus = METSalesOrderProcessingStatus::ReadyForPricing;
+            metSalesTable.CPIRepriced = NoYes::Yes;
+            metSalesTable.update();
+
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            // Retry logic for deadlocks
+            if (xSession::currentRetryCount() < #RetryNum)
+            {
+                retry;
+            }
+            else
+            {
+                throw Exception::Deadlock;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            // Retry logic for update conflicts
+            if (appl.ttsLevel() == 0 && xSession::currentRetryCount() < #RetryNum)
+            {
+                retry;
+            }
+            else
+            {
+                throw Exception::UpdateConflictNotRecovered;
+            }
+        }
+        catch (Exception::Error)
+        {
+            // Catch-all for unexpected errors
+            Global::exceptionTextFallThrough();
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
