@@ -17,6 +17,7 @@ class METSysMessageProcessorTaskService extends SysOperationServiceBase
     SysMessageProcessorBatchAffinity            affinity;
     UserConnection                  secondConnection;
     int counter;
+    guid topPickingProcessId;
 
 }
 ]]></Declaration>
@@ -44,7 +45,7 @@ class METSysMessageProcessorTaskService extends SysOperationServiceBase
     {
         messageQueue = _contract.parmMessageQueue();
         isMainBatchTask    = _contract.parmIsMainBatchTask();
-        affinity = _contract.parmTopPickingProcessId();
+        topPickingProcessId = _contract.parmTopPickingProcessId();
         
         this.initialise();
 
@@ -60,28 +61,32 @@ class METSysMessageProcessorTaskService extends SysOperationServiceBase
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>processTaskOld</Name>
+				<Name>processTask</Name>
 				<Source><![CDATA[
     /// <summary>
     /// Process the batch tasks.
     /// </summary>
     /// <param name = "_readPast">Read past table setting.</param>
-    public void processTaskOld(boolean _readPast)
+    public void processTask(boolean _readPast)
     {        
+        str startStr;
+        str startEnd;
+        
+        Map logMap = new Map(Types::Int64, Types::Container);
+
         while (this.getMessageFromQueue(_readPast))
         {
             try
-            {
-                setPrefix(strFmt("Processing message %1", this.messageRecId));
-                
-                //ttsbegin;
+            {              
                 if (this.messageRecId)
                 {
-                    print "Processing message ", this.messageRecId;
+                    startStr = time2Str(DateTimeUtil::time(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), DateTimeUtil::getUserPreferredTimeZone())), TimeSeparator::Colon, TimeFormat::AMPM);
                     this.execute(this.messageRecId);
-                    info(strFmt("Message processed %1", this.messageRecId));
+                    startEnd = time2Str(DateTimeUtil::time(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), DateTimeUtil::getUserPreferredTimeZone())), TimeSeparator::Colon, TimeFormat::AMPM);
                 }
-                //ttscommit;
+
+                logMap.insert(this.messageRecId, [startStr, startEnd]);
+                
             }
             catch (Exception::Error)
             {
@@ -90,18 +95,27 @@ class METSysMessageProcessorTaskService extends SysOperationServiceBase
                 Global::exceptionTextFallThrough();
             }
         }
+
+        MapEnumerator me = logMap.getEnumerator();
+        while (me.moveNext())
+        {
+            setPrefix(strFmt("Processed message %1", me.currentKey()));
+            info(strFmt("Start %1 - End %2", conPeek(me.currentValue(), 1), conPeek(me.currentValue(), 2)));
+        }
+
+        
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>processTask</Name>
+				<Name>execute</Name>
 				<Source><![CDATA[
     /// <summary>
     /// Process the batch tasks.
     /// </summary>
     /// <param name = "_readPast">Read past table setting.</param>
-    public void processTask(boolean _readPast)
+    /*public void processTask(boolean _readPast)
     {
         SysMessageProcessingState messageProcessingState;
         messageProcessingState.readPast(_readPast);
@@ -143,13 +157,8 @@ class METSysMessageProcessorTaskService extends SysOperationServiceBase
             }
         }
         while (messageProcessingState);
-    }
+    }*/
 
-]]></Source>
-			</Method>
-			<Method>
-				<Name>execute</Name>
-				<Source><![CDATA[
     /// <summary>
     /// Executes the main process.
     /// </summary>
@@ -185,7 +194,7 @@ class METSysMessageProcessorTaskService extends SysOperationServiceBase
 
             //lastErrorState = null;
 
-            //ttsbegin;
+            ttsbegin;
 
             //boolean continueTransaction;
             //do
@@ -211,6 +220,12 @@ class METSysMessageProcessorTaskService extends SysOperationServiceBase
                 //continue;
                 return false;
             }
+
+            // VNG TEST ERROR
+            /*if (false)
+            {
+                throw error ("Error test");
+            }*/
 
             //this.ensureTakePessimisticLockIfRequired(message);
 
@@ -270,7 +285,7 @@ class METSysMessageProcessorTaskService extends SysOperationServiceBase
 
             this.updateMessageStateToDesiredNextState(processedLog.elements());
 
-            //ttscommit;
+            ttscommit;
         }
         catch (Exception::DuplicateKeyException)
         {
@@ -338,6 +353,12 @@ class METSysMessageProcessorTaskService extends SysOperationServiceBase
                     isInMessageCancellation);
 
             this.onMessageProcessingUnrecoverableError(errorState);*/
+            // TODO: should be calling the standard method instead, temp workaround to flag messages as failed if any error
+            ttsbegin;
+            SysMessageProcessingState messageProcessingState = SysMessageProcessingState::find(_messageRecId, true);
+            messageProcessingState.State = SysMessageState::Failed;
+            messageProcessingState.update();
+            ttscommit;
         }
 
         return true;
@@ -356,8 +377,7 @@ class METSysMessageProcessorTaskService extends SysOperationServiceBase
     /// <returns>Get sales order id to substitute</returns>
     private SysMessageRecId getMessageFromQueue(boolean _readPast)
     {
-        //SysMessage message;
-        SysMessageProcessingState messageProcessingState;
+        METPEPricingTopPickingQueue pricingTopPickingQueue;
         
         #OCCRetryCount
         int backOffWait;
@@ -365,7 +385,7 @@ class METSysMessageProcessorTaskService extends SysOperationServiceBase
         Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
         Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
         
-        messageProcessingState.readPast(_readPast);
+        pricingTopPickingQueue.readPast(_readPast);
 
         try
         {
@@ -382,20 +402,20 @@ class METSysMessageProcessorTaskService extends SysOperationServiceBase
             {
                 this.messageRecId = message.RecId;*/
 
-            select firstonly pessimisticlock message
-            from messageProcessingState
-            where messageProcessingState.MessageQueue == messageQueue
-               && messageProcessingState.State == SysMessageState::Queued;
+            select firstonly pessimisticlock MessageRecId
+            from pricingTopPickingQueue
+            where pricingTopPickingQueue.ProcessId == topPickingProcessId;
 
-            if (messageProcessingState.Message)
+            if (pricingTopPickingQueue.MessageRecId)
             {
-                this.messageRecId = messageProcessingState.Message;
-                counter++;
+                this.messageRecId = pricingTopPickingQueue.MessageRecId;
+                //counter++;
 
                 /*VNGMessageProcessorDebug table;
                 table.Counter = counter;
                 table.MessageRecId = messageProcessingState.Message;
                 table.insert();*/
+                pricingTopPickingQueue.delete();
             }
             else
             {
