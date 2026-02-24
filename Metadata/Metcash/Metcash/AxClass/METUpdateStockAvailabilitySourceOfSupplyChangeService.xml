@@ -11,11 +11,41 @@ internal final class METUpdateStockAvailabilitySourceOfSupplyChangeService exten
     METStockAvailDate stockAvailabilityDate;
     EcoResProductLifecycleStateId productLifeCycleStateId;
     container newItemSitePair;
-    int countOfRecords = 0 ;
+    int countOfRecords = 0;
+    int countOfRecordsProcessed = 0;
+    int countOfRecordsUpdated = 0;
+    Query itemFilterQuery;
 
 }
 ]]></Declaration>
 		<Methods>
+			<Method>
+				<Name>continueForItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if it can continue for the item.
+    /// </summary>
+    /// <param name = "_itemId">Item Id.</param>
+    /// <returns>True if it can; otherwise, false.</returns>
+    private boolean continueForItem(ItemId _itemId)
+    {
+        QueryBuildDataSource qbds;
+        QueryRun queryRun;
+
+        qbds = itemFilterQuery.dataSourceTable(tableNum(InventTable));
+
+        if (qbds)
+        {
+            SysQuery::findOrCreateRange(qbds, fieldNum(InventTable, ItemId)).value(queryValue(_itemId));
+        }
+
+        queryRun = new QueryRun(itemFilterQuery);
+
+        return queryRun.next();
+    }
+
+]]></Source>
+			</Method>
 			<Method>
 				<Name>process</Name>
 				<Source><![CDATA[
@@ -28,101 +58,110 @@ internal final class METUpdateStockAvailabilitySourceOfSupplyChangeService exten
         if (METVendParameters::find().UpdateFromParentToTransferSites)
         {
             ReqItemTable reqItemTableAsPerContractParm;
-            InventDim inventDim;            
-            
+            InventDim inventDim;  
+            boolean recordExists;
             QueryRun queryRun = this.initialiseQueryRun(_contract);
-            countOfRecords = SysQuery::countTotal(queryRun);
+            itemFilterQuery = _contract.getQuery();
 
-            if (countOfRecords)
+            while(queryRun.next())
             {
-                while(queryRun.next())
+                try
                 {
-                    try
-                    {
-                        ReqItemTable reqItemTableSubSelection;
-                        InventDim    iventDimSubSelection;
-                        
-                        reqItemTableAsPerContractParm = queryRun.get(tableNum(ReqItemTable));
-                        inventDim                     = queryRun.get(tableNum(InventDim));
+                    ReqItemTable reqItemTableSubSelection;
+                    InventDim    iventDimSubSelection;
+                    newItemSitePair = conNull();
+                    recordExists = true;
+                    countOfRecordsProcessed++;
 
-                        if (METInventItemOrderSetup::findByItemAndSite(reqItemTableAsPerContractParm.ItemId, inventDim.InventSiteId).ItemStatus == '')
+                    reqItemTableAsPerContractParm = queryRun.get(tableNum(ReqItemTable));
+                    inventDim                     = queryRun.get(tableNum(InventDim));
+
+                    RecId    origRecId     = reqItemTableAsPerContractParm.RecId;
+                    RecVersion origRecVersion = reqItemTableAsPerContractParm.RecVersion;
+
+                    if (!this.continueForItem(reqItemTableAsPerContractParm.ItemId))
+                    {
+                        continue;
+                    }
+
+                    if (METInventItemOrderSetup::findByItemAndSite(reqItemTableAsPerContractParm.ItemId, inventDim.InventSiteId).ItemStatus == '')
+                    {
+                        warning(strFmt("@MET:JobExitedDueToBlankStatus", inventDim.InventSiteId, reqItemTableAsPerContractParm.ItemId));
+                        return;
+                    }
+
+                    if (reqItemTableAsPerContractParm.ReqPOType == ReqPOType::Transfer)
+                    {
+                        while select reqItemTableSubSelection
+                            where reqItemTableSubSelection.ItemId == reqItemTableAsPerContractParm.ItemId
+                        join iventDimSubSelection
+                            where iventDimSubSelection.inventDimId == reqItemTableSubSelection.CovInventDimId
+                                && iventDimSubSelection.InventLocationId == reqItemTableAsPerContractParm.InventLocationIdReqMain //Coverage Warehouse == Main Warehouse
                         {
-                            warning(strFmt("@MET:JobExitedDueToBlankStatus", inventDim.InventSiteId, reqItemTableAsPerContractParm.ItemId));
-                            return;
+                            // Default order settings of Item and Site (here Coverage Site value is same as that of the Main warehouse, thus 'reqItemTableSubSelection' acting as Parent)
+                            METInventItemOrderSetup metInventItemDOS = METInventItemOrderSetup::findByItemAndSite(reqItemTableSubSelection.ItemID, iventDimSubSelection.InventSiteId);
+                                
+                            newItemSitePair = conIns(newItemSitePair,
+                                                    conLen(newItemSitePair) + 1,
+                                                    this.updateDefaultOrderSettingsForItemSite(reqItemTableAsPerContractParm.ItemID, inventDim.InventSiteId, metInventItemDOS));
                         }
 
-                        if (reqItemTableAsPerContractParm.ReqPOType == ReqPOType::Transfer)
+                        //Loop through the newItemSitePair
+                        this.processWithUpdateStockAvailabilityService(newItemSitePair);
+                        this.markStockAvailabilityUpdated(origRecVersion, origRecId);
+                    }
+                    else if (reqItemTableAsPerContractParm.ReqPOType == ReqPOType::Purch)
+                    {
+                        if (!reqItemTableAsPerContractParm.METInterCompanySourced || !reqItemTableAsPerContractParm.METIntercompanySourcedWarehouse)
                         {
-                            while select reqItemTableSubSelection
-                                where reqItemTableSubSelection.ItemId == reqItemTableAsPerContractParm.ItemId
-                            join iventDimSubSelection
-                                where iventDimSubSelection.inventDimId == reqItemTableSubSelection.CovInventDimId
-                                    && iventDimSubSelection.InventLocationId == reqItemTableAsPerContractParm.InventLocationIdReqMain //Coverage Warehouse == Main Warehouse
+                            Info(strFmt("@MET:ItemCoverageEitherNotEnabledAsIntercompanSourceOrIntercompanySourceWarehouseNoSet",
+                            reqItemTableAsPerContractParm.ItemId,
+                            inventDim.InventSiteId,
+                            inventDim.InventLocationId,
+                            enum2Str(reqItemTableAsPerContractParm.ReqPOType)
+                            ));
+
+                            continue;
+                        }
+
+                        InventParameters  inventParameters = InventParameters::find();
+                        METGlobal::validateCursorFieldValue(inventParameters, fieldNum(InventParameters, METInterCompanyPurchaseLegalEntity), true);
+                        DataAreaId metInterCompanyPurchaseLegalEntity = inventParameters.METInterCompanyPurchaseLegalEntity;
+
+                        if (metInterCompanyPurchaseLegalEntity)
+                        {
+                            METInventItemOrderSetup metInventItemDOS;
+                            changecompany(metInterCompanyPurchaseLegalEntity)
                             {
-                                // Default order settings of Item and Site (here Coverage Site value is same as that of the Main warehouse, thus 'reqItemTableSubSelection' acting as Parent)
-                                METInventItemOrderSetup metInventItemDOS = METInventItemOrderSetup::findByItemAndSite(reqItemTableSubSelection.ItemID, iventDimSubSelection.InventSiteId);
-                                
-                                newItemSitePair = conIns(newItemSitePair,
-                                                        conLen(newItemSitePair) + 1,
-                                                        this.updateDefaultOrderSettingsForItemSite(reqItemTableAsPerContractParm.ItemID, inventDim.InventSiteId, metInventItemDOS));
+                                while select reqItemTableSubSelection
+                                    where reqItemTableSubSelection.ItemId == reqItemTableAsPerContractParm.ItemId
+                                join iventDimSubSelection
+                                    where iventDimSubSelection.inventDimId == reqItemTableSubSelection.CovInventDimId
+                                        && iventDimSubSelection.InventLocationId == reqItemTableAsPerContractParm.METIntercompanySourcedWarehouse
+                                {
+                                    metInventItemDOS = METInventItemOrderSetup::findByItemAndSite(reqItemTableSubSelection.ItemID, iventDimSubSelection.InventSiteId);
+                                }
                             }
+
+                            newItemSitePair = conIns(newItemSitePair,
+                                                    conLen(newItemSitePair) + 1,
+                                                    this.updateDefaultOrderSettingsForItemSite(reqItemTableAsPerContractParm.ItemID, inventDim.InventSiteId, metInventItemDOS));
 
                             //Loop through the newItemSitePair
+
                             this.processWithUpdateStockAvailabilityService(newItemSitePair);
+                            this.markStockAvailabilityUpdated(origRecVersion, origRecId);
                         }
-                        else if (reqItemTableAsPerContractParm.ReqPOType == ReqPOType::Purch)
-                        {
-                            if (!reqItemTableAsPerContractParm.METInterCompanySourced || !reqItemTableAsPerContractParm.METIntercompanySourcedWarehouse)
-                            {
-                                Info(strFmt("@MET:ItemCoverageEitherNotEnabledAsIntercompanSourceOrIntercompanySourceWarehouseNoSet",
-                                reqItemTableAsPerContractParm.ItemId,
-                                inventDim.InventSiteId,
-                                inventDim.InventLocationId,
-                                enum2Str(reqItemTableAsPerContractParm.ReqPOType)
-                                ));
-
-                                continue;
-                            }
-
-                            DataAreaId metInterCompanyPurchaseLegalEntity = InventParameters::find().METInterCompanyPurchaseLegalEntity;
-                            if (metInterCompanyPurchaseLegalEntity)
-                            {
-                                METInventItemOrderSetup metInventItemDOS;
-                                changecompany(metInterCompanyPurchaseLegalEntity)
-                                {
-                                    while select reqItemTableSubSelection
-                                        where reqItemTableSubSelection.ItemId == reqItemTableAsPerContractParm.ItemId
-                                    join iventDimSubSelection
-                                        where iventDimSubSelection.inventDimId == reqItemTableSubSelection.CovInventDimId
-                                            && iventDimSubSelection.InventLocationId == reqItemTableAsPerContractParm.METIntercompanySourcedWarehouse
-                                    {
-                                        metInventItemDOS = METInventItemOrderSetup::findByItemAndSite(reqItemTableSubSelection.ItemID, iventDimSubSelection.InventSiteId);
-                                    }
-                                }
-
-                                newItemSitePair = conIns(newItemSitePair,
-                                                        conLen(newItemSitePair) + 1,
-                                                        this.updateDefaultOrderSettingsForItemSite(reqItemTableAsPerContractParm.ItemID, inventDim.InventSiteId, metInventItemDOS));
-
-                                //Loop through the newItemSitePair
-
-                                this.processWithUpdateStockAvailabilityService(newItemSitePair);
-
-                            }
-                            else
-                            {
-                                Info(strFmt("@MET:CannotProceedUpdateStockAvailbilityBasedOnSourceOfSupplyChange ", curExt()));
-                            }
-                        }
-                    }
-                    catch(Exception::Error)
-                    {
-                        str message = strFmt("@MET:UnexpectedErrorExecutingUpdateStocAvailabilityBasedOnSourceChange", _contract.parmInventLocationId(), _contract.parmPlannedOrderTpye());
-                        error(this.catchMessages(_contract, message));
                     }
                 }
+                catch(Exception::Error)
+                {
+                    str message = strFmt("@MET:UnexpectedErrorExecutingUpdateStocAvailabilityBasedOnSourceChange", _contract.parmInventLocationId(), _contract.parmPlannedOrderTpye());
+                    error(this.catchMessages(_contract, message));
+                }
             }
-            else
+            
+            if (!recordExists)
             {
                 str message = strFmt("@MET:NoRecordsToProcessAnUpdateStockAvailabilityForProvidedParameters", _contract.parmInventLocationId(), _contract.parmPlannedOrderTpye());
                 
@@ -133,6 +172,8 @@ internal final class METUpdateStockAvailabilitySourceOfSupplyChangeService exten
         {
             Info("@MET:MetcashAPParameterForUpdateDatesStatesParentToTransferSitesNotEnabled");
         }
+
+        Info(strFmt("Processing complete. Total records in query: %1, Records updated: %2", countOfRecordsProcessed, countOfRecordsUpdated));
     }
 
 ]]></Source>
@@ -153,19 +194,6 @@ internal final class METUpdateStockAvailabilitySourceOfSupplyChangeService exten
         // 1. Get existing datasources
         QueryBuildDataSource reqItemTableQBDS = query.dataSourceTable(tableNum(ReqItemTable));
         QueryBuildDataSource inventDimQBDS    = query.dataSourceTable(tableNum(InventDim));
-         
-        // 2. Add Join to InventTable (Link ReqItemTable -> InventTable)
-        QueryBuildDataSource inventTableQBDS = reqItemTableQBDS.addDataSource(tableNum(InventTable));
-        inventTableQBDS.addLink(fieldNum(ReqItemTable, ItemId), fieldNum(InventTable, ItemId));
-        inventTableQBDS.joinMode(JoinMode::InnerJoin);
-
-        // 3. Add Join to EcoResProduct (Link InventTable -> EcoResProduct)
-        QueryBuildDataSource ecoResProductQBDS = inventTableQBDS.addDataSource(tableNum(EcoResProduct));
-        ecoResProductQBDS.addLink(fieldNum(InventTable, Product), fieldNum(EcoResProduct, RecId));
-        ecoResProductQBDS.joinMode(JoinMode::InnerJoin);
-
-        // 4. HARDCODE THE FILTER: Product Type = Item
-        ecoResProductQBDS.addRange(fieldNum(EcoResProduct, ProductType)).value(queryValue(EcoResProductType::Item)); 
         
         InventLocationId covInventLocationId             = _contract.parmInventLocationId();
         InventLocationId metInterCompanyInventLocationId = _contract.parmMetIntercompanySourcedWarehouseId();
@@ -173,6 +201,32 @@ internal final class METUpdateStockAvailabilitySourceOfSupplyChangeService exten
         NoYes metIntercompanySourced                     = _contract.parmMetIntercompanySourced();
         ReqPOType plannedOrderType                       = _contract.parmPlannedOrderTpye();
         
+        // Filter records based on selected query mode
+        METStockAvailabilityUpdateType queryMode = _contract.parmQueryMode();
+
+        switch (queryMode)
+        {
+            case METStockAvailabilityUpdateType::OnlyModified:
+                reqItemTableQBDS.addRange(fieldNum(ReqItemTable, METIsStockAvailabilityUpdated))
+                    .value(queryValue(NoYes::No));
+                break;
+
+            case METStockAvailabilityUpdateType::All:
+                // No additional range — process all records
+                break;
+
+            case METStockAvailabilityUpdateType::BasedOnDaysBefore:
+                Days lookbackDays = _contract.parmModifiedDateTimeDays();
+                if (lookbackDays <= 0)
+                {
+                    lookbackDays = 1;
+                }
+                utcDateTime fromDateTime = DateTimeUtil::addHours(DateTimeUtil::getSystemDateTime(), -24 * lookbackDays);
+                reqItemTableQBDS.addRange(fieldNum(ReqItemTable, ModifiedDateTime))
+                    .value(SysQuery::range(fromDateTime, DateTimeUtil::getSystemDateTime()));
+                break;
+        }
+
         if (itemId)
         {
             reqItemTableQBDS.addRange(fieldNum(ReqItemTable, ItemId)).value(queryValue(itemId));
@@ -245,7 +299,8 @@ internal final class METUpdateStockAvailabilitySourceOfSupplyChangeService exten
                     metInventItemDOSUpdate.ProductLifecycleStateId = _metInventItemDOS.ProductLifecycleStateId;
                     metInventItemDOSUpdate.doUpdate();
                     ttscommit;
-                        
+
+                    countOfRecordsUpdated++;
                     return [_itemId, _inventSideId, _metInventItemDOS.StockAvailDate, _metInventItemDOS.ProductLifecycleStateId];
                 }
                 else if(metInventItemDOSUpdate.RecId)
@@ -320,6 +375,35 @@ internal final class METUpdateStockAvailabilitySourceOfSupplyChangeService exten
           
             METUpdateStockAvailabilityService  metUpdateStockAvailabilityService = new METUpdateStockAvailabilityService();
             metUpdateStockAvailabilityService.process(metUpdateStockAvailabilityContract);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markStockAvailabilityUpdated</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Marks the ReqItemTable record's stock availability flag as updated.
+    /// Uses doUpdate() to bypass CoC and avoid clearing the flag.
+    /// Skips silently if RecVersion has changed (optimistic concurrency).
+    /// </summary>
+    /// <param name = "_origRecVersion">Original RecVersion at time of query</param>
+    /// <param name = "_origRecId">RecId of the ReqItemTable record</param>
+    private void markStockAvailabilityUpdated(RecVersion _origRecVersion, RecId _origRecId)
+    {
+        ReqItemTable reqItemTable;
+
+        select forupdate reqItemTable
+            where reqItemTable.RecId == _origRecId
+               && reqItemTable.RecVersion == _origRecVersion;
+
+        if (reqItemTable.RecId)
+        {
+            ttsbegin;
+            reqItemTable.METIsStockAvailabilityUpdated = NoYes::Yes;
+            reqItemTable.doUpdate();
+            ttscommit;
         }
     }
 

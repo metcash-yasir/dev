@@ -12,10 +12,38 @@ class METChangeItemStatusService
     InventParameters InventParameters = InventParameters::find();
     ItemId mainItemId;
     InventSiteId mainSiteId;
+    Query itemFilterQuery;
 
 }
 ]]></Declaration>
 		<Methods>
+			<Method>
+				<Name>continueForItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if it can continue for the item.
+    /// </summary>
+    /// <param name = "_itemId">Item Id.</param>
+    /// <returns>True if it can; otherwise, false.</returns>
+    private boolean continueForItem(ItemId _itemId)
+    {                                            
+        QueryBuildDataSource qbds;
+        QueryRun queryRun;
+
+        qbds = itemFilterQuery.dataSourceTable(tableNum(InventTable));
+
+        if (qbds)
+        {
+            SysQuery::findOrCreateRange(qbds, fieldNum(InventTable, ItemId)).value(queryValue(_itemId));
+        }
+
+        queryRun = new QueryRun(itemFilterQuery);
+
+        return queryRun.next();
+    }
+
+]]></Source>
+			</Method>
 			<Method>
 				<Name>changeStatus</Name>
 				<Source><![CDATA[
@@ -33,10 +61,10 @@ class METChangeItemStatusService
         
         try
         {
-            ttsbegin;
             query   = new Query();
             ItemId  itemId  = _metChangeItemStatusContract.parmItemId();
             InventSiteId siteId  = _metChangeItemStatusContract.parmInventSiteId();
+            itemFilterQuery = _metChangeItemStatusContract.getQuery();
             qbds = query.addDataSource(tableNum(METInventItemOrderSetup));
 
             if (itemId != '')
@@ -60,22 +88,6 @@ class METChangeItemStatusService
                     METItemStatusTable::findByStatus(METItemsStatus::New).ItemStatus));
             }
 
-            qbdsInventTable = qbds.addDataSource(tableNum(InventTable));
-
-            qbdsInventTable.addLink(fieldNum(METInventItemOrderSetup, ItemId), fieldNum(InventTable, ItemId));
-            qbdsInventTable.joinMode(JoinMode::ExistsJoin);
-            qbdsInventTable.relations(true);
-
-            qbdsEcoResProduct = qbdsInventTable.addDataSource(tableNum(EcoResProduct));
-
-            qbdsEcoResProduct.addLink(fieldNum(InventTable, Product), fieldNum(EcoResProduct, RecId));
-            qbdsEcoResProduct.joinMode(JoinMode::ExistsJoin);
-            qbdsEcoResProduct.relations(true);
-
-            qbrProductType = qbdsEcoResProduct.addRange(fieldNum(EcoResProduct, ProductType));
-
-            qbrProductType.value(enum2Str(EcoResProductType::Item));
-
             QueryRun                queryRun = new QueryRun(query);
 
             if (_metChangeItemStatusContract.parmMETItemStatus() == METConstants::Active)
@@ -94,7 +106,6 @@ class METChangeItemStatusService
             {
                 this.changeStatusToDeleted(queryRun);
             }
-            ttscommit;
         }
         catch (Exception::Deadlock)
         {
@@ -154,6 +165,11 @@ class METChangeItemStatusService
             mainItemId = metInventItemOrderSetup.ItemId;
             mainSiteId = metInventItemOrderSetup.SiteId;
 
+            if (!this.continueForItem(mainItemId))
+            {
+                continue;
+            }
+
             InventSite inventSite = InventSite::find(InventDim::find(metInventItemOrderSetup.InventDimId).InventSiteId);
 
             while select ItemId, CovInventDimId, ReqPOType, InventLocationIdReqMain, VendId, ReqItemTableRecId, InventLocationId
@@ -169,7 +185,8 @@ class METChangeItemStatusService
                 {
                     if ((this.checkIfItemIsTemp(metReqItemTableInventDimView.ItemId)
                         && this.checkIfItemIsTempItemForPackChange(metReqItemTableInventDimView.ItemId))
-                        || (this.checkIfItemIsChild(metReqItemTableInventDimView.ItemId, inventSite.SiteId)))
+                        || (this.checkIfItemIsChild(metReqItemTableInventDimView.ItemId, inventSite.SiteId))
+                        || (!this.continueForItem(metReqItemTableInventDimView.ItemId)))
                     {
                         continue;
                     }
@@ -209,7 +226,8 @@ class METChangeItemStatusService
 
                     if (this.checkIfItemIsTemp(metInventItemOrderSetup.ItemId) && this.checkIfItemIsTempItemForPackChange(metInventItemOrderSetup.ItemId)
                         || (this.checkIfItemIsChild(metInventItemOrderSetup.ItemId, inventSite.SiteId))
-                        || (!this.checkIfSourceSiteWithItemStatusNotDiscontinued(metInventItemOrderSetup)))
+                        || (!this.checkIfSourceSiteWithItemStatusNotDiscontinued(metInventItemOrderSetup))
+                        || (!this.continueForItem(metInventItemOrderSetup.ItemId)))
                     {
                         continue;
                     }
@@ -250,6 +268,7 @@ class METChangeItemStatusService
                     if ((this.checkIfItemIsTemp(metInventItemOrderSetup.ItemId) && this.checkIfItemIsTempItemForPackChange(metInventItemOrderSetup.ItemId))
                         || (this.checkIfItemIsChild(metInventItemOrderSetup.ItemId, inventSite.SiteId))
                         || (!this.checkIfSourceSiteWithItemStatusNotDiscontinued_IntCom(metInventItemOrderSetup, metReqItemTableInventDimView))
+                        || (!this.continueForItem(metInventItemOrderSetup.ItemId))
                         )
                     {
                         continue;
@@ -478,7 +497,7 @@ class METChangeItemStatusService
                         where metInventItemOrderSetupTransferSite.SiteId == inventSite.SiteId
                         && metInventItemOrderSetupTransferSite.ItemId == _metInventItemOrderSetup.ItemId;
 
-                    if (inventSite.METNDCSite && metInventItemOrderSetupTransferSite && (metInventItemOrderSetupTransferSite.ItemStatus != METConstants::Deleted || metInventItemOrderSetupTransferSite.ItemStatus != METConstants::Discontinued))
+                    if (inventSite.METNDCSite && metInventItemOrderSetupTransferSite && (metInventItemOrderSetupTransferSite.ItemStatus != METConstants::Deleted && metInventItemOrderSetupTransferSite.ItemStatus != METConstants::Discontinued))
                     {
                         this.copyDelReasonAndVendReplacementFromSourceToTransferSiteMain(_metInventItemOrderSetup, metInventItemOrderSetupTransferSite);
                         if (metInventItemOrderSetupTransferSite.TempItemPackChg)
@@ -572,28 +591,27 @@ class METChangeItemStatusService
     private void copyDelReasonAndVendReplacementFromSourceToTransferSite(METInventItemOrderSetup _metInventItemOrderSetupSource, METInventItemOrderSetup _metInventItemOrderSetupDestination)
     {
         InventItemPurchSetup inventItemPurchSetup = InventItemPurchSetup::find(_metInventItemOrderSetupDestination.ItemId,_metInventItemOrderSetupDestination.InventDimId);
+        
+        ttsbegin;
 
         if (_metInventItemOrderSetupDestination)
         {
-            ttsbegin;
             _metInventItemOrderSetupDestination.selectForUpdate(true);
             _metInventItemOrderSetupDestination.ItemStatus = METConstants::Discontinued;
             _metInventItemOrderSetupDestination.DiscontinueDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
             _metInventItemOrderSetupDestination.VendReplacement = _metInventItemOrderSetupSource.VendReplacement;
             _metInventItemOrderSetupDestination.DeletionReason = _metInventItemOrderSetupSource.DeletionReason;
             _metInventItemOrderSetupDestination.update();
-            ttscommit;
         }
 
         if (inventItemPurchSetup)
         {
-            ttsbegin;
             inventItemPurchSetup.selectForUpdate(true);
             inventItemPurchSetup.Stopped = true;
             inventItemPurchSetup.update();
-            ttscommit;
         }
 
+        ttscommit;
     }
 
 ]]></Source>
@@ -788,25 +806,25 @@ class METChangeItemStatusService
         if (_metInventItemOrderSetup)
         {
             ttsbegin;
+
             _metInventItemOrderSetup.selectForUpdate(true);
             _metInventItemOrderSetup.ItemStatus         = METConstants::Deleted;
             _metInventItemOrderSetup.DeleteStatusDate   = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
             _metInventItemOrderSetup.SubrangeId         = '';
             _metInventItemOrderSetup.SubrangeDesc       = '';
             _metInventItemOrderSetup.update();
-            ttscommit;
-            
+
             InventItemPurchSetup inventItemPurchSetup       = InventItemPurchSetup::find(_metInventItemOrderSetup.ItemId, _inventDimId, true);
-            
+
             if (inventItemPurchSetup)
             {
-                ttsbegin;
                 inventItemPurchSetup.Override = true;
                 inventItemPurchSetup.Stopped = true;
                 inventItemPurchSetup.update();
-                ttscommit;
+                
             }
-            
+
+            ttscommit;
         }
     }
 
@@ -899,41 +917,46 @@ class METChangeItemStatusService
 
             metInventItemOrderSetup = _queryRun.get(tableNum(METInventItemOrderSetup));
 
-            ttsbegin;
-            update_recordset metInventItemOrderSetupToDiscontinue
+            if (this.continueForItem(metInventItemOrderSetup.ItemId))
+            {
+                ttsbegin;
+                update_recordset metInventItemOrderSetupToDiscontinue
                 setting ItemStatus = METConstants::Discontinued
                 where metInventItemOrderSetupToDiscontinue.ItemId == metInventItemOrderSetup.ItemId
                     && metInventItemOrderSetupToDiscontinue.SiteId == metInventItemOrderSetup.SiteId
-                    && (metInventItemOrderSetupToDiscontinue.ItemStatus != METConstants::Discontinued || metInventItemOrderSetupToDiscontinue.ItemStatus != METConstants::Deleted)
+                    && (metInventItemOrderSetupToDiscontinue.ItemStatus != METConstants::Discontinued && metInventItemOrderSetupToDiscontinue.ItemStatus != METConstants::Deleted)
                     && (metInventItemOrderSetupToDiscontinue.DiscontinueDate != Global::DateNull()
                     || metInventItemOrderSetupToDiscontinue.DiscontinueDate <= DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
 
-            // New condition to make Item as Actice from discontinue batch job
-            update_recordset metInventItemOrderSetupToActive
+                // New condition to make Item as Actice from discontinue batch job
+                update_recordset metInventItemOrderSetupToActive
                 setting ItemStatus = METConstants::Active
                 where metInventItemOrderSetupToActive.ItemId == metInventItemOrderSetup.ItemId
                     && metInventItemOrderSetupToActive.SiteId == metInventItemOrderSetup.SiteId
                     && metInventItemOrderSetupToActive.ItemStatus == METConstants::Discontinued
                     && (metInventItemOrderSetupToActive.DiscontinueDate == Global::DateNull()
                     || metInventItemOrderSetupToActive.DiscontinueDate > DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
-            ttscommit;
+                ttscommit;
 
-            metInventItemOrderSetup.reread();
+                metInventItemOrderSetup.reread();
 
-            //NS-Bug 218466: CB267 - Change Item Status batch job = Discontinued not working when the Discontinue Date field is updated to a future date or removed
-            if (metInventItemOrderSetup.ItemStatus == METConstants::Discontinued)
-            {
-                update_recordset inventItemPurchSetup setting Override = NoYes::Yes, Stopped = NoYes::Yes
+                //NS-Bug 218466: CB267 - Change Item Status batch job = Discontinued not working when the Discontinue Date field is updated to a future date or removed
+                ttsbegin;
+                if (metInventItemOrderSetup.ItemStatus == METConstants::Discontinued)
+                {
+                    update_recordset inventItemPurchSetup setting Override = NoYes::Yes, Stopped = NoYes::Yes
                     where inventItemPurchSetup.ItemId == metInventItemOrderSetup.ItemId
                     && inventItemPurchSetup.InventDimId == metInventItemOrderSetup.InventDimId;
-            }
-            else if (metInventItemOrderSetup.ItemStatus == METConstants::Active)
-            {
-                update_recordset inventItemPurchSetup setting Override = NoYes::No, Stopped = NoYes::No
+                }
+                else if (metInventItemOrderSetup.ItemStatus == METConstants::Active)
+                {
+                    update_recordset inventItemPurchSetup setting Override = NoYes::No, Stopped = NoYes::No
                     where inventItemPurchSetup.ItemId == metInventItemOrderSetup.ItemId
                     && inventItemPurchSetup.InventDimId == metInventItemOrderSetup.InventDimId;
+                }
+                ttscommit;
+                //NE-Bug 218466: CB267 - Change Item Status batch job = Discontinued not working when the Discontinue Date field is updated to a future date or removed
             }
-            //NE-Bug 218466: CB267 - Change Item Status batch job = Discontinued not working when the Discontinue Date field is updated to a future date or removed
         }
     }
 
@@ -1034,7 +1057,7 @@ class METChangeItemStatusService
             METInventItemOrderSetup    metInventItemOrderSetup, metInventItemOrderSetupSupplySite;
             metInventItemOrderSetup = _queryRun.get(tableNum(METInventItemOrderSetup));
             
-            if (!this.checkIfItemIsChild(metInventItemOrderSetup.ItemId, metInventItemOrderSetup.SiteId))
+            if (!this.checkIfItemIsChild(metInventItemOrderSetup.ItemId, metInventItemOrderSetup.SiteId) && this.continueForItem(metInventItemOrderSetup.ItemId))
             {
                 METReqItemTableInventDimView metReqItemTableInventDimView;
                 METItemStatusWarehouses metItemStatusWarehouses;
@@ -1296,7 +1319,7 @@ class METChangeItemStatusService
             METInventItemOrderSetup    metInventItemOrderSetup, metInventItemOrderSetupSupplySite;
             metInventItemOrderSetup = _queryRun.get(tableNum(METInventItemOrderSetup));
             
-            if (!this.checkIfItemIsChild(metInventItemOrderSetup.ItemId, metInventItemOrderSetup.SiteId))
+            if (!this.checkIfItemIsChild(metInventItemOrderSetup.ItemId, metInventItemOrderSetup.SiteId) && this.continueForItem(metInventItemOrderSetup.ItemId))
             {
                 METReqItemTableInventDimView metReqItemTableInventDimView;
                 METItemStatusWarehouses metItemStatusWarehouses;
