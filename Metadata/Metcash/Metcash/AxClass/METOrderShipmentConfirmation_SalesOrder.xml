@@ -21,6 +21,7 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
     public boolean post()
     {
         boolean         isPosted;
+        boolean         postedPackingSlip = true;
         AccountOrder    accountOrder;
 
         #OCCRetryCount
@@ -30,7 +31,16 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
 
             accountOrder = metSalesOrderShipmentLoadHeader.PostMultiDocument == NoYes::No ? AccountOrder::Account : AccountOrder::None;
 
-            isPosted = this.postPackingslipInvoiceReport(metSalesOrderShipmentLoadHeader, accountOrder);
+            isPosted = this.postPackingSlipReport(metSalesOrderShipmentLoadHeader, accountOrder);
+
+            if (!isPosted)
+            {
+                postedPackingSlip = false;
+            }
+            else
+            {
+                isPosted = this.postSalesInvoice(metSalesOrderShipmentLoadHeader);
+            }
 
             ttsCommit;
 
@@ -60,18 +70,11 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
         //CBNF019_Observability_SalesOrderShipping
         catch (Exception::Error)
         {
-            METSalesOrderShipmentLoadLines metSalesOrderShipmentLoadLinesTel;
-            str errorMessage;
-            SysInfologEnumerator enumerator;
-            SysInfologMessageStruct msgStruct;
+            isPosted = false;
+            str failureStep = postedPackingSlip ? "@SYS522" : "@SYS114660";
 
-            // 1. Extract error messages from the Infolog
-            enumerator = SysInfologEnumerator::newData(infolog.cut());
-            while (enumerator.moveNext())
-            {
-                msgStruct = new SysInfologMessageStruct(enumerator.currentMessage());
-                errorMessage += msgStruct.message() + " ";
-            }
+            METSalesOrderShipmentLoadLines metSalesOrderShipmentLoadLinesTel;
+            str errorMessage = this.extractErrorMessagesFromInfolog();
 
             select firstonly metSalesOrderShipmentLoadLinesTel
                 where metSalesOrderShipmentLoadLinesTel.ShipmentId == metSalesOrderShipmentLoadHeader.ShipmentId;
@@ -80,10 +83,19 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
             {
                 METTelemetrySOShipmentErrorEvent::runTelemetryEvent(metSalesOrderShipmentLoadLinesTel.OrderNum, errorMessage);
             }
-        }
+
+            error(strFmt("@MET:SalesShipmentConfirmationFailed", failureStep, errorMessage));
+        } 
         //CBNF019_Observability_SalesOrderShipping
         catch
         {
+            isPosted = false;
+            str errorDetails = this.extractErrorMessagesFromInfolog();
+    
+            error(strFmt("@MET:ExceptionDuringSalesConfirmation",
+                         metSalesOrderShipmentLoadHeader.ShipmentId, 
+                         errorDetails));
+          
             exceptionTextFallThrough();
         }
 
@@ -93,7 +105,7 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>postPackingslipInvoiceReport</Name>
+				<Name>postPackingSlipReport</Name>
 				<Source><![CDATA[
     /// <summary>
     /// Method to post the invoice report
@@ -101,12 +113,10 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
     /// <param name = "_shipmentLoadHeader">Shipment load leader</param>
     /// <param name = "_accountOrder">Account order</param>
     /// <returns>Boolean result</returns>
-    private boolean postPackingslipInvoiceReport(METSalesOrderShipmentLoadHeader    _shipmentLoadHeader, AccountOrder _accountOrder)
+    private boolean postPackingSlipReport(METSalesOrderShipmentLoadHeader  _shipmentLoadHeader, AccountOrder _accountOrder)
     {
         boolean                         isPosted = false;
-        JournalId                       jourId;
-        SalesFormLetter                 salesFormLetter;
-        SalesFormLetter_Invoice         salesFormLetterInvoice;
+        SalesFormLetter                 salesFormLetter;        
 
         this.createPostCustomerMDFConsolidation(metSalesOrderShipmentLoadHeader);
 
@@ -115,8 +125,7 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
         if (salesFormLetter.parmJournalRecord().TableId == tableNum(CustPackingSlipJour))
         {
             CustPackingSlipJour     jourTable;
-            jourTable = salesFormLetter.parmJournalRecord();
-            jourId  = jourTable.packingSlipId;
+            jourTable = salesFormLetter.parmJournalRecord();           
 
             if (jourTable)
             {
@@ -133,34 +142,46 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
 
                 isPosted = true;
             }
-        }
-       
-        if (isPosted)
+        }      
+        
+
+        return isPosted;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postSalesInvoice</Name>
+				<Source><![CDATA[
+    private boolean postSalesInvoice(METSalesOrderShipmentLoadHeader _shipmentLoadHeader)
+    {
+        METSalesOrderShipmentLoadLines      shipmentLoadLines;
+        SalesFormLetter_Invoice             salesFormLetterInvoice;
+        boolean                             isPosted = false;
+
+        if (_shipmentLoadHeader.PostMultiDocument)
         {
-            METSalesOrderShipmentLoadLines      shipmentLoadLines;
-
-            if (_shipmentLoadHeader.PostMultiDocument)
-            {
-                while select shipmentLoadLines
-                    group by orderNum 
+            while select shipmentLoadLines
+                    group by orderNum
                         where shipmentLoadLines.ShipmentId == _shipmentLoadHeader.ShipmentId
-                {
-                    salesFormLetterInvoice = this.postInvoice(shipmentLoadLines.OrderNum);
-                }
-            }
-            else
             {
-                salesFormLetterInvoice = this.postInvoiceForShipment(_shipmentLoadHeader.ShipmentId);
+                salesFormLetterInvoice = this.postInvoice(shipmentLoadLines.OrderNum);                
             }
+        }
+        else
+        {
+            salesFormLetterInvoice = this.postInvoiceForShipment(_shipmentLoadHeader.ShipmentId);
+            
+        }
 
-            METSalesOrderShipmentLoadLines          metSalesOrderShipmentLoadLines;
-            SalesLine                               salesLine;
-            CustInvoiceTrans                        invoiceTrans;
-            CustInvoiceJour                         invoiceJour;
+        METSalesOrderShipmentLoadLines          metSalesOrderShipmentLoadLines;
+        SalesLine                               salesLine;
+        CustInvoiceTrans                        invoiceTrans;
+        CustInvoiceJour                         invoiceJour;
 
-            invoiceJour.skipDataMethods(true);
+        invoiceJour.skipDataMethods(true);
 
-            update_recordset invoiceJour
+        update_recordset invoiceJour
                 setting METLoadId = _shipmentLoadHeader.LoadId,
                     METShipmentId = _shipmentLoadHeader.ShipmentId
                     where invoiceJour.METLoadId == ""
@@ -177,19 +198,16 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
                         metSalesOrderShipmentLoadLines.LineNum == salesLine.LineNum     &&
                         metSalesOrderShipmentLoadLines.ShipmentId == _shipmentLoadHeader.ShipmentId;
 
-            if (invoiceJour.RowCount() == 0)
-            {
-                isPosted = false;
-            }
-            else
-            {
-                info(strFmt("@MET:InvoicePosted", _shipmentLoadHeader.ShipmentId));
-
-            }
+        if (invoiceJour.RowCount() == 0)
+        {
+            isPosted = false;
+            warning(strFmt("@MET:SalesInvoicePostingFailed", _shipmentLoadHeader.ShipmentId));
+        
         }
         else
         {
-            Error (strFmt("@MET:PackingSlipError", _shipmentLoadHeader.ShipmentId));
+            isPosted = true;
+            info(strFmt("@MET:InvoicePosted", _shipmentLoadHeader.ShipmentId));
         }
 
         return isPosted;
@@ -284,7 +302,7 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
             
             tmpFrmVirtual.TableNum      = custPackingSlipJour.TableId;
             tmpFrmVirtual.RecordNo      = custPackingSlipJour.RecId;
-            tmpfrmvirtual.NoYes         = NoYes::Yes;
+            tmpFrmVirtual.NoYes         = NoYes::Yes;
             tmpFrmVirtual.Id            = custPackingSlipJour.SalesId;
             
             tmpFrmVirtual.insert();
@@ -314,7 +332,7 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
         }
         //NE - CB274
 
-        return SalesFormLetter;
+        return salesFormLetter;
     }
 
 ]]></Source>
@@ -419,6 +437,31 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
             throw Error(strFmt("@MET:NoValidShipment", _shipmentId));
         }
         return new sysQueryRun(qry);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>extractErrorMessagesFromInfolog</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Extract error messages from the Infolog
+    /// </summary>
+    /// <returns>Concatenated error messages from Infolog</returns>
+    private str extractErrorMessagesFromInfolog()
+    {
+        str errorMessage = "";
+        SysInfologEnumerator enumerator;
+        SysInfologMessageStruct msgStruct;
+
+        enumerator = SysInfologEnumerator::newData(infolog.cut());
+        while (enumerator.moveNext())
+        {
+            msgStruct = new SysInfologMessageStruct(enumerator.currentMessage());
+            errorMessage += msgStruct.message() + " ";
+        }
+
+        return errorMessage;
     }
 
 ]]></Source>
