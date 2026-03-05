@@ -1,0 +1,259 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METTMSEngineOrderProcessservice</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// CB166_SalesOrderSubstitutes
+/// Post sales order creation processing multithread batch task
+/// inspired from new class LedgerJournalBatchPost
+/// </summary>
+class METTMSEngineOrderProcessservice extends METSysOperationService
+{
+    private guid topPickingProcessId;
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getTaskServiceClass</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns task service class name.
+    /// </summary>
+    /// <returns>Task service class name</returns>
+    protected str getTaskServiceClass()
+    {
+        return classStr(METTMSEngineOrderProcessTaskService);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTaskServiceClassMethod</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns task service class method.
+    /// </summary>
+    /// <returns>Task service class method</returns>
+    protected str getTaskServiceClassMethod()
+    {
+        return methodStr(METTMSEngineOrderProcessTaskService, process);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getTaskServiceCaption</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns caption of the task service class.
+    /// </summary>
+    /// <returns>Task service class caption</returns>
+    protected str getTaskServiceCaption()
+    {
+        return "@MET:METTMSTASKCAPTION";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    /// <param name = "_contract">
+    /// <c>METSysOperationTaskDataContract</c>
+    /// </param>
+    public void process(METTMSEngineOrderProcessContract _contract)
+        {
+            this.processInternal(_contract);
+        }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+        /// <summary>Initialise global variables</summary>
+        public void initialise()
+        {
+            super();
+        
+            QueryBuildDataSource                qdbsSalesTable, qdbsMetSalesTable;
+            METTMSEngineOrderProcessContract    contract    = dataContract as METTMSEngineOrderProcessContract;
+            Query                               query       = contract.getQuery();
+            
+            container salesCon = contract.parmSalesContainer();
+
+            if (salesCon != conNull())
+            {
+                qdbsSalesTable      = query.dataSourceTable(tableNum(SalesTable));
+                qdbsMetSalesTable   = query.dataSourceTable(tableNum(METSalesTable));
+                qdbsMetSalesTable.clearRange(fieldNum(METSalesTable, OrderProcessingStatus));
+
+                for(int i=1; i<= conLen(salesCon); i++)
+                {
+                    qdbsSalesTable.addRange(fieldNum(SalesTable, SalesId)).value(SysQuery::value(conPeek(salesCon, i)));
+                }
+            }
+            this.processSalesOrders(query, contract.parmExcludeLines());
+        }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initTaskDataContract</Name>
+				<Source><![CDATA[
+        /// <summary>
+        /// Initializes the task data contract.
+        /// </summary>
+        /// <param name = "_taskDataContract">task data contract</param>
+        protected void initTaskDataContract(METSysOperationTaskDataContract _taskDataContract)
+        {
+            super(_taskDataContract);
+            METTMSEngineOrderProcessContract contract = _taskDataContract as METTMSEngineOrderProcessContract;
+            contract.parmTopPickingProcessId(topPickingProcessId);
+        }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>taskDataContractObject</Name>
+				<Source><![CDATA[
+        /// <summary>
+        /// Provides task data contract.
+        /// </summary>
+        /// <returns>task data contract</returns>
+        protected METSysOperationTaskDataContract taskDataContractObject()
+        {
+            return new METTMSEngineOrderProcessContract();
+        }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processSalesOrders</Name>
+				<Source><![CDATA[
+        /// <summary>
+        /// Process sales orders to substitute from the query and insert SO number in <c>METPostSalesOrderCreationProcessingQueue</c>
+        /// </summary>
+        /// <param name = "_query"><c>Query</c> object</param>
+        /// <param name = "_excludeLines">Exclude lines with manual reservation</param>
+        void processSalesOrders(Query _query, METExcludeLinesWithManualReservation _excludeLines)
+        {
+            SalesTable          st;
+            RecordInsertList    postSalesOrderCreationProcessingQueueList;
+            Set                 uniqueGroups = new Set(Types::String);
+            str                 groupKey;
+            #OCCRetryCount
+
+            METPostSalesOrderCreationProcessingQueue::cleanUpPostSalesOrderCreationProcessingQueue();
+            postSalesOrderCreationProcessingQueueList = new RecordInsertList(tableNum(METPostSalesOrderCreationProcessingQueue));
+            topPickingProcessId = newGuid();
+
+            QueryRun qr = new QueryRun(_query);
+
+            while (qr.next())
+            {
+                try
+                {
+                    st = qr.get(tableNum(SalesTable));
+
+                    // <--- NEW: Create a unique key
+                    groupKey = st.CustAccount + '#' + st.InventLocationId;
+                 
+                    if (!uniqueGroups.in(groupKey))
+                    {
+                        this.addToPostSalesOrderCreationProcessingQueueList(
+                        postSalesOrderCreationProcessingQueueList,
+                        st.CustAccount,
+                        st.InventLocationId);
+
+                        uniqueGroups.add(groupKey); // <--- NEW: Mark as processed
+                    }
+                }
+                catch (Exception::Deadlock)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::Deadlock;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                catch (Exception::UpdateConflict)
+                {
+                    if (appl.ttsLevel() == 0)
+                    {
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            throw Exception::UpdateConflictNotRecovered;
+                        }
+                        else
+                        {
+                            retry;
+                        }
+                    }
+                    else
+                    {
+                        throw Exception::UpdateConflict;
+                    }
+                }
+                catch (Exception::Error)
+                {
+                    // catch the errors so processing can continue
+                    curext(); // avoids a warning about an empty block
+                }
+            }
+
+            this.insertIntoTopPickingQueue(postSalesOrderCreationProcessingQueueList);
+        }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addToPostSalesOrderCreationProcessingQueueList</Name>
+				<Source><![CDATA[
+        /// <summary>
+        /// Adding sales order to process into the RecordInsertList
+        /// </summary>
+        /// <param name = "_journalPostQueueList"><c>RecordInsertList</c> object</param>
+        /// <param name = "_custAccount">vendor account number</param>
+        /// <param name = "_inventLocationId">Sales order location id</param>
+        private void addToPostSalesOrderCreationProcessingQueueList(
+        RecordInsertList _journalPostQueueList,
+        CustAccount      _custAccount,
+        InventLocationId _inventLocationId)
+        {
+            METPostSalesOrderCreationProcessingQueue postRecord;
+        
+            postRecord.ProcessId        = this.topPickingProcessId;
+            postRecord.CustAccount      = _custAccount;
+            postRecord.InventLocationId = _inventLocationId;
+
+            _journalPostQueueList.add(postRecord);
+        }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertIntoTopPickingQueue</Name>
+				<Source><![CDATA[
+        /// <summary>
+        /// Buld insert from RecordInsertList into <c>METPostSalesOrderCreationProcessingQueue</c>
+        /// </summary>
+        /// <param name = "_postSalesOrderCreationProcessingQueueList">RecordInsertList to bulk insert</param>
+        private void insertIntoTopPickingQueue(RecordInsertList _postSalesOrderCreationProcessingQueueList)
+        {
+            _postSalesOrderCreationProcessingQueueList.insertDatabase();
+        }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
