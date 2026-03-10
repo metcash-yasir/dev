@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METBatchMonitoringMultiTestTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Task service for the multithreaded batch monitoring test job.
+/// Each thread drains CustTable records from METBatchMonitoringTestQueue and counts their sales lines.
+/// </summary>
+class METBatchMonitoringMultiTestTaskService extends METSysOperationTaskService
+{
+    guid            topProcessId;
+    CustAccount     custAccount;
+    Integer         sleepMs;
+    NoYes           generateError;
+    METProcMetrics  procMetrics;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Entry point called by the framework for each task thread.
+    /// </summary>
+    public void process(METBatchMonitoringMultiTestContract _contract)
+    {
+        this.processInternal(_contract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reads contract fields and begins the procMetrics task log entry.
+    /// </summary>
+    protected void initialise()
+    {
+        super();
+
+        METBatchMonitoringMultiTestContract contract = dataContract as METBatchMonitoringMultiTestContract;
+        topProcessId  = contract.parmTopProcessId();
+        sleepMs       = contract.parmSleepMs() > 0 ? contract.parmSleepMs() : 10;
+        generateError = contract.parmGenerateError();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Drains the queue and processes each CustTable record.
+    /// generateError causes a fatal throw after the first record, setting procMetrics status to Failed.
+    /// </summary>
+    public void processTask(boolean _readPast)
+    {
+        #OCCRetryCount
+
+        SalesLine   salesLine;
+        boolean     firstRecord = true;
+
+        procMetrics = METProcMetrics::construct(METBatchLogOperation::METBatchMonitoringTest);
+        procMetrics.beginTrace('Test job multi: processing task');
+
+        while (this.getCustFromQueue(topProcessId, _readPast))
+        {
+            try
+            {
+                procMetrics.ttsBeginTrace();
+
+                select count(RecId) from salesLine
+                    where salesLine.CustAccount == custAccount;
+
+                METGlobal::sleep(sleepMs);
+
+                procMetrics.ttsCommitTrace();
+
+                procMetrics.incProcessedCount();
+            }
+            catch (Exception::Deadlock)
+            {
+                retry;
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+            catch
+            {
+                Global::exceptionTextFallThrough();
+            }
+
+            // Intentional throw outside the per-record try/catch so it escapes
+            // processTask and is caught by processInternal -> updateOnError -> Failed status.
+            if (generateError && firstRecord)
+            {
+                throw error("Test error generated after first record.");
+            }
+
+            firstRecord = false;
+        }
+
+        procMetrics.endTrace('Test task completed');
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateOnError</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Called by the base class processInternal catch when an unhandled exception escapes processTask.
+    /// Marks the procMetrics log entry as Failed.
+    /// </summary>
+    protected void updateOnError()
+    {
+        procMetrics.endTrace('Task failed', METBatchMonitoringStatus::Failed);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCustFromQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Pessimistic-locks and dequeues one CustAccount from METBatchMonitoringTestQueue.
+    /// Returns the CustAccount if a record was found, empty string otherwise.
+    /// </summary>
+    private CustAccount getCustFromQueue(guid _processId, boolean _readPast)
+    {
+        METBatchMonitoringTestQueue queue;
+
+        #OCCRetryCount
+        int     backOffWait;
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException             deadLockException;
+        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException        updateConflictException;
+        Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError    transientSqlConnectionError;
+
+        queue.readPast(_readPast);
+
+        try
+        {
+            ttsbegin;
+
+            select firstonly pessimisticlock CustAccount
+                from queue
+                    where queue.ProcessId == _processId;
+
+            if (queue.RecId)
+            {
+                this.custAccount = queue.CustAccount;
+                queue.delete();
+            }
+            else
+            {
+                this.custAccount = '';
+            }
+
+            ttscommit;
+        }
+        catch (deadLockException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw deadLockException;
+                }
+            }
+            else
+            {
+                throw deadLockException;
+            }
+        }
+        catch (updateConflictException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+            }
+            else
+            {
+                throw updateConflictException;
+            }
+        }
+        catch (transientSqlConnectionError)
+        {
+            if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw transientSqlConnectionError;
+            }
+        }
+
+        return this.custAccount;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

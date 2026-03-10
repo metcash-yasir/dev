@@ -17,9 +17,70 @@ public class METBatchMonitoringLog extends common
         ;
         if (this.EndDateTime && this.StartDateTime)
         {
-            res = any2int(DateTimeUtil::getDifference(this.LastUpdatedDateTime, this.StartDateTime));
+            res = any2int(DateTimeUtil::getDifference(this.EndDateTime, this.StartDateTime));
         }
         return res;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>aggregatedDocumentCount</Name>
+				<Source><![CDATA[
+    private int aggregatedDocumentCount()
+    {
+        METBatchMonitoringLog child;
+        ;
+        if (!this.BatchJobId || !this.BatchTaskId)
+        {
+            return 0;
+        }
+        select sum(DocumentCount) from child
+            where child.BatchJobId  == this.BatchJobId
+               && child.BatchTaskId != this.BatchTaskId
+               && child.BatchTaskId != 0;
+        return any2int(child.DocumentCount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isHeaderWithChildren</Name>
+				<Source><![CDATA[
+    private boolean isHeaderWithChildren()
+    {
+        METBatchMonitoringLog child;
+        ;
+        if (!this.BatchJobId || !this.BatchTaskId)
+        {
+            return false;
+        }
+        select firstonly RecId from child
+            where child.BatchJobId  == this.BatchJobId
+               && child.BatchTaskId != this.BatchTaskId
+               && child.BatchTaskId != 0;
+        return child.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>allChildrenCompleted</Name>
+				<Source><![CDATA[
+    private boolean allChildrenCompleted()
+    {
+        METBatchMonitoringLog child;
+        ;
+        if (!this.BatchJobId || !this.BatchTaskId)
+        {
+            return true;
+        }
+        select firstonly RecId from child
+            where child.BatchJobId  == this.BatchJobId
+               && child.BatchTaskId != this.BatchTaskId
+               && child.BatchTaskId != 0
+               && child.Status == METBatchMonitoringStatus::Running;
+        return child.RecId == 0;
     }
 
 ]]></Source>
@@ -29,8 +90,9 @@ public class METBatchMonitoringLog extends common
 				<Source><![CDATA[
     display Integer remainingDisp()
     {
+        int docCount = this.isHeaderWithChildren() ? this.aggregatedDocumentCount() : this.DocumentCount;
         ;
-        return max(0, this.LinesToProcess - this.DocumentCount);
+        return max(0, this.LinesToProcess - docCount);
     }
 
 ]]></Source>
@@ -40,8 +102,9 @@ public class METBatchMonitoringLog extends common
 				<Source><![CDATA[
     display Integer percentCompleteDisp()
     {
+        int docCount = this.isHeaderWithChildren() ? this.aggregatedDocumentCount() : this.DocumentCount;
         ;
-        return this.LinesToProcess > 0 ? (this.DocumentCount * 100 / this.LinesToProcess) : 0;
+        return this.LinesToProcess > 0 ? (docCount * 100 / this.LinesToProcess) : 0;
     }
 
 ]]></Source>
@@ -68,17 +131,72 @@ public class METBatchMonitoringLog extends common
 				<Source><![CDATA[
     display Integer estimatedRemainingDisp()
     {
-        Integer elapsedSec, remaining;
+        Integer     elapsedSec, remaining;
+        int         docCount;
+        boolean     isComplete;
+        UtcDateTime endDt;
         ;
-        if (!this.StartDateTime || this.DocumentCount <= 0 || this.LinesToProcess <= 0 || this.Status == METBatchMonitoringStatus::Completed)
+        if (!this.StartDateTime || this.LinesToProcess <= 0)
         {
             return 0;
         }
-        elapsedSec = any2int(DateTimeUtil::getDifference(
-            this.EndDateTime ? this.EndDateTime : DateTimeUtil::getSystemDateTime(),
-            this.StartDateTime));
-        remaining  = max(0, this.LinesToProcess - this.DocumentCount);
-        return (remaining * elapsedSec) / this.DocumentCount;
+
+        if (this.isHeaderWithChildren())
+        {
+            // For multi-thread header rows: aggregate progress from child task records.
+            // No isComplete check -- the formula naturally returns 0 when remaining = 0.
+            docCount = this.aggregatedDocumentCount();
+            if (docCount <= 0)
+            {
+                return 0;
+            }
+            endDt      = DateTimeUtil::getSystemDateTime();
+            elapsedSec = any2int(DateTimeUtil::getDifference(endDt, this.StartDateTime));
+            remaining  = max(0, this.LinesToProcess - docCount);
+            return (remaining * elapsedSec) / docCount;
+        }
+        else
+        {
+            docCount   = this.DocumentCount;
+            isComplete = this.Status == METBatchMonitoringStatus::Completed;
+            endDt = this.EndDateTime ? this.EndDateTime : DateTimeUtil::getSystemDateTime();
+        }
+
+        if (docCount <= 0 || isComplete)
+        {
+            return 0;
+        }
+
+        elapsedSec = any2int(DateTimeUtil::getDifference(endDt, this.StartDateTime));
+        remaining  = max(0, this.LinesToProcess - docCount);
+        return (remaining * elapsedSec) / docCount;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setSession</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Populates SessionId and SessionLoginDateTime from the current session.
+    /// Follows the master session when running inside a child session.
+    /// </summary>
+    public void setSession()
+    {
+        xSession xSession = new xSession(sessionid());
+        
+        this.SessionId            = xSession.sessionId();
+        this.SessionLoginDateTime = xSession.loginDateTime();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isSessionActive</Name>
+				<Source><![CDATA[
+    display NoYes isSessionActive()
+    {
+        return Global::isSessionActive(this.SessionId, this.SessionLoginDateTime);
     }
 
 ]]></Source>
@@ -106,7 +224,7 @@ public class METBatchMonitoringLog extends common
 			</Method>
 		</Methods>
 	</SourceCode>
-	<Label>Operations log table</Label>
+	<Label>@MET:METBatchMonitoringLogTable</Label>
 	<SubscriberAccessLevel>
 		<Read>Allow</Read>
 	</SubscriberAccessLevel>
@@ -188,7 +306,7 @@ public class METBatchMonitoringLog extends common
 		</AxTableFieldGroup>
 		<AxTableFieldGroup>
 			<Name>GridGroup</Name>
-			<Label>Overview</Label>
+			<Label>@MET:METBatchMonitoringLogOverview</Label>
 			<Fields>
 				<AxTableFieldGroupField>
 					<DataField>Status</DataField>
@@ -238,14 +356,8 @@ public class METBatchMonitoringLog extends common
 				<AxTableFieldGroupField>
 					<DataField>SessionId</DataField>
 				</AxTableFieldGroupField>
-			</Fields>
-		</AxTableFieldGroup>
-		<AxTableFieldGroup>
-			<Name>SystemGroup</Name>
-			<Label>System</Label>
-			<Fields>
 				<AxTableFieldGroupField>
-					<DataField>SessionId</DataField>
+					<DataField>SessionLoginDateTime</DataField>
 				</AxTableFieldGroupField>
 			</Fields>
 		</AxTableFieldGroup>
@@ -255,13 +367,13 @@ public class METBatchMonitoringLog extends common
 			i:type="AxTableFieldInt64">
 			<Name>BatchJobId</Name>
 			<ExtendedDataType>RefRecId</ExtendedDataType>
-			<Label>Batch job ID</Label>
+			<Label>@MET:METBatchMonitoringLogBatchJobId</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldInt64">
 			<Name>BatchTaskId</Name>
 			<ExtendedDataType>RefRecId</ExtendedDataType>
-			<Label>Batch task ID</Label>
+			<Label>@MET:METBatchMonitoringLogBatchTaskId</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldString">
@@ -272,13 +384,13 @@ public class METBatchMonitoringLog extends common
 			i:type="AxTableFieldString">
 			<Name>Details</Name>
 			<ExtendedDataType>NotesLine</ExtendedDataType>
-			<Label>Description</Label>
+			<Label>@MET:METBatchMonitoringLogDetails</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldInt">
 			<Name>Duration</Name>
 			<ExtendedDataType>PositiveNumber</ExtendedDataType>
-			<Label>Duration(sec)</Label>
+			<Label>@MET:METBatchMonitoringLogDuration</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldUtcDateTime">
@@ -288,13 +400,13 @@ public class METBatchMonitoringLog extends common
 		<AxTableField xmlns=""
 			i:type="AxTableFieldUtcDateTime">
 			<Name>LastUpdatedDateTime</Name>
-			<Label>Last updated</Label>
+			<Label>@MET:METBatchMonitoringLastUpdated</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldInt">
 			<Name>LineCount</Name>
 			<ExtendedDataType>PositiveNumber</ExtendedDataType>
-			<Label>Line count</Label>
+			<Label>@MET:METBatchMonitoringLineCount</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldEnum">
@@ -320,7 +432,7 @@ public class METBatchMonitoringLog extends common
 			i:type="AxTableFieldInt">
 			<Name>LinesToProcess</Name>
 			<ExtendedDataType>PositiveNumber</ExtendedDataType>
-			<Label>Total document</Label>
+			<Label>@MET:METBatchMonitoringLinesToProcess</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldString">
@@ -331,12 +443,17 @@ public class METBatchMonitoringLog extends common
 			i:type="AxTableFieldInt">
 			<Name>DocumentCount</Name>
 			<ExtendedDataType>PositiveNumber</ExtendedDataType>
-			<Label>Current document</Label>
+			<Label>@MET:METBatchMonitoringDocumentCount</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldInt64">
 			<Name>DualWriteTime</Name>
-			<Label>Dual write time (ms)</Label>
+			<Label>@MET:METBatchMonitoringDualWriteTime</Label>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldUtcDateTime">
+			<Name>SessionLoginDateTime</Name>
+			<Label>@MET:METBatchMonitoringSessionLoginDateTime</Label>
 		</AxTableField>
 	</Fields>
 	<FullTextIndexes />
