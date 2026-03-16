@@ -25,62 +25,87 @@ public class METBatchMonitoringLog extends common
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>aggregatedDocumentCount</Name>
+				<Name>hasChildren</Name>
 				<Source><![CDATA[
-    private int aggregatedDocumentCount()
+    private boolean hasChildren()
     {
         METBatchMonitoringLog child;
         ;
-        if (!this.BatchJobId || !this.BatchTaskId)
-        {
-            return 0;
-        }
-        select sum(DocumentCount) from child
-            where child.BatchJobId  == this.BatchJobId
-               && child.BatchTaskId != this.BatchTaskId
-               && child.BatchTaskId != 0;
-        return any2int(child.DocumentCount);
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>isHeaderWithChildren</Name>
-				<Source><![CDATA[
-    private boolean isHeaderWithChildren()
-    {
-        METBatchMonitoringLog child;
-        ;
-        if (!this.BatchJobId || !this.BatchTaskId)
+        if (!this.BatchJobId || this.LinesToProcess == 0)
         {
             return false;
         }
         select firstonly RecId from child
-            where child.BatchJobId  == this.BatchJobId
-               && child.BatchTaskId != this.BatchTaskId
-               && child.BatchTaskId != 0;
+            where child.BatchJobId     == this.BatchJobId
+               && child.Operation      == this.Operation
+               && child.LinesToProcess == 0;
         return child.RecId != 0;
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>allChildrenCompleted</Name>
+				<Name>hasRunningChildren</Name>
 				<Source><![CDATA[
-    private boolean allChildrenCompleted()
+    /// <summary>
+    /// Returns true if at least one child task log is still in Running status.
+    /// Used by display methods to short-circuit once all children have finished.
+    /// </summary>
+    boolean hasRunningChildren()
     {
         METBatchMonitoringLog child;
         ;
-        if (!this.BatchJobId || !this.BatchTaskId)
-        {
-            return true;
-        }
         select firstonly RecId from child
-            where child.BatchJobId  == this.BatchJobId
-               && child.BatchTaskId != this.BatchTaskId
-               && child.BatchTaskId != 0
-               && child.Status == METBatchMonitoringStatus::Running;
-        return child.RecId == 0;
+            where child.BatchJobId     == this.BatchJobId
+               && child.Operation      == this.Operation
+               && child.LinesToProcess == 0
+               && child.Status         == METBatchMonitoringStatus::Running;
+        return child.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>childDocumentCount</Name>
+				<Source><![CDATA[
+    private int childDocumentCount()
+    {
+        METBatchMonitoringLog child;
+        ;
+        select sum(DocumentCount) from child
+            where child.BatchJobId     == this.BatchJobId
+               && child.Operation      == this.Operation
+               && child.LinesToProcess == 0;
+        return any2int(child.DocumentCount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>effectiveLinesToProcess</Name>
+				<Source><![CDATA[
+    private int effectiveLinesToProcess()
+    {
+        METBatchMonitoringLog parent, sibling;
+        ;
+        if (this.LinesToProcess > 0 || !this.BatchJobId)
+        {
+            return this.LinesToProcess;
+        }
+        select firstonly LinesToProcess from parent
+            where parent.BatchJobId     == this.BatchJobId
+               && parent.Operation      == this.Operation
+               && parent.LinesToProcess > 0;
+        if (!parent.LinesToProcess)
+        {
+            return 0;
+        }
+        select sum(DocumentCount) from sibling
+            where sibling.BatchJobId     == this.BatchJobId
+               && sibling.Operation      == this.Operation
+               && sibling.LinesToProcess == 0
+               && sibling.RecId          != this.RecId;
+        return max(this.DocumentCount, parent.LinesToProcess - any2int(sibling.DocumentCount));
     }
 
 ]]></Source>
@@ -90,9 +115,21 @@ public class METBatchMonitoringLog extends common
 				<Source><![CDATA[
     display Integer remainingDisp()
     {
-        int docCount = this.isHeaderWithChildren() ? this.aggregatedDocumentCount() : this.DocumentCount;
-        ;
-        return max(0, this.LinesToProcess - docCount);
+        if (this.hasChildren())
+        {
+            if (!this.hasRunningChildren())
+            {
+                return 0;
+            }
+            return max(0, this.LinesToProcess - this.childDocumentCount());
+        }
+
+        if (this.Status == METBatchMonitoringStatus::Completed)
+        {
+            return 0;
+        }
+
+        return max(0, this.effectiveLinesToProcess() - this.DocumentCount);
     }
 
 ]]></Source>
@@ -102,9 +139,28 @@ public class METBatchMonitoringLog extends common
 				<Source><![CDATA[
     display Integer percentCompleteDisp()
     {
-        int docCount = this.isHeaderWithChildren() ? this.aggregatedDocumentCount() : this.DocumentCount;
-        ;
-        return this.LinesToProcess > 0 ? (docCount * 100 / this.LinesToProcess) : 0;
+        int linesToProcess;
+        int docCount;
+
+        if (this.hasChildren())
+        {
+            if (!this.hasRunningChildren())
+            {
+                return 100;
+            }
+            linesToProcess = this.LinesToProcess;
+            docCount       = this.childDocumentCount();
+            return linesToProcess > 0 ? (docCount * 100 / linesToProcess) : 0;
+        }
+
+        if (this.Status == METBatchMonitoringStatus::Completed)
+        {
+            return 100;
+        }
+
+        linesToProcess = this.effectiveLinesToProcess();
+        docCount       = this.DocumentCount;
+        return linesToProcess > 0 ? (docCount * 100 / linesToProcess) : 0;
     }
 
 ]]></Source>
@@ -114,13 +170,37 @@ public class METBatchMonitoringLog extends common
 				<Source><![CDATA[
     display Integer elapsedDisp()
     {
-        UtcDateTime endDt;
+        METBatchMonitoringLog   child;
+        UtcDateTime             endDt;
         ;
         if (!this.StartDateTime)
         {
             return 0;
         }
-        endDt = this.EndDateTime ? this.EndDateTime : DateTimeUtil::getSystemDateTime();
+        if (this.hasChildren())
+        {
+            select firstonly RecId from child
+                where child.BatchJobId     == this.BatchJobId
+                   && child.Operation      == this.Operation
+                   && child.LinesToProcess == 0
+                   && child.Status         == METBatchMonitoringStatus::Running;
+            if (child.RecId)
+            {
+                endDt = DateTimeUtil::getSystemDateTime();
+            }
+            else
+            {
+                select maxof(EndDateTime) from child
+                    where child.BatchJobId     == this.BatchJobId
+                       && child.Operation      == this.Operation
+                       && child.LinesToProcess == 0;
+                endDt = child.EndDateTime ? child.EndDateTime : DateTimeUtil::getSystemDateTime();
+            }
+        }
+        else
+        {
+            endDt = this.EndDateTime ? this.EndDateTime : DateTimeUtil::getSystemDateTime();
+        }
         return any2int(DateTimeUtil::getDifference(endDt, this.StartDateTime));
     }
 
@@ -131,45 +211,41 @@ public class METBatchMonitoringLog extends common
 				<Source><![CDATA[
     display Integer estimatedRemainingDisp()
     {
-        Integer     elapsedSec, remaining;
-        int         docCount;
-        boolean     isComplete;
-        UtcDateTime endDt;
-        ;
-        if (!this.StartDateTime || this.LinesToProcess <= 0)
-        {
-            return 0;
-        }
+        Integer             elapsedSec, remaining, linesToProcess, docCount;
+        UtcDateTime         endDt;
 
-        if (this.isHeaderWithChildren())
+        if (this.hasChildren())
         {
-            // For multi-thread header rows: aggregate progress from child task records.
-            // No isComplete check -- the formula naturally returns 0 when remaining = 0.
-            docCount = this.aggregatedDocumentCount();
-            if (docCount <= 0)
+            if (!this.hasRunningChildren())
             {
                 return 0;
             }
-            endDt      = DateTimeUtil::getSystemDateTime();
-            elapsedSec = any2int(DateTimeUtil::getDifference(endDt, this.StartDateTime));
-            remaining  = max(0, this.LinesToProcess - docCount);
-            return (remaining * elapsedSec) / docCount;
-        }
-        else
-        {
-            docCount   = this.DocumentCount;
-            isComplete = this.Status == METBatchMonitoringStatus::Completed;
-            endDt = this.EndDateTime ? this.EndDateTime : DateTimeUtil::getSystemDateTime();
+            linesToProcess = this.LinesToProcess;
+            docCount       = this.childDocumentCount();
+            if (linesToProcess <= 0 || docCount <= 0)
+            {
+                return 0;
+            }
+            elapsedSec = any2int(DateTimeUtil::getDifference(DateTimeUtil::getSystemDateTime(), this.StartDateTime));
+            remaining  = max(0, linesToProcess - docCount);
+            return remaining == 0 ? 0 : (remaining * elapsedSec) / docCount;
         }
 
-        if (docCount <= 0 || isComplete)
+        if (!this.StartDateTime || this.Status == METBatchMonitoringStatus::Completed)
         {
             return 0;
         }
 
+        // Child or standalone
+        linesToProcess = this.effectiveLinesToProcess();
+        if (linesToProcess <= 0 || this.DocumentCount <= 0)
+        {
+            return 0;
+        }
+        endDt      = this.EndDateTime ? this.EndDateTime : DateTimeUtil::getSystemDateTime();
         elapsedSec = any2int(DateTimeUtil::getDifference(endDt, this.StartDateTime));
-        remaining  = max(0, this.LinesToProcess - docCount);
-        return (remaining * elapsedSec) / docCount;
+        remaining  = max(0, linesToProcess - this.DocumentCount);
+        return (remaining * elapsedSec) / this.DocumentCount;
     }
 
 ]]></Source>
@@ -202,22 +278,11 @@ public class METBatchMonitoringLog extends common
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>clearLog</Name>
+				<Name>linesToProcessDisp</Name>
 				<Source><![CDATA[
-    static void clearLog(int _daysToKeep = 0)
+    display Integer linesToProcessDisp()
     {
-        METBatchMonitoringLog  batchMonitoringLog;
-        TransDateTime          delDate = DateTimeUtil::addDays(DateTimeUtil::utcNow(), -1 * _daysToKeep);
-        ;
-        if (! _daysToKeep)
-        {
-            delete_from batchMonitoringLog;
-        }
-        else
-        {
-            delete_from batchMonitoringLog
-                where batchMonitoringLog.createdDateTime < delDate;
-        }
+        return this.LinesToProcess ? this.LinesToProcess : this.DocumentCount;
     }
 
 ]]></Source>
@@ -230,6 +295,7 @@ public class METBatchMonitoringLog extends common
 	</SubscriberAccessLevel>
 	<TitleField1>Operation</TitleField1>
 	<TitleField2>StartDateTime</TitleField2>
+	<AllowRowVersionChangeTracking>Yes</AllowRowVersionChangeTracking>
 	<ClusteredIndex>SesUserIdx</ClusteredIndex>
 	<CreatedBy>Yes</CreatedBy>
 	<CreatedDateTime>Yes</CreatedDateTime>
@@ -283,7 +349,13 @@ public class METBatchMonitoringLog extends common
 					<DataField>UserId</DataField>
 				</AxTableFieldGroupField>
 				<AxTableFieldGroupField>
+					<DataField>DocumentCount</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
 					<DataField>DualWriteTime</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>SessionLoginDateTime</DataField>
 				</AxTableFieldGroupField>
 			</Fields>
 		</AxTableFieldGroup>
@@ -367,35 +439,41 @@ public class METBatchMonitoringLog extends common
 			i:type="AxTableFieldInt64">
 			<Name>BatchJobId</Name>
 			<ExtendedDataType>RefRecId</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
 			<Label>@MET:METBatchMonitoringLogBatchJobId</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldInt64">
 			<Name>BatchTaskId</Name>
 			<ExtendedDataType>RefRecId</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
 			<Label>@MET:METBatchMonitoringLogBatchTaskId</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldString">
 			<Name>CompanyId</Name>
 			<ExtendedDataType>CompanyId</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldString">
 			<Name>Details</Name>
 			<ExtendedDataType>NotesLine</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
 			<Label>@MET:METBatchMonitoringLogDetails</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldInt">
 			<Name>Duration</Name>
 			<ExtendedDataType>PositiveNumber</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
 			<Label>@MET:METBatchMonitoringLogDuration</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldUtcDateTime">
 			<Name>EndDateTime</Name>
 			<ExtendedDataType>EndDateTime</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldUtcDateTime">
@@ -406,6 +484,7 @@ public class METBatchMonitoringLog extends common
 			i:type="AxTableFieldInt">
 			<Name>LineCount</Name>
 			<ExtendedDataType>PositiveNumber</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
 			<Label>@MET:METBatchMonitoringLineCount</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
@@ -417,11 +496,13 @@ public class METBatchMonitoringLog extends common
 			i:type="AxTableFieldInt">
 			<Name>SessionId</Name>
 			<ExtendedDataType>SessionId</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldUtcDateTime">
 			<Name>StartDateTime</Name>
 			<ExtendedDataType>StartDateTime</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldEnum">
@@ -432,17 +513,20 @@ public class METBatchMonitoringLog extends common
 			i:type="AxTableFieldInt">
 			<Name>LinesToProcess</Name>
 			<ExtendedDataType>PositiveNumber</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
 			<Label>@MET:METBatchMonitoringLinesToProcess</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldString">
 			<Name>UserId</Name>
 			<ExtendedDataType>UserId</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
 		</AxTableField>
 		<AxTableField xmlns=""
 			i:type="AxTableFieldInt">
 			<Name>DocumentCount</Name>
 			<ExtendedDataType>PositiveNumber</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
 			<Label>@MET:METBatchMonitoringDocumentCount</Label>
 		</AxTableField>
 		<AxTableField xmlns=""
@@ -476,6 +560,21 @@ public class METBatchMonitoringLog extends common
 			<Fields>
 				<AxTableIndexField>
 					<DataField>StartDateTime</DataField>
+				</AxTableIndexField>
+			</Fields>
+		</AxTableIndex>
+		<AxTableIndex>
+			<Name>SesClearLogIdx</Name>
+			<AllowDuplicates>Yes</AllowDuplicates>
+			<Fields>
+				<AxTableIndexField>
+					<DataField>Operation</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>CreatedDateTime</DataField>
+				</AxTableIndexField>
+				<AxTableIndexField>
+					<DataField>Status</DataField>
 				</AxTableIndexField>
 			</Fields>
 		</AxTableIndex>

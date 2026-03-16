@@ -1,19 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-	<Name>METBatchMonitoringMultiTestTaskService</Name>
+	<Name>METBatchMonitoringTestMultiTaskService</Name>
 	<SourceCode>
 		<Declaration><![CDATA[
 /// <summary>
 /// Task service for the multithreaded batch monitoring test job.
 /// Each thread drains CustTable records from METBatchMonitoringTestQueue and counts their sales lines.
 /// </summary>
-class METBatchMonitoringMultiTestTaskService extends METSysOperationTaskService
+class METBatchMonitoringTestMultiTaskService extends METSysOperationTaskService
 {
     guid            topProcessId;
     CustAccount     custAccount;
     Integer         sleepMs;
     NoYes           generateError;
-    METProcMetrics  procMetrics;
 
 }
 ]]></Declaration>
@@ -24,9 +23,16 @@ class METBatchMonitoringMultiTestTaskService extends METSysOperationTaskService
     /// <summary>
     /// Entry point called by the framework for each task thread.
     /// </summary>
-    public void process(METBatchMonitoringMultiTestContract _contract)
+    public void process(METBatchMonitoringTestMultiContract _contract)
     {
-        this.processInternal(_contract);
+        METProcMetrics procMetrics = METProcMetrics::construct(METBatchLogOperation::METBatchMonitoringTestMulti);
+        procMetrics.beginTrace('Process started');
+
+        using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
+        {
+            this.processInternal(_contract);
+            procMetrics.endTrace();
+        }
     }
 
 ]]></Source>
@@ -41,10 +47,50 @@ class METBatchMonitoringMultiTestTaskService extends METSysOperationTaskService
     {
         super();
 
-        METBatchMonitoringMultiTestContract contract = dataContract as METBatchMonitoringMultiTestContract;
+        METBatchMonitoringTestMultiContract contract = dataContract as METBatchMonitoringTestMultiContract;
         topProcessId  = contract.parmTopProcessId();
         sleepMs       = contract.parmSleepMs() > 0 ? contract.parmSleepMs() : 10;
         generateError = contract.parmGenerateError();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCustAccount</Name>
+				<Source><![CDATA[
+    public void processCustAccount(CustAccount _custAccount)
+    {
+        SalesLine   salesLine;
+        METProcMetrics procMetrics = METProcMetricsScope::current();
+
+        if (procMetrics)
+        {
+            procMetrics.ttsBeginTrace();
+        }
+        else
+        {
+            ttsbegin;
+        }
+
+        while select RecId from salesLine
+                where salesLine.CustAccount == _custAccount
+        {
+            if (procMetrics)
+            {
+                procMetrics.incLineCount(1);
+            }
+        }
+
+        if (procMetrics)
+        {
+            procMetrics.ttsCommitTrace();
+            procMetrics.incProcessedCountWithDocument(_custAccount);
+            // Or use procMetrics.incProcessedCount(); if you don't want to track document id in the log
+        }
+        else
+        {
+            ttscommit;
+        }
     }
 
 ]]></Source>
@@ -60,30 +106,26 @@ class METBatchMonitoringMultiTestTaskService extends METSysOperationTaskService
     {
         #OCCRetryCount
 
-        SalesLine   salesLine;
         boolean     firstRecord = true;
-
-        procMetrics = METProcMetrics::construct(METBatchLogOperation::METBatchMonitoringTest);
-        procMetrics.beginTrace('Test job multi: processing task');
 
         while (this.getCustFromQueue(topProcessId, _readPast))
         {
             try
             {
-                procMetrics.ttsBeginTrace();
-
-                select count(RecId) from salesLine
-                    where salesLine.CustAccount == custAccount;
+                this.processCustAccount(custAccount);
 
                 METGlobal::sleep(sleepMs);
-
-                procMetrics.ttsCommitTrace();
-
-                procMetrics.incProcessedCount();
             }
             catch (Exception::Deadlock)
             {
-                retry;
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
             }
             catch (Exception::UpdateConflict)
             {
@@ -117,22 +159,6 @@ class METBatchMonitoringMultiTestTaskService extends METSysOperationTaskService
 
             firstRecord = false;
         }
-
-        procMetrics.endTrace('Test task completed');
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>updateOnError</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Called by the base class processInternal catch when an unhandled exception escapes processTask.
-    /// Marks the procMetrics log entry as Failed.
-    /// </summary>
-    protected void updateOnError()
-    {
-        procMetrics.endTrace('Task failed', METBatchMonitoringStatus::Failed);
     }
 
 ]]></Source>
