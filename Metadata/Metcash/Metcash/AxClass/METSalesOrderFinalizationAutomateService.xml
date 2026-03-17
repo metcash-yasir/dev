@@ -55,7 +55,28 @@ class METSalesOrderFinalizationAutomateService  extends METSysOperationService
     /// </param>
     public void process(METSalesOrderFinalizationAutomateContract _contract)
     {
-        this.processInternal(_contract);
+        METProcMetrics          procMetrics;
+        METOrderTransactionType orderTransactionType = _contract.parmOrderTransactionType();
+
+        switch (orderTransactionType)
+        {
+            case METOrderTransactionType::SalesOrder:
+                procMetrics = METProcMetrics::construct(METBatchLogOperation::SalesFinalizationAutomation);
+                break;
+            
+            case METOrderTransactionType::TransferOrder:
+                procMetrics = METProcMetrics::construct(METBatchLogOperation::TransferFinalizationAutomation);
+                break;
+            
+            default:
+                throw error(strFmt("@SYS19306", funcName()));
+        }
+
+        using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
+        {
+            this.processInternal(_contract);
+            procMetrics.endTrace();
+        }
     }
 
 ]]></Source>
@@ -130,7 +151,7 @@ class METSalesOrderFinalizationAutomateService  extends METSysOperationService
         METContainerTypeTable           mETContainerTypeTable;
         ListIterator                    literator;
         Map                             filteredMap = new Map(Types::Int64, Types::String);
-        METProcMetrics                  procMetrics; //Batch monitoring log
+        METProcMetrics                  procMetrics = METProcMetricsScope::current();
 
         warehouseList = _contract.parmWarehouseList();
         fromDate = _contract.parmFromDate();
@@ -152,82 +173,75 @@ class METSalesOrderFinalizationAutomateService  extends METSysOperationService
         
         queryRun = new QueryRun(query);
 
-        //Batch monitoring log - Start
-        procMetrics = METProcMetrics::construct(METBatchLogOperation::SalesFinalizationAutomation);
-        procMetrics.setTotalCountFromQuery(queryRun);
-        procMetrics.beginTrace('Process started');
-        //Or use procMetrics start trace method: pass count & description to set and start the log in one call
-        //Batch monitoring log - End
-
-        using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
+        if (procMetrics)
         {
-            while (queryrun.next())
+            procMetrics.setTotalCountFromQuery(queryRun);
+            procMetrics.beginTrace('Process started');
+            //Or use procMetrics start trace method: pass count & description to set and start the log in one call
+        }
+
+        while (queryrun.next())
+        {
+            metSalesOrderShipmentLoadHeader = queryRun.get(tableNum(METSalesOrderShipmentLoadHeader));
+
+            if (metSalesOrderShipmentLoadHeader.displayLoadPickComplete() == NoYes::Yes && metSalesOrderShipmentLoadHeader.isValidShipmentToShipped())
             {
-                metSalesOrderShipmentLoadHeader = queryRun.get(tableNum(METSalesOrderShipmentLoadHeader));
-
-                if (metSalesOrderShipmentLoadHeader.displayLoadPickComplete() == NoYes::Yes && metSalesOrderShipmentLoadHeader.isValidShipmentToShipped())
+                try
                 {
-                    try
+                    ttsbegin;
+
+                    postQueue.clear();
+                    postQueue.ProcessId = this.topPickingProcessId;
+                    postQueue.ShipmentId = metSalesOrderShipmentLoadHeader.ShipmentId;
+
+                    shipmentConfirmationRecordList.add(postQueue);
+
+                    METSalesOrderShipmentLoadHeader::updateDocStatusInHeader(MetShipmentStatus::Loaded, DocumentStatus::None, metSalesOrderShipmentLoadHeader.ShipmentId);
+
+                    ttscommit;
+
+                    if (procMetrics)
                     {
-                        ttsbegin;
-
-                        postQueue.clear();
-                        postQueue.ProcessId = this.topPickingProcessId;
-                        postQueue.ShipmentId = metSalesOrderShipmentLoadHeader.ShipmentId;
-
-                        shipmentConfirmationRecordList.add(postQueue);
-
-                        METSalesOrderShipmentLoadHeader::updateDocStatusInHeader(MetShipmentStatus::Loaded, DocumentStatus::None, metSalesOrderShipmentLoadHeader.ShipmentId);
-
-                        //Batch monitoring log - Start
                         procMetrics.incProcessedCount();
-                        //Batch monitoring log - End
-
-                        ttscommit;
-
                     }
-                    catch (Exception::Deadlock)
+                }
+                catch (Exception::Deadlock)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::Deadlock;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                catch (Exception::UpdateConflict)
+                {
+                    if (appl.ttsLevel() == 0)
                     {
                         if (xSession::currentRetryCount() >= #RetryNum)
                         {
-                            throw Exception::Deadlock;
+                            throw Exception::UpdateConflictNotRecovered;
                         }
                         else
                         {
                             retry;
                         }
                     }
-                    catch (Exception::UpdateConflict)
+                    else
                     {
-                        if (appl.ttsLevel() == 0)
-                        {
-                            if (xSession::currentRetryCount() >= #RetryNum)
-                            {
-                                throw Exception::UpdateConflictNotRecovered;
-                            }
-                            else
-                            {
-                                retry;
-                            }
-                        }
-                        else
-                        {
-                            throw Exception::UpdateConflict;
-                        }
-                    }
-                    catch (Exception::Error)
-                    {
-                        exceptionTextFallThrough();
+                        throw Exception::UpdateConflict;
                     }
                 }
+                catch (Exception::Error)
+                {
+                    exceptionTextFallThrough();
+                }
             }
-        
-            shipmentConfirmationRecordList.insertDatabase();
-
-            //Batch monitoring log - Start
-            procMetrics.endTrace();
-            //Batch monitoring log - End
         }
+        
+        shipmentConfirmationRecordList.insertDatabase();
     }
 
 ]]></Source>
