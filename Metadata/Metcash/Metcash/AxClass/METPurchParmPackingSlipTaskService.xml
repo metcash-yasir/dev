@@ -178,44 +178,66 @@ class METPurchParmPackingSlipTaskService extends METSysOperationTaskService
         InventQty                       qtyReceiveNow;
 
         postRegisteredQuantity = false;
+
         // Loop through all lines for given ParmId and TableRefId
         while select parmLine
             where parmLine.ParmId == purchParmTable.ParmId
             &&    parmLine.TableRefId == purchParmTable.TableRefId
-        join purchLine 
+        join purchLine
             where purchLine.RecId == parmLine.PurchLineRecId
-            && purchLine.PurchStatus == PurchStatus::Backorder 
         {
-            // Determine if line is CW item line.
             boolean isCWItem = this.isCWItemLine(parmLine.PurchLineRecId);
             qtyReceiveNow = parmLine.InventNow;
 
-            if (METPurchParmPackingSlipTaskService::isOverDelivered(purchLine, qtyReceiveNow))
+            METExciseRegisterEntryAIS registerEntryAIS;
+
+            // Registration logic (only for Backorder lines)
+            if (purchLine.PurchStatus == PurchStatus::Backorder)
             {
+                // Handle over-delivery case
+                if (METPurchParmPackingSlipTaskService::isOverDelivered(purchLine, qtyReceiveNow))
+                {
+                    ttsbegin;
+                    parmLine.selectForUpdate(true);
+                    parmLine.delete();
+
+                    // Delete related excise register entries
+                    delete_from registerEntryAIS
+                        where registerEntryAIS.AISIntegrationId == parmLine.ParmId
+                        && registerEntryAIS.ItemId == parmLine.ItemId;
+
+                    ttscommit;
+                    continue;
+                }
+
+                if (qtyReceiveNow != 0 && parmLine.PdsCWPreviousReceiveNow != 0)
+                {
+                    registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, qtyReceiveNow, parmLine.PdsCWPreviousReceiveNow);
+                    registerService.register();
+                }
+                else if (qtyReceiveNow != 0 && parmLine.PdsCWPreviousReceiveNow == 0)
+                {
+                    registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, !isCWItem ? qtyReceiveNow : 0, isCWItem ? qtyReceiveNow : 0);
+                    registerService.register();
+                }
+                else if (qtyReceiveNow == 0 && parmLine.PdsCWPreviousReceiveNow != 0)
+                {
+                    registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, qtyReceiveNow, parmLine.PdsCWPreviousReceiveNow);
+                    registerService.register();
+                }
+            }
+            else
+            {
+                // For non-Backorder lines, delete parmLine + excise entries
                 ttsbegin;
                 parmLine.selectForUpdate(true);
                 parmLine.delete();
-                ttscommit;
-                continue;
-            }
 
-            // 1. Both CW and Qty present (CW update â‰  0, Qty â‰  0)
-            if (qtyReceiveNow != 0 && parmLine.PdsCWPreviousReceiveNow != 0)
-            {
-                registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, qtyReceiveNow, parmLine.PdsCWPreviousReceiveNow);
-                registerService.register();
-            }
-            // 2. Qty present, CW zero (CW update == 0, Qty â‰  0)
-            else if (qtyReceiveNow != 0 && parmLine.PdsCWPreviousReceiveNow == 0)
-            {
-                registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, !isCWItem ? qtyReceiveNow : 0, isCWItem ? qtyReceiveNow : 0);
-                registerService.register();
-            }
-            // 3. CW present, Qty zero (CW update â‰  0, Qty == 0)
-            else if (qtyReceiveNow == 0 && parmLine.PdsCWPreviousReceiveNow != 0)
-            {
-                registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, qtyReceiveNow, parmLine.PdsCWPreviousReceiveNow);
-                registerService.register();
+                delete_from registerEntryAIS
+                where registerEntryAIS.AISIntegrationId == parmLine.ParmId
+                   && registerEntryAIS.ItemId == parmLine.ItemId;
+
+                ttscommit;
             }
         }
     }
