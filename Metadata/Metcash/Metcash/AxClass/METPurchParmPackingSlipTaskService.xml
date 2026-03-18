@@ -174,35 +174,51 @@ class METPurchParmPackingSlipTaskService extends METSysOperationTaskService
     {
         METInventTransRegisterService   registerService;
         PurchParmLine                   parmLine;
+        PurchLine                       purchLine;
         InventQty                       qtyReceiveNow;
 
         postRegisteredQuantity = false;
+
         // Loop through all lines for given ParmId and TableRefId
         while select parmLine
             where parmLine.ParmId == purchParmTable.ParmId
             &&    parmLine.TableRefId == purchParmTable.TableRefId
+        join purchLine
+            where purchLine.RecId == parmLine.PurchLineRecId
         {
-            // Determine if line is CW item line.
             boolean isCWItem = this.isCWItemLine(parmLine.PurchLineRecId);
             qtyReceiveNow = parmLine.InventNow;
 
-            // 1. Both CW and Qty present (CW update â‰  0, Qty â‰  0)
-            if (qtyReceiveNow != 0 && parmLine.PdsCWPreviousReceiveNow != 0)
+            // Registration logic (only for Backorder lines)
+            if (purchLine.PurchStatus == PurchStatus::Backorder)
             {
-                registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, qtyReceiveNow, parmLine.PdsCWPreviousReceiveNow);
-                registerService.register();
+                // Handle over-delivery case
+                if (METPurchParmPackingSlipTaskService::isOverDelivered(purchLine, qtyReceiveNow))
+                {
+                    this.deleteParmLineAndExcise(parmLine);
+                    continue;
+                }
+
+                if (qtyReceiveNow != 0 && parmLine.PdsCWPreviousReceiveNow != 0)
+                {
+                    registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, qtyReceiveNow, parmLine.PdsCWPreviousReceiveNow);
+                    registerService.register();
+                }
+                else if (qtyReceiveNow != 0 && parmLine.PdsCWPreviousReceiveNow == 0)
+                {
+                    registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, !isCWItem ? qtyReceiveNow : 0, isCWItem ? qtyReceiveNow : 0);
+                    registerService.register();
+                }
+                else if (qtyReceiveNow == 0 && parmLine.PdsCWPreviousReceiveNow != 0)
+                {
+                    registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, qtyReceiveNow, parmLine.PdsCWPreviousReceiveNow);
+                    registerService.register();
+                }
             }
-            // 2. Qty present, CW zero (CW update == 0, Qty â‰  0)
-            else if (qtyReceiveNow != 0 && parmLine.PdsCWPreviousReceiveNow == 0)
+            else
             {
-                registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, !isCWItem ? qtyReceiveNow : 0, isCWItem ? qtyReceiveNow : 0);
-                registerService.register();
-            }
-            // 3. CW present, Qty zero (CW update â‰  0, Qty == 0)
-            else if (qtyReceiveNow == 0 && parmLine.PdsCWPreviousReceiveNow != 0)
-            {
-                registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, qtyReceiveNow, parmLine.PdsCWPreviousReceiveNow);
-                registerService.register();
+                // For non-Backorder lines, delete parmLine + excise entries
+                this.deleteParmLineAndExcise(parmLine);
             }
         }
     }
@@ -652,6 +668,77 @@ class METPurchParmPackingSlipTaskService extends METSysOperationTaskService
                 }
             }
         }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isOverDelivered</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether a purchase line is over-delivered based on the quantity being received.
+    /// </summary>
+    /// <param name="_purchLine">
+    /// The purchase line record containing ordered quantity and over-delivery percentage.
+    /// </param>
+    /// <param name="_qtyReceiveNow">
+    /// The quantity that is currently being received.
+    /// </param>
+    /// <returns>
+    /// Returns true if the received quantity exceeds the allowed maximum (ordered quantity plus over-delivery percentage),
+    /// otherwise returns false.
+    /// </returns>
+    /// <remarks>
+    /// This method calculates the maximum allowed quantity by applying the over-delivery percentage to the ordered quantity.
+    /// If the quantity being received now is greater than this allowed maximum, the method flags it as over-delivered.
+    /// </remarks>
+    public static boolean isOverDelivered(PurchLine _purchLine, Qty _qtyReceiveNow)
+    {
+        boolean overDelivered = false;
+
+        if (_purchLine)
+        {
+            // Calculate allowed maximum quantity
+            real allowedQty = _purchLine.QtyOrdered * (1 + (_purchLine.OverDeliveryPct / 100));
+
+            if (_qtyReceiveNow > allowedQty)
+            {
+                overDelivered = true;
+            }
+        }
+
+        return overDelivered;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteParmLineAndExcise</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes a PurchParmLine record and its related excise register entries.
+    /// </summary>
+    /// <param name="_parmLine">
+    /// The PurchParmLine record to delete. Related entries in METExciseRegisterEntryAIS
+    /// and METExciseRegisterEntry will also be removed based on ParmId and ItemId.
+    /// </param>
+    /// <remarks>
+    /// This method ensures transactional consistency by wrapping deletes in ttsbegin/ttscommit.
+    /// </remarks>
+    private void deleteParmLineAndExcise(PurchParmLine _parmLine)
+    {
+        METExciseRegisterEntryAIS registerEntryAIS;
+
+        ttsbegin;
+        _parmLine.selectForUpdate(true);
+        _parmLine.delete();
+
+        // Delete related excise register entries
+        delete_from registerEntryAIS
+        where registerEntryAIS.AISIntegrationId == _parmLine.ParmId
+           && registerEntryAIS.ItemId == _parmLine.ItemId;
 
         ttscommit;
     }
