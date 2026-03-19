@@ -438,6 +438,10 @@ final class METWMSOrderTrans_Extension
 			<Method>
 				<Name>propcessCancelledTOLines</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Method to process cancelled transfer order lines. When a transfer order line is cancelled, the corresponding record in WMSOrderTrans will not be deleted but the quantity will be updated to 0. This method will check if the quantity is updated to 0 and if the order type is transfer order, then it will remove the cancelled line from shipment and load, and update the order extract status to open for the cancelled line so that it can be extracted in transfer order finalization screen if needed.
+    /// </summary>
+    /// <param name = "_orderTrans">Order trans</param>
     public void propcessCancelledTOLines(WMSOrderTrans  _orderTrans)
     {
         #OCCRetryCount
@@ -533,6 +537,10 @@ final class METWMSOrderTrans_Extension
 			<Method>
 				<Name>removeLineFromShipmentAndLoad</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Method to remove the transfer order line from shipment and load when the transfer order line is cancelled. If there are other lines with non-zero quantity in the same shipment, only the cancelled line will be removed from the shipment. If there is no other line with non-zero quantity in the same shipment, then all lines of the cancelled transfer order will be removed from the shipment and the shipment header will be deleted as well. This is to make sure there is no cancelled line in any shipment which will be processed for finalization and also to make sure we don't have any orphaned shipment header without any line after the cancellation.
+    /// </summary>
+    /// <param name = "_orderTrans">Order trans reference</param>
     public void removeLineFromShipmentAndLoad(WMSOrderTrans _orderTrans)
     {
         METSalesOrderShipmentLoadHeader TOShipmentLoadHeader, otherShipmentInLoadExist;
@@ -540,17 +548,26 @@ final class METWMSOrderTrans_Extension
         WMSOrderTrans                   wmsOrderTransLocal;
         MetShipmentId                   shipmentId;
         MetLoadId                       loadId;
-
+        container                       toIdsInShipment;
+        METOrderShipmentLoadCreation    metOrderShipmentLoadCreation = METOrderShipmentLoadCreation::construct(METOrderTransactionType::TransferOrder, '');//Initialize with dummy transaction type as it is not used in the method.
+        
         select firstonly RecId from wmsOrderTransLocal
             where wmsOrderTransLocal.inventTransRefId == _orderTrans.inventTransRefId
                 && wmsOrderTransLocal.qty != 0.00;
 
         if (wmsOrderTransLocal.RecId)
         {
+            ttsbegin;
             // Remove only the current line with zero qty
-            delete_from TOShipmentLoadLine
-                where TOShipmentLoadLine.WMSOrderTransRecId == _orderTrans.RecId;
+            while select forupdate TOShipmentLoadLine
+                where TOShipmentLoadLine.WMSOrderTransRecId == _orderTrans.RecId
+            {
+                 toIdsInShipment += TOShipmentLoadHeader.ShipmentId;
+                 TOShipmentLoadLine.delete();
+            }
 
+            metOrderShipmentLoadCreation.cleanShipmentIfNoLines(toIdsInShipment);
+            ttscommit;
             return;
         }
 
@@ -567,12 +584,21 @@ final class METWMSOrderTrans_Extension
             return;
         }
 
+        ttsbegin;
         // Delete all lines for this TO with qty == 0.00
-        delete_from TOShipmentLoadLine
+        while select forupdate TOShipmentLoadLine
             exists join wmsOrderTransLocal
-            where TOShipmentLoadLine.OrderNum == wmsOrderTransLocal.inventTransRefId
-                && wmsOrderTransLocal.inventTransRefId == _orderTrans.inventTransRefId
-                && wmsOrderTransLocal.qty == 0.00;
+                where TOShipmentLoadLine.OrderNum == wmsOrderTransLocal.inventTransRefId
+                    && wmsOrderTransLocal.inventTransRefId == _orderTrans.inventTransRefId
+                    && wmsOrderTransLocal.qty == 0.00
+        {
+
+            toIdsInShipment += TOShipmentLoadHeader.ShipmentId;
+            TOShipmentLoadLine.delete();
+        }
+        metOrderShipmentLoadCreation.cleanShipmentIfNoLines(toIdsInShipment);
+
+        ttscommit;
 
         // Check for other TOs in the same shipment
         select firstonly RecId from otherTOInShipmentExist
