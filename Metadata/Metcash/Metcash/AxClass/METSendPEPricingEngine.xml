@@ -168,6 +168,9 @@ class METSendPEPricingEngine extends SysOperationServiceBase
                 metSalesTable.update();
             }
 
+            // Generate picking list if required
+            this.generatePickingListAndRegister(salesTable);
+
             // All lines sucessfully inserted and update send the pass message
             result      = METProcessingStatus::Success;
             messageLoc  = "@MET:METPricingSucessfullyProcessed";
@@ -601,6 +604,120 @@ class METSendPEPricingEngine extends SysOperationServiceBase
             error = strfmt("%1", error, msgStruct.message());
         }
         return error;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generatePickingListAndRegister</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generate picking list and register it for the sales order if required
+    /// </summary>
+    /// <param name = "_salesTable">The sales table for which to generate and register the picking list</param>
+    private void generatePickingListAndRegister(SalesTable _salesTable)
+    {
+        WMSPickingRoute         wmsPickingRoute;
+        SalesFormLetter         salesFormLetter;
+        SalesParmTable          salesParmTable;
+        SalesParmLine           salesParmLine;
+        SalesLine               salesLineLoc;
+        METSalesLine            metSalesLine;
+        boolean                 pickingExists = false;
+        METSalesOrderTypes      metSalesOrderTypes = METSalesOrderTypes::find(_salesTable.METSalesOrderType);
+
+        if (!_salesTable || !_salesTable.SalesId || !metSalesOrderTypes.ExternalInvoiceNumber)
+        {
+            return;
+        }
+
+        // Check if picking route already exists
+        select firstonly wmsPickingRoute
+                where wmsPickingRoute.transType  == InventTransType::Sales
+                && wmsPickingRoute.transRefId == _salesTable.SalesId;
+
+        if (wmsPickingRoute.RecId)
+        {
+            pickingExists = true;
+        }
+
+        // Create Picking List if not exists
+        if (!pickingExists)
+        {
+            salesFormLetter = SalesFormLetter::construct(DocumentStatus::PickingList);
+            Query query = new Query(QueryStr(SalesUpdate));
+            QueryBuildDataSource qbdsSalesTable = query.dataSourceTable(tableNum(SalesTable));
+            qbdsSalesTable.addRange(fieldNum(SalesTable, SalesId)).value(queryValue(_salesTable.SalesId));
+            QueryRun queryRun = new sysQueryRun(query);
+            salesFormLetter.chooseLinesQuery(queryRun);
+            salesFormLetter.salesTable(_salestable);
+            salesFormLetter.initParmSalesTable(salesFormLetter.salesTable());
+            salesFormLetter.transDate(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
+            salesFormLetter.specQty(SalesUpdate::All);
+            salesFormLetter.printFormLetter(false);
+            salesFormLetter.createParmUpdateFromParmUpdateRecord(SalesFormletterParmData::initSalesParmUpdateFormletter(salesFormLetter.documentStatus(), salesFormLetter.pack()));
+    
+            salesFormLetter.initParameters(salesFormLetter.salesParmUpdate(), Printout::Current);
+            salesFormLetter.initLinesQuery();
+
+            while select forupdate salesParmLine
+                    where salesParmLine.ParmId == salesFormLetter.parmId()
+            {
+                salesLineLoc = salesParmLine.salesLine();
+                metSalesLine = METSalesLine::find(salesLineLoc.RecId);
+
+                if (PdsGlobal::pdsIsCWItem(salesLineLoc.ItemId))
+                {
+                    salesParmLine.PdsCWDeliverNow = salesLineLoc.SalesQty;
+                    salesParmLine.DeliverNow = metSalesLine.AISWeight;
+                }
+                else
+                {
+                    salesParmLine.DeliverNow = salesLineLoc.SalesQty;
+                }
+                
+                salesParmLine.setQty(DocumentStatus::PickingList, false);
+                salesParmLine.update();
+
+                this.reserveSOLineQty(salesLineLoc, salesParmLine.DeliverNow);
+            }
+
+            salesFormLetter.run();
+        }
+
+        // Re-read picking route
+        select firstonly wmsPickingRoute
+                where wmsPickingRoute.transType  == InventTransType::Sales
+                && wmsPickingRoute.transRefId == _salesTable.SalesId;
+
+        // Post registration
+        if (wmsPickingRoute.RecId &&
+                wmsPickingRoute.expeditionStatus != WMSExpeditionStatus::Complete)
+        {
+            List list = new List(Types::String);
+
+            list.addEnd(wmsPickingRoute.PickingRouteId);
+
+            WMSPickingRoute::finishMulti(list.pack());
+
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reserveSOLineQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Reserves the sales order line with the quantity picked.
+    /// </summary>
+    /// <param name = "_salesLine">Sales line</param>
+    /// <param name = "_qtyPicked">Quantity to reserve</param>
+    public void reserveSOLineQty(SalesLine _salesLine, InventQty _qtyPicked)
+    {
+        InventMovement movement = InventMovement::construct(_salesLine);
+        InventUpd_Reservation reservation = InventUpd_Reservation::newMovement(movement, -_qtyPicked, true);
+        reservation.updateNow();
     }
 
 ]]></Source>
