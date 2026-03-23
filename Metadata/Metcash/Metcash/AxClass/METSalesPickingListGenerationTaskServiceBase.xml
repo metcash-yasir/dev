@@ -195,6 +195,12 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
         this.initParms(_dataContract);
 
+        if (_dataContract.parmTriggerBusinessEvent())
+        {
+            this.finalThreadBusinessEventAndShipmentCleanup();
+            return;
+        }
+
         if (salesTable)
         {
             //Task 162245-CB123 - SalesOrderExtractScreenforCSD- start
@@ -262,7 +268,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 salesTable.METOrderExtractStatus = METOrderExtractStatus::Extracted;
                 salesTable.METOrderExtractDateTime = DateTimeUtil::getSystemDateTime();
                 salesTable.update();
-
+                
                 update_recordset metSalesLine
                     setting OrderExtractStatus = METOrderExtractStatus::Extracted
                         exists join salesLineUpdate
@@ -317,7 +323,8 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             changeCompany(purchTable_Reference.InterCompanyCompanyId)
             {
                 METStockReservation::construct(purchTable_Reference.interCompanySalesTable()).process();
-                this.postPickingList(purchTable_Reference.interCompanySalesTable(), false, true);
+                this.postPickingList(purchTable_Reference.interCompanySalesTable(), false);
+                this.finalThreadBusinessEventAndShipmentCleanup(true);
             }
         }
 
@@ -333,7 +340,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     /// </summary>
     /// <param name = "_salesTable">SalesTable buffer.</param>
     /// <param name = "_pickListOrderedQty">boolean buffer.</param>
-    public void postPickingList(SalesTable _salesTable, boolean _pickListOrderedQty = false, boolean _forceTriggerBusinessEvent = false)
+    public void postPickingList(SalesTable _salesTable, boolean _pickListOrderedQty = false)
     {
         boolean             isError;
         QueryRun            queryRun;
@@ -366,7 +373,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                     salesFormLetter.specQty(SalesUpdate::All);
                     salesFormLetter.printFormLetter(salesFormLetter.printFormLetter());
                     salesFormLetter.createParmUpdateFromParmUpdateRecord(SalesFormletterParmData::initSalesParmUpdateFormletter(salesFormLetter.documentStatus(), salesFormLetter.pack()));
-            
+
                     if (_pickListOrderedQty == false)
                     {
                         //For intercompany orders we always pick the reserved quantity
@@ -423,7 +430,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                     METOrderShipmentLoadCreation shipmentLoadCreation =
                         METOrderShipmentLoadCreation::construct(METOrderTransactionType::SalesOrder, _salesTable.SalesId);
-            
+
                     shipmentId = shipmentLoadCreation.createShippmentLoad(true,false);
 
                     select firstonly wmsPickingRoute
@@ -436,16 +443,6 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                         this.updateWmsPickingRoute(wmsPickingRoute);
                     }
                     
-                    if ((dataContract && dataContract.parmTriggerBusinessEvent()) || _forceTriggerBusinessEvent)
-                    {
-                        // Do not trigger the business event when SO extract is triggered from TO finalisation
-                        this.triggerBusinessEvent(wmsPickingRoute);
-
-                        container conShipmentIds = dataContract.parmShipmentIdList();
-                        conShipmentIds += [shipmentId];
-						shipmentLoadCreation.cleanShipmentIfNoLines(conShipmentIds);
-                    }
-
                     ttscommit;
 
                 }
@@ -494,32 +491,28 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         QueryBuildRange         qbrSalesLine;
         QueryBuildDataSource    qbdsSalesLine;
         boolean                 interCompanyPOCreated = false;
+        PurchLine               purchLineRef;
         METSalesTable metSalesTable = METSalesTable::findBySalesTable(_salesTable.RecId);
         
         InventLocation inventLocationLoc;
-
+        InventDim inventDim;
         qbdsSalesLine = qry.dataSourceTable(tableNum(SalesLine));
         
         while select forupdate salesLine
             where salesLine.SalesId == _salesTable.SalesId
-            // Bug 252392: CB173 - SO Extract attempting to create pick list on cancelled SO / lines
-            && salesLine.SalesStatus != SalesStatus::Canceled
+                && salesLine.SalesStatus != SalesStatus::Canceled
             join OrderExtractStatus from metSalesLineNotExtracted
                 where metSalesLineNotExtracted.SalesLine == salesLine.RecId
-        {
-            InventDim inventDim = salesLine.inventDim();
-
-            if (metSalesLine.OrderExtractStatus == METOrderExtractStatus::Extracted)
-            {
-                if(!(metSalesTable.InternalCrossDockOrder || inventDim.inventLocation().METCSDWarehouse))
-                {
-                    continue;
-                }
-            }
+            join inventdim
+                where inventDim.inventDimId == salesLine.inventDimId
+            join inventLocationLoc
+                where inventLocationLoc.InventLocationId == inventDim.inventLocationId &&
+                ( metSalesLineNotExtracted.OrderExtractStatus != METOrderExtractStatus::Extracted ||
+                ((metSalesTable.InternalCrossDockOrder == true && metSalesLineNotExtracted.OrderExtractStatus == METOrderExtractStatus::Extracted) ||
+                (inventLocationLoc.METCSDWarehouse == true && metSalesLineNotExtracted.OrderExtractStatus == METOrderExtractStatus::Extracted)))
             
-            salesLine.reread();
-
-            PurchLine purchLineRef = salesLine.referencedPurchLine();
+        {
+            purchLineRef = salesLine.referencedPurchLine();
 
             if (interCompanyPOCreated == false && salesLine.referencedPurchLine().RecId == 0 && InventTable::metGetOSCCode(salesLine.ItemId, inventDim) == METConstants::GroceryOscCode &&
                 _salesTable.METIntercompanyTransferFulfillment == NoYes::Yes
@@ -773,6 +766,31 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     public WMSPickingRoute getWMSPickingRoute()
     {
         return wmsPickingRoute;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>finalThreadBusinessEventAndShipmentCleanup</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Method to trigger business event and do shipment load cleanup if necessary when SO extract is called from TO finalisation.
+    /// </summary>
+    /// <param name = "_forceTriggerBusinessEvent">Trigger business event</param>
+    public void finalThreadBusinessEventAndShipmentCleanup(boolean _forceTriggerBusinessEvent = true)
+    {
+        if (_forceTriggerBusinessEvent || dataContract)
+        {
+            this.triggerBusinessEvent(wmsPickingRoute);
+
+            if (dataContract)
+            {
+                METOrderShipmentLoadCreation  shipmentLoadCreation  = METOrderShipmentLoadCreation::construct(METOrderTransactionType::SalesOrder, dataContract.parmSalesId());
+
+                container conShipmentIds = dataContract.parmShipmentIdList();
+                shipmentLoadCreation.cleanShipmentIfNoLines(conShipmentIds);
+            }
+        }
     }
 
 ]]></Source>
