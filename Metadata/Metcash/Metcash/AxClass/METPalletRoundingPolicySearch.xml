@@ -13,7 +13,8 @@ class METPalletRoundingPolicySearch
     
     METPalletRoundingPolicySearchParameters palletRoundingPolicySearchParameters;
     METPalletRoundingPolicyLine             palletRoundingPolicyLine;
-
+    METPalletRoundingPolicyLine             lastPolicyLine;
+    METPalletRoundingPolicyHeader           palletRoundingPolicyHeader;
     METCustOperGroupId                      custOperGroupId;
     container                               cacheValue;
     boolean                                 cacheMode;
@@ -176,12 +177,13 @@ class METPalletRoundingPolicySearch
         ListEnumerator policyTypeEnumerator = palletRoundingPolicyTypeOrderedList.getEnumerator();
         continueSearch = true;
 
+        METPalletRoundingPolicyItemCodeTypeOrderedList  palletRoundingPolicyItemCodeTypeOrderedList  = METPalletRoundingPolicyItemCodeTypeOrderedList::newFromOrder(SortOrder::Ascending);
+        METPalletRoundingPolicyPartyCodeTypeOrderedList palletRoundingPolicyPartyCodeTypeOrderedList = METPalletRoundingPolicyPartyCodeTypeOrderedList::newFromOrder(false, SortOrder::Ascending);
+        METPalletRoundingPolicyCacheKey cacheKey = METPalletRoundingPolicyCacheKey::construct();
+
         while (policyTypeEnumerator.moveNext() && continueSearch)
         {
             METRoundingPolicyType currentPolicyType = policyTypeEnumerator.current();
-
-            METPalletRoundingPolicyItemCodeTypeOrderedList  palletRoundingPolicyItemCodeTypeOrderedList  = METPalletRoundingPolicyItemCodeTypeOrderedList::newFromOrder(SortOrder::Ascending);
-            METPalletRoundingPolicyPartyCodeTypeOrderedList palletRoundingPolicyPartyCodeTypeOrderedList = METPalletRoundingPolicyPartyCodeTypeOrderedList::newFromOrder(false, SortOrder::Ascending);
 
             palletRoundingPolicyItemCodeTypeEnumerator  = palletRoundingPolicyItemCodeTypeOrderedList.getEnumerator();
             palletRoundingPolicyPartyCodeTypeEnumerator = palletRoundingPolicyPartyCodeTypeOrderedList.getEnumerator();
@@ -216,9 +218,7 @@ class METPalletRoundingPolicySearch
                         container key;
                         
                         if (cacheMode)
-                        {
-                            METPalletRoundingPolicyCacheKey cacheKey = METPalletRoundingPolicyCacheKey::construct();
-                            
+                        {                            
                             // Initialize the cacheKey
                             cacheKey.initialize(inventSiteId, accountCode, accountRelation, itemCode, itemRelation, currentPolicyType);
                             key = cacheKey.pack();
@@ -233,14 +233,18 @@ class METPalletRoundingPolicySearch
 
                         if (cacheValue == conNull())
                         {
-                            Query query = this.buildFindPalletRoundingPolicyQuery(inventSiteId, accountCode, accountRelation, itemCode, itemRelation, currentPolicyType);
-                            
-                            QueryRun queryRun = new QueryRun(query);
-
-                            while (queryRun.next())
+                            //Bug344903 - Optimizing the Post pricing order optimization
+                            While select palletRoundingPolicyLine
+                                exists join palletRoundingPolicyHeader
+                                    Where palletRoundingPolicyHeader.InventSiteId   == palletRoundingPolicyLine.InventSiteId
+                                        && palletRoundingPolicyHeader.Active        == NoYes::Yes
+                                        && palletRoundingPolicyLine.InventSiteId    == inventSiteId
+                                        && palletRoundingPolicyLine.AccountCode     == accountCode
+                                        && palletRoundingPolicyLine.AccountRelation == accountRelation
+                                        && palletRoundingPolicyLine.ItemCode        == itemCode
+                                        && palletRoundingPolicyLine.PolicyType      == currentPolicyType
+                                        && (itemCode != METItemTableGroup::Table || palletRoundingPolicyLine.ItemId == itemRelation)
                             {
-                                palletRoundingPolicyLine = queryRun.get(tableNum(METPalletRoundingPolicyLine));
-
                                 // For product category
                                 if (itemCode == METItemTableGroup::GroupId)
                                 {
@@ -254,24 +258,25 @@ class METPalletRoundingPolicySearch
 
                                 if (cacheMode)
                                 {
-                                    cacheValue += [[palletRoundingPolicyLine.RoundingPercentage, 
-                                        palletRoundingPolicyLine.RecId]];
-                                    
+                                    cacheValue += [[palletRoundingPolicyLine.RoundingPercentage,
+                                                    palletRoundingPolicyLine.RecId]];
+
                                     // in case multiple policies with item category
                                     break;
                                 }
                                 else
                                 {
                                     palletRoundingPolicyLineRefRecId = palletRoundingPolicyLine.RecId;
-                                    
+
                                     // Method to check if valid METPalletRoundingPolicyLine
                                     // Giving _palletRoundingPolicyLineRefRecId 0 as a parameter to avoid reselecting palletRoundingPolicyLine from above
+                                    lastPolicyLine = palletRoundingPolicyLine;
                                     continueSearch = this.continueSearch(palletRoundingPolicyLine);
                                     if (!continueSearch)
                                     {
                                         break;
                                     }
-                                   
+
                                 }
                             }
 
@@ -300,6 +305,7 @@ class METPalletRoundingPolicySearch
 
                                     if (palletRoundingPolicyLine)
                                     {
+                                        lastPolicyLine = palletRoundingPolicyLine;
                                         continueSearch = this.continueSearch(palletRoundingPolicyLine);
                                         if (!continueSearch)
                                         {
@@ -325,6 +331,10 @@ class METPalletRoundingPolicySearch
             }
         }
 
+        if (continueSearch && lastPolicyLine)
+        {
+            this.validate(lastPolicyLine, true);
+        }
         metPalletRoundingPolicySearchResultantHelper.parmMETPalletRoundingPolicyLine(palletRoundingPolicyLine);
         return metPalletRoundingPolicySearchResultantHelper;
     }
@@ -432,53 +442,6 @@ class METPalletRoundingPolicySearch
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>buildFindPalletRoundingPolicyQuery</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Builds the query for finding policy rounding policy based on the parameters.
-    /// </summary>
-    /// <param name = "_siteId">The <c>InventSiteId</c> value.</param>
-    /// <param name = "_accountCode">The account code.</param>
-    /// <param name = "_accountRel">The customer or customer operations group id.</param>
-    /// <param name = "_itemCode">The item code.</param>
-    /// <param name = "_itemRel">Item number or prodcut categorie.</param>
-    /// <param name = "_policyType">Rounding policy type, could be Pallet or Layer</param>
-    /// <returns>A <c>Query</c> object.</returns>
-    protected Query buildFindPalletRoundingPolicyQuery(InventSiteId                        _siteId,
-                                                       METCustomerGroupAll                 _accountCode,
-                                                       InventCustVendRel                   _accountRel,
-                                                       METItemTableGroup                   _itemCode,
-                                                       EcoResCategoryName                  _itemRel,
-                                                       METRoundingPolicyType               _policyType)
-    {
-        Query query = new Query();
-        
-        QueryBuildDataSource qbds = query.addDataSource(tableNum(METPalletRoundingPolicyLine));
-
-        qbds.addRange(fieldNum(METPalletRoundingPolicyLine, InventSiteId)).value(queryValue(_siteId));
-        qbds.addRange(fieldNum(METPalletRoundingPolicyLine, AccountCode)).value(queryValue(_accountCode));
-        qbds.addRange(fieldNum(METPalletRoundingPolicyLine, AccountRelation)).value(queryValue(_accountRel));
-        qbds.addRange(fieldNum(METPalletRoundingPolicyLine, ItemCode)).value(queryValue(_itemCode));
-        qbds.addRange(fieldNum(METPalletRoundingPolicyLine, PolicyType)).value(queryValue(_policyType));
-
-        // For table, we filter using the item id. 
-        // For category, as there is a hierarchy, we will validate the current item category is a descendant of ItemRelation
-        if (_itemCode == METItemTableGroup::Table)
-        {
-            qbds.addRange(fieldNum(METPalletRoundingPolicyLine, ItemId)).value(queryValue(_itemRel));
-        }
-
-        QueryBuildDataSource headerQbds = qbds.addDataSource(tableNum(METPalletRoundingPolicyHeader));
-        headerQbds.relations(true);
-        headerQbds.joinMode(JoinMode::ExistsJoin);
-        headerQbds.addRange(fieldNum(METPalletRoundingPolicyHeader, Active)).value(queryValue(NoYes::Yes));
-
-        return query;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
 				<Name>isRoundingThresholdSatisfied</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -572,14 +535,19 @@ class METPalletRoundingPolicySearch
     /// Validate before rounding policy is applied.
     /// </summary>
     /// <param name = "_palletRoundingPolicyLine">METPalletRoundingPolicyLine buffer</param>
+    /// <param name = "_isLastLine">boolean to check is it last line or not</param>
     /// <returns>True if validation successful; otherwise, false</returns>
-    protected boolean validate(METPalletRoundingPolicyLine _palletRoundingPolicyLine)
+    protected boolean validate(METPalletRoundingPolicyLine _palletRoundingPolicyLine, boolean _isLastLine = false)
     {
         boolean ret = true;
         
         if (!metInventItemOrderSetup)
         {
-            throw Error(strFmt("@MET:PalletRoundingInventItemOrderSetupError", itemId, inventSiteId));
+            if (_isLastLine)
+            {
+                throw Error(strFmt("@MET:PalletRoundingInventItemOrderSetupError", itemId, inventSiteId));
+            }
+            return false;
         }
 
         boolean checkDefaultOrderSettings(FieldId _fieldId)
@@ -603,7 +571,7 @@ class METPalletRoundingPolicySearch
             ret = checkDefaultOrderSettings(fieldNum(METInventItemOrderSetup, CartonPerLayer)) && ret;
         }
 
-        if (!ret)
+        if (!ret && _isLastLine)
         {
             throw Error("@SYS326740");
         }
