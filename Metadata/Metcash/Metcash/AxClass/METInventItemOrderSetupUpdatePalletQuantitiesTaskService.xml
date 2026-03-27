@@ -1,0 +1,251 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METInventItemOrderSetupUpdatePalletQuantitiesTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// METInventItemOrderSetupUpdatePalletQuantitiesTaskService
+/// Task service class responsible for executing batch updates of pallet-related
+/// quantities (CartonPerPallet, PalletLayerQty, PalletQty) in Default Order Settings.
+/// Retrieves eligible Item Order Setup records from the update queue,
+/// recalculates pallet values, and updates records accordingly.
+/// </summary>
+class METInventItemOrderSetupUpdatePalletQuantitiesTaskService extends METSysOperationTaskService
+{
+    guid topPickingProcessId;
+    ItemId itemId;
+    InventSiteId siteId;
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    // <summary>
+    /// Entry point for processing pallet quantity updates using the provided contract.
+    /// </summary>
+    /// <param name="_contract">The pallet quantity update data contract.</param>
+    public void process(METInventItemOrderSetupUpdatePalletQuantitiesContract _contract)
+    {
+        this.processInternal(_contract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the task service by retrieving the process identifier from the contract.
+    /// </summary>
+    protected void initialise()
+    {
+        METInventItemOrderSetupUpdatePalletQuantitiesContract contract;
+        
+        super();
+
+        // get the topPickingProcessId from the contract
+        contract            = dataContract as METInventItemOrderSetupUpdatePalletQuantitiesContract;
+        topPickingProcessId = contract.parmTopPickingProcessId();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Runs the task service loop, retrieving Item Order Setup records from the update queue
+    /// and executing pallet quantity update logic until all eligible records are processed.
+    /// </summary>
+    /// <param name="_readPast">Boolean flag indicating whether past records should be read.</param>
+    protected void processTask(boolean _readPast)
+    {
+        while (this.getDataFromTopPickingQueue(topPickingProcessId, _readPast))
+        {
+            try
+            {
+                ttsbegin;
+                this.execute();
+                ttscommit;
+            }
+            catch (Exception::Error)
+            {
+                // Catch any exception so that one error won't stop the entire repricing process.
+                Global::exceptionTextFallThrough();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getDataFromTopPickingQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Retrieves the next Item Order Setup record from the pallet quantity update queue for processing.
+    /// Implements retry logic for deadlocks, update conflicts, and transient SQL errors.
+    /// </summary>
+    /// <param name="_processId">Process identifier created and added in the contract <c>METInventItemOrderSetupUpdatePalletQuantitiesContract</c>.</param>
+    /// <param name="_readPast">Boolean flag to determine if past records should be read.</param>
+    /// <returns>True if an Item Order Setup record was retrieved from the queue; otherwise, false.</returns>
+    private boolean getDataFromTopPickingQueue(guid _processId, boolean _readPast)
+    {
+        #OCCRetryCount
+    
+        METInventItemOrderSetupQueue topPickingQueue;
+        int backOffWait;
+    
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockException;
+        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
+        Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
+        
+        topPickingQueue.readPast(_readPast);
+
+        try
+        {
+            ttsbegin;
+    
+            select firstonly pessimisticlock topPickingQueue
+                where topPickingQueue.ProcessId == _processId;
+
+            if (topPickingQueue.RecId)
+            {
+                itemId = topPickingQueue.ItemId;
+                siteId = topPickingQueue.SiteId;
+                topPickingQueue.delete();
+            }
+            else
+            {
+                itemId = METConstants::emptyString;
+                siteId = METConstants::emptyString;
+            }
+           
+            ttscommit;
+        }
+        catch (deadLockException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw deadLockException;
+                }
+            }
+            else
+            {
+                throw deadLockException;
+            }
+        }
+        catch (updateConflictException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+            }
+            else
+            {
+                throw updateConflictException;
+            }
+        }
+        catch (transientSqlConnectionError)
+        {
+            if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw transientSqlConnectionError;
+            }
+        }
+
+        return (itemId != METConstants::emptyString);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes pallet quantity update logic for the current Item Order Setup record.
+    /// Recalculates CartonPerPallet and PalletQty based on CartonPerLayer and Layers,
+    /// then updates the record in the database.
+    /// </summary>
+    private void execute()
+    {
+        #OCCRetryCount
+        METInventItemOrdersetup InventItemOrderSetup;
+
+        try
+        {
+            ttsbegin;
+
+            while select forupdate InventItemOrderSetup
+                where InventItemOrderSetup.ItemId == itemId
+                && InventItemOrderSetup.SiteId == siteId
+            {
+                if (InventItemOrderSetup.CartonPerLayer != 0.00
+                    && InventItemOrderSetup.Layers != 0.00)
+                {
+                    InventItemOrderSetup.CartonPerPallet = InventItemOrderSetup.CartonPerLayer * InventItemOrderSetup.Layers;
+                    InventItemOrderSetup.calculatePalletQty();
+                    InventItemOrderSetup.update();
+                }
+            }
+
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            // Retry logic for deadlocks
+            if (xSession::currentRetryCount() < #RetryNum)
+            {
+                retry;
+            }
+            else
+            {
+                throw Exception::Deadlock;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            // Retry logic for update conflicts
+            if (appl.ttsLevel() == 0 && xSession::currentRetryCount() < #RetryNum)
+            {
+                retry;
+            }
+            else
+            {
+                throw Exception::UpdateConflictNotRecovered;
+            }
+        }
+        catch (Exception::Error)
+        {
+            // Catch-all for unexpected errors
+            Global::exceptionTextFallThrough();
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
