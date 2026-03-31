@@ -40,41 +40,52 @@ internal final class METGUPItemBasePriceUpdateValidJob_Extension
     {
         next postUpdateValidBasePrice(_operationGuid);
 
-        GUPParameters gupParameters = GUPParameters::find();
+        METProcMetrics procMetrics = METProcMetrics::construct(METBatchLogOperation::BasePriceActivation_ActivateCurrentPrice);
+        procMetrics.setSessionGuid(this.parmSessionGuid());
+        procMetrics.beginTrace(GUPItemBasePriceUpdateValidJob::description());
 
-        if (gupParameters.METCreateItemPrice)
+        using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
         {
-            GUPItemBasePrice itemBasePrice, itemBasePricePastRecord, itembasePriceUpdate;
+            GUPParameters gupParameters = GUPParameters::find();
 
-            while select ItemId, PriceType, InventDimId, FromDate, ToDate, OperationGuid 
-                from itemBasePrice
-                where itemBasePrice.OperationGuid                   == _operationGuid
-                    && itemBasePrice.PriceType                      == GUPBasePriceType::BasePriceInventoryCost
-                    && itemBasePrice.FromDate                       <= systemDateGet()
-                    && itemBasePrice.METItemPriceActivationStatus   != METItemPriceActivationStatus::Completed
-                    && itemBasePrice.METItemPriceActivationStatus   != METItemPriceActivationStatus::Skipped
-                    && (itemBasePrice.ToDate                        == dateNull() || itemBasePrice.ToDate >= systemDateGet())
-            notexists join itemBasePricePastRecord
-                where itemBasePricePastRecord.OperationGuid  == itemBasePrice.OperationGuid
-                    && itemBasePricePastRecord.PriceType     == itemBasePrice.PriceType
-                    && itemBasePricePastRecord.ItemId        == itemBasePrice.ItemId
-                    && itemBasePricePastRecord.InventDimId   == itemBasePrice.InventDimId
-                    && itemBasePricePastRecord.FromDate      >  itemBasePrice.FromDate
-                    && itemBasePricePastRecord.FromDate      <= systemDateGet()
+            if (gupParameters.METCreateItemPrice)
             {
-                itembasePriceUpdate = GUPItemBasePrice::findByDateRanges(itemBasePrice.ItemId,
-                                                                itemBasePrice.PriceType,
-                                                                itemBasePrice.InventDimId,
-                                                                itemBasePrice.FromDate,
-                                                                itemBasePrice.ToDate,
-                                                                itemBasePrice.OperationGuid,
-                                                                false);
+                GUPItemBasePrice itemBasePrice;
+                Set              processedItemDimSet = new Set(Types::String);
+                str              itemDimKey;
 
-                if (itembasePriceUpdate.RecId)
+                while select forUpdate itemBasePrice
+                    order by itemBasePrice.ItemId, itemBasePrice.InventDimId, itemBasePrice.FromDate desc, itemBasePrice.RecId desc
+                    where itemBasePrice.OperationGuid                   == _operationGuid
+                        && itemBasePrice.PriceType                      == GUPBasePriceType::BasePriceInventoryCost
+                        && itemBasePrice.FromDate                       <= METGlobal::systemDateGet()
+                        && itemBasePrice.METItemPriceActivationStatus   == METItemPriceActivationStatus::None
+                        && (itemBasePrice.ToDate                        == dateNull() || itemBasePrice.ToDate >= METGlobal::systemDateGet())
                 {
-                    itembasePriceUpdate.inventItemPriceCreation();
+                    itemDimKey = strFmt('%1|%2', itemBasePrice.ItemId, itemBasePrice.InventDimId);
+
+                    if (procMetrics)
+                    {
+                        procMetrics.incProcessedCountWithDocument(itemDimKey);
+                    }
+
+                    if (processedItemDimSet.in(itemDimKey))
+                    {
+                        itemBasePrice.metUpdateActivationStatus(METItemPriceActivationStatus::Skipped);
+                    }
+                    else
+                    {
+                        itemBasePrice.inventItemPriceCreation();
+                    }
+
+                    if (!processedItemDimSet.in(itemDimKey))
+                    {
+                        processedItemDimSet.add(itemDimKey);
+                    }
                 }
             }
+
+            procMetrics.endTrace();
         }
     }
 

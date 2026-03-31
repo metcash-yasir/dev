@@ -14,13 +14,14 @@ class METInventItemPriceActivationJob extends RunBaseBatch implements BatchRetry
     QueryRun       queryRun;
 
     BatchHeader    currentBatchHeader;
-    guid           currentSessionId;
+    int            priceRecordsCount;
 
     #define.CurrentVersion(1)
     #localmacro.CurrentList
         fromDate,
         itemId
     #endmacro
+    #define.RetryNum(3)
 
 }
 ]]></Declaration>
@@ -52,7 +53,7 @@ class METInventItemPriceActivationJob extends RunBaseBatch implements BatchRetry
         SysQuery::findOrCreateRange(
             queryRun.query().dataSourceTable(tableNum(GUPItemBasePrice)),
             fieldNum(GUPItemBasePrice, FromDate))
-            .value(!fromDate ? SysQuery::range(dateNull(), systemDateGet()) : queryValue(fromDate));
+            .value(fromDate ? queryValue(fromDate) : SysQuery::range(dateNull(), METGlobal::systemDateGet()));
 
         SysQuery::findOrCreateRange(
             queryRun.query().dataSourceTable(tableNum(GUPItemBasePrice)),
@@ -70,6 +71,7 @@ class METInventItemPriceActivationJob extends RunBaseBatch implements BatchRetry
     public void initParmDefault()
     {
         this.initQuery();
+        super();
     }
 
 ]]></Source>
@@ -87,16 +89,16 @@ class METInventItemPriceActivationJob extends RunBaseBatch implements BatchRetry
         priceTypeRange = SysQuery::findOrCreateRange(qbds, fieldnum(GUPItemBasePrice, PriceType));
         priceTypeRange.status(RangeStatus::Locked);
         priceTypeRange.value(queryValue(GUPBasePriceType::BasePriceInventoryCost));
-
-        priceActivationStatusRange = SysQuery::findOrCreateRange(qbds, fieldnum(GUPItemBasePrice, METItemPriceActivationStatus));
-        priceActivationStatusRange.status(RangeStatus::Locked);
-        priceActivationStatusRange.value(queryValue(METItemPriceActivationStatus::None));
-
-        QueryBuildRange toDateRange = SysQuery::findOrCreateRange(qbds, fieldnum(GUPItemBasePrice, ToDate));
-        toDateRange.status(RangeStatus::Locked);
-        toDateRange.value(SysQuery::valueUnlimited()); // refreshed at runtime to exclude expired records
+        
+        priceActivationStatusRange = SysQuery::findOrCreateRange(qbds, fieldNum(GUPItemBasePrice, METItemPriceActivationStatus));
+        priceActivationStatusRange.value(strFmt('%1', queryValue(METItemPriceActivationStatus::None)));
 
         SysQuery::findOrCreateRange(qbds, fieldnum(GUPItemBasePrice, ItemId));
+
+        qbds.addSortField(fieldnum(GUPItemBasePrice, ItemId));
+        qbds.addSortField(fieldnum(GUPItemBasePrice, InventDimId));
+        qbds.addSortField(fieldnum(GUPItemBasePrice, FromDate), SortOrder::Descending);
+        qbds.addSortField(fieldnum(GUPItemBasePrice, RecId), SortOrder::Descending);
 
         queryRun = new QueryRun(query);
     }
@@ -152,24 +154,156 @@ class METInventItemPriceActivationJob extends RunBaseBatch implements BatchRetry
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>runBatch</Name>
+				<Source><![CDATA[
+    public void runBatch()
+    {
+        GUPItemBasePrice                        itemBasePrice;
+        str                                     batchItemDimKey;
+        Set                                     batchProcessedItemDimSet = new Set(Types::String);
+
+        ttsbegin;
+
+        this.initCurrentBatchHeader();
+
+        // Build tasks — no sim creation here, all deferred to sub-tasks
+        METInventItemPriceActivationByGUPTasksBuilder tasksBuilder = METInventItemPriceActivationByGUPTasksBuilder::construct()
+                      .setBundleSize(InventParameters::find()
+                            .InventItemPriceActivationBundleSize);
+
+        // Deduplicate by ItemId+InventDimId before distributing to bundle tasks.
+        // Query is sorted ItemId ASC, InventDimId ASC, FromDate DESC — first record per key is the latest.
+        // Duplicates are marked Skipped here so each task receives at most one record per key.
+        while (queryRun.next())
+        {
+            itemBasePrice = queryRun.get(tableNum(GUPItemBasePrice));
+            batchItemDimKey = strFmt('%1|%2', itemBasePrice.ItemId, itemBasePrice.InventDimId);
+
+            if (batchProcessedItemDimSet.in(batchItemDimKey))
+            {
+                GUPItemBasePrice basePriceSkip = GUPItemBasePrice::findRecId(itemBasePrice.RecId, true);
+                basePriceSkip.metUpdateActivationStatus(METItemPriceActivationStatus::Skipped);
+            }
+            else
+            {
+                batchProcessedItemDimSet.add(batchItemDimKey);
+                tasksBuilder.addGUPItemBasePrice(itemBasePrice);
+                priceRecordsCount++;
+            }
+        }
+
+        if (priceRecordsCount > 0)
+        {
+            this.scheduleItemPriceActivationTasks(tasksBuilder.getResult(), priceRecordsCount);
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runSequential</Name>
+				<Source><![CDATA[
+    public void runSequential()
+    {
+        GUPItemBasePrice                        itemBasePrice;
+        GUPItemBasePrice                        itemBasePriceUpdate;
+        boolean                                 activated;
+        Set                                     processedItemDimSet = new Set(Types::String);
+        str                                     itemDimKey;
+
+        while (queryRun.next())
+        {
+            itemBasePrice = queryRun.get(tableNum(GUPItemBasePrice));
+
+            itemDimKey = strFmt('%1|%2', itemBasePrice.ItemId, itemBasePrice.InventDimId);
+
+            boolean alreadyProcessed = processedItemDimSet.in(itemDimKey);
+
+            try
+            {
+                ttsbegin;
+
+                itemBasePriceUpdate = GUPItemBasePrice::findRecId(itemBasePrice.RecId, true);
+
+                if (alreadyProcessed)
+                {
+                    itemBasePriceUpdate.metUpdateActivationStatus(METItemPriceActivationStatus::Skipped);
+                }
+                else
+                {
+                    activated = itemBasePriceUpdate.inventItemPriceCreation();
+
+                    if (activated)
+                    {
+                        priceRecordsCount++;
+                    }
+                }
+
+                ttscommit;
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() <= #RetryNum)
+                    {
+                        retry;
+                    }
+                    else
+                    {
+                        this.markFailed(itemBasePrice.RecId);
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() <= #RetryNum)
+                    {
+                        retry;
+                    }
+                    else
+                    {
+                        this.markFailed(itemBasePrice.RecId);
+                    }
+                }
+                else
+                {
+                    throw Exception::Deadlock;
+                }
+            }
+            catch (Exception::Error)
+            {
+                this.markFailed(itemBasePrice.RecId);
+            }
+            catch
+            {
+                this.markFailed(itemBasePrice.RecId);
+            }
+
+            if (!alreadyProcessed)
+            {
+                processedItemDimSet.add(itemDimKey);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>run</Name>
 				<Source><![CDATA[
     public void run()
     {
-        int                                     processedCounter;
-        int                                     priceRecordsCount;
-        GUPItemBasePrice                        itemBasePrice;
-        GUPItemBasePrice                        itemBasePriceUpdate;
-        GUPItemBasePrice                        newerBasePriceRecord;
-        InventItemPriceSim                      inventItemPriceSim;
-        GUPParameters                           gupParameters = GUPParameters::find();
-        InventItemPriceActivationTasksBuilder   tasksBuilder;
-        List                                    basePriceRecIds;
-        TransDate                               jobStartDate = systemDateGet(); // captured before processing to avoid day-boundary issues
-
-        currentSessionId = newGuid();
-
-        this.initCurrentBatchHeader();
+        METProcMetrics procMetrics   = METProcMetrics::construct(METBatchLogOperation::BasePriceActivation_ActivateFuturePrice);
+        GUPParameters  gupParameters = GUPParameters::find();
 
         // For scheduled batch the query is unpacked from a previous run; refresh the date range to today
         if (!fromDate)
@@ -177,144 +311,41 @@ class METInventItemPriceActivationJob extends RunBaseBatch implements BatchRetry
             SysQuery::findOrCreateRange(
                 queryRun.query().dataSourceTable(tableNum(GUPItemBasePrice)),
                 fieldNum(GUPItemBasePrice, FromDate))
-                .value(SysQuery::range(dateNull(), systemDateGet()));
+                .value(SysQuery::range(dateNull(), METGlobal::systemdateget()));
         }
 
-        // Refresh ToDate range to exclude expired records (open-ended or end date >= today)
-        SysQuery::findOrCreateRange(
-            queryRun.query().dataSourceTable(tableNum(GUPItemBasePrice)),
-            fieldNum(GUPItemBasePrice, ToDate))
-            .value(strfmt('((%1 == %2) || (%1 >= %3))',
+        // Include open-ended records (ToDate == dateNull) OR records not yet expired (ToDate >= today).
+        QueryBuildDataSource qbds = queryRun.query().dataSourceTable(tableNum(GUPItemBasePrice));
+        SysQuery::findOrCreateRange(qbds, fieldNum(GUPItemBasePrice, ToDate))
+            .value(strFmt('(%1 == %2) || (%1 >= %3)',
                 fieldStr(GUPItemBasePrice, ToDate),
                 date2StrXpp(dateNull()),
-                date2StrXpp(systemDateGet())));
+                date2StrXpp(METGlobal::systemdateget())));
 
-        if (this.isInBatch())
+        procMetrics.setTotalCountFromQuery(queryRun);
+        procMetrics.beginTrace(METInventItemPriceActivationJob::description());
+
+        using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
         {
-            tasksBuilder    = InventItemPriceActivationTasksBuilder::construct()
-                                .setPrototype(InventItemPriceActivationTaskActivateSim::construct())
-                                .setBundleSize(InventParameters::find().InventItemPriceActivationBundleSize);
-            basePriceRecIds = new List(Types::Int64);
-        }
-
-        while (queryRun.next())
-        {
-            itemBasePrice = queryRun.get(tableNum(GUPItemBasePrice));
-
-            // Skip if a newer past-dated record exists for this item+inventdim (activate only the most recent)
-            select firstonly RecId from newerBasePriceRecord
-                where newerBasePriceRecord.PriceType   == itemBasePrice.PriceType
-                   && newerBasePriceRecord.ItemId      == itemBasePrice.ItemId
-                   && newerBasePriceRecord.InventDimId == itemBasePrice.InventDimId
-                   && newerBasePriceRecord.FromDate    >  itemBasePrice.FromDate
-                   && newerBasePriceRecord.FromDate    <= systemDateGet();
-
-            if (newerBasePriceRecord.RecId)
+            if (this.isInBatch())
             {
-                continue;
-            }
-
-            ttsbegin;
-
-            itemBasePriceUpdate = GUPItemBasePrice::findByDateRanges(
-                                    itemBasePrice.ItemId, itemBasePrice.PriceType, itemBasePrice.InventDimId,
-                                    itemBasePrice.FromDate, itemBasePrice.ToDate, itemBasePrice.OperationGuid, true);
-
-            if (!itemBasePriceUpdate)
-            {
-                ttsabort;
-                continue;
-            }
-
-            inventItemPriceSim.clear();
-            inventItemPriceSim.ItemId      = itemBasePriceUpdate.ItemId;
-            inventItemPriceSim.VersionId   = gupParameters.METCostingVersionId;
-            inventItemPriceSim.InventDimId = InventTable::priceInventDimId(itemBasePriceUpdate.ItemId, itemBasePriceUpdate.InventDimId);
-            inventItemPriceSim.PriceType   = CostingVersionPriceType::Cost;
-            inventItemPriceSim.PriceQty    = 1;
-            inventItemPriceSim.PriceUnit   = 1;
-            inventItemPriceSim.Markup      = 0;
-            inventItemPriceSim.UnitID      = itemBasePriceUpdate.UnitId;
-            inventItemPriceSim.Price       = itemBasePriceUpdate.Price;
-            inventItemPriceSim.PriceCalcId = itemBasePriceUpdate.PriceCalcId;
-            inventItemPriceSim.FromDate    = itemBasePriceUpdate.FromDate;
-
-            if (inventItemPriceSim.validateWrite())
-            {
-                if (InventItemPriceSim::find(inventItemPriceSim.ItemId, inventItemPriceSim.VersionId,
-                                             inventItemPriceSim.FromDate, inventItemPriceSim.PriceType,
-                                             inventItemPriceSim.InventDimId))
-                {
-                    info(strfmt("Duplicate cost found and activation skipped Item Number : %1 Cost Price : %2 From Date : %3",
-                        inventItemPriceSim.ItemId,
-                        inventItemPriceSim.Price,
-                        date2StrUsr(inventItemPriceSim.FromDate, DateFlags::FormatAll)));
-
-                    itemBasePriceUpdate.METItemPriceActivationStatus = METItemPriceActivationStatus::Skipped;
-                    itemBasePriceUpdate.update();
-                }
-                else
-                {
-                    inventItemPriceSim.METGUPItemBasePriceId = itemBasePriceUpdate.RecId;
-                    inventItemPriceSim.METSessionGuid        = currentSessionId;
-                    inventItemPriceSim.insert();
-
-                    if (this.isInBatch())
-                    {
-                        tasksBuilder.addInventItemPriceSimForActivation(inventItemPriceSim);
-                        basePriceRecIds.addEnd(itemBasePriceUpdate.RecId);
-                        priceRecordsCount++;
-                    }
-                    else
-                    {
-                        METItemPriceActivationStatus activationStatus = METItemPriceActivationStatus::Failed;
-
-                        try
-                        {
-                            InventItemPriceActivationJob::activateInventItemPriceSimExt(inventItemPriceSim);
-                            activationStatus = METItemPriceActivationStatus::Completed;
-                        }
-                        catch
-                        {
-                            // activationStatus remains Failed; error already in infolog
-                            inventItemPriceSim.delete();
-                        }
-
-                        itemBasePriceUpdate.METItemPriceActivationStatus = activationStatus;
-                        itemBasePriceUpdate.update();
-                    }
-                }
-
-                processedCounter++;
+                this.runBatch();
             }
             else
             {
-                warning(strfmt("Cost price creation skipped due to validation failure for Item Number : %1 From Date : %2",
-                    itemBasePriceUpdate.ItemId,
-                    date2StrUsr(itemBasePriceUpdate.FromDate, DateFlags::FormatAll)));
-                itemBasePriceUpdate.METItemPriceActivationStatus = METItemPriceActivationStatus::Failed;
-                itemBasePriceUpdate.update();
-                processedCounter++;
+                this.runSequential();
             }
 
-            ttscommit;
+            if (gupParameters.METCostingVersionId)
+            {
+                CostingVersion::updateLastActivation(gupParameters.METCostingVersionId);
+                CostingVersion::updateLastUpdated(gupParameters.METCostingVersionId);
+            }
+
+            procMetrics.endTrace();
         }
 
-        if (this.isInBatch() && priceRecordsCount > 0)
-        {
-            this.scheduleItemPriceActivationTasks(tasksBuilder.getResult(), basePriceRecIds, priceRecordsCount, jobStartDate);
-        }
-
-        // For batch mode, costing version dates are updated by the completion task after prices are activated
-        if (!this.isInBatch() && gupParameters.METCostingVersionId)
-        {
-            ttsbegin;
-            CostingVersion::updateLastActivation(gupParameters.METCostingVersionId);
-            CostingVersion::updateLastUpdated(gupParameters.METCostingVersionId);
-            ttscommit;
-        }
-
-        info(strfmt(" %1 record(s) processed", processedCounter));
+        info(strfmt(" %1 record(s) processed", priceRecordsCount));
     }
 
 ]]></Source>
@@ -335,37 +366,46 @@ class METInventItemPriceActivationJob extends RunBaseBatch implements BatchRetry
 			<Method>
 				<Name>scheduleItemPriceActivationTasks</Name>
 				<Source><![CDATA[
-    private void scheduleItemPriceActivationTasks(
-        Enumerator  _taskEnumerator,
-        List        _basePriceRecIds,
-        int         _scheduled,
-        TransDate   _jobStartDate)
+    private void scheduleItemPriceActivationTasks(Enumerator _taskEnumerator, int _scheduled)
     {
         ttsbegin;
 
-        GUPParameters gupParams = GUPParameters::find();
-
-        METInventItemPriceActivationTaskComplete metCompletionTask = METInventItemPriceActivationTaskComplete::construct();
-        metCompletionTask.parmBasePriceRecIds(_basePriceRecIds);
-        metCompletionTask.parmCostingVersionId(gupParams.METCostingVersionId);
-        metCompletionTask.parmPricesScheduledCount(_scheduled);
-        metCompletionTask.parmJobStartDate(_jobStartDate);
-        metCompletionTask.batchInfo().parmRuntimeTask(true);
-        metCompletionTask.batchInfo().parmGroupId(currentBatch.GroupId);
-        currentBatchHeader.addTask(metCompletionTask);
-
         while (_taskEnumerator.moveNext())
         {
-            InventItemPriceActivationTaskActivateSim task = _taskEnumerator.current();
-            task.batchInfo().parmRuntimeTask(true);
-            task.batchInfo().parmGroupId(currentBatch.GroupId);
-            currentBatchHeader.addTask(task);
-            currentBatchHeader.addDependency(metCompletionTask, task, BatchDependencyStatus::FinishedOrError);
+            METInventItemPriceActivationByGUPTask bundleTask = _taskEnumerator.current();
+            bundleTask.batchInfo().parmRuntimeTask(true);
+            bundleTask.batchInfo().parmGroupId(currentBatch.GroupId);
+            currentBatchHeader.addTask(bundleTask);
         }
 
         currentBatchHeader.save();
-
         ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markFailed</Name>
+				<Source><![CDATA[
+    private void markFailed(RecId _basePriceRecId)
+    {
+        UserConnection      userCon = new UserConnection();
+        GUPItemBasePrice    basePriceForFail;
+        basePriceForFail.setConnection(userCon);
+
+        userCon.ttsbegin();
+
+        select firstonly forupdate basePriceForFail
+          where basePriceForFail.RecId == _basePriceRecId;
+
+        if (basePriceForFail.RecId)
+        {
+            basePriceForFail.METItemPriceActivationStatus = METItemPriceActivationStatus::Failed;
+            basePriceForFail.doUpdate();
+        }
+
+        userCon.ttscommit();
+        userCon.finalize();
     }
 
 ]]></Source>
@@ -435,7 +475,7 @@ class METInventItemPriceActivationJob extends RunBaseBatch implements BatchRetry
 				<Source><![CDATA[
     static ClassDescription description()
     {
-        return "Metcash - Activate future cost price";
+        return "Metcash - activate cost price";
     }
 
 ]]></Source>
