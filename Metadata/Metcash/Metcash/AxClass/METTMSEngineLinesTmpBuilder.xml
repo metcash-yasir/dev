@@ -31,6 +31,10 @@ abstract class METTMSEngineLinesTmpBuilder
     METTMSShipmentID shipmentId;
     CustAccount customerAccount;
 
+    METSalesUnit itemDefaultSalesUnit;
+    UnitOfMeasureSymbol whsUOM;
+    real convFactorToWHSUOM;
+
 }
 ]]></Declaration>
 		<Methods>
@@ -233,6 +237,8 @@ abstract class METTMSEngineLinesTmpBuilder
 
             prevInventLocationId = inventLocationId;
         }
+
+        this.setVariables(_sourceLine);
     }
 
 ]]></Source>
@@ -413,16 +419,9 @@ abstract class METTMSEngineLinesTmpBuilder
 
         processLinesTmp.IsKegItem      = this.isKegItem(processLinesTmp.ItemId);
         processLinesTmp.LineCommodity  = this.getLineCommodity(processLinesTmp.IsTobaccoItem, metInventItemOrderSetup.FilterCode, orderSplitGroup);
-        if (isCWItem)
-        {
-            processLinesTmp.CaseQty_CaseLines = processLinesTmp.Qty;
-        }
-        else
-        {
-            processLinesTmp.CaseQty_CaseLines  = (processLinesTmp.IsKegItem == NoYes::No && processLinesTmp.IsTobaccoItem == NoYes::No && processLinesTmp.Unit != METConstants::unitEach) ? processLinesTmp.Qty : 0;
-        }
+        processLinesTmp.CaseQty_CaseLines = this.getCaseQty_CaseLines(processLinesTmp, _sourceLine, isCWItem);
         processLinesTmp.BrokenCasesCountSecurity = processLinesTmp.IsTobaccoItem == NoYes::Yes ? processLinesTmp.Qty : 0;
-        processLinesTmp.BrokenCasesCountNonSecurity = (!isCWItem && processLinesTmp.IsKegItem == NoYes::No && processLinesTmp.IsTobaccoItem == NoYes::No && processLinesTmp.Unit == METConstants::unitEach) ? processLinesTmp.Qty : 0;
+        processLinesTmp.BrokenCasesCountNonSecurity = this.getBrokenCasesCountNonSecurity(processLinesTmp, _sourceLine, isCWItem);
         
         // CB626_TMSEngineSOPackingSlip
         processLinesTmp.Line_SupplyWhs = inventLocation.InventLocationId;
@@ -602,6 +601,157 @@ abstract class METTMSEngineLinesTmpBuilder
         weight  = roundUpDec(weight,2);
 
         return [volume, weight];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setVariables</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets variables.
+    /// </summary>
+    /// <param name = "_sourceLine">Source line.</param>
+    protected void setVariables(METTMSSourceRecordLineMap _sourceLine)
+    {
+        if (_sourceLine.TableId == tableNum(SalesLine))
+        {
+            InventItemSalesSetup itemSalesItem;
+            InventDim inventDim, inventDimSalesItem;
+            SalesLine salesLine;
+            
+            salesLine = _sourceLine;
+            inventDim = salesLine.inventDim();
+
+            select firstonly METSalesUnit from itemSalesItem
+                where itemSalesItem.ItemId == salesLine.ItemId
+                    exists join inventDimSalesItem
+                        where inventDimSalesItem.InventDimId == itemSalesItem.InventDimId
+                        &&    inventDimSalesItem.InventSiteId == inventDim.InventSiteId;
+
+            itemDefaultSalesUnit = itemSalesItem.METSalesUnit;
+        }
+        else if (_sourceLine.TableId == tableNum(InventTransferLine))
+        {
+            InventTransferLine transferLine = _sourceLine;
+            InventDim inventDim = transferLine.inventDim();
+
+            whsUOM = METInventLocation::getWarehouseUnit(transferLine.ItemId, inventDim);
+
+            if (whsUOM != transferLine.UnitId &&
+                EcoResProductUnitConverter::canBeConvertedGivenUnitSymbolsForReleasedProduct(transferLine.ItemId, transferLine.InventDimId, whsUOM, transferLine.UnitId))
+            {
+                convFactorToWHSUOM = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(transferLine.ItemId, transferLine.InventDimId, 1.0, whsUOM, transferLine.UnitId);
+            }
+            else
+            {
+                convFactorToWHSUOM = 1;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCaseQty_CaseLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets case qty.
+    /// </summary>
+    /// <param name = "_processLinesTmp">
+    /// <c>METTMSEngineOrderProccessLinesTmp</c>.
+    /// </param>
+    /// <param name = "_sourceLine">
+    /// <c>METTMSSourceRecordLineMap</c>.
+    /// </param>
+    /// <param name = "_isCWItem">
+    /// CW item.
+    /// </param>
+    /// <returns>Case qty.</returns>
+    protected SalesOrderedQty getCaseQty_CaseLines(METTMSEngineOrderProccessLinesTmp _processLinesTmp, METTMSSourceRecordLineMap _sourceLine, boolean _isCWItem)
+    {
+        SalesOrderedQty ret;
+
+        if (_sourceLine.TableId == tableNum(SalesLine))
+        {
+            if (_isCWItem)
+            {
+                ret = _processLinesTmp.Qty;
+            }
+            else
+            {
+                 ret = (_processLinesTmp.IsKegItem == NoYes::No 
+                        && _processLinesTmp.IsTobaccoItem == NoYes::No
+                        && (_processLinesTmp.Unit != METConstants::unitEach
+                        || _processLinesTmp.Unit == itemDefaultSalesUnit)) ? _processLinesTmp.Qty : 0;
+            }
+        }
+        else if (_sourceLine.TableId == tableNum(InventTransferLine))
+        {
+            if (_isCWItem || (_sourceLine.OrderUnit == whsUOM))
+            {
+                ret = _processLinesTmp.Qty;
+            }
+            else
+            {
+                if (_processLinesTmp.IsKegItem == NoYes::Yes ||  _processLinesTmp.IsTobaccoItem == NoYes::Yes)
+                {
+                    ret = 0;
+                }
+                else
+                {
+                    ret = roundDown((_sourceLine.OrderQty / convFactorToWHSUOM), 1);
+                }
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBrokenCasesCountNonSecurity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets broken cases count non-security.
+    /// </summary>
+    /// <param name = "_processLinesTmp">
+    /// <c>METTMSEngineOrderProccessLinesTmp</c>.
+    /// </param>
+    /// <param name = "_sourceLine">
+    ///  <c>METTMSSourceRecordLineMap</c>.
+    /// </param>
+    /// <param name = "_isCWItem">
+    ///  CW Item.
+    /// </param>
+    /// <returns>Broken cases count non-security</returns>
+    protected SalesOrderedQty getBrokenCasesCountNonSecurity(METTMSEngineOrderProccessLinesTmp _processLinesTmp, METTMSSourceRecordLineMap _sourceLine, boolean _isCWItem)
+    {
+        SalesOrderedQty ret;
+
+        if (_sourceLine.TableId == tableNum(SalesLine))
+        {
+            ret = (!_isCWItem
+                  && _processLinesTmp.IsKegItem == NoYes::No
+                  && _processLinesTmp.IsTobaccoItem == NoYes::No
+                  && _processLinesTmp.Unit == METConstants::unitEach
+                  && _processLinesTmp.Unit == itemDefaultSalesUnit) ? _processLinesTmp.Qty : 0;
+
+        }
+        else if (_sourceLine.TableId == tableNum(InventTransferLine))
+        {
+            if (_isCWItem || _sourceLine.OrderUnit == whsUOM || _processLinesTmp.IsKegItem == NoYes::Yes || _processLinesTmp.IsTobaccoItem == NoYes::Yes)
+            {
+                ret = 0;
+            }
+            else
+            {
+                ret = (_sourceLine.OrderQty mod convFactorToWHSUOM);
+            }
+        }
+
+        return ret;
     }
 
 ]]></Source>
