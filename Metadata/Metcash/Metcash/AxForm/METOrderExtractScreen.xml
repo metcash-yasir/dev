@@ -527,10 +527,28 @@ public class METOrderExtractScreen extends FormRun
             while (qr.next())
             {
                 SalesTable salesTableLoc = qr.get(tableNum(SalesTable));
-                SalesTable_ds.editMarkTrans(true, salesTableLoc, NoYes::Yes);
+                if(SalesTableLoc.METOrderExtractStatus != METOrderExtractStatus::Extracted)
+                {
+                    if(!paMarked.exists(salesTableLoc.RecId))
+                    {
+                        paMarked.insert(salesTableLoc.RecId, salesTableLoc.SalesId);
+                    }
+                }
+                else
+                {
+                    if(paMarked.exists(salesTableLoc.RecId))
+                    {
+                        paMarked.remove(salesTableLoc.RecId);
+                    }
+                }
+                // commented below line because we are setting the mark based on the map and not directly marking the record in the grid, 
+                //this is to avoid the refresh issue in the grid when we mark the record which causes issue in selecting multiple records in the grid
+                //SalesTable_ds.editMarkTrans(true, salesTableLoc, NoYes::Yes);
             }
             super();
             element.task(#taskRefresh);
+            SalesTable_ds.refresh();
+            element.enableOrDisableButtons();
         }
 
 ]]></Source>
@@ -556,10 +574,16 @@ public class METOrderExtractScreen extends FormRun
             while (qr.next())
             {
                 SalesTable salesTableLoc = qr.get(tableNum(SalesTable));
-                SalesTable_ds.editMarkTrans(true, salesTableLoc, NoYes::No);
+                if(pamarked.exists(salesTableLoc.RecId))
+                {
+                    paMarked.remove(salesTableLoc.RecId);
+                }
+                // commented below line because we are setting the mark based on the map and not directly marking the record in the grid,
+                //SalesTable_ds.editMarkTrans(true, salesTableLoc, NoYes::No);
             }
             super();
             element.task(#taskRefresh);
+            element.enableOrDisableButtons();
         }
 
 ]]></Source>
@@ -716,6 +740,9 @@ public class METOrderExtractScreen extends FormRun
             METSalesLine    metSalesLine;
             boolean         updateSalesTable;
 
+            //SysApplicationInsightsEventTelemetry telemetryEvent = new SysApplicationInsightsEventTelemetry("Sales order extract - Update status");
+            //telemetryEvent.addProperty("StartTime", DateTimeUtil::getSystemDateTime());
+
             try
             {
                 ttsbegin;
@@ -817,11 +844,150 @@ public class METOrderExtractScreen extends FormRun
 						<Name>updateOrderExtractScreenMap</Name>
 						<Source><![CDATA[
         /// <summary>
+        /// Bug347577 - 
+        /// This method is to update the status in bulk based on the map which has the selected records from the grid,
+        /// this is to avoid the refresh issue in the grid as we are updating the records one by one in the above method 
+        /// which is called from the grid and it causes refresh issue in the grid.
+        /// </summary>
+        /// <param name = "_map"></param>
+
+        private void updateOrderExtractScreenMap(Map _map)
+        {
+            #OCCRetryCount
+            SalesTable      salesTableLoc;
+            METSalesLine    metSalesLine;
+            SalesLine       salesLineLoc;
+            MapEnumerator   mapEnumerator = _map.getEnumerator();
+            int             processedCount = 0;
+            int             updatedCount = 0;
+            int             errorCount = 0;
+            List            salesTableList = new List(Types::Int64);
+            utcdatetime      startTime = DateTimeUtil::getSystemDateTime();
+            utcdatetime      endTime;
+            
+
+            //Build the list of sales order to be updated based upon pre-checks.
+            while (mapEnumerator.moveNext())
+            {
+                int64 recId = mapEnumerator.currentKey();
+
+                salesTableLoc = SalesTable::findRecId(recId);
+                if(!salesTableLoc.RecId)
+                {
+                    continue;
+                }
+
+                //Check if sales header has route and route stop number, if not then skip the record and show warning message
+                if (!salesTableLoc.METRoute || !salesTableLoc.METRouteStopNum)
+                {
+                    checkFailed(strFmt("@MET:SOExtractRouteWarning", mapEnumerator.currentValue()));
+                    errorCount++;
+                    continue;
+                }
+
+                SalesTableList.addEnd(recId);
+            }
+
+            ListEnumerator salesTableLE = salesTableList.getEnumerator();
+            while (salesTableLE.moveNext())
+            {
+                int64 recId = salesTableLE.current();
+
+                try
+                {
+                    ttsbegin;
+                    
+                    salesTableLoc = SalesTable::findRecId(recId, true);
+                    if(!salesTableLoc.RecId)
+                    {
+                        ttscommit;
+                        continue;
+                    }
+
+                    SalesTableloc.skipDataMethods(true);
+                    SalesTableloc.skipDatabaseLog(true);
+                    metSalesLine.skipDatabaseLog(true);
+                    metSalesLine.skipDataMethods(true);
+                    metSalesLine.allowIndexHint(true);
+
+                    if(salesTableLoc.METOrderExtractStatus == METOrderExtractStatus::ReadyForExtract)
+                    {
+                        salesTableLoc.METOrderExtractStatus = METOrderExtractStatus::Open;
+                        salesTableLoc.update();
+                        update_recordset metSalesLine 
+                            setting OrderExtractStatus = METOrderExtractStatus::Open    
+                                where metSalesLine.OrderExtractStatus == METOrderExtractStatus::ReadyForExtract
+                                exists join salesLineLoc
+                                    where metSalesLine.SalesLine == salesLineLoc.RecId &&
+                                        saleslineloc.SalesId == salesTableLoc.SalesId  &&
+                                        saleslineloc.SalesStatus == SalesStatus::Backorder;
+                    
+                        updatedCount++;
+                    }
+                    else if (salesTableLoc.METOrderExtractStatus == METOrderExtractStatus::Open)
+                    {
+                        salesTableLoc.METOrderExtractStatus = METOrderExtractStatus::ReadyForExtract;
+                        salesTableLoc.update();
+                        update_recordset metSalesLine
+
+                            setting OrderExtractStatus = METOrderExtractStatus::ReadyForExtract    
+                                where metSalesLine.OrderExtractStatus == METOrderExtractStatus::Open
+                                exists join salesLineLoc
+                                    where metSalesLine.SalesLine == salesLineLoc.RecId &&
+                                        saleslineloc.SalesId == salesTableLoc.SalesId  &&
+                                        saleslineloc.SalesStatus == SalesStatus::Backorder;
+                        updatedCount++;
+                    }
+                    ttscommit;
+                    processedCount++;
+                }
+                catch (Exception::Error)
+                {
+                    errorCount++;
+                    error("@MET:METBulkUpdateError");
+                }
+                catch (Exception::UpdateConflict)
+                {
+                    if (appl.ttsLevel() == 0)
+                    {
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            errorCount++;
+                            throw Exception::UpdateConflictNotRecovered;
+                        }
+                        else
+                        {
+                            retry;
+                        }
+                    }
+                    else
+                    {
+                        errorCount++;
+                        throw Exception::UpdateConflict;
+                    }
+                }
+            }
+            if(processedCount || updatedCount || errorCount)
+            {
+                info(strFmt("@MET:METBulkUpdateSummary", processedCount, updatedCount, errorCount));
+            }
+            //info(strFmt("Start time %1 End time: %2", startTime, DateTimeUtil::getSystemDateTime()));
+            
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>checkForCSDSalesOrder</Name>
+						<Source><![CDATA[
+        /// <summary>
         /// This method is to update the status
         /// CB173_SalesOrderExtract - PS
         /// </summary>
         /// <param name = "_map">Map</param>
-        private void updateOrderExtractScreenMap(Map _map)
+        /// 
+        /*
+        private void updateOrderExtractScreenMap_Original(Map _map)
         {
             #OCCRetryCount
             SalesTable      salesTableLoc;
@@ -830,7 +996,6 @@ public class METOrderExtractScreen extends FormRun
         
             try
             {
-                ttsbegin;
                 MapEnumerator mapEnumerator = _map.getEnumerator();
 
                 while (mapEnumerator.moveNext())
@@ -838,8 +1003,10 @@ public class METOrderExtractScreen extends FormRun
                     boolean updateStatus = true;
                     int64   recId = mapEnumerator.currentKey();
                     str     value = mapEnumerator.currentValue();
-                    salesTableLoc = SalesTable::findRecId(recId, true);
                     
+                    ttsbegin;
+                    salesTableLoc = SalesTable::findRecId(recId, true);
+                                        
                     if (salesTableLoc.RecId)
                     {
                         if (!salesTableLoc.METRoute || !salesTableLoc.METRouteStopNum)
@@ -865,7 +1032,6 @@ public class METOrderExtractScreen extends FormRun
 
                                 update_recordset metSalesLine
                                     setting OrderExtractStatus = METOrderExtractStatus::Open    
-                                        where metSalesLine.OrderExtractStatus == METOrderExtractStatus::ReadyForExtract 
                                         exists join salesLineLoc
                                             where metSalesLine.SalesLine == salesLineLoc.RecId &&
                                                 saleslineloc.SalesId == salesTableLoc.SalesId  &&
@@ -883,18 +1049,18 @@ public class METOrderExtractScreen extends FormRun
 
                                 update_recordset metSalesLine
                                     setting OrderExtractStatus = METOrderExtractStatus::ReadyForExtract
-                                        where metSalesLine.OrderExtractStatus == METOrderExtractStatus::Open
                                         exists join salesLineLoc
                                             where metSalesLine.SalesLine == salesLineLoc.RecId &&
                                                 saleslineloc.SalesId == salesTableLoc.SalesId  &&
-                                                saleslineloc.SalesStatus == SalesStatus::Backorder;
+                                                saleslineloc.SalesStatus == SalesStatus::Backorder &&
+                                                metSalesLine.OrderExtractStatus == METOrderExtractStatus::Open;
 
                                 info(StrFmt("@MET:METBulkUpdateInfo", salesTableLoc.SalesId));
                             }
                         }
                     }
+                    ttscommit;
                 }
-                ttscommit;
             }
             catch (Exception::Error)
             {
@@ -920,12 +1086,8 @@ public class METOrderExtractScreen extends FormRun
                 }
             }
         }
+        */
 
-]]></Source>
-					</Method>
-					<Method>
-						<Name>checkForCSDSalesOrder</Name>
-						<Source><![CDATA[
         /// <summary>
         /// CB123 SalesOrderExtractForCSD
         /// This method is check if the csd salesorder is found
