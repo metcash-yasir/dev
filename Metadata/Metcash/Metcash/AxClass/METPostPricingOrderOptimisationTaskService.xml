@@ -42,12 +42,8 @@ class METPostPricingOrderOptimisationTaskService extends METSysOperationTaskServ
     {
         str allErrorMessages;
         boolean success;
-
-        ttsbegin;
-        this.creditCheckForListOfSalesOrders(topPickingProcessId);
-        ttscommit;
-
-        setPrefix("@MET:PostPricingInitiate");
+        
+        Timezone tz = DateTimeUtil::getUserPreferredTimeZone();
 
         while (this.getSalesIdFromTopPickingQueue(topPickingProcessId, _readPast))
         {
@@ -59,32 +55,39 @@ class METPostPricingOrderOptimisationTaskService extends METSysOperationTaskServ
                     METSalesTable metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId, true);
                 
                     if (salesTable && metSalesTable)
-                    {      
-                        if (salesTable.METCreditCheckSalesOrder || salesTable.CredManInCreditControl)
-                        {
-                            info(strFmt("@MET:SOCreditSent", salesTable.SalesId));
-                            continue;
-                        }
-
+                    {                             
+                        setPrefix(this.salesId);
                         ttsbegin;
                         // execute optimisation processes after PE pricing update in FO                        
                         success = this.execute(salesTable, metSalesTable);                                         
                         ttscommit;
+                        info(strFmt('execute - after ttscommit %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));                      
                         
                         // update sales order processing status if credit management account status is active.
                         ttsbegin;
                         if (success)
                         {
+                            // Bug 344903: [MS-MET] PERF - Ops-Sell-Post pricing order optimisation - slow performance
+                            // Credit check must be done after optimisation, not before
+                            // Trigger proforma confirmation - credit check
+                            METSalesTable::runCustomCreditCheckForSalesOrder(salesTable, false);
+                            info(strFmt('After runCustomCreditCheckForSalesOrder %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
+                            
                             salesTable = SalesTable::find(this.salesId);
                             metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId, true);
                            
-                            this.updateSalesOrderProcessingStatus(metSalesTable,salesTable);
+                            if (!salesTable.METCreditCheckSalesOrder && !salesTable.CredManInCreditControl)
+                            {
+                                this.updateSalesOrderProcessingStatus(metSalesTable, salesTable);
+                            }
+                            info(strFmt('after updateSalesOrderProcessingStatus %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
                         }
                         else
                         {
                             throw error(strFmt("@MET:PostPricingOrderOptimisationError", this.salesId));
                         }
                         ttscommit;
+                        info(strFmt('updateSalesOrderProcessingStatus - after ttscommit %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
                     }
                 }
             }
@@ -161,12 +164,15 @@ class METPostPricingOrderOptimisationTaskService extends METSysOperationTaskServ
     private boolean execute(SalesTable _salesTable, METSalesTable _metSalesTable)
     {
         boolean success = true;
+        Timezone tz = DateTimeUtil::getUserPreferredTimeZone();
         
+        info(strFmt('execute - Begin %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
         // process pallet rounding
         if (SalesParameters::find().METActivatePalletRounding)
         {
             METSalesTablePalletRoundingProcess palletRoundingProcess = METSalesTablePalletRoundingProcess::construct(_salesTable.salesId);
             success = palletRoundingProcess.run();
+            info(strFmt('execute - after pallet rounding %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
         }
 
         if (success)
@@ -174,7 +180,9 @@ class METPostPricingOrderOptimisationTaskService extends METSysOperationTaskServ
             // Quota Min/Max trigger
             METSalesTableQuotaProcess quotaProcess = METSalesTableQuotaProcess::construct(_salesTable, _metSalesTable);
             quotaProcess.run();
+            info(strFmt('execute - after quota %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
         }
+        info(strFmt('execute - End %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
 
         return success;
     }
@@ -299,108 +307,6 @@ class METPostPricingOrderOptimisationTaskService extends METSysOperationTaskServ
 
         }
         ttscommit;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>creditCheckForListOfSalesOrders</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Method to execute credit check for list of sales orders which are in the same batch job.
-    /// This method will be called in the batch job after PE pricing process,
-    /// to trigger the credit management process for those sales orders which are qualified for credit check based on the setup in credit management status check setup form.
-    /// </summary>
-    /// <param name = "_processId">ProcessId reference</param>
-    public void creditCheckForListOfSalesOrders(guid _processId)
-    {
-        boolean credManStatusCheckSetupProf = CredManStatusCheckSetup::exist(CredManHoldType::Credit, CredManDocumentStatusCheck::METCreditCheck, true);;
-        boolean credManStatusCheckSetupPost = CredManStatusCheckSetup::exist(CredManHoldType::Credit, CredManDocumentStatusCheck::METCreditCheck, false);
-
-        if (credManStatusCheckSetupPost == false && credManStatusCheckSetupProf == false)
-        {
-            // if credit management check is not setup for both posting and proforma, then
-            return;
-        }
-        METPostPricingOrderOptimisationQueue postQueue;
-
-        CredManTable    credManTableDel;
-        CredManTrans    credManTrans;
-        SalesLine       salesLine;
-        SalesTable       salesTable;
-        boolean         isCreditCheckRequired = false;
-
-        Query                   qry = new Query(QueryStr(SalesUpdate));
-        QueryBuildDataSource    queryBuildDataSource = qry.dataSourceTable(tableNum(SalesTable));
-        QueryBuildRange         queryBuildRange = SysQuery::findOrCreateRange(queryBuildDataSource, fieldNum(SalesTable, SalesId));
-
-        while select pessimisticlock postQueue
-            where postQueue.ProcessId == _processId 
-                && postQueue.CreditCheckProcessed == false
-            exists join salesTable
-                where salesTable.SalesId == postQueue.SalesId
-                    && salesTable.CredManInCreditControl == false
-        {
-            postQueue.selectForUpdate(true);
-            queryBuildRange.value(queryValue(postQueue.SalesId));
-            postQueue.CreditCheckProcessed = true;
-            postQueue.update();
-
-            isCreditCheckRequired = true;
-
-        }
-
-        if (isCreditCheckRequired == false)
-        {
-            // if no credit check is required, then return directly.
-            return;
-        }
-
-        update_recordset salesTable
-            setting CredManId = ''
-                where salesTable.CredManId != ''
-            exists join postQueue
-                where postQueue.SalesId == salesTable.SalesId &&
-                    postQueue.ProcessId == _processId;  
-
-        METSalesTable       metSalesTable;
-
-        metSalesTable.skipDataMethods(true);
-
-        update_recordset metSalesTable
-                setting CustomCreditCheckExecute = NoYes::Yes
-            exists join salestable
-                where metSalesTable.SalesTable == salesTable.RecId 
-            exists join postQueue
-                where postQueue.SalesId == salesTable.SalesId &&
-                    postQueue.ProcessId == _processId;
-
-        delete_from credManTableDel
-             exists join postQueue
-                where postQueue.SalesId == credManTableDel.SalesId &&
-                    postQueue.ProcessId == _processId;
-
-        delete_from credManTrans
-            exists join salesLine
-                where credManTrans.InventTransId == salesLine.InventTransId
-             exists join postQueue
-                where postQueue.SalesId == salesLine.SalesId &&
-                    postQueue.ProcessId == _processId;
-
-
-        SysQueryRun queryRun = new SysQueryRun(qry);
-
-        SalesFormLetter     salesFormLetter;
-
-        salesFormLetter = SalesFormLetter::construct(DocumentStatus::Confirmation);
-
-        salesFormLetter.chooseLinesQuery(queryRun);
-        salesFormLetter.transDate(DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));
-        salesFormLetter.specQty(SalesUpdate::All);
-        salesFormLetter.proforma(NoYes::Yes);
-        salesFormLetter.chooseLines(false, true);
-
-        salesFormLetter.run();
     }
 
 ]]></Source>
