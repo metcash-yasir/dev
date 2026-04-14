@@ -101,56 +101,87 @@ public class METOrderExtractScreenTmp extends common
         InventDim               lineInventDim;
         InventItemSalesSetup    inventItemSalesSetup;
         InventDim               inventDimSetup;
-        METBrokenCase           reservedQty = 0;
+        METBrokenCase           estimatedBrokenCases = 0;
         InventTransId           inventTransId;
         SalesId                 salesId = this.SalesId;
         METSalesLine            metSalesLineLoc;
         METCase                 actualCases = 0;
         UnitOfMeasureSymbol     unitInvent;
+        InventQty               reservedQty = 0;
+        InventQty               onOrderQty = 0;
+        InventQty               priorityQty = 0;
+        METInventTransView      views;
 
         // Calculate for each sales line in this SalesId
-        while select salesUnit, InventTransId from salesLineLoc 
-                where salesLineLoc.SalesId == this.SalesId
-                    && salesLineLoc.SalesStatus == SalesStatus::Backorder
-            join lineInventDim 
-                where lineInventDim.inventDimId == salesLineLoc.InventDimId
-            join METSalesUnit, METAltSalesUnit from inventItemSalesSetup 
-                where inventItemSalesSetup.ItemId == salesLineLoc.ItemId
-            exists join inventDimSetup 
-                where inventDimSetup.InventDimId == inventItemSalesSetup.InventDimId
-                && inventDimSetup.InventSiteId == lineInventDim.InventSiteId
-            exists join metSalesLineLoc where metSalesLineLoc.SalesLine == salesLineLoc.RecId
-                    && metSalesLineLoc.OrderExtractStatus != METOrderExtractStatus::Extracted
+        while select salesUnit, InventTransId, ItemId, RecId from salesLineLoc
+            where salesLineLoc.SalesId == this.SalesId
+                && salesLineLoc.SalesStatus == SalesStatus::Backorder
+        join lineInventDim
+            where lineInventDim.inventDimId == salesLineLoc.InventDimId
+        join METSalesUnit, METAltSalesUnit, InventDimId from inventItemSalesSetup
+            where inventItemSalesSetup.ItemId == salesLineLoc.ItemId
+        exists join inventDimSetup
+            where inventDimSetup.InventDimId == inventItemSalesSetup.InventDimId
+            && inventDimSetup.InventSiteId == lineInventDim.InventSiteId
+        exists join metSalesLineLoc where metSalesLineLoc.SalesLine == salesLineLoc.RecId
+                && metSalesLineLoc.OrderExtractStatus != METOrderExtractStatus::Extracted
         {
+            // Only process alternate unit orders (broken cases logic)
             if (!(inventItemSalesSetup.METSalesUnit != salesLineLoc.salesUnit &&
-                inventItemSalesSetup.METAltSalesUnit == salesLineLoc.salesUnit))
+                 inventItemSalesSetup.METAltSalesUnit == salesLineLoc.salesUnit))
             {
-                reservedQty  = reservedQty;
+                continue;
+            }
+
+            inventTransId = salesLineLoc.InventTransId;
+            reservedQty = 0;
+            onOrderQty = 0;
+            priorityQty = 0;
+
+            // Step 1: Query Reservation quantity (ReservPhysical + ReservOrdered)
+            select sum(Qty) from views
+            where views.ReferenceId == salesId
+            && views.inventTransId == inventTransId
+            && (views.StatusIssue == StatusIssue::ReservPhysical
+                || views.StatusIssue == StatusIssue::ReservOrdered);
+
+            reservedQty = abs(views.Qty);
+
+            // Step 2: Prioritize Reservation; if zero, use On Order
+            if (reservedQty > 0)
+            {
+                priorityQty = reservedQty;
             }
             else
             {
-                // Cache keys               
-                inventTransId = salesLineLoc.InventTransId;
-
-                // Combine all relevant StatusIssue values in a single query
-                METInventTransView views;
+                // Query On Order quantity as fallback
                 select sum(Qty) from views
-                    where views.ReferenceId == salesId
-                    && views.inventTransId == inventTransId
-                    && (views.StatusIssue == StatusIssue::ReservPhysical
-                        || views.StatusIssue == StatusIssue::ReservOrdered
-                        || views.StatusIssue == StatusIssue::OnOrder);
+                where views.ReferenceId == salesId
+                && views.inventTransId == inventTransId
+                && views.StatusIssue == StatusIssue::OnOrder;
 
-                reservedQty = abs(views.Qty);
+                onOrderQty = abs(views.Qty);
+                priorityQty = onOrderQty;
             }
-            if (reservedQty != 0)
+
+            // Step 3: Convert to cases and calculate broken cases
+            if (priorityQty != 0)
             {
                 unitInvent = InventTableModule::find(salesLineLoc.ItemId, ModuleInventPurchSales::Invent).UnitId;
-                actualCases = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(salesLineLoc.ItemId, salesLineLoc.inventDimId, reservedQty, unitInvent, salesLineLoc.SalesUnit, NoYes::No, NoYes::No);
+                actualCases = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+                salesLineLoc.ItemId,
+                salesLineLoc.inventDimId,
+                priorityQty,
+                unitInvent,
+                inventItemSalesSetup.METSalesUnit,
+                NoYes::No,
+                NoYes::No);
+                
+                estimatedBrokenCases += priorityQty - actualCases;
             }
         }
 
-        return reservedQty - actualCases;
+        return estimatedBrokenCases;
     }
 
 ]]></Source>
