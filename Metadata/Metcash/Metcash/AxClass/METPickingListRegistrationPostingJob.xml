@@ -28,31 +28,47 @@ final class METPickingListRegistrationPostingJob
         container       conOrdTrans;
         WMSOrderTrans   orderTrans;
         int             i;
+        Set             salesIdsToConfirm = new Set(Types::String);
+        SetEnumerator   salesIdsToConfirmEnumerator;
 
         conOrdTrans = _contract.parmConOrderTrans();
-        
-        for (i=1; i <= conlen(conOrdTrans); i++)
+
+        METProcMetrics procMetrics = METProcMetrics::construct(METBatchLogOperation::DallasPicklistRegistration);
+        procMetrics.beginTrace('Process started');
+
+        using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
         {
-            try
+            procMetrics.setTotalCount(conlen(conOrdTrans));
+        
+            for (i=1; i <= conlen(conOrdTrans); i++)
             {
-                ttsbegin;
-                orderTrans = conpeek(conOrdTrans, i);
-                var selectedLine = new Map(Types::int64,Types::Container);
-                selectedLine.insert(orderTrans.RecId, [orderTrans.orderId, orderTrans.RecVersion]);
-
-                // Added condition to avoid exception if the ordertrans stuck in picked should not
-                // be processed again for picking as it is already picked and if we try to pick again it will throw error "WMSOrderTrans record with RecId %1 is already picked."
-                if (orderTrans.expeditionStatus != WMSExpeditionStatus::Picked)
+                try
                 {
-                    WMSOrderTransType::finishPickingLinesMulti(selectedLine.pack(), '', orderTrans.wmsPickingRoute().OperatorWorker);
-                }
-                
-                this.updateIsKegsItemSOTO(orderTrans);
-                orderTrans.selectForUpdate(true);
+                    if (procMetrics)
+                    {
+                        procMetrics.ttsBeginTrace();
+                    }
+                    else
+                    {
+                        ttsbegin;
+                    }
+                    orderTrans = conpeek(conOrdTrans, i);
+                    var selectedLine = new Map(Types::int64,Types::Container);
+                    selectedLine.insert(orderTrans.RecId, [orderTrans.orderId, orderTrans.RecVersion]);
 
-                // Bug 193337: CB616 - "Trigger cancellation" button not triggering TMS processing
-                // reread the record otherwise the current buffer still has the previous status
-                orderTrans.reread();
+                    // Added condition to avoid exception if the ordertrans stuck in picked should not
+                    // be processed again for picking as it is already picked and if we try to pick again it will throw error "WMSOrderTrans record with RecId %1 is already picked."
+                    if (orderTrans.expeditionStatus != WMSExpeditionStatus::Picked)
+                    {
+                        WMSOrderTransType::finishPickingLinesMulti(selectedLine.pack(), '', orderTrans.wmsPickingRoute().OperatorWorker);
+                    }
+                
+                    this.updateIsKegsItemSOTO(orderTrans);
+                    orderTrans.selectForUpdate(true);
+
+                    // Bug 193337: CB616 - "Trigger cancellation" button not triggering TMS processing
+                    // reread the record otherwise the current buffer still has the previous status
+                    orderTrans.reread();
 
                 // Bug 246341: CB387 - Dallas Picklist Registration - zero pick quantity is updating the picking list registration when importing using data entity Picklist registration entity
                 // For 0 pick, status updated to cancel, we also need to cancel the SO line deliver remainder.
@@ -61,28 +77,116 @@ final class METPickingListRegistrationPostingJob
                 {
                     if (orderTrans.inventTransType == InventTransType::TransferOrderShip && this.isPickingListRegistrationCompleteForOrder(orderTrans))
                     {
-                        //Added for Task 282558: CB913/CB162 - Campbells -Integration - Campbells Transfer Order Receipt
-                        if (METCampbellTransferOrderProcessor::construct().processCampbellsTransferOrder(InventTransferTable::find(orderTrans.inventTransRefId)) == false)
+                        if (orderTrans.inventTransType == InventTransType::TransferOrderShip && this.isPickingListRegistrationCompleteForOrder(orderTrans))
                         {
-                            throw error (strFmt("@MET:ProcessFailedTO", orderTrans.inventTransRefId));
+                            //Added for Task 282558: CB913/CB162 - Campbells -Integration - Campbells Transfer Order Receipt
+                            if (METCampbellTransferOrderProcessor::construct().processCampbellsTransferOrder(InventTransferTable::find(orderTrans.inventTransRefId)) == false)
+                            {
+                                throw error (strFmt("@MET:ProcessFailedTO", orderTrans.inventTransRefId));
+                            }
+                        }
+                    }
+                    if (procMetrics)
+                    {
+                        procMetrics.ttsCommitTrace();
+                    }
+                    else
+                    {
+                        ttscommit;
+                    }
+                    orderTrans.metShortPickDeliveryReminderUpd();
+                    
+                    if (orderTrans.inventTransType == InventTransType::Sales
+                    && METSalesTable::findBySalesId(orderTrans.inventTransRefId).OrderProcessingStatus == METSalesOrderProcessingStatus::OptimisationCompleted
+                    && this.isSalesPickingListRegistrationCompleted(orderTrans.inventTransRefId))
+                    {
+                        salesIdsToConfirm.add(orderTrans.inventTransRefId);
+                    }
+
+                    if (orderTrans.qty == 0)
+                    {
+                        METSalesOrderShipmentLoadLines  shipmentLoadLines;
+ 
+                        if (procMetrics)
+                        {
+                            procMetrics.ttsBeginTrace();
+                        }
+                        else
+                        {
+                            ttsbegin;
+                        }
+                        while select forupdate shipmentLoadLines
+                        where shipmentLoadLines.WMSOrderTransRecId == orderTrans.RecId
+                        {
+                            conShipmentIds += shipmentLoadLines.ShipmentId;
+                            shipmentLoadLines.delete();
+                        }
+                        if (procMetrics)
+                        {
+                            procMetrics.ttsCommitTrace();
+                        }
+                        else
+                        {
+                            ttscommit;
                         }
                     }
                 }
-                ttscommit;
-                orderTrans.metShortPickDeliveryReminderUpd();
-
-                //async process to trigger the sales confirmation for Food and liquor entity
-                ttsbegin;                  
-                if (orderTrans.inventTransType == InventTransType::Sales                     
-                    && METSalesTable::findBySalesId(orderTrans.inventTransRefId).OrderProcessingStatus == METSalesOrderProcessingStatus::OptimisationCompleted
-                    && this.isSalesPickingListRegistrationCompleted(orderTrans.inventTransRefId))
+                catch(Exception::Deadlock)
                 {
-                    METLegalEntityType metLegalEntityType = CompanyInfo::find().METLegalEntityType;
+                    retry;
+                }
+                catch (Exception::UpdateConflict)
+                {
+                    if (appl.ttsLevel() == 0)
+                    {
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            throw Exception::UpdateConflictNotRecovered;
+                        }
+                        else
+                        {
+                            retry;
+                        }
+                    }
+                    else
+                    {
+                        throw Exception::UpdateConflict;
+                    }
+                }
+                // Bug 246341: CB387 - Dallas Picklist Registration - zero pick quantity is updating the picking list registration when importing using data entity Picklist registration entity
+                // Poor exception handling, if any errors go to the next picking list line to register
+                catch(Exception::Error)
+                {
+                    error(strFmt("@MET:PickListPost", orderTrans.inventTransRefId));
+                }
 
+                procMetrics.incProcessedCountWithDocument(orderTrans.inventTransRefId);
+
+            }
+
+            METLegalEntityType metLegalEntityType = CompanyInfo::find().METLegalEntityType;
+            salesIdsToConfirmEnumerator = salesIdsToConfirm.getEnumerator();
+
+            //async process to trigger the sales confirmation for Food and liquor entity
+            while (salesIdsToConfirmEnumerator.moveNext())
+            {
+                SalesId salesId = salesIdsToConfirmEnumerator.current();
+
+                try
+                {
+                    if (procMetrics)
+                    {
+                        procMetrics.ttsBeginTrace();
+                    }
+                    else
+                    {
+                        ttsbegin;
+                    }
+                    
                     switch(metLegalEntityType)
                     {
-                        case METLegalEntityType::Liquor:   
-                            this.salesOrderConfirm(orderTrans.inventTransRefId);
+                        case METLegalEntityType::Liquor:
+                            this.salesOrderConfirm(salesId);
                             break;
 
                         case METLegalEntityType::Food:
@@ -90,61 +194,53 @@ final class METPickingListRegistrationPostingJob
                             CustConfirmJour custConfirmJour;
 
                             select count(RecId) from custConfirmJour
-                                where custConfirmJour.SalesId == orderTrans.inventTransRefId;
+                                    where custConfirmJour.SalesId == salesId;
 
                             if (CustConfirmJour.RecId == 0)
                             {
-                                this.salesOrderConfirm(orderTrans.inventTransRefId);
+                                this.salesOrderConfirm(salesId);
                             }
-                            break;  
-
+                            break;
                     }
-                    
-                }
-                ttscommit;
 
-                if (orderTrans.qty == 0)
-                {
-                    METSalesOrderShipmentLoadLines  shipmentLoadLines;
- 
-                    ttsbegin;
-                    while select forupdate shipmentLoadLines
-                        where shipmentLoadLines.WMSOrderTransRecId == orderTrans.RecId
+                    if (procMetrics)
                     {
-                        conShipmentIds += shipmentLoadLines.ShipmentId;
-                        shipmentLoadLines.delete();
-                    }
-                    ttscommit;
-                }
-            }
-            catch(Exception::Deadlock)
-            {
-                retry;
-            }
-            catch (Exception::UpdateConflict)
-            {
-                if (appl.ttsLevel() == 0)
-                {
-                    if (xSession::currentRetryCount() >= #RetryNum)
-                    {
-                        throw Exception::UpdateConflictNotRecovered;
+                        procMetrics.ttsCommitTrace();
                     }
                     else
                     {
-                        retry;
+                        ttscommit;
                     }
                 }
-                else
+                catch(Exception::Deadlock)
                 {
-                    throw Exception::UpdateConflict;
+                    retry;
+                }
+                catch (Exception::UpdateConflict)
+                {
+                    if (appl.ttsLevel() == 0)
+                    {
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            throw Exception::UpdateConflictNotRecovered;
+                        }
+                        else
+                        {
+                            retry;
+                        }
+                    }
+                    else
+                    {
+                        throw Exception::UpdateConflict;
+                    }
+                }
+                catch(Exception::Error)
+                {
+                    error(strFmt("@MET:DallasPickListRegSOConfirm", salesId));
                 }
             }
-            // Bug 246341: CB387 - Dallas Picklist Registration - zero pick quantity is updating the picking list registration when importing using data entity Picklist registration entity
-            // Poor exception handling, if any errors go to the next picking list line to register
-            catch(Exception::Error)
-            {
-                error(strFmt("@MET:PickListPost", orderTrans.inventTransRefId));
-            }
+
+            procMetrics.endTrace();
         }
 
         METSalesOrderShipmentLoadHeader::cleanShipmentIfNoLines(conShipmentIds);
