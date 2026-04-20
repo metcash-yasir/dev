@@ -117,11 +117,13 @@ class METSendPEPricingEngine extends SysOperationServiceBase
         if (lines &&  salesTable.checkUpdate(true))
         {
             METSendPricingLineContract              sendPricingLineContract;
+            boolean                                 avoidNegativeQtySalesId = false;
 
             lineEnumerator = lines.getEnumerator();
             while (lineEnumerator.moveNext())
             {
                 sendPricingLineContract = lineEnumerator.current();
+                avoidNegativeQtySalesId = avoidNegativeQtySalesId || (sendPricingLineContract.parmSalesQty() < 0);
                 resultCon = this.createUpdateSalesLine(_sendPEPricingRequest, sendPricingLineContract, salesTable);
                 result = conPeek(resultCon, 1);
                 messageLoc = conPeek(resultCon, 2);
@@ -169,7 +171,7 @@ class METSendPEPricingEngine extends SysOperationServiceBase
             }
 
             // Generate picking list if required
-            if (sendPricingLineContract.parmSalesQty() > 0) //  Avoid the picking list generation if the sales qty negative which is not expected but added this check to avoid any edge case scenario
+            if (!avoidNegativeQtySalesId) //  Avoid the picking list generation if the sales qty negative which is not expected but added this check to avoid any edge case scenario
             {
                 this.generatePickingListAndRegister(salesTable);
             }
@@ -630,6 +632,7 @@ class METSendPEPricingEngine extends SysOperationServiceBase
     /// <param name = "_salesTable">The sales table for which to generate and register the picking list</param>
     private void generatePickingListAndRegister(SalesTable _salesTable)
     {
+        WMSOrderTrans           wmsOrderTrans;
         WMSPickingRoute         wmsPickingRoute;
         SalesFormLetter         salesFormLetter;
         SalesParmTable          salesParmTable;
@@ -638,6 +641,7 @@ class METSendPEPricingEngine extends SysOperationServiceBase
         METSalesLine            metSalesLine;
         boolean                 pickingExists = false;
         METSalesOrderTypes      metSalesOrderTypes = METSalesOrderTypes::find(_salesTable.METSalesOrderType);
+        Map                     qtyMap = new Map(Types::String, Types::Container);
 
         if (!_salesTable || !_salesTable.SalesId || !metSalesOrderTypes.ExternalInvoiceNumber)
         {
@@ -670,6 +674,9 @@ class METSendPEPricingEngine extends SysOperationServiceBase
             salesFormLetter.printFormLetter(false);
             salesFormLetter.createParmUpdateFromParmUpdateRecord(SalesFormletterParmData::initSalesParmUpdateFormletter(salesFormLetter.documentStatus(), salesFormLetter.pack()));
     
+            salesFormLetter.salesParmUpdate().ReduceOnHand  = NoYes::No;
+            salesFormLetter.salesParmUpdate().Reserve       = NoYes::No;
+
             salesFormLetter.initParameters(salesFormLetter.salesParmUpdate(), Printout::Current);
             salesFormLetter.initLinesQuery();
 
@@ -677,22 +684,27 @@ class METSendPEPricingEngine extends SysOperationServiceBase
                     where salesParmLine.ParmId == salesFormLetter.parmId()
             {
                 salesLineLoc = salesParmLine.salesLine();
-                metSalesLine = METSalesLine::find(salesLineLoc.RecId);
+                boolean isCWItem = PdsGlobal::pdsIsCWItem(salesLineLoc.ItemId);
 
-                if (PdsGlobal::pdsIsCWItem(salesLineLoc.ItemId))
+                if (isCWItem)
                 {
+                    metSalesLine = METSalesLine::find(salesLineLoc.RecId);
                     salesParmLine.PdsCWDeliverNow = salesLineLoc.SalesQty;
                     salesParmLine.DeliverNow = metSalesLine.AISWeight;
+                    qtyMap.insert(salesLineLoc.InventTransId, [1, salesLineLoc.SalesQty, metSalesLine.AISWeight]);
                 }
                 else
                 {
                     salesParmLine.DeliverNow = salesLineLoc.SalesQty;
                 }
-                
+
                 salesParmLine.setQty(DocumentStatus::PickingList, false);
                 salesParmLine.update();
 
-                this.reserveSOLineQty(salesLineLoc, salesParmLine.DeliverNow);
+                if (!isCWItem)
+                {
+                    qtyMap.insert(salesLineLoc.InventTransId, [0, salesParmLine.InventNow, 0.0]);//SalesQty in inventory units
+                }
             }
 
             salesFormLetter.run();
@@ -703,6 +715,36 @@ class METSendPEPricingEngine extends SysOperationServiceBase
                 where wmsPickingRoute.transType  == InventTransType::Sales
                 && wmsPickingRoute.transRefId == _salesTable.SalesId;
 
+        ttsbegin;
+        wmsPickingRoute.selectForUpdate(true);
+        wmsPickingRoute.METExternalInvoicedSO = NoYes::Yes;
+        wmsPickingRoute.update();
+
+        while select forupdate wmsOrderTrans
+                where wmsOrderTrans.routeId == wmsPickingRoute.pickingRouteID
+        {
+            container qtyContainer = qtyMap.lookup(wmsOrderTrans.inventTransId);
+            if (qtyContainer)
+            {
+                boolean isCWItem = conPeek(qtyContainer, 1);
+                InventQty salesQty = conPeek(qtyContainer, 2);
+                InventQty aisWeight = conPeek(qtyContainer, 3);
+                
+                wmsOrderTrans.qty = isCWItem ? aisWeight : salesQty;
+
+                if (isCWItem)
+                {
+                    wmsOrderTrans.PdsCWQty = salesQty;
+                }
+                
+                wmsOrderTrans.wmsOrderTransType().updateQty();
+                wmsOrderTrans.METPickedQtyProcessed = NoYes::No;
+                wmsOrderTrans.METPickedQtyUpdated = NoYes::Yes;
+                wmsOrderTrans.update();
+            }
+        }
+        ttscommit;
+
         // Post registration
         if (wmsPickingRoute.RecId &&
                 wmsPickingRoute.expeditionStatus != WMSExpeditionStatus::Complete)
@@ -712,7 +754,6 @@ class METSendPEPricingEngine extends SysOperationServiceBase
             list.addEnd(wmsPickingRoute.PickingRouteId);
 
             WMSPickingRoute::finishMulti(list.pack());
-
         }
     }
 

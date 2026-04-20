@@ -299,6 +299,7 @@ class METItemPackChangeHelper
 
         ret = this.checkNDCSite() && ret;
         ret = this.checkCDSSite() && ret;
+        ret = this.checkVendorChangeRequest() && ret;
 
         // Determine controlling site
         METSiteControllingAndSubOrdinateSetup metSiteControllingAndSubOrdinateSetup = this.getCampbellsControllingSite();
@@ -1198,6 +1199,7 @@ class METItemPackChangeHelper
     private void rePriceOpenSalesOrders()
     {
         SalesTable                  salesTable;
+        METSalesTable               metSalesTable, metSalesTableUpdate;
         SalesLine                   salesLine;
         METSalesLine                metSalesLine;
         InventDim                   inventDim;
@@ -1210,6 +1212,8 @@ class METItemPackChangeHelper
         InventTableModule           inventTableModuleOldPack;
         real                        factorA, factorB, convertedValue;
         int                         numberOfRecordsProcessed = 0;
+        Set                         metSalesTableSet = new Set(Types::Int64);
+        SetEnumerator               metSalesTableSetEnumerator;
 
         inventDim.clear();
         
@@ -1220,11 +1224,13 @@ class METItemPackChangeHelper
         {
             while select RecId from salesTable
                 where salesTable.SalesStatus == SalesStatus::Backorder
-                && salesTable.DocumentStatus == DocumentStatus::Confirmation
+                join metSalesTable
+                where metSalesTable.SalesTable == salesTable.RecId
+                && metSalesTable.OrderProcessingStatus == METSalesOrderProcessingStatus::OptimisationCompleted
                     join salesLine
                     where salesLine.SalesId == salesTable.SalesId
                     && salesLine.ItemId == metInventItemOrderSetupOrigItem.ItemId
-                    && salesLine.SalesStatus == SalesStatus::Backorder
+                    && salesLine.SalesStatus != SalesStatus::Canceled
                         join RecId, ItemId from inventTable 
                         where InventTable.ItemId == SalesLine.ItemId
                             join RecId from ecoResProduct
@@ -1269,16 +1275,42 @@ class METItemPackChangeHelper
                     unitOfMeasureConversionDirect   = UnitOfMeasureConversion::findByConversion(unitOfMeasureTo.RecId, unitOfMeasureFrom.RecId);
                     convertedValue                  = this.roundValue(factorA / factorB, unitOfMeasureTo, unitOfMeasureConversionDirect.Rounding);
 
+                    salesline.metDeletePriceComponents();
+
                     ttsbegin;
                     salesLine.selectForUpdate(true);
                     salesLine.SalesUnit             = unitOfMeasureFrom.Symbol;
                     salesline.SalesQty              = convertedValue;
-                    
+
                     salesLine.update();
+
+                    metSalesLine.selectForUpdate(true);
+                    metSalesLine.addIndicator(METConstants::A);
+
+                    metSalesLine.update();                                 
                     ttscommit;
 
+                    if (!metSalesTableSet.in(metSalesTable.SalesTable))
+                    {
+                        metSalesTableSet.add(metSalesTable.SalesTable);
+                    }
+                    
                     ++numberOfRecordsProcessed;
-                }               
+                }  
+             
+                metSalesTableSetEnumerator = metSalesTableSet.getEnumerator();
+                while (metSalesTableSetEnumerator.moveNext())
+                {
+                    metSalesTableUpdate = METSalesTable::findBySalesTable(metSalesTableSetEnumerator.current(), true);
+
+                    if(metSalesTableUpdate.RecId)
+                    {
+                        ttsbegin;
+                        metSalesTableUpdate.OrderProcessingStatus = METSalesOrderProcessingStatus::ReadyForPricing;
+                        metSalesTableUpdate.update();
+                        ttscommit;
+                    }
+                }
             }
 
             if (mainSiteId == metInventItemOrderSetupOrigItem.SiteId)
@@ -1757,7 +1789,6 @@ class METItemPackChangeHelper
 
         while select metReqItemTableInventDimView
             where metReqItemTableInventDimView.ItemId == metInventItemOrderSetupOrigItem.ItemId
-            && metReqItemTableInventDimView.ReqPOType == ReqPOType::Transfer
             exists join metSiteControllingAndSubOrdinateSetup
             where metSiteControllingAndSubOrdinateSetup.SiteId == metReqItemTableInventDimView.InventSiteId
             && metSiteControllingAndSubOrdinateSetup.ControllingSiteId == metInventItemOrderSetupOrigItem.SiteId
@@ -1784,6 +1815,9 @@ class METItemPackChangeHelper
                 metItemPackChangeHelperDependentSites.parmWHSPhysDimUOMTempItem(METItemPackChangeHelper::getWhsPhysDimOUM(tmpItem));
 
                 metItemPackChangeHelperDependentSites.startOperation_DependentSites();
+
+                siteList.addEnd(metReqItemTableInventDimView.InventSiteId);
+                warehouseList.addEnd(metReqItemTableInventDimView.InventLocationId);
             }
         }
     }
@@ -1824,6 +1858,38 @@ class METItemPackChangeHelper
         {
             warehouseList.addEnd(metReqItemTableInventDimView.InventLocationId);
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>checkVendorChangeRequest</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check pending vendor change request with future date for the item and site combination, if exist then throw error to user.
+    /// </summary>
+    /// <returns>True or false</returns>
+    private boolean checkVendorChangeRequest()
+    {
+        METReqItemTable metReqItemTable;
+        METReqItemTableInventDimView metReqItemTableInventDimView;
+
+        boolean ret = true;
+
+        select firstonly RecId from metReqItemTableInventDimView
+            exists join metReqItemTable
+            where metReqItemTable.RefRecId == metReqItemTableInventDimView.ReqItemTableRecId
+                && metReqItemTable.PendingVendChangeDate > DateTimeUtil::getSystemDateTime()
+                && metReqItemTable.PendingVendAccountNumber != ''
+                && metReqItemTableInventDimView.ItemId == metInventItemOrderSetupOrigItem.ItemId
+                && metReqItemTableInventDimView.InventSiteId == metInventItemOrderSetupOrigItem.SiteId;
+        
+        if (metReqItemTableInventDimView.RecId)
+        {
+            ret = checkFailed("@MET:ValidationPackChangeVendorChangeRequest");
+        }
+
+        return ret;
     }
 
 ]]></Source>
