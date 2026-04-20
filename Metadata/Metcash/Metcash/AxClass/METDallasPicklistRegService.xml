@@ -31,7 +31,25 @@ final class METDallasPicklistRegService extends SysOperationServiceBase
         BatchHeader                     batchHeader;
         int                             counter     = 0;
         int                             totalTasks  = _dataContract.parmParallelTasksNumber();
+        boolean                         processExtInvSO = _dataContract.parmProcessExtInvSo();
         Query                           query = _dataContract.getQuery();
+
+        // --- Apply filter based on ExternalInvoiceOrder flag ---
+        if (!processExtInvSO)
+        {
+            QueryBuildDataSource qbdsWmsOrderTrans, qbdsWmsPickingRoute;
+            qbdsWmsOrderTrans = query.dataSourceTable(tableNum(WmsOrderTrans));
+
+            qbdsWmsPickingRoute = qbdsWmsOrderTrans.addDataSource(tableNum(WMSPickingRoute));
+            qbdsWmsPickingRoute.relations(false);
+            qbdsWmsPickingRoute.joinMode(JoinMode::OuterJoin);
+            qbdsWmsPickingRoute.addLink(fieldNum(WmsOrderTrans, routeId), fieldNum(WMSPickingRoute, pickingRouteID));
+       
+            qbdsWmsPickingRoute.addRange(fieldNum(WMSPickingRoute, METExternalInvoicedSO))
+                                  .value(SysQuery::value(NoYes::No));
+        }
+
+        METProcMetrics procMetrics   = METProcMetrics::construct(METBatchLogOperation::DallasPicklistRegistration);
 
         if (totalTasks  <= 0)
         {
@@ -52,42 +70,66 @@ final class METDallasPicklistRegService extends SysOperationServiceBase
             
             // Populate the map to group WMSOrderTrans by routeId
             QueryRun queryRun = new QueryRun(query);
-            while (queryRun.next())
+
+            procMetrics.setTotalCountFromQuery(queryRun);
+            procMetrics.beginTrace('Process started');
+            
+            using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
             {
-                wmsOrderTrans = queryRun.get(tableNum(WMSOrderTrans));
 
-                if (wmsOrderTransRouteMap.exists(wmsOrderTrans.routeId))
+                while (queryRun.next())
                 {
-                    conOrdTransRoute = wmsOrderTransRouteMap.lookup(wmsOrderTrans.routeId);
-                }
-                else
-                {
-                    conOrdTransRoute = conNull();
-                }
+                    wmsOrderTrans = queryRun.get(tableNum(WMSOrderTrans));
 
-                conOrdTransRoute += [wmsOrderTrans];
-                wmsOrderTransRouteMap.insert(wmsOrderTrans.routeId, conOrdTransRoute);
-            }
+                    if (wmsOrderTransRouteMap.exists(wmsOrderTrans.routeId))
+                    {
+                        conOrdTransRoute = wmsOrderTransRouteMap.lookup(wmsOrderTrans.routeId);
+                    }
+                    else
+                    {
+                        conOrdTransRoute = conNull();
+                    }
 
-            // Recalculate bundle size based on grouped WMSOrderTrans
-            bundleSize = real2int(roundUp((wmsOrderTransRouteMap.elements() / totalTasks), 1.0));
-
-            // Now process each group of WMSOrderTrans by routeId
-            MapEnumerator mapEnumerator = wmsOrderTransRouteMap.getEnumerator();
-            while (mapEnumerator.moveNext())
-            {
-                conOrdTransRoute = mapEnumerator.currentValue();
-
-                counter += 1;
-
-                if (counter == 1)
-                {
-                    conOrdTrans = conNull();
+                    conOrdTransRoute += [wmsOrderTrans];
+                    wmsOrderTransRouteMap.insert(wmsOrderTrans.routeId, conOrdTransRoute);
                 }
 
-                conOrdTrans += conOrdTransRoute;
+                // Recalculate bundle size based on grouped WMSOrderTrans
+                bundleSize = real2int(roundUp((wmsOrderTransRouteMap.elements() / totalTasks), 1.0));
+
+                // Now process each group of WMSOrderTrans by routeId
+                MapEnumerator mapEnumerator = wmsOrderTransRouteMap.getEnumerator();
+                while (mapEnumerator.moveNext())
+                {
+                    conOrdTransRoute = mapEnumerator.currentValue();
+
+                    counter += 1;
+
+                    if (counter == 1)
+                    {
+                        conOrdTrans = conNull();
+                    }
+
+                    conOrdTrans += conOrdTransRoute;
                 
-                if (counter == bundlesize)
+                    if (counter == bundlesize)
+                    {
+                        controller      = new SysOperationServiceController(
+                                                classStr(METPickingListRegistrationPostingJob),
+                                                methodStr(METPickingListRegistrationPostingJob, postPickListRegistration));
+
+                        controller.parmDialogCaption(strFmt("@MET:PostPackingSlipSubTask", counter));
+
+                        metDataContract = controller.getDataContractObject() as METDallasPicklistRegContract;
+                        metDataContract.parmConOrderTrans(conOrdTrans);
+
+                        batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
+                    
+                        counter = 0;
+                    }
+                }
+  
+                if (counter > 0)
                 {
                     controller      = new SysOperationServiceController(
                                                 classStr(METPickingListRegistrationPostingJob),
@@ -99,26 +141,12 @@ final class METDallasPicklistRegService extends SysOperationServiceBase
                     metDataContract.parmConOrderTrans(conOrdTrans);
 
                     batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
-                    
-                    counter = 0;
                 }
+
+                batchHeader.save();
+
+                procMetrics.endTrace();
             }
-  
-            if (counter > 0)
-            {
-                controller      = new SysOperationServiceController(
-                                                classStr(METPickingListRegistrationPostingJob), 
-                                                methodStr(METPickingListRegistrationPostingJob, postPickListRegistration));
-
-                controller.parmDialogCaption(strFmt("@MET:PostPackingSlipSubTask", counter));
-
-                metDataContract = controller.getDataContractObject() as METDallasPicklistRegContract;
-                metDataContract.parmConOrderTrans(conOrdTrans);
-
-                batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
-            }
-
-            batchHeader.save();
         }
         catch(Exception::Deadlock)
         {
