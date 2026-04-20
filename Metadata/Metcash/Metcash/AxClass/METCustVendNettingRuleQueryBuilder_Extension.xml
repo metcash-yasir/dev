@@ -227,11 +227,11 @@ final class METCustVendNettingRuleQueryBuilder_Extension
         RecId                           pairRecId   = _nettingPair.RecId;
         VendNettingTransView            vendNettingTransView;
         CustNettingTransTotalView       custNettingTransTotalView;
-        METNettingTransCustVendRefTable existingRef, deleteRef, insertRef, updateRef;
+        METNettingTransCustVendRefTable existingRef, deleteRef, insertRef;
         
         if (_isCreditSide)
         {
-            // idempotent guard: check for rows already inserted for this pair/run
+            // Check for rows already inserted for this pair/run
             select firstonly RecId from existingRef
                 where existingRef.AccountNum == _nettingPair.CreditAccountNum
                    && existingRef.LegalEntity == _nettingPair.CreditCompany
@@ -244,43 +244,39 @@ final class METCustVendNettingRuleQueryBuilder_Extension
             }
 
             ttsBegin;
-            // delete previous refs for this account/company/type for this pair/run only (avoid removing other runs)
+
+            // Cleanup: remove any rows with empty ExecutionId for this account
+            // to prevent them from being picked up again.
+            delete_from deleteRef
+                where deleteRef.AccountNum == _nettingPair.DebitAccountNum
+                   && (deleteRef.ExecutionId == '' || deleteRef.ExecutionId == null);
+
+            // delete previous refs for this account/company/type for this pair/run only
             delete_from deleteRef
                 where deleteRef.AccountNum == _nettingPair.CreditAccountNum
                    && deleteRef.LegalEntity == _nettingPair.CreditCompany
                    && deleteRef.NettingTransType == METNettingTransType::Credit
                    && deleteRef.ExecutionId == runIdStr;
 
-            // Insert vendor open transactions from vendor company context
+            // Insert vendor open transactions.
             changecompany(_nettingPair.DebitCompany)
             {
-                if (_currencyCode && _currencyCode != '')
+                while select Invoice, AccountNum, DataAreaId, AmountCur from vendNettingTransView
+                    where vendNettingTransView.AccountNum == _nettingPair.DebitAccountNum
+                       && vendNettingTransView.Invoice != ''
+                       && (!_currencyCode || _currencyCode == '' || vendNettingTransView.CurrencyCode == _currencyCode)
                 {
-                    insert_recordset insertRef (Invoice, AccountNum, LegalEntity, AmountCurCredit)
-                        select Invoice, AccountNum, DataAreaId, AmountCur
-                        from vendNettingTransView
-                        where vendNettingTransView.AccountNum == _nettingPair.DebitAccountNum
-                          && vendNettingTransView.CurrencyCode == _currencyCode
-                          && vendNettingTransView.Invoice != '';
-                }
-                else
-                {
-                    METNettingTransType transType = METNettingTransType::Credit;
-                    insert_recordset insertRef (Invoice, AccountNum, LegalEntity, AmountCurCredit)
-                        select Invoice, AccountNum, DataAreaId, AmountCur
-                        from vendNettingTransView
-                        where vendNettingTransView.AccountNum == _nettingPair.DebitAccountNum
-                          && vendNettingTransView.Invoice != '';
+                    insertRef.clear();
+                    insertRef.Invoice          = vendNettingTransView.Invoice;
+                    insertRef.AccountNum       = vendNettingTransView.AccountNum;
+                    insertRef.LegalEntity      = _nettingPair.CreditCompany;
+                    insertRef.AmountCurCredit  = vendNettingTransView.AmountCur;
+                    insertRef.NettingTransType = METNettingTransType::Credit;
+                    insertRef.ExecutionId      = runIdStr;
+                    insertRef.NettingExecutionId = pairRecId;
+                    insertRef.insert();
                 }
             }
-
-            // tag inserted rows with constants + run id and pair rec id
-            update_recordset updateRef
-                setting LegalEntity        = _nettingPair.CreditCompany,
-                        NettingTransType   = METNettingTransType::Credit,
-                        ExecutionId        = runIdStr
-                where updateRef.AccountNum == _nettingPair.DebitAccountNum
-                && (updateRef.ExecutionId == '' || updateRef.ExecutionId == null);
 
             ttsCommit;
 
@@ -302,40 +298,37 @@ final class METCustVendNettingRuleQueryBuilder_Extension
 
             ttsBegin;
 
+            // Cleanup: remove any rows with empty ExecutionId for this account
+            delete_from deleteRef
+                where deleteRef.AccountNum == _nettingPair.CreditAccountNum
+                   && (deleteRef.ExecutionId == '' || deleteRef.ExecutionId == null);
+
+            // delete previous refs for this account/company/type for this pair/run only
             delete_from deleteRef
                 where deleteRef.AccountNum == _nettingPair.CreditAccountNum
                    && deleteRef.LegalEntity == _nettingPair.DebitCompany
                    && deleteRef.NettingTransType == METNettingTransType::Debit
                    && deleteRef.ExecutionId == runIdStr;
 
+            // Insert customer open transactions with all tagging fields set atomically
             changecompany(_nettingPair.CreditCompany)
             {
-                if (_currencyCode && _currencyCode != '')
+                while select Invoice, AccountNum, DataAreaId, AmountCur from custNettingTransTotalView
+                    where custNettingTransTotalView.AccountNum == _nettingPair.CreditAccountNum
+                       && custNettingTransTotalView.Invoice != ''
+                       && (!_currencyCode || _currencyCode == '' || custNettingTransTotalView.CurrencyCode == _currencyCode)
                 {
-                    insert_recordset insertRef (Invoice, AccountNum, LegalEntity, AmountCurDebit)
-                        select Invoice, AccountNum, DataAreaId, AmountCur
-                        from custNettingTransTotalView
-                        where custNettingTransTotalView.AccountNum == _nettingPair.CreditAccountNum
-                          && custNettingTransTotalView.CurrencyCode == _currencyCode
-                          && custNettingTransTotalView.Invoice != '';
-                }
-                else
-                {
-                    insert_recordset insertRef (Invoice, AccountNum, LegalEntity, AmountCurDebit)
-                        select Invoice, AccountNum, DataAreaId, AmountCur
-                        from custNettingTransTotalView
-                        where custNettingTransTotalView.AccountNum == _nettingPair.CreditAccountNum
-                          && custNettingTransTotalView.Invoice != '';
+                    insertRef.clear();
+                    insertRef.Invoice          = custNettingTransTotalView.Invoice;
+                    insertRef.AccountNum       = custNettingTransTotalView.AccountNum;
+                    insertRef.LegalEntity      = _nettingPair.DebitCompany;
+                    insertRef.AmountCurDebit   = custNettingTransTotalView.AmountCur;
+                    insertRef.NettingTransType = METNettingTransType::Debit;
+                    insertRef.ExecutionId      = runIdStr;
+                    insertRef.NettingExecutionId = pairRecId;
+                    insertRef.insert();
                 }
             }
-
-            update_recordset updateRef
-                setting LegalEntity        = _nettingPair.DebitCompany,
-                        NettingTransType   = METNettingTransType::Debit,
-                        ExecutionId        = runIdStr,
-                        NettingExecutionId = pairRecId
-                where updateRef.AccountNum == _nettingPair.CreditAccountNum
-                  && (updateRef.ExecutionId == '' || updateRef.ExecutionId == null);
 
             ttsCommit;
 
