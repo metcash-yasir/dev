@@ -17,48 +17,61 @@ final class METSalesLineSalesPurchLine_Extension
 				<Name>calcLineAmount</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Calculates line amount.
+    /// Calculates the line amount based on quantity, weight, and pricing rules.
     /// </summary>
-    /// <param name = "_qty">Qty.</param>
-    /// <returns>Amount.</returns>
+    /// <param name="_qty">The quantity to calculate against.</param>
+    /// <returns>The calculated line amount.</returns>
     public AmountCur calcLineAmount(Qty _qty)
     {
+        // Start with the base calculation from the parent method
         AmountCur amount = next calcLineAmount(_qty);
 
-        ItemId ItemId = this.parmItemId();
+        // Retrieve item and sales line details
+        ItemId itemId = this.parmItemId();
+        SalesLine salesLine = this.parmSalesLine();
+        InventDim inventDim = salesLine.inventDim();
+        UnitOfMeasureSymbol unitSales = salesLine.SalesUnit;
 
-        if (PdsGlobal::pdsIsCWItem(ItemId)  || SalesLineSalesPurchLine::getPricedByWeightAttributeValue(ItemId))
+        // Cache flags to avoid repeated static method calls
+        boolean isCWItem = PdsGlobal::pdsIsCWItem(itemId);
+        boolean isPricedByWeight = SalesLineSalesPurchLine::getPricedByWeightAttributeValue(itemId);
+
+        // Only proceed if item is catch weight or priced by weight
+        if (isCWItem || isPricedByWeight)
         {
-            SalesLine salesLine = this.parmSalesLine();
-
             WMSOrderTrans wmsOrderTrans;
-            METWHSPhysDimUOMSite    metWHSPhysDimUOMSite;
-            InventDim inventDim = salesLine.inventDim();
-            UnitOfMeasureSymbol unitSales = salesLine.SalesUnit;
+            METWHSPhysDimUOMSite metWHSPhysDimUOMSite;
+
+            // Get warehouse transaction quantity (only if expedition is complete or activated)
+            select firstonly Qty from wmsOrderTrans
+                where wmsOrderTrans.InventTransId == salesLine.InventTransId
+               && (wmsOrderTrans.expeditionStatus == WMSExpeditionStatus::Complete
+                   || wmsOrderTrans.expeditionStatus == WMSExpeditionStatus::Activated);
+
+            // Get physical dimensions (weight per UOM for the site)
+            select firstonly weight, NetWeight from metWHSPhysDimUOMSite
+                where metWHSPhysDimUOMSite.ItemId == itemId
+              && metWHSPhysDimUOMSite.UOM == unitSales
+              && metWHSPhysDimUOMSite.SiteId == inventDim.InventSiteId;
+
             AmountCur pickQty;
 
-            select firstonly Qty from wmsOrderTrans
-                where wmsOrderTrans.InventTransId == salesLine.InventTransId &&
-                    (wmsOrderTrans.expeditionStatus == WMSExpeditionStatus::Complete ||
-                    wmsOrderTrans.expeditionStatus == WMSExpeditionStatus::Activated);
-
-            if (wmsOrderTrans.qty)
+            // If warehouse transaction quantity exists
+            if (wmsOrderTrans.Qty)
             {
-                pickQty = wmsOrderTrans.qty;
+                // If item is priced by weight but not catch weight, multiply by NetWeight
+                pickQty = isPricedByWeight && !isCWItem
+                ? wmsOrderTrans.Qty * metWHSPhysDimUOMSite.NetWeight
+                : wmsOrderTrans.Qty;
             }
             else
             {
-                select firstonly weight, NetWeight from metWHSPhysDimUOMSite
-                    where metWHSPhysDimUOMSite.ItemId == ItemId
-                    && metWHSPhysDimUOMSite.UOM == unitSales
-                    && metWHSPhysDimUOMSite.SiteId == inventDim.InventSiteId;
-
+                // Otherwise, calculate based on sales quantity and NetWeight
                 pickQty = metWHSPhysDimUOMSite.NetWeight * salesLine.SalesQty;
             }
-      
-            amount = pickQty * (salesLine.SalesPrice - salesLine.LineDisc);
 
-            amount = round(amount, 0.01);
+            // Final amount = picked quantity × (price - discount)
+            amount = round(pickQty * (salesLine.SalesPrice - salesLine.LineDisc), 0.01);
         }
 
         return amount;
