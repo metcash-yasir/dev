@@ -1,0 +1,247 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METReturnOrderCopyChargesHelper</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Helper class for copying charges from original sales orders to return orders.
+/// </summary>
+public class METReturnOrderCopyChargesHelper
+{
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>getOrginalSalesTable</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the original sales table based on the provided original invoice.
+    /// </summary>
+    /// <param name = "_originalInvoice">The original invoice identifier.</param>
+    /// <returns>The original sales table.</returns>
+    public static SalesTable getOrginalSalesTable(METOriginalInvoice _originalInvoice)
+    {
+        SalesTable      originalSalesTable;
+        CustInvoiceJour custInvoiceJourLocal;
+
+        select firstonly originalSalesTable
+            where originalSalesTable.SalesId == _originalInvoice;
+
+        if (originalSalesTable)
+        {
+            return originalSalesTable;
+        }
+
+        select firstonly originalSalesTable
+            join custInvoiceJourLocal
+                where custInvoiceJourLocal.InvoiceId == _originalInvoice
+                   && custInvoiceJourLocal.SalesId  == originalSalesTable.SalesId;
+
+        return originalSalesTable; 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copySOHeaderAndLineCharges</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copy the original sales order charges into charge only SO
+    /// </summary>
+    /// <param name = "_salesTable"> current SalesTable buffer </param>
+    /// <param name = "_salesTableOrig"> original SalesTable buffer </param>
+    /// <param name = "_copyLines"> flag to indicate whether to copy line charges </param>
+    public static void copySOHeaderAndLineCharges(SalesTable _salesTable, SalesTable _salesTableOrig, boolean _copyLines = false)
+    {
+        MarkupTrans         markupTrans, markupTransOrig;
+        CustInvoiceJour     custInvoiceJour;
+        SalesLine           salesLine;
+        
+        // Copy the original SO invoiced header charges to charge only SO
+        while select markupTransOrig
+            exists join custInvoiceJour
+                where markupTransOrig.TransTableId == custInvoiceJour.TableId
+                && markupTransOrig.TransRecId == custInvoiceJour.RecId
+                && custInvoiceJour.SalesId == _salesTableOrig.SalesId
+        {
+            markupTrans.clear();
+            markupTrans                         = markupTrans.data(markupTransOrig);
+            markupTrans.RecId                   = 0;
+            markupTrans.Position                = 0;
+            markupTrans.Value                   = markupTransOrig.MarkupCategory == MarkupCategory::Fixed ? markupTrans.Value * -1 : markupTrans.Value;
+            markupTrans.CalculatedAmount        = 0;
+            markupTrans.Voucher                 = '';
+            markupTrans.MarkupCategory          = markupTransOrig.MarkupCategory;
+            markupTrans.TransTableId            = _salesTable.TableId;
+            markupTrans.TransRecId              = _salesTable.RecId;
+            markupTrans.LineNum                 = MarkupTrans::lastLineNum(markupTrans.TransTableId, markupTrans.TransRecId) + 1;
+            markupTrans.METAdvancedCalculation  = NoYes::No;
+            markupTrans.IsAutoCharge            = NoYes::No;
+
+            markupTrans.insert();
+        }
+        
+        if (_copyLines)
+        {
+            while select forupdate salesLine
+                where salesLine.SalesId == _salesTable.SalesId
+                && salesLine.SalesQty < 0
+            {
+                Markup::delete(salesLine);
+                METReturnOrderCopyChargesHelper::copySOLineCharges(salesLine, _salesTableOrig);
+                METReturnOrderCopyChargesHelper::createPriceComponentsByLine(salesLine, _salesTableOrig);
+                ttsbegin;
+                salesLine.reread();
+                METReturnOrderCopyChargesHelper::updateSalesLinePrices(salesLine, _salesTableOrig);
+                salesLine.update();
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>copySOLineCharges</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Copy the original SO invoiced line charges to the specified sales line.
+    /// </summary>
+    /// <param name = "_salesLine">The sales line to copy charges to.</param>
+    /// <param name = "_salesTableOrig">The original sales table containing the invoiced charges.</param>
+    public static void copySOLineCharges(SalesLine _salesLine, SalesTable _salesTableOrig)
+    {
+        MarkupTrans         markupTrans, markupTransOrig;
+        CustInvoiceTrans    custInvoiceTrans;
+
+        while select custInvoiceTrans
+                where custInvoiceTrans.SalesId == _salesTableOrig.SalesId
+                && custInvoiceTrans.ItemId == _salesLine.ItemId
+            join markupTransOrig
+                where markupTransOrig.TransTableId == custInvoiceTrans.TableId
+                && markupTransOrig.TransRecId == custInvoiceTrans.RecId
+        {
+            markupTrans                         = markupTrans.data(markupTransOrig);
+            markupTrans.RecId                   = 0;
+            markupTrans.Position                = 0;
+            markupTrans.Value                   = markupTransOrig.MarkupCategory == MarkupCategory::Fixed ? markupTrans.Value * -1 : markupTrans.Value;
+            markupTrans.CalculatedAmount        = 0;
+            markupTrans.Voucher                 = '';
+            markupTrans.MarkupCategory          = markupTransOrig.MarkupCategory;
+            markupTrans.TransTableId            = _salesLine.TableId;
+            markupTrans.TransRecId              = _salesLine.RecId;
+            markupTrans.LineNum                 = MarkupTrans::lastLineNum(markupTrans.TransTableId, markupTrans.TransRecId) + 1;
+            markupTrans.METAdvancedCalculation  = NoYes::No;
+            markupTrans.IsAutoCharge            = NoYes::No;
+
+            markupTrans.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPriceComponentsByLine</Name>
+				<Source><![CDATA[
+    public static void createPriceComponentsByLine(SalesLine _salesLine, SalesTable _salesTableOrig)
+    {
+        CustInvoiceJour     custInvoiceJour;
+        CustInvoiceTrans    custInvoiceTrans;
+        SalesLine           salesLineOrig;
+
+        // Copy the original SO line price components to charge only SO lines
+        while select salesLineOrig
+            join SalesId, ItemId from custInvoiceTrans
+                where custInvoiceTrans.InventTransId == salesLineOrig.InventTransId
+                && custInvoiceTrans.SalesId == _salesTableOrig.SalesId
+                && custInvoiceTrans.ItemId == _salesLine.ItemId
+        {
+            METSalesLinePriceComponent          salesLinePriceComponentOrig, salesLinePriceComponent;
+            METSalesLinePriceComponentDetail    salesLinePriceComponentDetailOrig, salesLinePriceComponentDetail;
+
+            real convFactor = 1;
+
+            delete_from salesLinePriceComponent
+                        where salesLinePriceComponent.InventTransId == _salesLine.InventTransId;
+
+            delete_from salesLinePriceComponentDetail
+                        where salesLinePriceComponentDetail.InventTransId == _salesLine.InventTransId;
+
+            while select salesLinePriceComponentOrig
+                    where salesLinePriceComponentOrig.InventTransId == salesLineOrig.InventTransId
+            {
+                salesLinePriceComponent.clear();
+                salesLinePriceComponent = salesLinePriceComponent.data(salesLinePriceComponentOrig);
+                salesLinePriceComponent.value = salesLinePriceComponent.Value * -1;
+
+                if(_salesLine.SalesUnit != salesLineOrig.SalesUnit)
+                {
+                    convFactor = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(_salesLine.itemId,
+                                                                            _salesLine.InventDimId,
+                                                                            1,
+                                                                            salesLineOrig.SalesUnit,
+                                                                            _salesLine.SalesUnit,
+                                                                            NoYes::Yes);
+
+                    salesLinePriceComponent.Value = convFactor ? salesLinePriceComponent.Value / convFactor : salesLinePriceComponent.Value;
+                }
+
+                salesLinePriceComponent.RecId           = 0;
+                salesLinePriceComponent.InventTransId   = _salesLine.InventTransId;
+
+                salesLinePriceComponent.insert();
+            }
+
+            while select salesLinePriceComponentDetailOrig
+                        where salesLinePriceComponentDetailOrig.InventTransId == salesLineOrig.InventTransId
+            {
+                salesLinePriceComponentDetail.clear();
+                salesLinePriceComponentDetail               = salesLinePriceComponentDetail.data(salesLinePriceComponentDetailOrig);
+                salesLinePriceComponentDetail.RecId         = 0;
+                salesLinePriceComponentDetail.InventTransId = _salesLine.InventTransId;
+                salesLinePriceComponentDetail.Value = -1*(salesLinePriceComponentDetail.Value / convFactor);
+                salesLinePriceComponentDetail.VendorValue = salesLinePriceComponentDetail.VendorValue / convFactor;
+
+                salesLinePriceComponentDetail.insert();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSalesLinePrices</Name>
+				<Source><![CDATA[
+    public static void updateSalesLinePrices(SalesLine _salesLine, SalesTable _salesTableOrig)
+    {
+        CustInvoiceTrans    custInvoiceTrans;
+        SalesLine           salesLineOrig;
+
+        while select salesLineOrig
+            join SalesId, ItemId from custInvoiceTrans
+                where custInvoiceTrans.InventTransId == salesLineOrig.InventTransId
+                && custInvoiceTrans.SalesId == _salesTableOrig.SalesId
+                && custInvoiceTrans.ItemId == _salesLine.ItemId
+        {
+            real convFactor = 1;
+            if(_salesLine.SalesUnit != salesLineOrig.SalesUnit)
+            {
+                convFactor = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(_salesLine.itemId,
+                                                                            _salesLine.InventDimId,
+                                                                            1,
+                                                                            salesLineOrig.SalesUnit,
+                                                                            _salesLine.SalesUnit,
+                                                                            NoYes::Yes);
+            }
+            _salesLine.SalesPrice = convFactor ? salesLineOrig.SalesPrice / convFactor : salesLineOrig.SalesPrice;
+            _salesLine.LineDisc = convFactor ? salesLineOrig.LineDisc / convFactor : salesLineOrig.LineDisc;
+            _salesLine.calcLineAmount();
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
