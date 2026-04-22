@@ -104,6 +104,7 @@ class METSalesOrderReturnCreditRegistrationService extends SysOperationServiceBa
         METProcessingStatus                     result;
         Description255                          messageLoc;
         ItemId                                  itemNumber;
+        boolean                                 lineProcessed = false;
 
         rmaNumber = _metSalesOrderReturnCreditRegistrationContract.parmRMANumber();
         lineNumber = _metSalesOrderReturnCreditRegistrationContract.parmLineNumber();
@@ -122,57 +123,82 @@ class METSalesOrderReturnCreditRegistrationService extends SysOperationServiceBa
         
         select firstonly salesTable where salesTable.ReturnItemNum == rmaNumber; // Not using field list because using same buffer in Business event. 
 
-        select firstonly salesLineReg
-            where salesLineReg.SalesId == salesTable.SalesId &&
-                  salesLineReg.ItemId == itemNumber;
-
-        if (salesLineReg.RecId != 0 && salesLineReg.ReturnStatus == ReturnStatusLine::Awaiting)
+        
+        if (!salesTable || !salesTable.RecId)
         {
-            args.record(salesLineReg);
+            messageLoc = "@MET:ReturnOrderLineNotExists";
+            result      = METProcessingStatus::Error;            
+            return [result, messageLoc];
+        }
 
-            tradeOrderLineRegister = SalesReturnOrderLineRegister::construct();
-            tradeOrderLineRegister.parmArgs(args);
-            tradeOrderLineRegister.init();
-            salesReturnOrderLineRegister = tradeOrderLineRegister;
-            salesReturnOrderLineRegister.runPreSuper();
+        while select  salesLineReg
+            where salesLineReg.SalesId == salesTable.SalesId 
+            && salesLineReg.ItemId == itemNumber
+            && salesLineReg.ReturnStatus == ReturnStatusLine::Awaiting
+        {  
+            try
+            {
+                args.record(salesLineReg);
 
-            //update returnDisposioncode
-            salesLineReg.ReturnDispositionCodeId = dispositionCodeId;
-            salesLineReg.update();
+                tradeOrderLineRegister = SalesReturnOrderLineRegister::construct();
+                tradeOrderLineRegister.parmArgs(args);
+                tradeOrderLineRegister.init();
+                salesReturnOrderLineRegister = tradeOrderLineRegister;
+                salesReturnOrderLineRegister.runPreSuper();
 
-            select firstOnly crossCompany inventTrans
+                //update returnDisposioncode
+                salesLineReg.ReturnDispositionCodeId = dispositionCodeId;
+                salesLineReg.update();
+
+                select firstOnly crossCompany inventTrans
                 join RecId, InventTransId from inventTransOrigin
                     where inventTransOrigin.InventTransId == salesLineReg.InventTransId
                     && inventTrans.InventTransOrigin == inventTransOrigin.RecId;
 
-            inventTransWMS_register = inventTransWMS_register::newStandard(tmpInventTransWMS);
-            tmpInventTransWMS.clear();
-            tmpInventTransWMS.initFromInventTrans(inventTrans);            
-            tmpInventTransWMS.InventDimId = inventTrans.InventDimId;
-            // Bug 215261: CB197 - Registration is failing for batch-enabled items when web services are used.
-            // this is require to set the itemId which is failing in Class\InventTransWMS_Register\updateInventoryBatch
-            tmpInventTransWMS.initFromInventTransOrigin(inventTrans.inventTransOrigin());
-            tmpInventTransWMS.insert();
-            inventTransWMS_register.writeTmpInventTransWMS(tmpInventTransWMS,
-                                                        inventTrans,
-                                                        inventTrans.inventDim());
-            inventTransWMS_register.updateInvent(salesLineReg);
+                if (inventTrans.RecId)
+                {
+                    inventTransWMS_register = inventTransWMS_register::newStandard(tmpInventTransWMS);
+                    tmpInventTransWMS.clear();
+                    tmpInventTransWMS.initFromInventTrans(inventTrans);
+                    tmpInventTransWMS.InventDimId = inventTrans.InventDimId;
+                    // Bug 215261: CB197 - Registration is failing for batch-enabled items when web services are used.
+                    // this is require to set the itemId which is failing in Class\InventTransWMS_Register\updateInventoryBatch
+                    tmpInventTransWMS.initFromInventTransOrigin(inventTrans.inventTransOrigin());
+                    tmpInventTransWMS.insert();
+                    inventTransWMS_register.writeTmpInventTransWMS(tmpInventTransWMS,
+                                                            inventTrans,
+                                                            inventTrans.inventDim());
+                    inventTransWMS_register.updateInvent(salesLineReg);
 
-            // Bug 216784: CB871-Business event not supplying correct details.
-            // Moving the business event trigger outside of custom service so it can be called from both UI and customer service
-            /*select firstonly RecId from salesLineReg
-                where salesLineReg.SalesId == salesTable.SalesId    &&
+                    // Bug 216784: CB871-Business event not supplying correct details.
+                    // Moving the business event trigger outside of custom service so it can be called from both UI and customer service
+                    /*select firstonly RecId from salesLineReg
+                    where salesLineReg.SalesId == salesTable.SalesId    &&
                     salesLineReg.ReturnStatus != ReturnStatusLine::Registered;
 
-            if (salesLineReg.RecId == 0) // All lines are registered for the RMA
+                    if (salesLineReg.RecId == 0) // All lines are registered for the RMA
+                    {
+                    METSOReturnAndClaimsBusinessEvent::newFromSalesTable(salesTable).send();
+                    }*/
+                }
+                else
+                {
+                    result = METProcessingStatus::Error;
+                    messageLoc = strfmt("@MET:InventTransNotFoundForSalesLine", salesLineReg.LineNum);
+                    break;
+                }
+                result = METProcessingStatus::Success;
+                messageLoc = "@MET:ReturnLineRegistered";
+                lineProcessed = true;
+            }
+            catch
             {
-                METSOReturnAndClaimsBusinessEvent::newFromSalesTable(salesTable).send();
-            }*/
-
-            result = METProcessingStatus::Success;
-            messageLoc = "@MET:ReturnLineRegistered";
+                result = METProcessingStatus::Error;
+                messageLoc = strFmt("@MET:ErrorProcessingReturnLine", salesLineReg.LineNum, Global::METGetErrorAndCLR());
+            }
         }
-        else
+
+        if (!lineProcessed)
         {
             result = METProcessingStatus::Error;
             messageLoc = "@MET:ReturnOrderLineNotExists";
