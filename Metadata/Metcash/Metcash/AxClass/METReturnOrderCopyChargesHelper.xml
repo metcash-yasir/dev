@@ -21,7 +21,7 @@ public class METReturnOrderCopyChargesHelper
     /// <param name = "_salesTable">SalesTable.</param>
     public static void copySOHeaderCharges(METSalesTable _metSalesTable, SalesTable _salesTable)
     {
-        MarkupTrans         markupTrans, markupTransOrig;
+        MarkupTrans         markupTransOrig;
         CustInvoiceJour     custInvoiceJour;
         boolean             isInvoice;
         
@@ -60,14 +60,15 @@ public class METReturnOrderCopyChargesHelper
     /// Copy the original sales order line charges to the specified sales line.
     /// </summary>
     /// <param name = "_metSalesLine">METSalesLine.</param>
+    /// <param name = "_salesLine">The SalesLine.</param>
     /// <param name = "_isUpdate">Flag to indicate whether it's an update scenario.</param>
-    public static void copySOLineCharges(METSalesLine _metSalesLine, boolean _isUpdate = false)
+    public static void copySOLineCharges(METSalesLine _metSalesLine, SalesLine _salesLine = null, boolean _isUpdate = false)
     {
-        MarkupTrans         markupTrans, markupTransOrig;
+        MarkupTrans         markupTransOrig;
         CustInvoiceTrans    custInvoiceTrans;
         SalesLine           salesLine;
 
-        salesLine = _metSalesLine.salesLine();
+        salesLine = _salesLine ? _salesLine : _metSalesLine.salesLine();
 
         if (_isUpdate)
         {
@@ -75,14 +76,40 @@ public class METReturnOrderCopyChargesHelper
             Markup::delete(salesLine);
         }
 
-        while select custInvoiceTrans
-                where custInvoiceTrans.InvoiceId == _metSalesLine.InvoiceNumber
+        if (_metSalesLine.InvoiceNumber && _metSalesLine.InvoiceLineNumber)
+        {
+            SalesTable salesTableOriginal = _metSalesLine.findOriginalSalesTableForReturn(salesLine);
+
+            while select custInvoiceTrans
+                where custInvoiceTrans.SalesId == salesTableOriginal.SalesId
                 && custInvoiceTrans.LineNum == _metSalesLine.InvoiceLineNumber
             join markupTransOrig
                 where markupTransOrig.TransTableId == custInvoiceTrans.TableId
                 && markupTransOrig.TransRecId == custInvoiceTrans.RecId
+            {
+                METReturnOrderCopyChargesHelper::createMarkupTrans(markupTransOrig, salesLine.TableId, salesLine.RecId);
+            }
+        }
+        else
         {
-            METReturnOrderCopyChargesHelper::createMarkupTrans(markupTransOrig, salesLine.TableId, salesLine.RecId);
+            METSalesTable metSalesTable = salesLine.salesTable().metSalesTable();
+            METOriginalInvoice originalInvoice = metSalesTable.OriginalInvoice;
+            if (!originalInvoice)
+            {
+                return;
+            }
+            SalesTable salesTableOriginal = metSalesTable.findOriginalSalesTableForReturn();
+
+            while select custInvoiceTrans
+                order by custInvoiceTrans.InvoiceId desc
+                where custInvoiceTrans.SalesId == salesTableOriginal.SalesId
+                && custInvoiceTrans.ItemId == salesLine.ItemId
+            join markupTransOrig
+                where markupTransOrig.TransTableId == custInvoiceTrans.TableId
+                && markupTransOrig.TransRecId == custInvoiceTrans.RecId
+            {
+                METReturnOrderCopyChargesHelper::createMarkupTrans(markupTransOrig, salesLine.TableId, salesLine.RecId);
+            }
         }
     }
 
@@ -127,20 +154,25 @@ public class METReturnOrderCopyChargesHelper
     /// Create price components for the specified sales line.
     /// </summary>
     /// <param name = "_metSalesLine">The METSalesLine.</param>
+    /// <param name = "_salesLine">The SalesLine.</param>
     public static void createPriceComponentsByLine(METSalesLine _metSalesLine, SalesLine _salesLine = null)
     {
         CustInvoiceTrans    custInvoiceTrans;
         SalesLine           salesLine, salesLineOrig;
 
         salesLine = _salesLine ? _salesLine : _metSalesLine.salesLine();
+        int salesLineCurrencyDecimal = Currency::decimals(salesLine.CurrencyCode);
 
         if (_metSalesLine.InvoiceNumber && _metSalesLine.InvoiceLineNumber)
         {
+            SalesTable salesTableOriginal = _metSalesLine.findOriginalSalesTableForReturn(salesLine);
+
             // Copy the original SO line price components to charge only SO lines
             while select salesLineOrig
             join SalesId, ItemId from custInvoiceTrans
+                order by custInvoiceTrans.InvoiceId desc
                 where custInvoiceTrans.InventTransId == salesLineOrig.InventTransId
-                && custInvoiceTrans.InvoiceId == _metSalesLine.InvoiceNumber
+                && custInvoiceTrans.SalesId == salesTableOriginal.SalesId
                 && custInvoiceTrans.LineNum == _metSalesLine.InvoiceLineNumber
             {
                 METSalesLinePriceComponent          salesLinePriceComponentOrig, salesLinePriceComponent;
@@ -148,11 +180,17 @@ public class METReturnOrderCopyChargesHelper
 
                 real convFactor = 1;
 
-                delete_from salesLinePriceComponent
-                        where salesLinePriceComponent.InventTransId == salesLine.InventTransId;
+                while select forupdate salesLinePriceComponent
+                    where salesLinePriceComponent.InventTransId == salesLine.InventTransId
+                {
+                    salesLinePriceComponent.delete();
+                }
 
-                delete_from salesLinePriceComponentDetail
-                        where salesLinePriceComponentDetail.InventTransId == salesLine.InventTransId;
+                while select forupdate salesLinePriceComponentDetail
+                    where salesLinePriceComponentDetail.InventTransId == salesLine.InventTransId
+                {
+                    salesLinePriceComponentDetail.delete();
+                }
 
                 while select salesLinePriceComponentOrig
                     where salesLinePriceComponentOrig.InventTransId == salesLineOrig.InventTransId
@@ -161,7 +199,7 @@ public class METReturnOrderCopyChargesHelper
                     salesLinePriceComponent = salesLinePriceComponent.data(salesLinePriceComponentOrig);
                     salesLinePriceComponent.value = salesLinePriceComponent.Value * -1;
 
-                    if(salesLine.SalesUnit != salesLineOrig.SalesUnit)
+                    if(!salesLine.pdsCWUnitId() && salesLine.SalesUnit != salesLineOrig.SalesUnit)
                     {
                         convFactor = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(salesLine.itemId,
                                                                             salesLine.InventDimId,
@@ -170,7 +208,7 @@ public class METReturnOrderCopyChargesHelper
                                                                             salesLine.SalesUnit,
                                                                             NoYes::Yes);
 
-                        salesLinePriceComponent.Value = convFactor ? salesLinePriceComponent.Value / convFactor : salesLinePriceComponent.Value;
+                        salesLinePriceComponent.Value = convFactor ? round(salesLinePriceComponent.Value / convFactor, salesLineCurrencyDecimal) : salesLinePriceComponent.Value;
                     }
 
                     salesLinePriceComponent.RecId           = 0;
@@ -186,8 +224,8 @@ public class METReturnOrderCopyChargesHelper
                     salesLinePriceComponentDetail               = salesLinePriceComponentDetail.data(salesLinePriceComponentDetailOrig);
                     salesLinePriceComponentDetail.RecId         = 0;
                     salesLinePriceComponentDetail.InventTransId = salesLine.InventTransId;
-                    salesLinePriceComponentDetail.Value = -1*(salesLinePriceComponentDetail.Value / convFactor);
-                    salesLinePriceComponentDetail.VendorValue = salesLinePriceComponentDetail.VendorValue / convFactor;
+                    salesLinePriceComponentDetail.Value = convFactor ? -1*round((salesLinePriceComponentDetail.Value / convFactor),salesLineCurrencyDecimal) : -1*salesLinePriceComponentDetail.Value;
+                    salesLinePriceComponentDetail.VendorValue = convFactor ? round(salesLinePriceComponentDetail.VendorValue / convFactor, salesLineCurrencyDecimal) : salesLinePriceComponentDetail.VendorValue;
 
                     salesLinePriceComponentDetail.insert();
                 }
@@ -220,7 +258,6 @@ public class METReturnOrderCopyChargesHelper
 
             METSalesLinePriceComponent          salesLinePriceComponentOrig, salesLinePriceComponent;
             METSalesLinePriceComponentDetail    salesLinePriceComponentDetailOrig, salesLinePriceComponentDetail;
-            int                                 salesLineCurrencyDecimal = Currency::decimals(salesLine.CurrencyCode);
 
             real convFactor = 1;
 
@@ -236,7 +273,7 @@ public class METReturnOrderCopyChargesHelper
                 salesLinePriceComponentDetail.delete();
             }
 
-            if (salesLine.SalesUnit != salesLineOrig.SalesUnit)
+            if (!salesLine.pdsCWUnitId() && salesLine.SalesUnit != salesLineOrig.SalesUnit)
             {
                 convFactor = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(salesLine.itemId,
                                                                     salesLine.InventDimId,
@@ -253,12 +290,9 @@ public class METReturnOrderCopyChargesHelper
                 salesLinePriceComponent = salesLinePriceComponent.data(salesLinePriceComponentOrig);
                 salesLinePriceComponent.Value = salesLinePriceComponent.Value * -1;
 
-                if (salesLine.SalesUnit != salesLineOrig.SalesUnit)
-                {
-                    salesLinePriceComponent.Value = convFactor ? 
+                salesLinePriceComponent.Value = convFactor ?
                         round(salesLinePriceComponent.Value / convFactor, salesLineCurrencyDecimal) :
                         salesLinePriceComponent.Value;
-                }
 
                 salesLinePriceComponent.RecId           = 0;
                 salesLinePriceComponent.InventTransId   = salesLine.InventTransId;
@@ -273,16 +307,8 @@ public class METReturnOrderCopyChargesHelper
                 salesLinePriceComponentDetail = salesLinePriceComponentDetail.data(salesLinePriceComponentDetailOrig);
                 salesLinePriceComponentDetail.InventTransId = salesLine.InventTransId;
 
-                if (salesLine.SalesUnit != salesLineOrig.SalesUnit)
-                {
-                    salesLinePriceComponentDetail.Value       = -1 * round((salesLinePriceComponentDetailOrig.Value / convFactor), salesLineCurrencyDecimal);
-                    salesLinePriceComponentDetail.VendorValue = round(salesLinePriceComponentDetailOrig.VendorValue / convFactor, salesLineCurrencyDecimal);
-                }
-                else
-                {
-                    salesLinePriceComponentDetail.Value       = -1 * salesLinePriceComponentDetailOrig.Value;
-                    salesLinePriceComponentDetail.VendorValue = salesLinePriceComponentDetailOrig.VendorValue;
-                }
+                salesLinePriceComponentDetail.Value       = convFactor ? -1 * round((salesLinePriceComponentDetailOrig.Value / convFactor), salesLineCurrencyDecimal) : -1*salesLinePriceComponentDetailOrig.Value;
+                salesLinePriceComponentDetail.VendorValue = convFactor ? round(salesLinePriceComponentDetailOrig.VendorValue / convFactor, salesLineCurrencyDecimal) : salesLinePriceComponentDetailOrig.VendorValue;
 
                 salesLinePriceComponentDetail.insert();
             }
@@ -298,22 +324,72 @@ public class METReturnOrderCopyChargesHelper
     /// Update sales line prices for the specified METSalesLine based on the original invoice line.
     /// </summary>
     /// <param name = "_metSalesLine">The METSalesLine.</param>
-    public static void updateSalesLinePrices(METSalesLine _metSalesLine)
+    /// <param name = "_salesLine">The SalesLine.</param>
+    public static void updateSalesLinePrices(METSalesLine _metSalesLine, SalesLine _salesLine = null)
     {
         CustInvoiceTrans    custInvoiceTrans;
         SalesLine           salesLine, salesLineOrig;
 
         ttsbegin;
-        salesLine = _metSalesLine.salesLine(true);
+        salesLine = _salesLine ? _salesLine : _metSalesLine.salesLine();
+        salesLine.selectForUpdate(true);
 
-        while select salesLineOrig
+        int salesLineCurrencyDecimal = Currency::decimals(salesLine.CurrencyCode);
+
+        if (_metSalesLine.InvoiceNumber && _metSalesLine.InvoiceLineNumber)
+        {
+            SalesTable salesTableOriginal = _metSalesLine.findOriginalSalesTableForReturn(salesLine);
+
+            while select salesLineOrig
             join SalesId, ItemId from custInvoiceTrans
                 where custInvoiceTrans.InventTransId == salesLineOrig.InventTransId
-                && custInvoiceTrans.InvoiceId == _metSalesLine.InvoiceNumber
+                && custInvoiceTrans.SalesId == salesTableOriginal.SalesId
                 && custInvoiceTrans.LineNum == _metSalesLine.InvoiceLineNumber
+            {
+                real convFactor = 1;
+                if(!salesLine.pdsCWUnitId() && salesLine.SalesUnit != salesLineOrig.SalesUnit)
+                {
+                    convFactor = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(salesLine.itemId,
+                                                                            salesLine.InventDimId,
+                                                                            1,
+                                                                            salesLineOrig.SalesUnit,
+                                                                            salesLine.SalesUnit,
+                                                                            NoYes::Yes);
+                }
+                salesLine.SalesPrice = convFactor ? round(salesLineOrig.SalesPrice / convFactor, salesLineCurrencyDecimal) : salesLineOrig.SalesPrice;
+                salesLine.LineDisc = convFactor ? round(salesLineOrig.LineDisc / convFactor, salesLineCurrencyDecimal) : salesLineOrig.LineDisc;
+                salesLine.LineAmount = salesLine.calcLineAmount();
+                salesLine.update();
+            }
+           
+        }
+        else
         {
+            METSalesTable metSalesTable = salesLine.salesTable().metSalesTable();
+            METOriginalInvoice originalInvoice = metSalesTable.OriginalInvoice;
+
+            if (!originalInvoice)
+            {
+                return;
+            }
+
+            SalesTable salesTableOriginal = metSalesTable.findOriginalSalesTableForReturn();
+
+            // Copy the original SO line price components to charge only SO lines
+            select firstonly custInvoiceTrans
+                order by custInvoiceTrans.InvoiceId desc
+                where custInvoiceTrans.SalesId == salesTableOriginal.SalesId
+                   && custInvoiceTrans.ItemId == salesLine.ItemId;
+
+            if (!custInvoiceTrans.RecId)
+            {
+                return;
+            }
+
+            salesLineOrig = SalesLine::findInventTransId(custInvoiceTrans.InventTransId);
+
             real convFactor = 1;
-            if(salesLine.SalesUnit != salesLineOrig.SalesUnit)
+            if(!salesLine.pdsCWUnitId() && salesLine.SalesUnit != salesLineOrig.SalesUnit)
             {
                 convFactor = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(salesLine.itemId,
                                                                             salesLine.InventDimId,
@@ -322,11 +398,12 @@ public class METReturnOrderCopyChargesHelper
                                                                             salesLine.SalesUnit,
                                                                             NoYes::Yes);
             }
-            salesLine.SalesPrice = convFactor ? salesLineOrig.SalesPrice / convFactor : salesLineOrig.SalesPrice;
-            salesLine.LineDisc = convFactor ? salesLineOrig.LineDisc / convFactor : salesLineOrig.LineDisc;
+            salesLine.SalesPrice = convFactor ? round(salesLineOrig.SalesPrice / convFactor, salesLineCurrencyDecimal) : salesLineOrig.SalesPrice;
+            salesLine.LineDisc = convFactor ? round(salesLineOrig.LineDisc / convFactor, salesLineCurrencyDecimal) : salesLineOrig.LineDisc;
             salesLine.LineAmount = salesLine.calcLineAmount();
             salesLine.update();
         }
+
         ttscommit;
     }
 
