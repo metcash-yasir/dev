@@ -25,14 +25,16 @@ public class METOrderExtractScreen extends FormRun
     //Bug 229712 CB628 - Update status in extraction screen got refresh issue -start
     #SysSystemDefinedButtons
     FormCommandButtonControl            editbutton;
+	//Bug 229712 CB628 - Update status in extraction screen got refresh issue -end
+
+    Map metricsCacheMap;
+
 }
 ]]></Source>
 			</Method>
 			<Method>
 				<Name>getMap</Name>
 				<Source><![CDATA[
-	//Bug 229712 CB628 - Update status in extraction screen got refresh issue -end
-
     /// <summary>
     /// This is a getter and setter method
     /// </summary>
@@ -66,6 +68,10 @@ public class METOrderExtractScreen extends FormRun
     /// </summary>
     public void populateOrders()
     {
+        METProcMetrics procMetrics = METProcMetricsScope::current();
+
+        metricsCacheMap = new Map(Types::Int64, Types::Container);
+
         delete_from METOrderExtractScreenTmpDS;
 
         if (this.args().parmObject() == null)
@@ -78,8 +84,9 @@ public class METOrderExtractScreen extends FormRun
         }
 
         metOrderExtractScreenParameters.loadLastValue(formStr(METOrderExtractScreen));
-    
+
         metOrderExtractScreenProcessor = METOrderExtractScreenProcessor::construct(METOrderExtractScreenTmpDS, metOrderExtractScreenParameters);
+
         //CS - CB173_SalesOrderExtract - PS
         if (metOrderExtractScreenProcessor)
         {
@@ -88,7 +95,7 @@ public class METOrderExtractScreen extends FormRun
             METOrderExtractScreenTmpDS.linkPhysicalTableInstance(metOrderExtractScreenTmp);
             container   con = metOrderExtractScreenProcessor.parmCon();
             metOrderExtractScreenProcessor.parmMETOrderExtractScreenTmp(metOrderExtractScreenTmp);
-            
+        
             //Bug 229712 CB628 - Update status in extraction screen got refresh issue -start
             if (conLen(con) > 0)
             {
@@ -109,6 +116,38 @@ public class METOrderExtractScreen extends FormRun
         totalPallets = metOrderExtractScreenProcessor.parmTotalpallets();
 
         SalesTable_ds.executeQuery();
+
+        if (procMetrics)
+        {
+            procMetrics.setDescription2(strFmt('Extract parameters - Route: %1, Site: %2, Warehouse: %3 From: %4, To: %5, Extracted: %6, Split group: %7 Order type: %8 Cust account: %9 Credit: %10',
+            metOrderExtractScreenParameters.parmRoute(),
+            metOrderExtractScreenParameters.parmSite(),
+            metOrderExtractScreenParameters.parmWarehouse(),
+            metOrderExtractScreenParameters.parmShippingDateConfirmFrom(),
+            metOrderExtractScreenParameters.parmShippingDateConfirmTo(),
+            metOrderExtractScreenParameters.parmExtracted(),
+            metOrderExtractScreenParameters.parmOrderSplitGroup(),
+            metOrderExtractScreenParameters.parmOrderType(),
+            metOrderExtractScreenParameters.parmCustAccount(),
+            metOrderExtractScreenParameters.parmCredManagement()));
+
+            select count(RecId) from metOrderExtractScreenTmp;
+
+            procMetrics.setTotalCount(metOrderExtractScreenTmp.RecId);
+            procMetrics.beginTrace('Populate orders - Sales order extract screen');
+
+            SalesLine salesLineLoc;
+            METSalesLine metSalesLineLoc;
+
+            select count(RecId) from salesLineLoc
+                join RecId from metSalesLineLoc
+                    where metSalesLineLoc.SalesLine == salesLineLoc.RecId
+                    && metSalesLineLoc.OrderExtractStatus != METOrderExtractStatus::Extracted
+                join metOrderExtractScreenTmp
+                    where salesLineLoc.SalesId == metOrderExtractScreenTmp.SalesId;
+
+            procMetrics.incLineCount(salesLineLoc.RecId);
+        }
     }
 
 ]]></Source>
@@ -121,7 +160,14 @@ public class METOrderExtractScreen extends FormRun
     /// </summary>
     private void refresh()
     {
-        element.populateOrders();
+        METProcMetrics  procMetrics = METProcMetrics::construct(METBatchLogOperation::SalesOrderExtractScreen);
+
+        using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
+        {
+            element.populateOrders();
+
+            procMetrics.endTrace();
+        }
     }
 
 ]]></Source>
@@ -162,7 +208,313 @@ public class METOrderExtractScreen extends FormRun
         editbutton  = this.control(this.controlId(#SystemDefinedViewEditButton)) as FormCommandButtonControl;
         editbutton.enabled(false);
         //Bug 229712 CB628 - Update status in extraction screen got refresh issue -end
+    }
 
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcMetrics</Name>
+				<Source><![CDATA[
+    public container calcMetrics(METOrderExtractScreenTmp _rec)
+    {
+        if (metricsCacheMap.exists(_rec.RecId))
+        {
+            return metricsCacheMap.lookup(_rec.RecId);
+        }
+
+        SalesLine               salesLineLoc;
+        METSalesLine            metSalesLineLoc;
+        InventDim               lineInventDim;
+        InventDim               prevLineInventDim;
+        InventItemSalesSetup    inventItemSalesSetup;
+        InventDim               inventDimSetup;
+        InventTrans             inventTrans;
+        InventTransOrigin       inventTransOrigin;
+        InventTableModule       inventTableModule;
+        ItemId                  prevItemId;
+        InventDimId             prevInventDimId;
+        UnitOfMeasureSymbol     prevSalesUnit;
+        SalesQty                prevSalesQty;
+        real                    prevSalesUnitWeight;
+        real                    prevSalesUnitVolume;
+        real                    prevCWActualWeight;
+        real                    prevAISWeight;
+        RefRecId                prevIISRecId;
+        UnitOfMeasureSymbol     prevMETSalesUnit;
+        UnitOfMeasureSymbol     prevMETAltSalesUnit;
+        UnitOfMeasureSymbol     prevUnitInvent;
+        METCase                 cases;
+        METBrokenCase           brokenCase;
+        METGrossWeight          orderedWeight;
+        METUOMVolume            orderedVolume;
+        METCase                 actualCases;
+        METBrokenCase           actualBrokenCase;
+        METUOMVolume            actualVolume;
+        METGrossWeight          actualWeight;
+        InventQty               reservedOnOrderQty;
+        InventQty               cummReservPhysical, cummReservOrdered, cummOnOrder;
+        InventTransId           currentInventTransId;
+        boolean                 lineChanged;
+
+        while select SalesQty, SalesUnit, ItemId, InventDimId, RecId, InventTransId from salesLineLoc
+        order by salesLineLoc.InventTransId asc
+            where salesLineLoc.SalesId     == _rec.SalesId
+                && salesLineLoc.SalesStatus == SalesStatus::Backorder
+        join lineInventDim
+            where lineInventDim.inventDimId == salesLineLoc.InventDimId
+        join SalesUnitWeight, SalesUnitVolume, CWActualWeight, AISWeight, RecId from metSalesLineLoc
+            where metSalesLineLoc.SalesLine          == salesLineLoc.RecId
+                && metSalesLineLoc.OrderExtractStatus != METOrderExtractStatus::Extracted
+        outer join UnitId, RecId from inventTableModule
+            where inventTableModule.ItemId     == salesLineLoc.ItemId
+                && inventTableModule.ModuleType == ModuleInventPurchSales::Invent
+        outer join RecId, METSalesUnit, METAltSalesUnit from inventItemSalesSetup
+            where inventItemSalesSetup.ItemId == salesLineLoc.ItemId
+        outer join RecId from inventTransOrigin
+            where inventTransOrigin.InventTransId     == salesLineLoc.InventTransId
+                && inventTransOrigin.ReferenceCategory == InventTransType::Sales
+        outer join Qty, StatusIssue from inventTrans
+            where inventTrans.InventTransOrigin == inventTransOrigin.RecId
+                && (inventTrans.StatusIssue == StatusIssue::ReservPhysical
+                    || inventTrans.StatusIssue == StatusIssue::ReservOrdered
+                    || inventTrans.StatusIssue == StatusIssue::OnOrder)
+        exists join inventDimSetup
+            where inventDimSetup.InventDimId  == inventItemSalesSetup.InventDimId
+                && inventDimSetup.InventSiteId == lineInventDim.InventSiteId
+        {
+            if (currentInventTransId && currentInventTransId != salesLineLoc.InventTransId)
+            {
+                lineChanged = true;
+            }
+
+            if (lineChanged)
+            {
+                boolean prevIsCaseType   = prevIISRecId
+                                    && prevMETSalesUnit    == prevSalesUnit
+                                    && prevMETAltSalesUnit != prevSalesUnit;
+
+                boolean prevIsBrokenType = prevIISRecId
+                                    && prevMETSalesUnit    != prevSalesUnit
+                                    && prevMETAltSalesUnit == prevSalesUnit;
+
+                if (prevIsCaseType)
+                {
+                    cases += prevSalesQty;
+
+                    InventQty totalQty = abs(cummReservPhysical + cummReservOrdered + cummOnOrder);
+
+                    if (totalQty != 0)
+                    {
+                        METCase totalQtyInSalesUnit = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+                        prevItemId,
+                        prevInventDimId,
+                        totalQty,
+                        prevUnitInvent,
+                        prevSalesUnit,
+                        NoYes::No,
+                        NoYes::No);
+
+                        actualCases  += totalQtyInSalesUnit;
+                        actualVolume += METWHSPhysDimUOMSite::convertVolume(prevItemId, totalQtyInSalesUnit, prevSalesUnit, prevLineInventDim);
+
+                        if (prevCWActualWeight == 0 && prevAISWeight == 0)
+                        {
+                            actualWeight += METWHSPhysDimUOMSite::convertWeight(prevItemId, totalQtyInSalesUnit, prevSalesUnit, prevLineInventDim);
+                        }
+                    }
+
+                    if (prevCWActualWeight != 0)
+                    {
+                        actualWeight += prevCWActualWeight;
+                    }
+                    else if (prevAISWeight != 0)
+                    {
+                        actualWeight += prevAISWeight;
+                    }
+                }
+                else if (prevIsBrokenType)
+                {
+                    brokenCase += prevSalesQty;
+
+                    InventQty reservedQty = abs(cummReservPhysical + cummReservOrdered);
+                    reservedOnOrderQty = reservedQty > 0 ? reservedQty : abs(cummOnOrder);
+
+                    InventQty totalQtyAllStatuses = abs(cummReservPhysical + cummReservOrdered + cummOnOrder);
+
+                    if (reservedOnOrderQty != 0)
+                    {
+                        METBrokenCase reservedOnOrderQtyInSalesUnit = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+                        prevItemId,
+                        prevInventDimId,
+                        reservedOnOrderQty,
+                        prevUnitInvent,
+                        prevMETSalesUnit,
+                        NoYes::No,
+                        NoYes::No);
+
+                        actualBrokenCase += reservedOnOrderQty - reservedOnOrderQtyInSalesUnit;
+                    }
+
+                    if (totalQtyAllStatuses != 0)
+                    {
+                        actualVolume += METWHSPhysDimUOMSite::convertVolume(prevItemId, totalQtyAllStatuses, prevUnitInvent, prevLineInventDim);
+
+                        if (prevCWActualWeight == 0 && prevAISWeight == 0)
+                        {
+                            actualWeight += METWHSPhysDimUOMSite::convertWeight(prevItemId, totalQtyAllStatuses, prevUnitInvent, prevLineInventDim);
+                        }
+                    }
+
+                    if (prevCWActualWeight != 0)
+                    {
+                        actualWeight += prevCWActualWeight;
+                    }
+                    else if (prevAISWeight != 0)
+                    {
+                        actualWeight += prevAISWeight;
+                    }
+                }
+
+                orderedWeight += prevSalesQty * prevSalesUnitWeight;
+                orderedVolume += prevSalesQty * prevSalesUnitVolume;
+
+                cummReservPhysical = 0;
+                cummReservOrdered  = 0;
+                cummOnOrder        = 0;
+                lineChanged        = false;
+            }
+
+            if (inventTrans.RecId)
+            {
+                if (inventTrans.StatusIssue == StatusIssue::ReservPhysical)
+                {
+                    cummReservPhysical += inventTrans.Qty;
+                }
+                else if (inventTrans.StatusIssue == StatusIssue::ReservOrdered)
+                {
+                    cummReservOrdered  += inventTrans.Qty;
+                }
+                else if (inventTrans.StatusIssue == StatusIssue::OnOrder)
+                {
+                    cummOnOrder        += inventTrans.Qty;
+                }
+            }
+
+            currentInventTransId = salesLineLoc.InventTransId;
+            prevItemId           = salesLineLoc.ItemId;
+            prevInventDimId      = salesLineLoc.InventDimId;
+            prevSalesUnit        = salesLineLoc.SalesUnit;
+            prevSalesQty         = salesLineLoc.SalesQty;
+            prevSalesUnitWeight  = metSalesLineLoc.SalesUnitWeight;
+            prevSalesUnitVolume  = metSalesLineLoc.SalesUnitVolume;
+            prevCWActualWeight   = metSalesLineLoc.CWActualWeight;
+            prevAISWeight        = metSalesLineLoc.AISWeight;
+            prevIISRecId         = inventItemSalesSetup.RecId;
+            prevMETSalesUnit     = inventItemSalesSetup.METSalesUnit;
+            prevMETAltSalesUnit  = inventItemSalesSetup.METAltSalesUnit;
+            prevUnitInvent       = inventTableModule.UnitId;
+            prevLineInventDim.data(lineInventDim);
+        }
+
+        // Process last line
+        if (prevItemId)
+        {
+            boolean prevIsCaseType   = prevIISRecId
+                                && prevMETSalesUnit    == prevSalesUnit
+                                && prevMETAltSalesUnit != prevSalesUnit;
+
+            boolean prevIsBrokenType = prevIISRecId
+                                && prevMETSalesUnit    != prevSalesUnit
+                                && prevMETAltSalesUnit == prevSalesUnit;
+
+            if (prevIsCaseType)
+            {
+                cases += prevSalesQty;
+
+                InventQty totalQty = abs(cummReservPhysical + cummReservOrdered + cummOnOrder);
+
+                if (totalQty != 0)
+                {
+                    METCase actualCasesInSalesUnit = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+                    prevItemId,
+                    prevInventDimId,
+                    totalQty,
+                    prevUnitInvent,
+                    prevSalesUnit,
+                    NoYes::No,
+                    NoYes::No);
+
+                    actualCases  += actualCasesInSalesUnit;
+                    actualVolume += METWHSPhysDimUOMSite::convertVolume(prevItemId, actualCasesInSalesUnit, prevSalesUnit, prevLineInventDim);
+
+                    if (prevCWActualWeight == 0 && prevAISWeight == 0)
+                    {
+                        actualWeight += METWHSPhysDimUOMSite::convertWeight(prevItemId, actualCasesInSalesUnit, prevSalesUnit, prevLineInventDim);
+                    }
+                }
+
+                if (prevCWActualWeight != 0)
+                {
+                    actualWeight += prevCWActualWeight;
+                }
+                else if (prevAISWeight != 0)
+                {
+                    actualWeight += prevAISWeight;
+                }
+            }
+            else if (prevIsBrokenType)
+            {
+                brokenCase += prevSalesQty;
+
+                InventQty reservedQty = abs(cummReservPhysical + cummReservOrdered);
+                reservedOnOrderQty = reservedQty > 0 ? reservedQty : abs(cummOnOrder);
+
+                InventQty totalQtyAllStatuses = abs(cummReservPhysical + cummReservOrdered + cummOnOrder);
+
+                if (reservedOnOrderQty != 0)
+                {
+                    METBrokenCase reservedOnOrderQtyInSalesUnit = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+                    prevItemId,
+                    prevInventDimId,
+                    reservedOnOrderQty,
+                    prevUnitInvent,
+                    prevMETSalesUnit,
+                    NoYes::No,
+                    NoYes::No);
+
+                    actualBrokenCase += reservedOnOrderQty - reservedOnOrderQtyInSalesUnit;
+                }
+
+                if (totalQtyAllStatuses != 0)
+                {
+                    actualVolume += METWHSPhysDimUOMSite::convertVolume(prevItemId, totalQtyAllStatuses, prevUnitInvent, prevLineInventDim);
+
+                    if (prevCWActualWeight == 0 && prevAISWeight == 0)
+                    {
+                        actualWeight += METWHSPhysDimUOMSite::convertWeight(prevItemId, totalQtyAllStatuses, prevUnitInvent, prevLineInventDim);
+                    }
+                }
+
+                if (prevCWActualWeight != 0)
+                {
+                    actualWeight += prevCWActualWeight;
+                }
+                else if (prevAISWeight != 0)
+                {
+                    actualWeight += prevAISWeight;
+                }
+            }
+
+            orderedWeight += prevSalesQty * prevSalesUnitWeight;
+            orderedVolume += prevSalesQty * prevSalesUnitVolume;
+        }
+
+        // Positions: 1=Cases 2=BrokenCase 3=OrderedWeight 4=OrderedVolume
+        //            5=ActualCases 6=ActualBrokenCase 7=ActualVolume 8=ActualWeight
+        container result = [cases, brokenCase, orderedWeight, orderedVolume,
+                        actualCases, actualBrokenCase, actualVolume, actualWeight];
+        metricsCacheMap.insert(_rec.RecId, result);
+        return result;
     }
 
 ]]></Source>
@@ -457,6 +809,94 @@ public class METOrderExtractScreen extends FormRun
 
 ]]></Source>
 					</Method>
+					<Method>
+						<Name>displayMETCases</Name>
+						<Source><![CDATA[
+        [SysClientCacheDataMethodAttribute(true)]
+        public display METCase displayMETCases()
+        {
+            return conPeek(element.calcMetrics(this.cursor()), 1);
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>displayMETBrokenCase</Name>
+						<Source><![CDATA[
+        [SysClientCacheDataMethodAttribute(true)]
+        public display METBrokenCase displayMETBrokenCase()
+        {
+            return conPeek(element.calcMetrics(this.cursor()), 2);
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>displayMETOrderedWeight</Name>
+						<Source><![CDATA[
+        [SysClientCacheDataMethodAttribute(true)]
+        public display METGrossWeight displayMETOrderedWeight()
+        {
+            return conPeek(element.calcMetrics(this.cursor()), 3);
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>displayMETOrderedVolume</Name>
+						<Source><![CDATA[
+        [SysClientCacheDataMethodAttribute(true)]
+        public display METUOMVolume displayMETOrderedVolume()
+        {
+            return conPeek(element.calcMetrics(this.cursor()), 4);
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>displayMETActualCases</Name>
+						<Source><![CDATA[
+        [SysClientCacheDataMethodAttribute(true)]
+        public display METCase displayMETActualCases()
+        {
+            return conPeek(element.calcMetrics(this.cursor()), 5);
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>displayMETActualBrokenCase</Name>
+						<Source><![CDATA[
+        [SysClientCacheDataMethodAttribute(true)]
+        public display METBrokenCase displayMETActualBrokenCase()
+        {
+            return conPeek(element.calcMetrics(this.cursor()), 6);
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>displayMETActualUnitVolume</Name>
+						<Source><![CDATA[
+        [SysClientCacheDataMethodAttribute(true)]
+        public display METUOMVolume displayMETActualUnitVolume()
+        {
+            return conPeek(element.calcMetrics(this.cursor()), 7);
+        }
+
+]]></Source>
+					</Method>
+					<Method>
+						<Name>displayMETActualWeight</Name>
+						<Source><![CDATA[
+        [SysClientCacheDataMethodAttribute(true)]
+        public display METGrossWeight displayMETActualWeight()
+        {
+            return conPeek(element.calcMetrics(this.cursor()), 8);
+        }
+
+]]></Source>
+					</Method>
 				</Methods>
 				<Fields />
 			</DataSource>
@@ -613,8 +1053,8 @@ public class METOrderExtractScreen extends FormRun
             METCase         cases, actualCases;
             METBrokenCase   brokenCase, actBrokenCases;
             SalesId         salesIdLoc;
-            Volume          soPallet, estimatedPallet;           
-
+            Volume          soPallet, estimatedPallet;   
+        
             MapEnumerator mapEnumerator = paMarked.getEnumerator();
             totalPal    = 0;
             estTotalPal = 0;
@@ -912,7 +1352,7 @@ public class METOrderExtractScreen extends FormRun
             List            salesTableList = new List(Types::Int64);
             utcdatetime      startTime = DateTimeUtil::getSystemDateTime();
             utcdatetime      endTime;
-            
+
 
             //Build the list of sales order to be updated based upon pre-checks.
             while (mapEnumerator.moveNext())
@@ -2610,7 +3050,7 @@ public class METOrderExtractScreen extends FormRun
 						<FormControlExtension
 							i:nil="true" />
 						<CacheDataMethod>Yes</CacheDataMethod>
-						<DataMethod>METBrokenCase</DataMethod>
+						<DataMethod>displayMETBrokenCase</DataMethod>
 						<DataSource>METOrderExtractScreenTmpDS</DataSource>
 						<Label>@MET:OrderedBrokenCase</Label>
 					</AxFormControl>
@@ -2621,7 +3061,7 @@ public class METOrderExtractScreen extends FormRun
 						<FormControlExtension
 							i:nil="true" />
 						<CacheDataMethod>Yes</CacheDataMethod>
-						<DataMethod>METCases</DataMethod>
+						<DataMethod>displayMETCases</DataMethod>
 						<DataSource>METOrderExtractScreenTmpDS</DataSource>
 						<Label>@MET:OrderedCase</Label>
 					</AxFormControl>
@@ -2632,7 +3072,7 @@ public class METOrderExtractScreen extends FormRun
 						<FormControlExtension
 							i:nil="true" />
 						<CacheDataMethod>Yes</CacheDataMethod>
-						<DataMethod>METOrderedWeight</DataMethod>
+						<DataMethod>displayMETOrderedWeight</DataMethod>
 						<DataSource>METOrderExtractScreenTmpDS</DataSource>
 						<Label>@MET:Orderedweight</Label>
 					</AxFormControl>
@@ -2643,7 +3083,7 @@ public class METOrderExtractScreen extends FormRun
 						<FormControlExtension
 							i:nil="true" />
 						<CacheDataMethod>Yes</CacheDataMethod>
-						<DataMethod>METOrderedVolume</DataMethod>
+						<DataMethod>displayMETOrderedVolume</DataMethod>
 						<DataSource>METOrderExtractScreenTmpDS</DataSource>
 						<Label>@MET:OrderedVolume</Label>
 					</AxFormControl>
@@ -2768,7 +3208,7 @@ public class METOrderExtractScreen extends FormRun
 						<FormControlExtension
 							i:nil="true" />
 						<CacheDataMethod>Yes</CacheDataMethod>
-						<DataMethod>METActualBrokenCase</DataMethod>
+						<DataMethod>displayMETActualBrokenCase</DataMethod>
 						<DataSource>METOrderExtractScreenTmpDS</DataSource>
 						<Label>@MET:EstimatedActualBrokenCase</Label>
 					</AxFormControl>
@@ -2779,7 +3219,7 @@ public class METOrderExtractScreen extends FormRun
 						<FormControlExtension
 							i:nil="true" />
 						<CacheDataMethod>Yes</CacheDataMethod>
-						<DataMethod>METActualCases</DataMethod>
+						<DataMethod>displayMETActualCases</DataMethod>
 						<DataSource>METOrderExtractScreenTmpDS</DataSource>
 						<Label>@MET:EstimatedActualCases</Label>
 					</AxFormControl>
@@ -2790,7 +3230,7 @@ public class METOrderExtractScreen extends FormRun
 						<FormControlExtension
 							i:nil="true" />
 						<CacheDataMethod>Yes</CacheDataMethod>
-						<DataMethod>METActualUnitVolume</DataMethod>
+						<DataMethod>displayMETActualUnitVolume</DataMethod>
 						<DataSource>METOrderExtractScreenTmpDS</DataSource>
 						<Label>@MET:EstimatedActualVolume</Label>
 					</AxFormControl>
@@ -2801,7 +3241,7 @@ public class METOrderExtractScreen extends FormRun
 						<FormControlExtension
 							i:nil="true" />
 						<CacheDataMethod>Yes</CacheDataMethod>
-						<DataMethod>METActualWeight</DataMethod>
+						<DataMethod>displayMETActualWeight</DataMethod>
 						<DataSource>METOrderExtractScreenTmpDS</DataSource>
 						<Label>@MET:EstimatedActualWeight</Label>
 					</AxFormControl>
