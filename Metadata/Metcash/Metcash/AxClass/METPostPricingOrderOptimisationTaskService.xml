@@ -61,7 +61,7 @@ class METPostPricingOrderOptimisationTaskService extends METSysOperationTaskServ
                         // execute optimisation processes after PE pricing update in FO                        
                         success = this.execute(salesTable, metSalesTable);                                         
                         ttscommit;
-                        info(strFmt('execute - after ttscommit %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));                      
+                        //info(strFmt('execute - after ttscommit %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));                      
                         
                         // update sales order processing status if credit management account status is active.
                         ttsbegin;
@@ -70,15 +70,17 @@ class METPostPricingOrderOptimisationTaskService extends METSysOperationTaskServ
                             // Bug 344903: [MS-MET] PERF - Ops-Sell-Post pricing order optimisation - slow performance
                             // Credit check must be done after optimisation, not before
                             // Trigger proforma confirmation - credit check
-                            METSalesTable::runCustomCreditCheckForSalesOrder(salesTable, false);
-                            info(strFmt('After runCustomCreditCheckForSalesOrder %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
+                            // The below process has been moved to CreditCheckForListOfSalesorders method
+                            //METSalesTable::runCustomCreditCheckForSalesOrder(salesTable, false);
+                            this.creditCheckForListOfSalesrders(salesTable);
+                            //info(strFmt('After runCustomCreditCheckForSalesOrder %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
                             
                             salesTable = SalesTable::find(this.salesId);
                             metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId, true);
 
                             this.updateSalesOrderProcessingStatus(metSalesTable, salesTable);
 
-                            info(strFmt('after updateSalesOrderProcessingStatus %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
+                            //info(strFmt('after updateSalesOrderProcessingStatus %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
                         }
                         else
                         {
@@ -164,13 +166,13 @@ class METPostPricingOrderOptimisationTaskService extends METSysOperationTaskServ
         boolean success = true;
         Timezone tz = DateTimeUtil::getUserPreferredTimeZone();
         
-        info(strFmt('execute - Begin %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
+        //info(strFmt('execute - Begin %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
         // process pallet rounding
         if (SalesParameters::find().METActivatePalletRounding)
         {
             METSalesTablePalletRoundingProcess palletRoundingProcess = METSalesTablePalletRoundingProcess::construct(_salesTable.salesId);
             success = palletRoundingProcess.run();
-            info(strFmt('execute - after pallet rounding %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
+            //info(strFmt('execute - after pallet rounding %1', DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), tz)));
         }
 
         if (success)
@@ -305,6 +307,114 @@ class METPostPricingOrderOptimisationTaskService extends METSysOperationTaskServ
 
         }
         ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>creditCheckForListOfSalesrders</Name>
+				<Source><![CDATA[
+    protected void creditCheckForListOfSalesrders(SalesTable _salesTable)
+    {
+        boolean credManStatusCheckSetupProf = CredManStatusCheckSetup::exist(CredManHoldType::Credit, CredManDocumentStatusCheck::METCreditCheck, true);;
+        boolean credManStatusCheckSetupPost = CredManStatusCheckSetup::exist(CredManHoldType::Credit, CredManDocumentStatusCheck::METCreditCheck, false);
+        SalesTable salesTableLoc;
+        METSalesTable metSalesTableLoc;
+        CredManTable credManTableLoc;
+        CredManTrans credManTransLoc;
+        SalesLine   salesLineLoc;
+
+
+        if (credManStatusCheckSetupPost == false && credManStatusCheckSetupProf == false)
+        {
+            // if credit management check is not setup for both posting and proforma, then
+            return;
+        }
+
+        salesTableLoc.skipDataMethods(true);
+        salesTableLoc.skipEvents(true);
+        update_recordset salesTableLoc
+            setting METCreditCheckSalesOrder = true
+            where salesTableLoc.RecId == _salesTable.RecId;
+
+        metSalesTableLoc.skipDataMethods(true);
+
+        update_recordset metSalesTableLoc
+            setting CustomCreditCheckExecute = NoYes::Yes
+                where metSalesTableLoc.SalesTable == _salesTable.RecId;
+
+
+        delete_from credManTableLoc
+            where credManTableLoc.SalesId == _salesTable.SalesId;  
+ 
+
+        delete_from credManTransLoc
+            exists join salesLineLoc
+                where credManTransLoc.InventTransId == salesLineLoc.InventTransId
+                    && salesLineLoc.SalesId == _salesTable.SalesId;
+
+        this.performCreditCheck(salesTableLoc.SalesId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>performCreditCheck</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The method takes sales order id as parameter, 
+    /// then build necessary tables for credit check and 
+    /// trigger the credit check process in order to create credit hold if necessary.
+    /// </summary>
+    /// <param name = "_salesId"></param>
+    protected void performCreditCheck(SalesId _salesId)
+    {
+        SalesTable salesTableLoc = SalesTable::find(_salesId);
+        METSalesTable metSalesTable = METSalesTable::findBySalesTable(salesTableLoc.RecId);
+        SalesParmUpdate salesParmUpdate;
+        SalesParmTable salesParmTable;
+        SalesFormletterParmData parmData = SalesFormletterParmData::construct(DocumentStatus::Confirmation);
+        SalesTotals salesTotals;
+
+        // Calculate sales totals
+        salesTotals = SalesTotals::construct(salesTableLoc, SalesUpdate::All, AccountOrder::None);
+        salesTotals.calc();
+
+        //Build sales parm tables
+        ttsbegin;
+        parmData.parmOnlyCreateParmUpdate(true);
+        parmData.createData(false);
+        salesParmUpdate = parmData.parmParmUpdate();
+        salesParmUpdate.Proforma = NoYes::Yes;
+        salesParmUpdate.doupdate();
+
+        salesParmTable.clear();
+        salesParmTable.TransDate                = systemDateGet();
+        salesParmTable.Ordering                 = DocumentStatus::Confirmation;
+        salesParmTable.ParmJobStatus            = ParmJobStatus::Waiting;
+        salesParmTable.salesId                  = salesTableLoc.salesId;
+        salesParmTable.salesName                = salesTableLoc.salesName;
+        salesParmTable.DeliveryName             = salesTableLoc.DeliveryName;
+        salesParmTable.DeliveryPostalAddress    = salesTableLoc.DeliveryPostalAddress;
+        salesParmTable.CustAccount              = salesTableLoc.CustAccount;
+        salesParmTable.CurrencyCode             = salesTableLoc.CurrencyCode;
+        salesParmTable.InvoiceAccount           = salesTableLoc.InvoiceAccount;
+        salesParmTable.ParmId                   = salesParmUpdate.ParmId;
+        salesParmTable.insert();
+        ttscommit;
+
+        // run credit check and create credit hold if necessary.
+        CredManCreditControl  creditControl =  CredManCreditControl::newFromDocumentStatusCheck(CredManDocumentStatusCheck::Confirmation);
+        creditControl.parmSalesTable(salesTableLoc);
+        creditControl.parmReleaseReasonMap(null);
+        creditControl.parmSalesParmTable(salesParmTable);
+        creditControl.parmSalesParmUpdate(salesParmUpdate);
+        creditControl.parmSalesTotals(salesTotals);
+        ttsbegin;
+        creditControl.check();
+        creditControl.createCreditHold();
+        ttscommit;
+
     }
 
 ]]></Source>
