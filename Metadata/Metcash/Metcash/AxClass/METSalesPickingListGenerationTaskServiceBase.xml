@@ -98,6 +98,26 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>getTotalCountOfLinesForSalesOrder</Name>
+				<Source><![CDATA[
+    public int getTotalCountOfLinesForSalesOrder(SalesId _salesId)
+    {
+        SalesLine    salesLine;
+        METSalesLine metSalesLine;
+
+        select count(RecId) from salesLine
+            where salesLine.SalesId == _salesId
+                && salesLine.SalesStatus != SalesStatus::Canceled
+            exists join metSalesLine
+                where metSalesLine.SalesLine == salesLine.RecId
+                    && metSalesLine.OrderExtractStatus != METOrderExtractStatus::Extracted;
+
+        return salesLine.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>process</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -109,8 +129,17 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         #OCCRetryCount
         try
         {
-            useLegacyMode = METCustParameters::Find().SalesExtractionPerfMode;
-            this.processPickingList(_dataContract);
+            METProcMetrics procMetrics = METProcMetrics::construct(METBatchLogOperation::SalesOrderExtractJob);
+            procMetrics.startTrace(1, _dataContract.parmSalesId());
+            procMetrics.incLineCount(this.getTotalCountOfLinesForSalesOrder(_dataContract.parmSalesId()));
+           
+            using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
+            {
+                useLegacyMode = METCustParameters::Find().SalesExtractionPerfMode;
+                this.processPickingList(_dataContract);
+
+                procMetrics.endTrace();
+            }
 
         }
         catch (Exception::Deadlock)
@@ -194,6 +223,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         str         actionToPerform;
         boolean     pickListForOrderedQty = false;
         companyInfo  = CompanyInfo::find();
+        METProcMetrics procMetrics = METProcMetricsScope::current();
 
         this.initParms(_dataContract);
 
@@ -223,14 +253,34 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 // If the supply from transfer option is enabled,
                 // 1. Do not attempt stock reservation on local warehouse.
                 // 2. create TO for the whole sales order quantity from NDC to CSD warehouse.
-                
+
+                if (procMetrics)
+                {
+                    procMetrics.startDescription2Time('Transfer order create');
+                }
+
                 METCrossDockTransferOrderProcessorBase::construct(salesTable).CreateTransferOrder();
+
+                if (procMetrics)
+                {
+                    procMetrics.endDescription2Time();
+                }
 
                 info(strFmt("@MET:TOCreatedForSO", salesTable.SalesId));
             }
             else if (actionToPerform == METConstants::SOExtractReservedSOPickAndTO)
             {
+                if (procMetrics)
+                {
+                    procMetrics.startDescription2Time('Stock reservation');
+                }
+
                 METStockReservation::construct(salesTable).process();
+
+                if (procMetrics)
+                {
+                    procMetrics.endDescription2Time();
+                }
 
                 if (useLegacyMode == NoYes::Yes)
                 {
@@ -241,9 +291,30 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                     this.postPickingListV2(salesTable);
                 }
 
+                if (procMetrics)
+                {
+                    procMetrics.startDescription6Time('Intercompany picking list');
+                }
+
+                //Intercompany picking list. 
                 this.postIntercompanyPickingList();
 
+                if (procMetrics)
+                {
+                    procMetrics.endDescription6Time();
+                }
+
+                if (procMetrics)
+                {
+                    procMetrics.startDescription7Time('Cross dock transfer order');
+                }
+
                 METCrossDockTransferOrderProcessorBase::construct(salesTable).CreateTransferOrder();
+
+                if (procMetrics)
+                {
+                    procMetrics.endDescription7Time();
+                }
             }
             else if (actionToPerform == METConstants::SOExtractOrderedSOPickOnly)
             {
@@ -257,12 +328,33 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                     this.postPickingListV2(salesTable, true);
                 }
 
+                if (procMetrics)
+                {
+                    procMetrics.startDescription6Time('Intercompany picking list');
+                }
+
                 //Post intercompany picking list. Sourcing all lines from a single company
                 this.postIntercompanyPickingList();
+
+                if (procMetrics)
+                {
+                    procMetrics.endDescription6Time();
+                }
             }
             else if (actionToPerform == METConstants::SOExtractReservedSOPickOnly)
             {
+                if (procMetrics)
+                {
+                    procMetrics.startDescription2Time('Stock reservation');
+                }
+
                 METStockReservation::construct(salesTable).process();
+
+                if (procMetrics)
+                {
+                    procMetrics.endDescription2Time();
+                }
+
                 //Post picking list
                 if (useLegacyMode == NoYes::Yes)
                 {
@@ -273,8 +365,18 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                     this.postPickingListV2(salesTable);
                 }
 
+                if (procMetrics)
+                {
+                    procMetrics.startDescription6Time('Intercompany picking list');
+                }
+
                 //Post intercompany picking list. Sourcing all lines from a single company
                 this.postIntercompanyPickingList();
+
+                if (procMetrics)
+                {
+                    procMetrics.endDescription6Time();
+                }
             }
             else if (actionToPerform == METConstants::SOExtractUpdateStatusOnly)
             {
@@ -1025,6 +1127,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         // Due to performance issue with extraction process, this method is created to directly update the tables instead of using the standard picking list generation process. This method will update the tables as if the picking list is generated with all the lines and quantities using the SalesFormLetter classes. Refer the previous implementation of postPickingList method where the SalesFormLetter class is used.
         boolean             isError;
         QueryRun            queryRun;
+        METProcMetrics      procMetrics = METProcMetricsScope::current();
 
         try
         {
@@ -1032,11 +1135,33 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             {
                 processExtraction = false;
 
+                if (procMetrics)
+                {
+                    procMetrics.startDescription3Time('Deliver remainder');
+                }
+
                 queryRun = this.calcQueryV2(_salesTable, _pickListOrderedQty);
+
+                if (procMetrics)
+                {
+                    procMetrics.endDescription3Time();
+                }
 
                 if (processExtraction == true)
                 {
-                    ttsbegin;
+                    if (procMetrics)
+                    {
+                        procMetrics.ttsBeginTrace();
+                    }
+                    else 
+                    {
+                        ttsbegin;
+                    }
+
+                    if (procMetrics)
+                    {
+                        procMetrics.startDescription4Time('Picking list creation');
+                    }
 
                     this.postPickingListDirect(_salesTable, _pickListOrderedQty, queryRun);
 
@@ -1049,7 +1174,19 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                     TaxWorkRegulation::clearRegulation(tableNum(SalesTable), _salesTable.RecId);
 
-                    ttscommit;
+                    if (procMetrics)
+                    {
+                        procMetrics.endDescription4Time();
+                    }
+
+                    if (procMetrics)
+                    {
+                        procMetrics.ttsCommitTrace();
+                    }
+                    else
+                    {
+                        ttscommit;
+                    }
                 }
             }
         }
@@ -1063,6 +1200,11 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         _salesTable.selectForUpdate(true);
         _salesTable.metUpdateExtractStatus();
 
+        if (procMetrics)
+        {
+            procMetrics.startDescription5Time('TMS Engine order process');
+        }
+
         if (!isError && !skipTMSProcess)
         {
             if (_salesTable.METOrderExtractStatus == METOrderExtractStatus::Extracted)
@@ -1070,6 +1212,11 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 METTMSEngineOrderProccess  metTMSEngineOrderProccess = METTMSEngineOrderProccess::construct(METTMSEngineExecutionMode::SalesOrderPickingList, wmsPickingRoute, wmsPickingRoute.PickingRouteID);
                 metTMSEngineOrderProccess.run();
             }
+        }
+
+        if (procMetrics)
+        {
+            procMetrics.endDescription5Time();
         }
     }
 
@@ -1083,6 +1230,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         boolean             isCSDPrint      = dataContract && dataContract.parmCSDSalesId() == dataContract.parmSalesId();
         InventLocation      inventLoc       = InventLocation::find(_salesTable.InventLocationId);
         WMSPickingRouteID   pickingRouteId  = NumberSeq::newGetNum(WMSParameters::numRefWMSPickingRouteId()).num();
+        METProcMetrics      procMetrics = METProcMetricsScope::current();
 
         // Create shipment and picking route headers
         WMSShipment wmsShipment = this.createWMSShipment();
@@ -1142,6 +1290,11 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             }
 
             this.updateIntercompanySalesLine(salesLine);
+
+            if (procMetrics)
+            {
+                procMetrics.incProcessedCount(1);
+            }
         }
 
         // Batch updates: charges, deliver-now fields, extraction status
