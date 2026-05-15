@@ -105,25 +105,7 @@ public final class METSalesTable_Extension
         metSalesTable.IndustryKey = METCustTable::find(this.CustAccount).IndustryKey;
         this.metPackMETSalesTable(metSalesTable);
         
-        this.metSetPostingProfile();
-
         next insert(_skipMarkup);
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>metSetPostingProfile</Name>
-				<Source><![CDATA[
-    private void metSetPostingProfile()
-    {
-        METCustTable metCustTable = METCustTable::find(this.CustAccount);
-        METCustParameters metCustParameter = METCustParameters::Find();
-
-        if(metCustTable.CustomerType == metCustParameter.InternalCustomerType && metCustParameter.InternalCustomerPostingProfile != '')
-        {
-            this.PostingProfile = metCustParameter.InternalCustomerPostingProfile;
-        }
     }
 
 ]]></Source>
@@ -150,8 +132,6 @@ public final class METSalesTable_Extension
             this.METCreditCheckSalesOrder = NoYes::No;
         }
 
-        this.metSetPostingProfile();
-        
         next update();
 
         //CB616_TMSEngineSOCancellation
@@ -159,6 +139,8 @@ public final class METSalesTable_Extension
         if (salesTableOrig.SalesStatus != SalesStatus::Canceled && this.SalesStatus == SalesStatus::Canceled)
         {
             METTMSProcessingStatus::insertTMSProcessingStatus(METTMSOrderType::SalesOrder, this.SalesId, METTMSEngineExecutionMode::SalesOrderCancellation);
+
+            this.metUpdateWaveStatus();
         }
 
         //CBNF019_Observability_SalesOrderExtracted
@@ -170,6 +152,50 @@ public final class METSalesTable_Extension
             SOExtractedInfoEvent.addRunTimePropertyToAppinsights(this);
 
             SOExtractedInfoEvent.processEvent(METTelemetryEventNames::SOPickedEvent);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metUpdateWaveStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates wave status, If all sales orders in the wave are cancelled, then update wave status to closed, otherwise keep the wave status unchanged.
+    /// </summary>
+    public void metUpdateWaveStatus()
+    {
+        METWaveLine     metWaveLine, metWaveLineCheck;
+        METWaveTable    metWaveTable;
+        SalesTable      salesTableCheck;
+
+        // Get WaveId for this sales order
+        select firstonly WaveId from metWaveLine
+            where metWaveLine.DocumentNumber == this.SalesId
+            && metWaveLine.Type          == METType::SalesOrder;
+
+        if (metWaveLine.WaveId)
+        {
+            // Check if any active order still exists in this wave
+            select firstonly RecId from salesTableCheck
+                exists join metWaveLineCheck
+                where metWaveLineCheck.WaveId         == metWaveLine.WaveId
+                    && metWaveLineCheck.DocumentNumber == salesTableCheck.SalesId
+                    && salesTableCheck.SalesStatus != SalesStatus::Canceled;
+
+            if (!salesTableCheck.RecId)
+            {
+                ttsbegin;
+                select forupdate metWaveTable
+                    where metWaveTable.WaveId == metWaveLine.WaveId;
+
+                if (metWaveTable && metWaveTable.WaveStatus != METCSDWaveStatus::Closed)
+                {
+                    metWaveTable.WaveStatus = METCSDWaveStatus::Closed;
+                    metWaveTable.update();
+                }
+                ttscommit;
+            }
         }
     }
 
@@ -531,62 +557,17 @@ public final class METSalesTable_Extension
                     if (waveTable.validateWrite())
                     {
                         waveTable.insert();
-                    }
-                }
-                ttscommit;
 
-                if (waveTable)
-                {
-                    try
-                    {
                         if (METWaveTable::existWaveNumWithZeroForInventLocationId(this.InventLocationId, waveTable.CreatedDateTime))
                         {
-                            ttsbegin;
                             waveTable.selectForUpdate(true);
                             waveTable.WaveNumber = METWaveTable::getWaveNum(waveTable.Warehouse, waveTable.CreatedDateTime);
                             waveTable.Update();
-                            ttscommit;
                         }
                     }
-                    catch (Exception::Deadlock)
-                    {
-                        retry;
-                    }
-                    catch (Exception::DuplicateKeyException)
-                    {
-                        if (xSession::currentRetryCount() >= #RetryNum)
-                        {
-                            throw Exception::UpdateConflictNotRecovered;
-                        }
-                        else
-                        {
-                            retry;
-                        }
-                    }
-                    catch (Exception::UpdateConflict)
-                    {
-                        if (appl.ttsLevel() == 0)
-                        {
-                            if (xSession::currentRetryCount() >= #RetryNum)
-                            {
-                                throw Exception::UpdateConflictNotRecovered;
-                            }
-                            else
-                            {
-                                retry;
-                            }
-                        }
-                        else
-                        {
-                            throw Exception::UpdateConflict;
-                        }
-                    }
-                    catch (Exception::Error)
-                    {
-                        throw error("@SYS93835");
-                    }
-                        
                 }
+
+                ttscommit;
             }
             catch (Exception::Deadlock)
             {

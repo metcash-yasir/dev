@@ -107,7 +107,7 @@ public class METSalesTable extends common
                 break;
 
             case fieldNum(METSalesTable, OriginalInvoice):
-                this.recalcNetAmountForReturnOrders();
+                this.ClaimSalesId = this.originalSalesId();
                 break;
         }
     }
@@ -163,19 +163,7 @@ public class METSalesTable extends common
         {
             Markup::delete(salesTable);
             METReturnOrderCopyChargesHelper::copySOHeaderCharges(this, salesTable);
-            
-            METSalesLine metSalesLine;
-            SalesLine salesLine;
-
-            while select metSalesLine
-                join salesLine
-                    where salesLine.RecId == metSalesLine.SalesLine
-                    && salesLine.SalesId == salesTable.SalesId
-            {
-                METReturnOrderCopyChargesHelper::updateSalesLinePrices(metSalesLine, salesLine);
-                METReturnOrderCopyChargesHelper::copySOLineCharges(metSalesLine, salesLine, true);
-                METReturnOrderCopyChargesHelper::createPriceComponentsByLine(metSalesLine, salesLine);
-            }
+            METReturnOrderCopyChargesHelper::syncSalesLines(this);
         }
 
         // Task192490_CB888_SalesOrderHeaderCharges
@@ -287,13 +275,14 @@ public class METSalesTable extends common
     {
         if (this.SalesTable)
         {
+            SalesTable  salesTable = SalesTable::findRecId(this.SalesTable);
+            this.SalesId = salesTable.SalesId;
+
             super();
 
             //Bug354734 
             if (this.OriginalInvoice)
             {
-                SalesTable  salesTable = SalesTable::findRecId(this.SalesTable);
-
                 if (salesTable.SalesType == SalesType::ReturnItem)
                 {
                     METReturnOrderCopyChargesHelper::copySOHeaderCharges(this, salesTable);
@@ -323,88 +312,58 @@ public class METSalesTable extends common
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>recalcNetAmountForReturnOrders</Name>
+				<Name>originalSalesId</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Recalc prices on return order.
+    /// Returns the original SalesId for this return order by looking up the CustInvoiceJour
     /// </summary>
-    public void recalcNetAmountForReturnOrders()
+    /// <param name = "_invoiceAccount">Optional invoice account to use for the lookup. If not provided, the invoice account from the sales table will be used.</param>
+    /// <returns>The original SalesId if found; otherwise, an empty SalesId.</returns>
+    public SalesId originalSalesId(CustInvoiceAccount _invoiceAccount = '')
     {
-        SalesTable salesTable;
-        SalesId salesIdReturn;
+        SalesId         origSalesId;
+        SalesTable      salesTable;
+        CustInvoiceJour custInvoiceJour;
+        CustInvoiceAccount invoiceAccount = _invoiceAccount;
 
-        select firstonly salesId, ReturnItemNum, InvoiceAccount from salesTable
-            where salesTable.RecId == this.SalesTable;
-            
-        if (salesTable.SalesId && salesTable.ReturnItemNum)
+        if (this.OriginalInvoice)
         {
-            CustInvoiceJour custInvoiceJour;
-
-            salesIdReturn = salesTable.salesId;
-
-            SalesId origSalesId = SalesTable::find(this.OriginalInvoice).SalesId;
-
-            if (!origSalesId)
+            if (!invoiceAccount)
             {
-                select firstOnly SalesId from custInvoiceJour
+                salesTable = SalesTable::findRecId(this.SalesTable);
+                invoiceAccount = salesTable.InvoiceAccount;
+            }
+
+            select firstOnly SalesId from custInvoiceJour
                 order by InvoiceDate desc
-                    where custInvoiceJour.InvoiceId == this.OriginalInvoice &&
-                    custInvoiceJour.invoiceAccount == salesTable.invoiceAccount;
+                where custInvoiceJour.InvoiceId      == this.OriginalInvoice
+                   && custInvoiceJour.InvoiceAccount == invoiceAccount;
 
-                origSalesId = custInvoiceJour.SalesId;
-            }
-
-            if (origSalesId)
-            {
-                SalesLine salesLine, salesLineOrig;
-
-                ttsbegin;
-                while select forupdate salesLine
-                    where salesLine.SalesId == salesIdReturn
-                join salesLineOrig
-                    where salesLineOrig.SalesId == origSalesId
-                    && salesLineOrig.ItemId == salesLine.ItemId
-                {
-                    salesLine.LineDisc = salesLineOrig.LineDisc;
-                    salesLine.SalesPrice = salesLineOrig.SalesPrice;
-                    salesLine.LineAmount = salesLine.calcLineAmount();
-                    salesLine.update();
-                }
-                ttscommit;
-            }
-            
+            origSalesId = custInvoiceJour.SalesId;
         }
+
+        return origSalesId;
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>findOriginalSalesTableForReturn</Name>
+				<Name>validateWrite</Name>
 				<Source><![CDATA[
-    public SalesTable findOriginalSalesTableForReturn()
+    /// <summary>
+    ///
+    /// </summary>
+    /// <returns></returns>
+    public boolean validateWrite()
     {
-        SalesTable salesTableReturn, salesTableOriginal;
-        CustInvoiceJour custInvoiceJour;
+        boolean ret = super();
 
-        if (this.OriginalInvoice)
+        if (ret && this.OriginalInvoice && !this.ClaimSalesId)
         {
-            salesTableOriginal = SalesTable::find(this.OriginalInvoice);
-
-            if (!salesTableOriginal)
-            {
-                salesTableReturn = SalesTable::findRecId(this.SalesTable);
-
-                select firstOnly SalesId from custInvoiceJour
-                    order by InvoiceDate desc
-                    where custInvoiceJour.InvoiceId == this.OriginalInvoice &&
-                         custInvoiceJour.invoiceAccount == salesTableReturn.invoiceAccount;
-
-                salesTableOriginal = SalesTable::find(custInvoiceJour.SalesId);
-            }
-                
+            ret = checkFailed(strFmt("@MET:OrigInvoiceNotFound", this.OriginalInvoice));
         }
 
-        return salesTableOriginal;
+        return ret;
     }
 
 ]]></Source>
@@ -450,6 +409,12 @@ public class METSalesTable extends common
 				</AxTableFieldGroupField>
 				<AxTableFieldGroupField>
 					<DataField>OriginalInvoice</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>OriginalSalesId</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>ClaimSalesId</DataField>
 				</AxTableFieldGroupField>
 			</Fields>
 		</AxTableFieldGroup>
@@ -590,7 +555,13 @@ public class METSalesTable extends common
 					<DataField>OriginalInvoice</DataField>
 				</AxTableFieldGroupField>
 				<AxTableFieldGroupField>
+					<DataField>OriginalSalesId</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
 					<DataField>ClaimReason</DataField>
+				</AxTableFieldGroupField>
+				<AxTableFieldGroupField>
+					<DataField>ClaimSalesId</DataField>
 				</AxTableFieldGroupField>
 			</Fields>
 		</AxTableFieldGroup>
@@ -1112,6 +1083,24 @@ public class METSalesTable extends common
 			i:type="AxTableFieldEnum">
 			<Name>DelayPricing</Name>
 			<EnumType>METDelayPricing</EnumType>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>OriginalSalesId</Name>
+			<AssetClassification>Customer Content</AssetClassification>
+			<ExtendedDataType>SalesIdBase</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
+			<Label>@SYS93292</Label>
+		</AxTableField>
+		<AxTableField xmlns=""
+			i:type="AxTableFieldString">
+			<Name>ClaimSalesId</Name>
+			<AllowEdit>No</AllowEdit>
+			<AllowEditOnCreate>No</AllowEditOnCreate>
+			<AssetClassification>Customer Content</AssetClassification>
+			<ExtendedDataType>SalesIdBase</ExtendedDataType>
+			<IgnoreEDTRelation>Yes</IgnoreEDTRelation>
+			<Label>@MET:ClaimSalesId</Label>
 		</AxTableField>
 	</Fields>
 	<FullTextIndexes />

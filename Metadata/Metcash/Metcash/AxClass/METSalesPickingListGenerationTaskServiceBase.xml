@@ -8,6 +8,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     boolean                                         processExtraction = false;
     METSalesPickingListGenerationTaskContract       dataContract;
     SalesTable                                      salesTable, csdSalesTable;
+    METSalesTable                                   metSalesTable;
     WMSPickingRoute                                 wmsPickingRoute;
     CompanyInfo                                     companyInfo;
     InventParameters                                inventParameter;
@@ -16,6 +17,10 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     RefRecId                                        salesOrderCount;
     //CB123_SalesOrderExtractScreenforCSD -end
     boolean                                         skipTMSProcess;
+    NoYes                                           useLegacyMode;  
+    Map                                             reservedQtyInSalesUnitMap = new Map(Types::Int64, Types::Real);
+    METProcMetrics                                  procMetrics;
+    #OCCRetryCount
 }
 ]]></Declaration>
 		<Methods>
@@ -94,6 +99,26 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>getTotalCountOfLinesForSalesOrder</Name>
+				<Source><![CDATA[
+    public int getTotalCountOfLinesForSalesOrder(SalesId _salesId)
+    {
+        SalesLine    salesLine;
+        METSalesLine metSalesLine;
+
+        select count(RecId) from salesLine
+            where salesLine.SalesId == _salesId
+                && salesLine.SalesStatus != SalesStatus::Canceled
+            exists join metSalesLine
+                where metSalesLine.SalesLine == salesLine.RecId
+                    && metSalesLine.OrderExtractStatus != METOrderExtractStatus::Extracted;
+
+        return salesLine.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>process</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -105,9 +130,18 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         #OCCRetryCount
         try
         {
-       
-            this.processPickingList(_dataContract);
-       
+            procMetrics = METProcMetrics::construct(METBatchLogOperation::SalesOrderExtractJob);
+            procMetrics.startTrace(1, _dataContract.parmSalesId());
+            procMetrics.incLineCount(this.getTotalCountOfLinesForSalesOrder(_dataContract.parmSalesId()));
+           
+            using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
+            {
+                useLegacyMode = METCustParameters::Find().SalesExtractionPerfMode;
+                this.processPickingList(_dataContract);
+
+                procMetrics.endTrace();
+            }
+
         }
         catch (Exception::Deadlock)
         {
@@ -190,12 +224,22 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         str         actionToPerform;
         boolean     pickListForOrderedQty = false;
         companyInfo  = CompanyInfo::find();
-
         this.initParms(_dataContract);
 
         if (_dataContract.parmTriggerBusinessEvent())
         {
+            if (procMetrics)
+            {
+                procMetrics.startDescription2Time('Trigger business event & shipment cleanup');
+            }
+
             this.finalThreadBusinessEventAndShipmentCleanup();
+
+            if (procMetrics)
+            {
+                procMetrics.endDescription2Time();
+            }
+
             return;
         }
 
@@ -204,10 +248,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             //Task 162245-CB123 - SalesOrderExtractScreenforCSD- start
             
             inventParameter = InventParameters::find();
-
-            select firstonly METWaveRequired, METPickDirector, METCSDWarehouse
-                    from inventLocation
-                    where inventLocation.InventLocationId == salesTable.InventLocationId;
+            inventLocation = InventLocation::find(salesTable.InventLocationId);
 
             //Task 162245-CB123 - SalesOrderExtractScreenforCSD
             if (this.isWaveRequired(salesTable, inventLocation))
@@ -222,37 +263,130 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 // If the supply from transfer option is enabled,
                 // 1. Do not attempt stock reservation on local warehouse.
                 // 2. create TO for the whole sales order quantity from NDC to CSD warehouse.
-                
+
+                if (procMetrics)
+                {
+                    procMetrics.startDescription2Time('Transfer order create');
+                }
+
                 METCrossDockTransferOrderProcessorBase::construct(salesTable).CreateTransferOrder();
+
+                if (procMetrics)
+                {
+                    procMetrics.endDescription2Time();
+                }
 
                 info(strFmt("@MET:TOCreatedForSO", salesTable.SalesId));
             }
             else if (actionToPerform == METConstants::SOExtractReservedSOPickAndTO)
             {
+                if (procMetrics)
+                {
+                    procMetrics.startDescription2Time('Stock reservation');
+                }
+
                 METStockReservation::construct(salesTable).process();
 
-                this.postPickingList(salesTable);
+                if (procMetrics)
+                {
+                    procMetrics.endDescription2Time();
+                }
 
+                if (useLegacyMode == NoYes::Yes)
+                {
+                    this.postPickingList(salesTable);
+                }
+                else 
+                {
+                    this.postPickingListV2(salesTable);
+                }
+
+                if (procMetrics)
+                {
+                    procMetrics.startDescription6Time('Intercompany picking list');
+                }
+
+                //Intercompany picking list. 
                 this.postIntercompanyPickingList();
 
+                if (procMetrics)
+                {
+                    procMetrics.endDescription6Time();
+                }
+
+                if (procMetrics)
+                {
+                    procMetrics.startDescription7Time('Cross dock transfer order');
+                }
+
                 METCrossDockTransferOrderProcessorBase::construct(salesTable).CreateTransferOrder();
+
+                if (procMetrics)
+                {
+                    procMetrics.endDescription7Time();
+                }
             }
             else if (actionToPerform == METConstants::SOExtractOrderedSOPickOnly)
             {
                 //Post picking list
-                this.postPickingList(salesTable, true);
+                if (useLegacyMode == NoYes::Yes)
+                {
+                    this.postPickingList(salesTable, true);
+                }
+                else
+                {
+                    this.postPickingListV2(salesTable, true);
+                }
+
+                if (procMetrics)
+                {
+                    procMetrics.startDescription6Time('Intercompany picking list');
+                }
 
                 //Post intercompany picking list. Sourcing all lines from a single company
                 this.postIntercompanyPickingList();
+
+                if (procMetrics)
+                {
+                    procMetrics.endDescription6Time();
+                }
             }
             else if (actionToPerform == METConstants::SOExtractReservedSOPickOnly)
             {
+                if (procMetrics)
+                {
+                    procMetrics.startDescription2Time('Stock reservation');
+                }
+
                 METStockReservation::construct(salesTable).process();
+
+                if (procMetrics)
+                {
+                    procMetrics.endDescription2Time();
+                }
+
                 //Post picking list
-                this.postPickingList(salesTable);
+                if (useLegacyMode == NoYes::Yes)
+                {
+                    this.postPickingList(salesTable);
+                }
+                else
+                {
+                    this.postPickingListV2(salesTable);
+                }
+
+                if (procMetrics)
+                {
+                    procMetrics.startDescription6Time('Intercompany picking list');
+                }
 
                 //Post intercompany picking list. Sourcing all lines from a single company
                 this.postIntercompanyPickingList();
+
+                if (procMetrics)
+                {
+                    procMetrics.endDescription6Time();
+                }
             }
             else if (actionToPerform == METConstants::SOExtractUpdateStatusOnly)
             {
@@ -324,7 +458,16 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             changeCompany(purchTable_Reference.InterCompanyCompanyId)
             {
                 METStockReservation::construct(purchTable_Reference.interCompanySalesTable()).process();
-                this.postPickingList(purchTable_Reference.interCompanySalesTable(), false);
+
+                if (useLegacyMode == NoYes::Yes)
+                {
+                    this.postPickingList(purchTable_Reference.interCompanySalesTable(), false);
+                }
+                else
+                {
+                    this.postPickingListV2(purchTable_Reference.interCompanySalesTable(), false);
+                }
+                
                 this.finalThreadBusinessEventAndShipmentCleanup(true);
             }
         }
@@ -442,11 +585,49 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                         // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
                         // update some extra fields when SO extract is called from TO finalisation
                         this.updateWmsPickingRoute(wmsPickingRoute);
-                    }
-                    
+                    }                    
                     ttscommit;
-
                 }
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error ("@WAX:UpdateCancelled");
+                    isError = true;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error ("@WAX:UpdateCancelled");
+                isError = true;
+            }
+        }
+        catch(Exception::DuplicateKeyException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error ("@WAX:UpdateCancelled");
+                    isError = true;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error ("@WAX:UpdateCancelled");
+                isError = true;
             }
         }
         catch
@@ -493,7 +674,6 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         QueryBuildDataSource    qbdsSalesLine;
         boolean                 interCompanyPOCreated = false;
         PurchLine               purchLineRef;
-        METSalesTable metSalesTable = METSalesTable::findBySalesTable(_salesTable.RecId);
         
         InventLocation inventLocationLoc;
         InventDim inventDim;
@@ -526,7 +706,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             {
                 continue;
             }
-            else 
+            else
             {
                 // Bug 297848: CB679 SO line cancelled & Back order not created
                 // when called from METCrossDockSalesFinalizationFacade\postPickingList, salesTable is never set, use the method parameter instead
@@ -570,6 +750,157 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>calcQueryV2</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Created for the CB274 - Intercompany Transfers.
+    /// Exclude the SO  line for extraction if it's a food item.
+    /// Create a Purchase order for the food item line.
+    /// </summary>
+    /// <param name = "_salesTable">Sales Id reference</param>
+    /// <param name = "_pickListOrderedQty">Set to yes if picking list to be generated by ordered qty</param>
+    /// <returns>SysQueryRun</returns>
+    private SysQueryRun calcQueryV2(SalesTable _salesTable, boolean _pickListOrderedQty)
+    {
+        Query                   qry = new Query(QueryStr(SalesUpdate));
+        RefRecId                salesLineRecId;
+        SalesLine               salesLine;
+        METSalesLine            metSalesLine, metSalesLineNotExtracted;
+        QueryBuildRange         qbrSalesLine;
+        QueryBuildDataSource    qbdsSalesLine;
+        boolean                 interCompanyPOCreated = false;
+        PurchLine               purchLineRef, purchLineRefJoin;
+        SalesUpdateRemain       salesUpdateRemain;
+
+        InventLocation inventLocationLoc;
+        InventDim inventDim;
+        qbdsSalesLine = qry.dataSourceTable(tableNum(SalesLine));
+
+        QueryBuildDataSource qbdsMETSalesLine;
+        qbdsMETSalesLine = qbdsSalesLine.addDataSource(tableNum(METSalesLine));
+        qbdsMETSalesLine.joinMode(JoinMode::OuterJoin);
+        qbdsMETSalesLine.fetchMode(QueryFetchMode::One2One);
+        qbdsMETSalesLine.relations(false);
+        qbdsMETSalesLine.addLink(fieldNum(SalesLine, RecId), fieldNum(METSalesLine, SalesLine));
+
+        if (_salesTable.METAllowBackOrders)
+        {
+            qbdsMETSalesLine.update(true);
+
+            // Range: only lock rows that still need updating
+            qbdsMETSalesLine.addRange(fieldNum(METSalesLine, OrderExtractStatus)).value(SysQuery::valueNot(enum2int(METOrderExtractStatus::Extracted)));
+        }
+
+        while select forupdate salesLine
+            where salesLine.SalesId == _salesTable.SalesId
+                && salesLine.SalesStatus != SalesStatus::Canceled
+            join OrderExtractStatus from metSalesLineNotExtracted
+                where metSalesLineNotExtracted.SalesLine == salesLine.RecId
+            join inventdim
+                where inventDim.inventDimId == salesLine.inventDimId
+            join inventLocationLoc
+                where inventLocationLoc.InventLocationId == inventDim.inventLocationId &&
+                ( metSalesLineNotExtracted.OrderExtractStatus != METOrderExtractStatus::Extracted ||
+                ((metSalesTable.InternalCrossDockOrder == true && metSalesLineNotExtracted.OrderExtractStatus == METOrderExtractStatus::Extracted) ||
+                (inventLocationLoc.METCSDWarehouse == true && metSalesLineNotExtracted.OrderExtractStatus == METOrderExtractStatus::Extracted)))
+            outer join purchLineRefJoin
+                where purchLineRefJoin.InventTransId == salesLine.InventRefTransId
+        {
+            reservedQtyInSalesUnitMap.add(salesLine.RecId, salesLine.reservedPhysicalInSalesUnit());
+
+            if (purchLineRefJoin.RecId && salesLine.InventRefTransId && salesLine.InventRefType == InventRefType::Purch && !purchLineRefJoin.IsDeleted)
+            {
+                purchLineRef = purchLineRefJoin;
+            }
+
+            if (interCompanyPOCreated == false
+                && purchLineRef.RecId == 0
+                && InventTable::metGetOSCCode(salesLine.ItemId, inventDim) == METConstants::GroceryOscCode
+                && _salesTable.METIntercompanyTransferFulfillment == NoYes::Yes
+                && _salesTable.InterCompanyOrigin != InterCompanyOrigin::Derived)
+            {
+                METSalesOrderProcessHelper::createPOForIntercompanyFulfillment(_salesTable, salesLine);
+                interCompanyPOCreated = true;
+            }
+            else if (purchLineRef.RecId != 0)
+            {
+                continue;
+            }
+            else
+            {
+                if (this.cancelSalesLineV2(_salesTable, salesLine, _pickListOrderedQty))
+                {
+                    if (salesLine.inventTable().pdsCWItem())
+                    {
+                        if (salesUpdateRemain == null)
+                        {
+                            salesUpdateRemain = SalesUpdateRemain::construct();
+                            salesUpdateRemain.metParmIsExtraction(true);
+                        }
+                        
+                        salesUpdateRemain.updateCatchWeightDeliverRemainder(salesLine, 0);
+                    }
+                    else
+                    {
+                        if (salesUpdateRemain == null)
+                        {
+                            salesUpdateRemain = SalesUpdateRemain::construct();
+                            salesUpdateRemain.metParmIsExtraction(true);
+                        }
+
+                        salesUpdateRemain.updateDeliverRemainder(salesLine, 0, 0);
+                    }
+
+                    info(strFmt("@MET:NoStock", salesLine.SalesId, salesLine.ItemId));
+
+                    update_recordset metSalesLine
+                            setting OrderExtractStatus = METOrderExtractStatus::Extracted
+                                where metSalesLine.SalesLine == salesLine.RecId &&
+                                      metSalesLine.OrderExtractStatus != METOrderExtractStatus::Extracted;
+
+                    if (procMetrics)
+                    {
+                        procMetrics.incDescription3Count(1);
+                    }
+                }
+                else
+                {
+                    if (_pickListOrderedQty == false && this.getSalesLineReservPhysicalInSalesUnit(salesLine) == 0)
+                    {
+                        continue;
+                    }
+
+                    processExtraction   = true;
+                    salesLineRecId      = salesLine.RecId;
+                    qbrSalesLine        = qbdsSalesLine.addRange(fieldnum(SalesLine, RecId));
+
+                    qbrSalesLine.value(SysQuery::value(salesLineRecId));
+                }
+            }
+        }
+        
+        if (salesUpdateRemain)
+        {
+            // Recalculating Sales totals if any line is cancelled due to no stock availability as we are skipping it in SalesUpdateRemain class. so need to explicitly call the update to recalculate the totals and other related fields which are normally calculated in updateCorrespondingSalesOrder method of SalesUpdateRemain class.
+
+            ttsbegin;
+
+            SalesTable salesTableTotalsUpdate = SalesTable::find(_salesTable.SalesId, true);
+            
+            if (salesTableTotalsUpdate.setEstimate())
+            {
+                salesTableTotalsUpdate.doUpdate();
+            }
+
+            ttscommit;
+        }
+        
+        return new sysQueryRun(qry);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>cancelSalesLine</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -583,11 +914,30 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     protected boolean cancelSalesLine(SalesTable _salesTable, SalesLine _salesLine, boolean _pickListOrderedQty)
     {
         boolean ret = true;
-        
+
         ret = (_salesTable.METAllowBackOrders == false && _pickListOrderedQty == false && _salesLine.reservedPhysicalInSalesUnit() == 0
                 // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
                 // For xDock, if there is a sales order line with reserved physical = 0 do not cancel it as it will be handled by the TO
                 && !_salesTable.metSalesTable().InternalCrossDockOrder);
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelSalesLineV2</Name>
+				<Source><![CDATA[
+    protected boolean cancelSalesLineV2(SalesTable _salesTable, 
+        SalesLine _salesLine, 
+        boolean _pickListOrderedQty)
+    {
+        boolean ret = true;
+
+        ret = (_salesTable.METAllowBackOrders == false && _pickListOrderedQty == false && this.getSalesLineReservPhysicalInSalesUnit(_salesLine) == 0
+                // Bug 221621: CB238 - NDC / Int xDock: D365 functional warehouse processing (F/L) - Finalization error
+                // For xDock, if there is a sales order line with reserved physical = 0 do not cancel it as it will be handled by the TO
+                && !metSalesTable.InternalCrossDockOrder);
 
         return ret;
     }
@@ -606,7 +956,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     public str getActionToPerform(SalesTable   _salesTable)
     {
         str actionToPerfrom;
-        METSalesTable   metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId);
+        metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId);
 
         if (inventParameter.METSupplyFromTransfer == NoYes::Yes) //Food entity
         {
@@ -805,6 +1155,597 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 METSalesOrderShipmentLoadHeader::cleanShipmentIfNoLines(conShipmentIds);
             }
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postPickingListV2</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Posts the picking list into the SalesTable.
+    /// </summary>
+    /// <param name = "_salesTable">Sales table record</param>
+    /// <param name = "_pickListOrderedQty">Flag to indicate if pick list ordered quantity should be considered</param>
+    public void postPickingListV2(SalesTable _salesTable, boolean _pickListOrderedQty = false)
+    {
+        // Due to performance issue with extraction process, this method is created to directly update the tables instead of using the standard picking list generation process. This method will update the tables as if the picking list is generated with all the lines and quantities using the SalesFormLetter classes. Refer the previous implementation of postPickingList method where the SalesFormLetter class is used.
+        boolean             isError;
+        QueryRun            queryRun;
+
+        try
+        {
+            if (_salesTable.SalesStatus != SalesStatus::Canceled)
+            {
+                processExtraction = false;
+
+                if (procMetrics)
+                {
+                    procMetrics.startDescription3Time('Deliver remainder (cancellation)');
+                }
+
+                queryRun = this.calcQueryV2(_salesTable, _pickListOrderedQty);
+
+                if (procMetrics)
+                {
+                    procMetrics.endDescription3Time();
+                }
+
+                if (processExtraction == true)
+                {
+                    if (procMetrics)
+                    {
+                        procMetrics.ttsBeginTrace();
+                    }
+                    else 
+                    {
+                        ttsbegin;
+                    }
+
+                    if (procMetrics)
+                    {
+                        procMetrics.startDescription4Time('Picking list creation');
+                    }
+
+                    this.postPickingListDirect(_salesTable, _pickListOrderedQty, queryRun);
+
+                    if (wmsPickingRoute) 
+                    {
+                        this.updateWmsPickingRoute(wmsPickingRoute);
+                    }
+
+                    TransactionLog::create(TransactionLogType::SalesPickingList, "@SYS50969");
+
+                    TaxWorkRegulation::clearRegulation(tableNum(SalesTable), _salesTable.RecId);
+
+                    if (procMetrics)
+                    {
+                        procMetrics.endDescription4Time();
+                    }
+
+                    if (procMetrics)
+                    {
+                        procMetrics.ttsCommitTrace();
+                    }
+                    else
+                    {
+                        ttscommit;
+                    }
+                }
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error ("@WAX:UpdateCancelled");
+                    isError = true;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error ("@WAX:UpdateCancelled");
+                isError = true;
+            }
+        }
+        catch(Exception::DuplicateKeyException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    error ("@WAX:UpdateCancelled");
+                    isError = true;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                error ("@WAX:UpdateCancelled");
+                isError = true;
+            }
+        }
+        catch
+        {
+            error ("@WAX:UpdateCancelled");
+            isError = true;
+        }
+
+        _salesTable.reread();
+        _salesTable.selectForUpdate(true);
+        _salesTable.metUpdateExtractStatus();
+
+        if (procMetrics)
+        {
+            procMetrics.startDescription5Time('TMS Engine order process');
+        }
+
+        if (!isError && !skipTMSProcess)
+        {
+            if (_salesTable.METOrderExtractStatus == METOrderExtractStatus::Extracted)
+            {
+                METTMSEngineOrderProccess  metTMSEngineOrderProccess = METTMSEngineOrderProccess::construct(METTMSEngineExecutionMode::SalesOrderPickingList, wmsPickingRoute, wmsPickingRoute.PickingRouteID);
+                metTMSEngineOrderProccess.run();
+            }
+        }
+
+        if (procMetrics)
+        {
+            procMetrics.endDescription5Time();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postPickingListDirect</Name>
+				<Source><![CDATA[
+    protected void postPickingListDirect(SalesTable _salesTable, boolean _pickListOrderedQty, QueryRun _queryRun)
+    {
+        boolean             isCSDPrint      = dataContract && dataContract.parmCSDSalesId() == dataContract.parmSalesId();
+        InventLocation      inventLoc       = InventLocation::find(_salesTable.InventLocationId);
+        WMSPickingRouteID   pickingRouteId  = NumberSeq::newGetNum(WMSParameters::numRefWMSPickingRouteId()).num();
+
+        // Create shipment and picking route headers
+        WMSShipment wmsShipment = this.createWMSShipment();
+        this.initWMSPickingRoute(_salesTable, inventLoc, pickingRouteId, wmsShipment);
+
+        // Pre-fetch prior picked qtys per InventTransId (backorder path only)
+        Map pickedQtyMap = _salesTable.METAllowBackOrders
+          ? this.buildPickedQtyMap(_salesTable)
+          : new Map(Types::String, Types::Real);
+
+        // Process each qualifying sales line
+        while (_queryRun.next())
+        {
+            SalesLine       salesLine   = _queryRun.get(tableNum(SalesLine));
+            InventQty       inventNow   = this.calcInventNow(salesLine, _pickListOrderedQty);
+            PdsCWInventQty  cwQty       = PdsGlobal::pdsIsCWItem(salesLine.ItemId) ? salesLine.pdsCWRemainInventPhysical : 0;
+
+            if (!inventNow)
+            {
+                continue;
+            }
+
+            InventQualityManagementBlockHandler::blockSalesPickingList(salesLine);
+
+            // Create WMS pick order and assign to shipment
+            WMSOrder  wmsOrder  = WMSOrderCreate::createOrUpdateWMSOrder(InventMovement::construct(salesLine), 
+                                                                            -inventNow,
+                                                                            WMSOrderType::OrderPick, 
+                                                                            '', 
+                                                                            -cwQty);
+            InventQty shipQty   = min(inventNow, wmsOrder.qtyNoShipment); // capture before updateShipment modifies buffer
+
+            wmsOrder.updateShipment(wmsShipment, 
+                shipQty, 
+                wmsPickingRoute.PickingRouteID, 
+                true, 
+                min(cwQty, wmsOrder.PdsCWQtyNoShipment));
+
+            InventQualityManagementCreateHandler::createSalesPickingListAfterPost(salesLine, inventNow, cwQty);
+
+            if (_salesTable.InterCompanyCompanyId)
+            {
+                SalesLineType::construct(salesLine).interCompanyResetDeliverNow();
+            }
+
+            if (!_salesTable.METAllowBackOrders && !metSalesTable.InternalCrossDockOrder)
+            {
+                this.updateDeliverRemainForLine(salesLine, cwQty);
+            }
+
+            // Determine and persist extraction status per line
+            METOrderExtractStatus lineStatus = this.resolveLineStatus(_salesTable, salesLine, shipQty, pickedQtyMap);
+
+            if (_salesTable.METAllowBackOrders)
+            {
+                this.updateMETSalesLineStatus(_queryRun, lineStatus);
+            }
+
+            this.updateIntercompanySalesLine(salesLine);
+
+            if (procMetrics)
+            {
+                procMetrics.incDescription4Count(1);
+            }   
+        }
+
+        // Batch updates: charges, deliver-now fields, extraction status
+        this.batchUpdateAfterLoop(_salesTable);
+
+        // Finalize route, sales table, and shipment
+        this.activatePickingRoute();
+        this.createPickingRouteLink(_salesTable);
+        this.finalizeSalesTableStatus(_salesTable);
+        this.finalizeShipment(wmsShipment);
+
+        // Create TMS shipment load
+        METOrderShipmentLoadCreation::construct(METOrderTransactionType::SalesOrder, _salesTable.SalesId)
+          .createShippmentLoad(true, false);
+
+        if (!isCSDPrint)
+        {
+            info(strFmt("@MET:PickListForReservedQty", _salesTable.SalesId));
+        }
+        else
+        {
+            info(strFmt("@MET:SOPickListForOrderQty", _salesTable.SalesId));
+        }
+
+        if (procMetrics)
+        {
+            procMetrics.incProcessedCount(1);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createWMSShipment</Name>
+				<Source><![CDATA[
+    // Creates and inserts WMSShipment record
+    private WMSShipment createWMSShipment()
+    {
+        WMSShipment wmsShipment;
+        wmsShipment.clear();
+        wmsShipment.initTypeOrderPick();
+        METGlobal::validateWriteRecordCheck(wmsShipment);
+        wmsShipment.insert();
+        return wmsShipment;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initWMSPickingRoute</Name>
+				<Source><![CDATA[
+    // Populates and inserts the class-level wmsPickingRoute
+    private void initWMSPickingRoute(SalesTable _salesTable, InventLocation _inventLoc, WMSPickingRouteID _pickingRouteId, WMSShipment _wmsShipment)
+    {
+        wmsPickingRoute.clear();
+        wmsPickingRoute.PickingRouteID                  = _pickingRouteId;
+        wmsPickingRoute.ParmId                          = _salesTable.SalesId;
+        wmsPickingRoute.Customer                        = _salesTable.CustAccount;
+        wmsPickingRoute.DeliveryPostalAddress           = _salesTable.DeliveryPostalAddress;
+        wmsPickingRoute.DlvDate                         = _salesTable.ShippingDateConfirmed;
+        wmsPickingRoute.DlvModeId                       = _salesTable.DlvMode;
+        wmsPickingRoute.DlvTermId                       = _salesTable.DlvTerm;
+        wmsPickingRoute.ExpeditionStatus                = WMSExpeditionStatus::Activated;
+        wmsPickingRoute.InventLocationId                = _salesTable.InventLocationId;
+        wmsPickingRoute.PrintMgmtSiteId                 = _inventLoc.InventSiteId;
+        wmsPickingRoute.ShipmentId                      = _wmsShipment.ShipmentId;
+        wmsPickingRoute.ShipmentType                    = WMSShipmentType::OrderPick;
+        wmsPickingRoute.TransRefId                      = _salesTable.SalesId;
+        wmsPickingRoute.TransType                       = InventTransType::Sales;
+        wmsPickingRoute.DeliveryName                    = _salesTable.DeliveryName;
+        wmsPickingRoute.METTransferOrderPickingRouteId  = '';
+        wmsPickingRoute.METExternalInvoicedSO           = NoYes::No;
+        wmsPickingRoute.InterCompanyPosted              = _salesTable.InterCompanyOrigin != InterCompanyOrigin::Source ? NoYes::Yes : NoYes::No;
+        METGlobal::validateWriteRecordCheck(wmsPickingRoute);
+        wmsPickingRoute.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildPickedQtyMap</Name>
+				<Source><![CDATA[
+    // Pre-fetches sum of already-picked qty per InventTransId (one query for all lines)
+    private Map buildPickedQtyMap(SalesTable _salesTable)
+    {
+        Map             pickedQtyMap = new Map(Types::String, Types::Real);
+        WMSOrderTrans   wmsOrderTransPre;
+        SalesLine       salesLineJoin;
+
+        while select sum(Qty), InventTransId from wmsOrderTransPre
+          group by wmsOrderTransPre.InventTransId
+          exists join salesLineJoin
+              where salesLineJoin.SalesId       == _salesTable.SalesId
+                 && salesLineJoin.InventTransId == wmsOrderTransPre.InventTransId
+        {
+            pickedQtyMap.add(wmsOrderTransPre.InventTransId, wmsOrderTransPre.Qty);
+        }
+
+        return pickedQtyMap;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>calcInventNow</Name>
+				<Source><![CDATA[
+    // Returns qty to pick in inventory unit (converts from sales unit)
+    private InventQty calcInventNow(SalesLine _salesLine, boolean _pickListOrderedQty)
+    {
+        InventQty sourceQty = _pickListOrderedQty
+          ? _salesLine.SalesQty
+          : this.getSalesLineReservPhysicalInSalesUnit(_salesLine);
+
+        return EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+            _salesLine.ItemId,  
+            _salesLine.InventDimId,
+            sourceQty,
+            _salesLine.SalesUnit,
+            _salesLine.inventTable().inventUnitId(),
+            NoYes::Yes);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateDeliverRemainForLine</Name>
+				<Source><![CDATA[
+    // Updates deliver remainder on the sales line (non-backorder, non-xDock only)
+    private void updateDeliverRemainForLine(SalesLine _salesLine, PdsCWInventQty _cwQty)
+    {
+        _salesLine.selectForUpdate(true);
+        _salesLine.pdsCWRemainInventPhysical = _cwQty;
+
+        SalesUpdateRemain salesUpdateRemain = SalesUpdateRemain::construct();
+        salesUpdateRemain.metParmIsExtraction(true);
+        salesUpdateRemain.updateDeliverRemainder(_salesLine, _salesLine.RemainSalesPhysical, _salesLine.RemainInventPhysical, _cwQty);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resolveLineStatus</Name>
+				<Source><![CDATA[
+    // Determines if this line is fully extracted or still open
+    private METOrderExtractStatus resolveLineStatus(SalesTable _salesTable, SalesLine _salesLine, InventQty _shipQty, Map _pickedQtyMap)
+    {
+        if (!_salesTable.METAllowBackOrders)
+        {
+            return METOrderExtractStatus::Extracted;
+        }
+
+        // Prior picks + this run = total picked so far
+        InventQty totalPicked = (_pickedQtyMap.exists(_salesLine.InventTransId)
+          ? _pickedQtyMap.lookup(_salesLine.InventTransId)
+          : 0) + _shipQty;
+
+        return (totalPicked == _salesLine.QtyOrdered)
+          ? METOrderExtractStatus::Extracted
+          : METOrderExtractStatus::Open;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMETSalesLineStatus</Name>
+				<Source><![CDATA[
+    // Updates METSalesLine extraction status using the already-joined buffer from QueryRun
+    private void updateMETSalesLineStatus(QueryRun _queryRun, METOrderExtractStatus _lineStatus)
+    {
+        METSalesLine metSalesLineUpd = _queryRun.get(tableNum(METSalesLine));
+        if (metSalesLineUpd.RecId)
+        {
+            metSalesLineUpd.OrderExtractStatus = _lineStatus;
+            metSalesLineUpd.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>batchUpdateAfterLoop</Name>
+				<Source><![CDATA[
+    // Batch updates for charge lines, deliver-now fields, and extraction status
+    private void batchUpdateAfterLoop(SalesTable _salesTable)
+    {
+        SalesLine   salesLineJoin;
+        MarkupTrans markupTransBatch;
+        markupTransBatch.skipDataMethods(true);
+
+        // Mark charge lines as picking list
+        update_recordset markupTransBatch
+          setting DocumentStatus = DocumentStatus::PickingList
+          where   markupTransBatch.TransTableId   == tableNum(SalesLine)
+               && markupTransBatch.Keep           == NoYes::No
+               && markupTransBatch.DocumentStatus != DocumentStatus::PickingList
+               && markupTransBatch.DocumentStatus != DocumentStatus::PackingSlip
+          exists join salesLineJoin
+              where salesLineJoin.SalesId    == _salesTable.SalesId
+                 && salesLineJoin.SalesStatus != SalesStatus::Canceled
+                 && salesLineJoin.RecId       == markupTransBatch.TransRecId;
+
+        // Clear deliver-now quantities
+        SalesLine salesLineDeliverNow;
+        salesLineDeliverNow.skipDataMethods(true);
+
+        update_recordset salesLineDeliverNow
+          setting SalesDeliverNow       = 0,
+                  InventDeliverNow      = 0,
+                  PdsCWInventDeliverNow = 0
+          where salesLineDeliverNow.SalesId    == _salesTable.SalesId
+             && salesLineDeliverNow.SalesStatus != SalesStatus::Canceled;
+
+        // Mark all lines extracted — backorder lines are updated per-line in the loop
+        if (!_salesTable.METAllowBackOrders)
+        {
+            METSalesLine metSalesLineBatch;
+            SalesLine    salesLineStatus;
+
+            update_recordset metSalesLineBatch
+              setting OrderExtractStatus = METOrderExtractStatus::Extracted
+              exists join salesLineStatus
+                  where salesLineStatus.SalesId    == _salesTable.SalesId
+                     && salesLineStatus.SalesStatus != SalesStatus::Canceled
+                     && salesLineStatus.RecId       == metSalesLineBatch.SalesLine;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>activatePickingRoute</Name>
+				<Source><![CDATA[
+    // Activates picking route and its order trans lines
+    private void activatePickingRoute()
+    {
+        WMSPickRouteStatusOnUpdate pickRouteStatus = SalesParameters::find().PickRouteStatusOnUpdate;
+
+        if (pickRouteStatus != WMSPickRouteStatusOnUpdate::completed)
+        {
+            WMSOrderTrans wmsOrderTransBatch;
+            wmsOrderTransBatch.skipDataMethods(true);
+
+            update_recordset wmsOrderTransBatch
+              setting ExpeditionStatus = WMSExpeditionStatus::Activated
+              where wmsOrderTransBatch.RouteId == wmsPickingRoute.PickingRouteID;
+
+            wmsPickingRoute.selectForUpdate(true);
+            wmsPickingRoute.ExpeditionStatus   = WMSExpeditionStatus::Activated;
+            wmsPickingRoute.ActivationDateTime = DateTimeUtil::getSystemDateTime();
+            wmsPickingRoute.update();
+
+            // Activate linked shipment
+            WMSShipment wmsShipmentActivate = wmsPickingRoute.wmsShipment(true);
+            if (wmsShipmentActivate.RecId)
+            {
+                wmsShipmentActivate.setStatus(NoYes::Yes, NoYes::No);
+            }
+        }
+        else
+        {
+            wmsPickingRoute.updateRoute(pickRouteStatus);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPickingRouteLink</Name>
+				<Source><![CDATA[
+    // Links the picking route back to the sales order
+    private void createPickingRouteLink(SalesTable _salesTable)
+    {
+        WMSPickingRouteLink wmsPickingRouteLink;
+        wmsPickingRouteLink.clear();
+        wmsPickingRouteLink.initFromSalesTable(_salesTable);
+        wmsPickingRouteLink.initFromWMSPickingRoute(wmsPickingRoute);
+        METGlobal::validateWriteRecordCheck(wmsPickingRouteLink);
+        wmsPickingRouteLink.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>finalizeSalesTableStatus</Name>
+				<Source><![CDATA[
+    // Updates sales table document status and header markup
+    private void finalizeSalesTableStatus(SalesTable _salesTable)
+    {
+        SalesTable salesTableUpd = SalesTable::find(_salesTable.SalesId, true);
+        salesTableUpd.updateDocumentStatus(DocumentStatus::PickingList);
+        salesTableUpd.updateBackStatus();
+        salesTableUpd.updateSalesType();
+
+        Markup::updateMarkupAsPosted(_salesTable, DocumentStatus::PickingList);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>finalizeShipment</Name>
+				<Source><![CDATA[
+    // Sets shipment to Picked status and fills location if missing
+    private void finalizeShipment(WMSShipment _wmsShipment)
+    {
+        _wmsShipment.selectForUpdate(true);
+        _wmsShipment.reread();
+
+        if (!_wmsShipment.InventLocationId)
+        {
+            WMSPickingRoute wmsPickingRouteForShipment;
+            select firstonly wmsPickingRouteForShipment
+              where wmsPickingRouteForShipment.ShipmentId == _wmsShipment.ShipmentId;
+
+            _wmsShipment.InventLocationId = wmsPickingRouteForShipment.InventLocationId;
+            _wmsShipment.InventSiteId     = InventLocation::find(wmsPickingRouteForShipment.InventLocationId).InventSiteId;
+        }
+
+        _wmsShipment.Status               = WMSShipmentStatus::Picked;
+        _wmsShipment.PickExpeditionStatus = WMSExpeditionStatus::Started;
+        _wmsShipment.doUpdate();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateIntercompanySalesLine</Name>
+				<Source><![CDATA[
+    protected void updateIntercompanySalesLine(SalesLine _salesLine)
+    {
+        // Replicates METSalesPickingListJournalPost_Extension.metUpdateOrigSalesOrder().
+        // Only fires for derived intercompany lines (food entity IC fulfillment).
+        // Always sets Extracted on the original SO line — _status parameter removed as it was never read.
+        if (_salesLine.isDerivedIntercompanyLine() && _salesLine.InterCompanyInventTransId)
+        {
+            changecompany(_salesLine.salesTable().InterCompanyCompanyId)
+            {
+                PurchLine purchLine = PurchLine::findInventTransId(_salesLine.InterCompanyInventTransId);
+                if (purchLine.InterCompanyInventTransId && purchLine.ItemRefType == InventRefType::Sales)
+                {
+                    SalesLine origSalesLine = SalesLine::findInventTransId(purchLine.InventRefTransId);
+                    METSalesLine metICSalesLine = METSalesLine::find(origSalesLine.RecId, true);
+
+                    if (metICSalesLine)
+                    {
+                        metICSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                        metICSalesLine.doUpdate();
+                    }
+
+                    origSalesLine.salesTable(true).metUpdateExtractStatus();
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSalesLineReservPhysicalInSalesUnit</Name>
+				<Source><![CDATA[
+    public SalesQtyReservPhysical getSalesLineReservPhysicalInSalesUnit(SalesLine _salesLine)
+    {
+        SalesQtyReservPhysical reservPhysical;
+
+        reservPhysical = reservedQtyInSalesUnitMap.exists(_salesLine.RecId) ?
+            reservedQtyInSalesUnitMap.lookup(_salesLine.RecId) :
+            _salesLine.reservedPhysicalInSalesUnit();
+        
+        return reservPhysical;
     }
 
 ]]></Source>

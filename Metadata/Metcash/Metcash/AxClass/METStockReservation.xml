@@ -19,6 +19,7 @@ class METStockReservation
     boolean isCrossDockOrCSDOrder;
     boolean isTOReceived;
     boolean isIntercompanyTransferFulfillment;
+    METProcMetrics procMetrics;
 
 }
 ]]></Declaration>
@@ -137,6 +138,8 @@ class METStockReservation
         
         try
         {
+            procMetrics = METProcMetricsScope::current();
+
             //Reserves stock.
             this.reserveStock();
 
@@ -148,8 +151,11 @@ class METStockReservation
                 //Optimises sales order.
                 this.optimiseSalesOrder();
 
-                //Re-reserves after sales order optimization.
-                this.reserveStock();
+                if (lineSubstituted)
+                {
+                    //Re-reserves after sales order optimization.
+                    this.reserveStock();
+                }
             }
             else
             {
@@ -160,8 +166,11 @@ class METStockReservation
                     //Optimises sales order.
                     this.optimiseSalesOrder();
 
-                    //Re-reserves after sales order optimization.
-                    this.reserveStock();
+                    if (lineSubstituted)
+                    {
+                        //Re-reserves after sales order optimization.
+                        this.reserveStock();
+                    }
                 }
 
             }
@@ -220,25 +229,41 @@ class METStockReservation
     {
         SalesLine             salesLine;
         METSalesLine          metSalesLine;
+        InventTrans           inventTrans;
+        InventTransOrigin     inventTransOrigin;
+        InventMovement        inventMovement;
+        InventQty             reserveQty;
+        InventUpd_Reservation reservation;
         
-        while select salesLine
-            where salesLine.SalesId     == salesTable.SalesId
-            &&    salesLine.SalesStatus == SalesStatus::Backorder
+
+        ttsbegin;
+        
+        while select QtyOrdered, InventTransId from salesLine
+                where salesLine.SalesId     == salesTable.SalesId
+                &&  salesLine.SalesStatus == SalesStatus::Backorder
+            join inventTrans
+                where inventTrans.StatusIssue == StatusIssue::OnOrder
+            join RecId from inventTransOrigin
+                where inventTransOrigin.RecId == inventTrans.InventTransOrigin
+                &&    inventTransOrigin.InventTransId == salesLine.InventTransId
             exists join metSalesLine
                 where metSalesLine.SalesLine == salesLine.RecId
                 &&    (metSalesLine.ReasonId  != METConstants::NIRReasonCode
-                ||     metSalesLine.ReasonId  != METConstants::NewReasonCode)
+                &&     metSalesLine.ReasonId  != METConstants::NewReasonCode)
         {
-            if (this.checkIfQtyAvailableForReservation(salesLine))
-            {
-                ttsbegin;
-                METInventTransReserveService reserveService = METInventTransReserveService::construct(salesLine.InventTransId, salesLine.QtyOrdered);
-                reserveService.parmPickPartialReservedLine(true);
-                reserveService.reserve();
-                ttscommit;
+            reserveQty = inventTrans.Qty;
 
+            inventMovement = inventTrans.inventMovement(true);
+            reservation    = InventUpd_Reservation::newMovement(inventMovement, reserveQty, true);
+            reservation.updateNow();
+
+            if (procMetrics)
+            {
+                procMetrics.incDescription2Count(1);
             }
         }
+
+        ttscommit;
     }
 
 ]]></Source>
@@ -255,20 +280,30 @@ class METStockReservation
         METSubstitutionSalesLineProcess subSalesLineProcess;
         SalesLine                       salesLine;
         METSalesLine                    metSalesLine;
+        InventTransOrigin               inventTransOrigin;
+        InventTrans                     inventTrans, inventTransReserved;
         
         while select salesLine
             where salesLine.SalesId     == salesTable.SalesId
             &&    salesLine.SalesStatus == SalesStatus::Backorder
-        exists join metSalesLine
+         join RecId from  metSalesLine
             where metSalesLine.SalesLine == salesLine.RecId
             &&    (metSalesLine.ReasonId  != METConstants::NIRReasonCode
-            ||     metSalesLine.ReasonId  != METConstants::NewReasonCode)
+            &&     metSalesLine.ReasonId  != METConstants::NewReasonCode)
+        join InventTransId, RecId from inventTransOrigin
+            where inventTransOrigin.InventTransId == salesLine.InventTransId
+        exists join RecId from inventTrans
+            where inventTrans.StatusIssue == StatusIssue::OnOrder &&
+            inventTrans.InventTransOrigin == inventTransOrigin.RecId    
+        notexists join RecId from inventTransReserved
+            where inventTransReserved.StatusIssue == StatusIssue::ReservPhysical &&
+            inventTransReserved.InventTransOrigin == inventTransOrigin.RecId
         {
             // Bug 251684: CB166 - Subs on extraction where have OOS then Never not being applied
             // Old method was considering "reserved ordered" which happens when counting journal not posted creates available for reservation stock
             // New method will look at "reserved physical" only
-            if (!salesLine.reservedPhysicalInSalesUnit())
-            {
+            //if (!salesLine.reservedPhysicalInSalesUnit())
+            //{
                 //CB238 - xDock If the order is cross dock, then attempt substitution on NDC warehouse.
                 // Bug 225259: CB238 - NDC / Int xDock: D365 functional warehouse processing Liquor LE SO extraction and TO extraction LSE004 and LTE003 substitution issues
                 // Adding local WH inventory dimension for stock on hand
@@ -289,7 +324,7 @@ class METStockReservation
                         lineSubstituted = true;
                     }
                 }
-            }
+            //}
         }
     }
 
@@ -303,7 +338,6 @@ class METStockReservation
     /// </summary>
     private void endProcess()
     {
-        ttsbegin;
         if (lineSubstituted)
         {
             ttsbegin;
@@ -313,16 +347,13 @@ class METStockReservation
                 metSalesTable.OrderProcessingStatus = METSalesOrderProcessingStatus::ReadyForPricing;
                 metSalesTable.update();
             }
-            ttscommit;
+            
 
             // Step 4: Call TMS engine
-            if (metSalesTable.OrderProcessingStatus == METSalesOrderProcessingStatus::ReadyForPricing)
-            {
-                METTMSEngineOrderProccess  METTMSEngineOrderProccess = METTMSEngineOrderProccess::construct(METTMSEngineExecutionMode::SalesOrderCreation, salesTable);
-                METTMSEngineOrderProccess.run();
-            }
+            METTMSEngineOrderProccess  METTMSEngineOrderProccess = METTMSEngineOrderProccess::construct(METTMSEngineExecutionMode::SalesOrderCreation, salesTable);
+            METTMSEngineOrderProccess.run();
+            ttscommit;
         }
-        ttscommit;
     }
 
 ]]></Source>
@@ -363,7 +394,6 @@ class METStockReservation
         {
             ret = availPhysical > 0;
         }
-
 
         return ret;
     }
