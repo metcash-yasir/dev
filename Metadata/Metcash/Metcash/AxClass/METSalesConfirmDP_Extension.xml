@@ -10,6 +10,7 @@
 [ExtensionOf(classStr(SalesConfirmDP))]
 internal final class METSalesConfirmDP_Extension
 {
+    private boolean isPickedCaseslIneProcessed;
 }
 ]]></Declaration>
 		<Methods>
@@ -99,6 +100,8 @@ internal final class METSalesConfirmDP_Extension
         CustConfirmTrans        custConfirmTrans = _confirmationLineSelection.parmCustConfirmTrans();
         SalesLine               SalesLine        = custConfirmTrans.salesLine();
         METSalesLine            METSalesLine     = METSalesLine::find(SalesLine.RecId);
+        METCase                 pickedCases       = SalesLine.metDisplayPickedCases();
+        METCase                 pickedBrokenCases = SalesLine.metDisplayPickedBrokenCases();
 
         salesConfirmTmp = next initializeSalesOrderConfirmationLine(_salesConfirmHeaderTmp, _confirmationLineSelection);
        
@@ -167,25 +170,67 @@ internal final class METSalesConfirmDP_Extension
             }
         }
 
-        if (metLegalEntityType == metLegalEntityType::Food)
+        salesConfirmTmp.SalesPrice  = this.getSalesLinePriceComponent(salesLine.InventTransId, false);
+
+        if (CompanyInfo::find().METLegalEntityType == metLegalEntityType::Liquor
+              && pickedCases != 0
+              || pickedBrokenCases != 0)
         {
-            salesConfirmTmp.METTotalPriceExclGST = salesLine.SalesPrice;
-            salesConfirmTmp.METTotalPriceIncGST = salesConfirmTmp.TaxAmount + salesConfirmTmp.METTotalPriceExclGST;
-        }
-        else if (metLegalEntityType == metLegalEntityType::Liquor)
-        {
-            salesConfirmTmp.METTotalPriceExclGST = salesLine.SalesPrice;
-            salesConfirmTmp.METWetAmount         = salesConfirmTmp.METWetAmount;
+            if (pickedCases != 0
+                && !isPickedCaseslIneProcessed)
+            {           
+                salesConfirmTmp.METSupplyQty = pickedCases;
+                salesConfirmTmp.METTotalPriceExclGST = salesConfirmTmp.SalesPrice  * salesConfirmTmp.METSupplyQty;
+                salesConfirmTmp.TaxAmount = salesConfirmTmp.TaxAmount * salesConfirmTmp.METSupplyQty;
+                salesConfirmTmp.METWetAmount = salesConfirmTmp.METWetAmount * salesConfirmTmp.METSupplyQty;
+            }
+          
+            if (pickedBrokenCases != 0
+                  && isPickedCaseslIneProcessed)
+            {
+                salesConfirmTmp.SalesUnitTxt = METConstants::unitEach;
+                salesConfirmTmp.METSupplyQty = pickedBrokenCases;
+
+                Qty qtyInSalesUOM = UnitOfMeasureConverter::convert(salesConfirmTmp.METSupplyQty, 
+                                                                    UnitOfMeasure::unitOfMeasureIdBySymbol(METConstants::unitEach),
+                                                                    UnitOfMeasure::unitOfMeasureIdBySymbol(SalesLine.SalesUnit),
+                                                                    NoYes::No, 
+                                                                    EcoResProduct::findByProductNumber(SalesLine.itemid).RecId,
+                                                                    NoYes::No);
+
+                if(qtyInSalesUOM > 0)
+                {
+                    salesConfirmTmp.METTotalPriceExclGST = salesConfirmTmp.SalesPrice * qtyInSalesUOM;
+                    salesConfirmTmp.TaxAmount = salesConfirmTmp.TaxAmount * qtyInSalesUOM;
+                    salesConfirmTmp.METWetAmount = SalesConfirmTmp.METWetAmount * qtyInSalesUOM;
+                }
+            }
+
             salesConfirmTmp.METTotalPriceIncGST  = salesConfirmTmp.METTotalPriceExclGST + salesConfirmTmp.METWetAmount + salesConfirmTmp.TaxAmount;
+        }
+        else
+        {
+            // populate default so confirmation line values.
+            salesConfirmTmp.METSupplyQty = custConfirmTrans.METSuppliedQty;
+
+            if (metLegalEntityType == metLegalEntityType::Food)
+            {
+                salesConfirmTmp.METTotalPriceExclGST = salesLine.SalesPrice;
+                salesConfirmTmp.METTotalPriceIncGST = salesConfirmTmp.TaxAmount + salesConfirmTmp.METTotalPriceExclGST;
+            }
+            else if (metLegalEntityType == metLegalEntityType::Liquor)
+            {
+                salesConfirmTmp.METTotalPriceExclGST = salesLine.SalesPrice;
+                salesConfirmTmp.METWetAmount         = salesConfirmTmp.METWetAmount;
+                salesConfirmTmp.METTotalPriceIncGST  = salesConfirmTmp.METTotalPriceExclGST + salesConfirmTmp.METWetAmount + salesConfirmTmp.TaxAmount;
+            }
         }
         
         // Bug 248887: CB175 - Ordered Qty Mapped Incorrectly, Supplied Qty Not Populated at Time Report is Generated
         // custConfirmTrans.Qty is init from SalesParmLine.DeliverNow which is not the ordered qty
         salesConfirmTmp.Qty                     = salesLine.SalesQty;
-        salesConfirmTmp.METSupplyQty            = custConfirmTrans.METSuppliedQty;
         salesConfirmTmp.METRebate               = this.getSalesLinePriceComponent(salesLine.InventTransId, true);
         salesConfirmTmp.METRebateFees           = MarkupTrans::findValue(tableNum(CustConfirmTrans), custConfirmTrans.RecId).CalculatedAmount;
-        salesConfirmTmp.SalesPrice              = this.getSalesLinePriceComponent(salesLine.InventTransId, false);
         salesConfirmTmp.METSalesLineQtyOrdered  = custConfirmTrans.METSalesLineQtyOrdered;
 
         if (SalesLine.PdsCWQty)
@@ -275,6 +320,42 @@ internal final class METSalesConfirmDP_Extension
 
         next insertSalesOrderConfirmationLine(_salesConfirmDetailsTmp);
             
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createSalesOrderConfirmationLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates and inserts sales order confirmation lines based on picked cases and picked broken cases.
+    /// For liquor legal entities, creates two lines if both picked cases and picked broken cases exist; otherwise, creates a single line.
+    /// </summary>
+    /// <param name = "_salesConfirmHeaderTmp"></param>
+    /// <param name = "_confirmationLineSelection"></param>
+    /// <returns></returns>
+    protected SalesConfirmDetailsTmp createSalesOrderConfirmationLine(
+        SalesConfirmHeaderTmp                           _salesConfirmHeaderTmp,
+        SalesConfirmDPConfirmationLineQuerySelection    _confirmationLineSelection)
+    {
+        SalesLine salesLine = _confirmationLineSelection.parmCustConfirmTrans().salesLine();
+
+        if (CompanyInfo::find().METLegalEntityType == metLegalEntityType::Liquor)
+        {
+            if (salesLine.metDisplayPickedCases() != 0
+                && salesLine.metDisplayPickedBrokenCases() != 0)
+            {
+                SalesConfirmDetailsTmp salesConfirmDetailsTmpPickedCases = this.initializeSalesOrderConfirmationLine(_salesConfirmHeaderTmp, _confirmationLineSelection);
+                this.insertSalesOrderConfirmationLine(salesConfirmDetailsTmpPickedCases);
+                isPickedCaseslIneProcessed = true;
+            }
+            else if (salesLine.metDisplayPickedBrokenCases() != 0)
+            {
+                isPickedCaseslIneProcessed = true;
+            }
+        }
+
+        return next createSalesOrderConfirmationLine(_salesConfirmHeaderTmp, _confirmationLineSelection); 
     }
 
 ]]></Source>
