@@ -5,11 +5,22 @@
 		<Declaration><![CDATA[
 /// <summary>
 /// Controller for the scheduled batch posting of recurring free text invoices.
+///
 /// Invoked from the "Post in Batch" menu item under
 /// Accounts Receivable > Invoices > Recurring Invoices > Post Recurring Invoices.
+///
 /// Mirrors the parallel bundle-splitting pattern of <c>CustRecurrenceInvoicePostController</c>
 /// but operates across all unposted <c>CustRecurrenceInvoiceGroup</c> records that satisfy
 /// the date-range query on <c>METCustRecurrenceInvoiceBatchPostContract</c>.
+///
+/// Always runs in batch mode; the "Batch processing" toggle is locked on and cannot
+/// be disabled by the user.
+///
+/// Child tasks carry groupRecId, startBundle, and endBundle as plain RecId scalars
+/// in METCustRecurrenceInvoiceBatchPostContract. Table-buffer DataMembers (such as
+/// CustRecurrenceInvoicePostContract.parmCustRecurrenceInvoiceGroup) lose their RecId
+/// during SysOperation XML serialisation across batch task session boundaries,
+/// causing a blank buffer and the "record has never been selected" error.
 /// </summary>
 public class METCustRecurrenceInvoiceBatchPostController extends SysOperationServiceController implements BatchRetryable
 {
@@ -22,9 +33,6 @@ public class METCustRecurrenceInvoiceBatchPostController extends SysOperationSer
 			<Method>
 				<Name>isRetryable</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Recurring invoice posting is not safely retryable.
-    /// </summary>
     [Hookable(false)]
     public boolean isRetryable()
     {
@@ -36,12 +44,6 @@ public class METCustRecurrenceInvoiceBatchPostController extends SysOperationSer
 			<Method>
 				<Name>mustGoBatch</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Forces the operation to always run in batch mode.
-    /// The "Run in background > Batch processing" checkbox will be checked
-    /// and disabled so the user cannot uncheck it.
-    /// </summary>
-    /// <returns>Always <c>true</c>.</returns>
     public boolean mustGoBatch()
     {
         return true;
@@ -52,10 +54,6 @@ public class METCustRecurrenceInvoiceBatchPostController extends SysOperationSer
 			<Method>
 				<Name>construct</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Constructs the controller wired to <c>splitInvoiceBundles</c> running as a scheduled batch.
-    /// The split method fans out per-group child tasks at runtime.
-    /// </summary>
     public static METCustRecurrenceInvoiceBatchPostController construct()
     {
         return new METCustRecurrenceInvoiceBatchPostController(
@@ -69,13 +67,6 @@ public class METCustRecurrenceInvoiceBatchPostController extends SysOperationSer
 			<Method>
 				<Name>main</Name>
 				<Source><![CDATA[
-    /// <summary>
-    /// Entry point invoked by the "Post in Batch" action menu item.
-    /// Displays the batch scheduling dialog, allowing the user to configure
-    /// a recurrence schedule and filter groups via "Records to include"
-    /// (generation date and invoice date). No record context is required.
-    /// </summary>
-    /// <param name="args">Args passed from the menu item.</param>
     public static void main(Args args)
     {
         METCustRecurrenceInvoiceBatchPostController controller;
@@ -92,17 +83,9 @@ public class METCustRecurrenceInvoiceBatchPostController extends SysOperationSer
 				<Name>splitInvoiceBundles</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Runs as the top-level batch task. Resolves all unposted
-    /// <c>CustRecurrenceInvoiceGroup</c> records from the contract query and,
-    /// for each group, splits its unposted invoices into bundles of at least
-    /// <c>SalesParameters.OrderBatchTaskSize</c> (minimum 100). Each bundle is
-    /// registered as a child batch task that delegates to the standard
-    /// <c>CustRecurrenceInvoicePostController.executeParallelTaskForRecurrenceInvoicePosting</c>.
+    /// Top-level batch task. Iterates all unposted CustRecurrenceInvoiceGroup records
+    /// from the contract query and registers one child batch task per invoice bundle.
     /// </summary>
-    /// <param name="_contract">
-    ///     Contract carrying the packed query used to filter recurring invoice groups
-    ///     by generation date and invoice date.
-    /// </param>
     internal void splitInvoiceBundles(METCustRecurrenceInvoiceBatchPostContract _contract)
     {
         const int MinBundleSize = 100;
@@ -129,7 +112,6 @@ public class METCustRecurrenceInvoiceBatchPostController extends SysOperationSer
         {
             custRecurrenceInvoiceGroup = queryRun.get(tableNum(CustRecurrenceInvoiceGroup));
 
-            // Guard: skip any group already posted at execution time.
             if (custRecurrenceInvoiceGroup.Posted != NoYes::No)
             {
                 continue;
@@ -162,24 +144,21 @@ public class METCustRecurrenceInvoiceBatchPostController extends SysOperationSer
                     i = 0;
 
                     batchHeader.addTask(
-                            this.cloneForSubProcess(custRecurrenceInvoiceGroup),
+                            this.cloneForSubProcess(custRecurrenceInvoiceGroup.RecId),
                             this.parmCurrentBatch().RecId);
                 }
 
-                lastBundle          = invoice.RecId;
+                lastBundle           = invoice.RecId;
                 hasInvoicesToProcess = true;
             }
 
-            // Flush any remaining invoices that did not fill a complete bundle,
-            // or create a single empty-range task when the group has no invoices
-            // (so the group status is still evaluated by the service).
             boolean shouldCreateBundle = (i > 0 || !hasInvoicesToProcess);
             if (shouldCreateBundle)
             {
                 endBundle = lastBundle;
 
                 batchHeader.addTask(
-                        this.cloneForSubProcess(custRecurrenceInvoiceGroup),
+                        this.cloneForSubProcess(custRecurrenceInvoiceGroup.RecId),
                         this.parmCurrentBatch().RecId);
             }
         }
@@ -193,34 +172,67 @@ public class METCustRecurrenceInvoiceBatchPostController extends SysOperationSer
 				<Name>cloneForSubProcess</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Creates a child <c>CustRecurrenceInvoicePostController</c> task scoped to
-    /// the current <c>startBundle</c> / <c>endBundle</c> range for the given group.
-    /// Reuses the standard parallel execution path so no custom service logic is
-    /// required for the actual posting work.
+    /// Creates a child task using METCustRecurrenceInvoiceBatchPostContract so that
+    /// groupRecId, startBundle, and endBundle are stored as plain RecId scalars.
+    /// Plain scalars survive SysOperation XML serialisation reliably.
+    /// Table-buffer DataMembers (e.g. CustRecurrenceInvoicePostContract.parmCustRecurrenceInvoiceGroup)
+    /// do NOT — their RecId becomes 0 after deserialisation in the child batch session.
     /// </summary>
-    /// <param name="_group">The recurring invoice group to post.</param>
-    /// <returns>
-    ///     A <c>CustRecurrenceInvoicePostController</c> ready to be added as a batch task.
-    /// </returns>
-    private CustRecurrenceInvoicePostController cloneForSubProcess(CustRecurrenceInvoiceGroup _group)
+    /// <param name="_groupRecId">RecId of the CustRecurrenceInvoiceGroup to post.</param>
+    private METCustRecurrenceInvoiceBatchPostController cloneForSubProcess(RecId _groupRecId)
     {
-        CustRecurrenceInvoicePostController controller = new CustRecurrenceInvoicePostController(
-                classStr(CustRecurrenceInvoicePostController),
-                methodStr(CustRecurrenceInvoicePostController, executeParallelTaskForRecurrenceInvoicePosting),
+        METCustRecurrenceInvoiceBatchPostController controller = new METCustRecurrenceInvoiceBatchPostController(
+                classStr(METCustRecurrenceInvoiceBatchPostController),
+                methodStr(METCustRecurrenceInvoiceBatchPostController, executeParallelTask),
                 SysOperationExecutionMode::Synchronous);
 
-        CustRecurrenceInvoicePostContract dataContract =
-                controller.getDataContractInfoObject().dataContractObject() as CustRecurrenceInvoicePostContract;
+        METCustRecurrenceInvoiceBatchPostContract dataContract =
+                controller.getDataContractInfoObject().dataContractObject() as METCustRecurrenceInvoiceBatchPostContract;
 
+        dataContract.parmGroupRecId(_groupRecId);
         dataContract.parmStartBundle(startBundle);
         dataContract.parmEndBundle(endBundle);
-        dataContract.parmCustRecurrenceInvoiceGroup(_group);
-        dataContract.parmRecurrenceInvoicePost(NoYes::Yes);
-        dataContract.parmRecurrencePostTransfer(NoYes::No);
-        dataContract.parmCheckRecurrenceInvoice(NoYes::No);
-        dataContract.parmValidateInSandbox(NoYes::No);
 
         return controller;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>executeParallelTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Child batch task entry point.
+    /// Re-selects CustRecurrenceInvoiceGroup by RecId using a direct select statement
+    /// so the buffer has the kernel DB-selected flag required for
+    /// selectForUpdate(true) + update() inside updateRecurrenceInvoiceGroupStatus.
+    /// groupRecId is read from the plain scalar parmGroupRecId() — not from a
+    /// table-buffer DataMember — because table-buffer DataMembers lose their RecId
+    /// across SysOperation XML serialisation boundaries.
+    /// </summary>
+    internal void executeParallelTask(METCustRecurrenceInvoiceBatchPostContract _contract)
+    {
+        CustRecurrenceInvoiceGroup custRecurrenceInvoiceGroup;
+
+        select firstonly custRecurrenceInvoiceGroup
+            where custRecurrenceInvoiceGroup.RecId == _contract.parmGroupRecId();
+
+        if (!custRecurrenceInvoiceGroup.RecId)
+        {
+            throw error(strFmt("@SYS22415", _contract.parmGroupRecId()));
+        }
+
+        CustRecurrenceInvoicePostContract postContract = new CustRecurrenceInvoicePostContract();
+        postContract.parmCustRecurrenceInvoiceGroup(custRecurrenceInvoiceGroup);
+        postContract.parmStartBundle(_contract.parmStartBundle());
+        postContract.parmEndBundle(_contract.parmEndBundle());
+        postContract.parmRecurrenceInvoicePost(NoYes::Yes);
+        postContract.parmRecurrencePostTransfer(NoYes::No);
+        postContract.parmCheckRecurrenceInvoice(NoYes::No);
+        postContract.parmValidateInSandbox(NoYes::No);
+
+        CustRecurrenceInvoicePostService postService = new CustRecurrenceInvoicePostService();
+        postService.post(postContract);
     }
 
 ]]></Source>
