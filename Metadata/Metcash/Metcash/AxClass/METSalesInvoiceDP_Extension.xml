@@ -222,12 +222,17 @@ final class METSalesInvoiceDP_Extension
         InventLocationId locationId = SalesTable::find(salesInvoiceHeaderFooterTmp.salesId).InventLocationId;
         salesInvoiceHeaderFooterTmp.METSupplierSiteNameAddress = LogisticsPostalAddress::findByLocation(InventLocation::getLocationFromRole(InventLocation::find(locationId).RecId, LogisticsLocationRoleType::Delivery)).Address;
 
+        METComponentCode metComponentCode;
+
         //getting line charges here
         while select saleslineloc
             group by metSalesLinePriceComponent.component,SalesLineloc.inventtransid
-                where saleslineloc.SalesId == salesTable.SalesId
-            join component from metSalesLinePriceComponent
+            where saleslineloc.SalesId == salesTable.SalesId
+                join component from metSalesLinePriceComponent
                 where METSalesLinePriceComponent.InventTransId == SalesLineloc.inventtransid
+                join metComponentCode
+                where metComponentCode.Component == metSalesLinePriceComponent.Component
+                && metComponentCode.PriceComponent == METPriceComponent::LineCharges
         {
             select sum(value) from metSalesLinePriceComponentloc
                 where metSalesLinePriceComponentloc.Component == metSalesLinePriceComponent.Component
@@ -628,6 +633,27 @@ final class METSalesInvoiceDP_Extension
         salesInvoiceTmp.METAlcoholContent   = metInventTable.AlcoholContent;
         salesInvoiceTmp.METCountryCode      = metInventTable.CountryCode;
         salesInvoiceTmp.METGTIN             = salesLine.BarCode;
+
+        // === Bug 351188 - ALM invoice picked cases / broken cases logic ===
+        SRSReportDesignName reportDesignName = METSalesOrderTypes::find(_custInvoiceJour.salesTable().METSalesOrderType).SalesInvoiceReportDesignName;
+
+        boolean isALMReport = (reportDesignName == METConstants::ALMDirectsCTInvoice || reportDesignName == METConstants::ALMExportSalesInvoice);
+
+        METLegalEntityType metLegalEntityType = CompanyInfo::find().METLegalEntityType;
+        if (metLegalEntityType == METLegalEntityType::Liquor && isALMReport)
+        {
+            // Scenario 1 & 3: insert picked cases line.
+            if (_custInvoiceTrans.METPickedCases != 0)
+            {
+                this.metInsertPickedCaseLine(salesInvoiceTmp, _custInvoiceTrans, salesLine, _custInvoiceTrans.METPickedCases, false);
+            }
+
+            // Scenario 2 & 3: insert broken cases line.
+            if (_custInvoiceTrans.METPickedBrokenCases != 0)
+            {
+                this.metInsertPickedCaseLine(salesInvoiceTmp, _custInvoiceTrans, salesLine, _custInvoiceTrans.METPickedBrokenCases, true);
+            }
+        }
     }
 
 ]]></Source>
@@ -968,6 +994,87 @@ final class METSalesInvoiceDP_Extension
         ttsbegin;
         delete_from salesInvoiceTmp
             where salesInvoiceTmp.ItemId == "" ;
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metInsertPickedCaseLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts a new line for the picked cases and another line for broken cases if applicable based on the METCase value on the invoice line.
+    /// </summary>
+    /// <param name = "_salesInvoiceTmpBase">SalesInvoiceTmp</param>
+    /// <param name = "_custInvoiceTrans">CustInvoiceTrans</param>
+    /// <param name = "_salesLine">SalesLine</param>
+    /// <param name = "_qty">METCase</param>
+    /// <param name = "_isBrokenCase">boolean</param>
+    private void metInsertPickedCaseLine(SalesInvoiceTmp     _salesInvoiceTmpBase,
+                                      CustInvoiceTrans    _custInvoiceTrans,
+                                      SalesLine           _salesLine,
+                                      METCase             _qty,
+                                      boolean             _isBrokenCase)
+    {
+        SalesInvoiceTmp caseLine;
+
+        // Copy all fields from base line - carries over ItemId, description,
+        // prices, charges, tax groups, and all other mapped fields.
+        caseLine.data(_salesInvoiceTmpBase);
+
+        // Clear RecId to force a new insert rather than updating existing record.
+        caseLine.RecId = 0;
+
+        if (_isBrokenCase)
+        {
+            // --- Broken cases line overrides (mapping sheet - bug 351188) ---
+
+            // Qty Supplied = picked broken cases value
+            caseLine.Qty            = _qty;
+
+            // Qty Ordered = 0 for broken case lines
+            caseLine.METOrderedQty  = 0;
+
+            // UOM = EA for broken case lines
+            caseLine.SalesUnitTxt   = METConstants::unitEach;
+
+            EcoResProduct product = EcoResProduct::findByProductNumber(_salesLine.itemid);
+            Recid fromUOM = UnitOfMeasure::unitOfMeasureIdBySymbol(_salesLine.SalesUnit);
+            Recid eaUOM = UnitOfMeasure::unitOfMeasureIdBySymbol(METConstants::unitEach); 
+
+            Qty qtyInEA = UnitOfMeasureConverter::convert(caseLine.Qty , fromUOM, eaUOM, NoYes::No, product.RecId, NoYes::No);
+
+            if(qtyInEA > 0)
+            {
+                salesInvoiceTmp.METLucInclGST = (salesInvoiceTmp.metcaseCost * caseLine.Qty)/ qtyInEA;
+
+                caseLine.METGSTTotal = (_salesInvoiceTmpBase.METGSTTotal/qtyInEA) * caseLine.Qty;
+            }
+
+            
+            
+        }
+        else
+        {
+            // --- Picked cases line overrides (mapping sheet - bug 351188) ---
+
+            // Qty Supplied = picked cases value
+            caseLine.Qty            = _qty;
+
+            // Qty Ordered = sales line SalesQty
+            caseLine.METOrderedQty  = _salesLine.SalesQty;
+
+            // UOM = sales order line unit
+            caseLine.SalesUnitTxt   = _custInvoiceTrans.SalesUnit;
+
+            caseLine.METLucInclGST = _salesInvoiceTmpBase.metcaseCost * caseLine.Qty;
+
+            caseLine.METGSTTotal = (_salesInvoiceTmpBase.METGSTTotal/caseLine.Qty) * caseLine.Qty;
+
+        }
+
+        ttsbegin;
+        caseLine.insert();
         ttscommit;
     }
 
