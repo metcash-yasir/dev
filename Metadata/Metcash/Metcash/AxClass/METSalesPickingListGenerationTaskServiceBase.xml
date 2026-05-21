@@ -21,6 +21,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     Map                                             reservedQtyInSalesUnitMap = new Map(Types::Int64, Types::Real);
     METProcMetrics                                  procMetrics;
     SalesUpdateRemain                               salesUpdateRemain;
+    boolean                                         isError;
     #OCCRetryCount
 }
 ]]></Declaration>
@@ -140,7 +141,8 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 useLegacyMode = METCustParameters::Find().SalesExtractionPerfMode;
                 this.processPickingList(_dataContract);
 
-                procMetrics.endTrace();
+                METBatchMonitoringStatus batchStatus = isError ? METBatchMonitoringStatus::Failed : METBatchMonitoringStatus::Completed;
+                procMetrics.endTrace(batchStatus);
             }
 
         }
@@ -229,23 +231,25 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
         if (_dataContract.parmTriggerBusinessEvent())
         {
-            if (procMetrics)
-            {
-                procMetrics.startDescription2Time("@MET:METSOExtractTriggerBusinessEvent");
-            }
-
             this.finalThreadBusinessEventAndShipmentCleanup();
-
-            if (procMetrics)
-            {
-                procMetrics.endDescription2Time();
-            }
 
             return;
         }
 
         if (salesTable)
         {
+            if (procMetrics)
+            {
+                procMetrics.startDescription2Time("SO Guide Check");
+            }
+
+            this.performSOGuideCheck();
+
+            if (procMetrics)
+            {
+                procMetrics.endDescription2Time();
+            }
+            
             //Task 162245-CB123 - SalesOrderExtractScreenforCSD- start
             
             inventParameter = InventParameters::find();
@@ -267,14 +271,14 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                 if (procMetrics)
                 {
-                    procMetrics.startDescription2Time("@MET:METSOExtractTransferOrderCreate");
+                    procMetrics.startDescription3Time("@MET:METSOExtractTransferOrderCreate");
                 }
 
                 METCrossDockTransferOrderProcessorBase::construct(salesTable).CreateTransferOrder();
 
                 if (procMetrics)
                 {
-                    procMetrics.endDescription2Time();
+                    procMetrics.endDescription3Time();
                 }
 
                 info(strFmt("@MET:TOCreatedForSO", salesTable.SalesId));
@@ -283,14 +287,14 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             {
                 if (procMetrics)
                 {
-                    procMetrics.startDescription2Time("@MET:METSOExtractStockReservation");
+                    procMetrics.startDescription3Time("@MET:METSOExtractStockReservation");
                 }
 
                 METStockReservation::construct(salesTable).process();
 
                 if (procMetrics)
                 {
-                    procMetrics.endDescription2Time();
+                    procMetrics.endDescription3Time();
                 }
 
                 if (useLegacyMode == NoYes::Yes)
@@ -301,19 +305,9 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 {
                     this.postPickingListV2(salesTable);
                 }
-
-                if (procMetrics)
-                {
-                    procMetrics.startDescription6Time("@MET:METSOExtractIntercompanyPickingList");
-                }
-
+                
                 //Intercompany picking list. 
                 this.postIntercompanyPickingList();
-
-                if (procMetrics)
-                {
-                    procMetrics.endDescription6Time();
-                }
 
                 if (procMetrics)
                 {
@@ -339,31 +333,21 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                     this.postPickingListV2(salesTable, true);
                 }
 
-                if (procMetrics)
-                {
-                    procMetrics.startDescription6Time("@MET:METSOExtractIntercompanyPickingList");
-                }
-
                 //Post intercompany picking list. Sourcing all lines from a single company
                 this.postIntercompanyPickingList();
-
-                if (procMetrics)
-                {
-                    procMetrics.endDescription6Time();
-                }
             }
             else if (actionToPerform == METConstants::SOExtractReservedSOPickOnly)
             {
                 if (procMetrics)
                 {
-                    procMetrics.startDescription2Time("@MET:METSOExtractStockReservation");
+                    procMetrics.startDescription3Time("@MET:METSOExtractStockReservation");
                 }
 
                 METStockReservation::construct(salesTable).process();
 
                 if (procMetrics)
                 {
-                    procMetrics.endDescription2Time();
+                    procMetrics.endDescription3Time();
                 }
 
                 //Post picking list
@@ -376,18 +360,8 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                     this.postPickingListV2(salesTable);
                 }
 
-                if (procMetrics)
-                {
-                    procMetrics.startDescription6Time("@MET:METSOExtractIntercompanyPickingList");
-                }
-
                 //Post intercompany picking list. Sourcing all lines from a single company
                 this.postIntercompanyPickingList();
-
-                if (procMetrics)
-                {
-                    procMetrics.endDescription6Time();
-                }
             }
             else if (actionToPerform == METConstants::SOExtractUpdateStatusOnly)
             {
@@ -456,6 +430,11 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         }
         else if (purchTable_Reference.RecId)
         {
+            if (procMetrics)
+            {
+                procMetrics.startDescription9Time("@MET:METSOExtractIntercompanyPickingList");
+            }
+
             changeCompany(purchTable_Reference.InterCompanyCompanyId)
             {
                 METStockReservation::construct(purchTable_Reference.interCompanySalesTable()).process();
@@ -470,6 +449,11 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 }
                 
                 this.finalThreadBusinessEventAndShipmentCleanup(true);
+            }
+
+            if (procMetrics)
+            {
+                procMetrics.endDescription9Time();
             }
         }
 
@@ -487,7 +471,6 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     /// <param name = "_pickListOrderedQty">boolean buffer.</param>
     public void postPickingList(SalesTable _salesTable, boolean _pickListOrderedQty = false)
     {
-        boolean             isError;
         QueryRun            queryRun;
         SalesTable          salesTableCurr = SalesTable::find(_salesTable.SalesId);
         SalesParmLine       salesParmLine;
@@ -794,7 +777,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         while select forupdate salesLine
             where salesLine.SalesId == _salesTable.SalesId
                 && salesLine.SalesStatus != SalesStatus::Canceled
-            join OrderExtractStatus from metSalesLineNotExtracted
+            join forupdate metSalesLineNotExtracted
                 where metSalesLineNotExtracted.SalesLine == salesLine.RecId
             join inventdim
                 where inventDim.inventDimId == salesLine.inventDimId
@@ -828,6 +811,14 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             {
                 if (this.cancelSalesLineV2(_salesTable, salesLine, _pickListOrderedQty))
                 {
+                    this.ttsBeginTrace();
+
+                    if (metSalesLineNotExtracted.OrderExtractStatus != METOrderExtractStatus::Extracted)
+                    {
+                        metSalesLineNotExtracted.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                        metSalesLineNotExtracted.update();
+                    }
+
                     if (salesLine.inventTable().pdsCWItem())
                     {
                         this.salesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
@@ -839,14 +830,11 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                     info(strFmt("@MET:NoStock", salesLine.SalesId, salesLine.ItemId));
 
-                    update_recordset metSalesLine
-                            setting OrderExtractStatus = METOrderExtractStatus::Extracted
-                                where metSalesLine.SalesLine == salesLine.RecId &&
-                                      metSalesLine.OrderExtractStatus != METOrderExtractStatus::Extracted;
+                    this.ttsCommitTrace();
 
                     if (procMetrics)
                     {
-                        procMetrics.incDescription3Count(1);
+                        procMetrics.incDescription4Count(1);
                     }
                 }
                 else
@@ -867,7 +855,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         if (salesUpdateRemain)
         {
             // Recalculating Sales totals if any line is cancelled due to no stock availability as we are skipping it in SalesUpdateRemain class. so need to explicitly call the update to recalculate the totals and other related fields which are normally calculated in updateCorrespondingSalesOrder method of SalesUpdateRemain class.
-            ttsbegin;
+            this.ttsBeginTrace();
 
             SalesTable salesTableTotalsUpdate = SalesTable::find(_salesTable.SalesId, true);
 
@@ -876,7 +864,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 salesTableTotalsUpdate.doUpdate();
             }
 
-            ttscommit;
+            this.ttsCommitTrace();
         }
 
         return qualifyingSalesLines;
@@ -1116,6 +1104,11 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     {
         if (_forceTriggerBusinessEvent || dataContract)
         {
+            if (procMetrics)
+            {
+                procMetrics.startDescription2Time("@MET:METSOExtractTriggerBusinessEvent");
+            }
+
             this.triggerBusinessEvent(wmsPickingRoute);
 
             if (dataContract)
@@ -1138,6 +1131,11 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                 METSalesOrderShipmentLoadHeader::cleanShipmentIfNoLines(conShipmentIds);
             }
+
+            if (procMetrics)
+            {
+                procMetrics.endDescription2Time();
+            }
         }
     }
 
@@ -1154,7 +1152,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     public void postPickingListV2(SalesTable _salesTable, boolean _pickListOrderedQty = false)
     {
         // Due to performance issue with extraction process, this method is created to directly update the tables instead of using the standard picking list generation process. This method will update the tables as if the picking list is generated with all the lines and quantities using the SalesFormLetter classes. Refer the previous implementation of postPickingList method where the SalesFormLetter class is used.
-        boolean             isError;
+        
         List                qualifyingSalesLineRecIds;
 
         try
@@ -1165,34 +1163,27 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                 if (procMetrics)
                 {
-                    procMetrics.startDescription3Time("@MET:METSOExtractDeliverRemainderCancel");
+                    procMetrics.startDescription4Time("@MET:METSOExtractDeliverRemainderCancel");
                 }
 
-                ttsbegin;
+                this.salesUpdateRemain().resetOrderCheckUpdate();
 
                 qualifyingSalesLineRecIds = this.calcQueryV2(_salesTable, _pickListOrderedQty);
-
-                ttscommit;
-
+                
                 if (procMetrics)
                 {
-                    procMetrics.endDescription3Time();
+                    procMetrics.endDescription4Time();
                 }
 
                 if (processExtraction == true)
                 {
-                    if (procMetrics)
-                    {
-                        procMetrics.ttsBeginTrace();
-                    }
-                    else
-                    {
-                        ttsbegin;
-                    }
+                    this.salesUpdateRemain().resetOrderCheckUpdate();
+
+                    this.ttsBeginTrace();
 
                     if (procMetrics)
                     {
-                        procMetrics.startDescription4Time("@MET:METSOExtractPickingListCreation");
+                        procMetrics.startDescription5Time("@MET:METSOExtractPickingListCreation");
                     }
 
                     this.postPickingListDirect(_salesTable, _pickListOrderedQty, qualifyingSalesLineRecIds);
@@ -1208,17 +1199,10 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                     if (procMetrics)
                     {
-                        procMetrics.endDescription4Time();
+                        procMetrics.endDescription5Time();
                     }
 
-                    if (procMetrics)
-                    {
-                        procMetrics.ttsCommitTrace();
-                    }
-                    else
-                    {
-                        ttscommit;
-                    }
+                    this.ttsCommitTrace();
                 }
             }
         }
@@ -1276,23 +1260,24 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         _salesTable.selectForUpdate(true);
         _salesTable.metUpdateExtractStatus();
 
-        if (procMetrics)
-        {
-            procMetrics.startDescription5Time("@MET:METSOExtractTMSEngineOrderProcess");
-        }
-
         if (!isError && !skipTMSProcess)
         {
             if (_salesTable.METOrderExtractStatus == METOrderExtractStatus::Extracted)
             {
+                if (procMetrics)
+                {
+                    procMetrics.startDescription6Time("@MET:METSOExtractTMSEngineOrderProcess");
+                }
+
                 METTMSEngineOrderProccess  metTMSEngineOrderProccess = METTMSEngineOrderProccess::construct(METTMSEngineExecutionMode::SalesOrderPickingList, wmsPickingRoute, wmsPickingRoute.PickingRouteID);
                 metTMSEngineOrderProccess.run();
-            }
-        }
 
-        if (procMetrics)
-        {
-            procMetrics.endDescription5Time();
+                if (procMetrics)
+                {
+                    procMetrics.incDescription6Count(1);
+                    procMetrics.endDescription6Time();
+                }
+            }
         }
     }
 
@@ -1336,7 +1321,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 {
                     continue;
                 }
-
+                
                 if (useQualityManagement)
                 {
                     InventQualityManagementBlockHandler::blockSalesPickingList(salesLine);
@@ -1397,7 +1382,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                 if (procMetrics)
                 {
-                    procMetrics.incDescription4Count(1);
+                    procMetrics.incDescription5Count(1);
                 }
             }
         }
@@ -1760,6 +1745,395 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             _salesLine.reservedPhysicalInSalesUnit();
         
         return reservPhysical;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>performSOGuideCheck</Name>
+				<Source><![CDATA[
+    public void performSOGuideCheck()
+    {
+        SalesLine               salesLine;
+        METSalesLine            metSalesLine;
+        METInventItemOrderSetup metInventItemOrderSetup;
+        InventDim               inventDim;
+        CustTable               custTable; 
+        LogisticsPostalAddress  deliveryAddress;
+        METSalesOrderGuideItem  salesOrderGuideItemCustomerOnlySellTo, salesOrderGuideItemCustomerOperationsGroupOnlySellTo, salesOrderGuideItemSiteOnlySellTo, salesOrderGuideItemStateOnlySellTo, salesOrderGuideItemCustomerDoNotSellTo, salesOrderGuideItemCustomerOperationsGroupDoNotSellTo, salesOrderGuideItemSiteDoNotSellTo, salesOrderGuideItemStateDoNotSellTo;
+
+        salesTable.reread();
+
+        if (salesTable.METOrderExtractStatus != METOrderExtractStatus::Open && salesTable.METOrderExtractStatus != METOrderExtractStatus::ReadyForExtract)
+        {
+            return;
+        }
+
+        select firstonly METCustOperGroupId
+            from custTable
+            where custTable.AccountNum == salesTable.CustAccount;
+
+        while select salesLine
+                where salesLine.SalesStatus == SalesStatus::Backorder
+                && salesLine.SalesId == salesTable.SalesId
+            join InventSiteId from inventDim
+                where inventDim.InventDimId == salesLine.InventDimId
+            join metSalesLine
+                where metSalesLine.SalesLine == salesLine.RecId
+            outer join ItemStatus, RecId from metInventItemOrderSetup
+                where metInventItemOrderSetup.ItemId == salesLine.ItemId
+                && METInventItemOrderSetup.SiteId == inventDim.InventSiteId
+            outer join State from deliveryAddress
+                where deliveryAddress.Location == salesLine.DeliveryPostalAddress
+            outer join RecId from salesOrderGuideItemCustomerOnlySellTo
+                where salesOrderGuideItemCustomerOnlySellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemCustomerOnlySellTo.ReferenceType == METSalesOrderGuideReferenceType::Customer
+                && salesOrderGuideItemCustomerOnlySellTo.Reference == salesLine.CustAccount
+                && salesOrderGuideItemCustomerOnlySellTo.Type == METSalesOrderGuideType::OnlySellTo
+                && salesOrderGuideItemCustomerOnlySellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemCustomerOnlySellTo.Reference != ''
+            outer join RecId from salesOrderGuideItemCustomerOperationsGroupOnlySellTo
+                where salesOrderGuideItemCustomerOperationsGroupOnlySellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemCustomerOperationsGroupOnlySellTo.ReferenceType == METSalesOrderGuideReferenceType::CustomerOperationsGroup
+                && salesOrderGuideItemCustomerOperationsGroupOnlySellTo.Reference == custTable.METCustOperGroupId
+                && salesOrderGuideItemCustomerOperationsGroupOnlySellTo.Type == METSalesOrderGuideType::OnlySellTo
+                && salesOrderGuideItemCustomerOperationsGroupOnlySellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemCustomerOperationsGroupOnlySellTo.Reference != ''
+            outer join RecId from salesOrderGuideItemSiteOnlySellTo
+                where salesOrderGuideItemSiteOnlySellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemSiteOnlySellTo.ReferenceType == METSalesOrderGuideReferenceType::Site
+                && salesOrderGuideItemSiteOnlySellTo.Reference == inventDim.InventSiteId
+                && salesOrderGuideItemSiteOnlySellTo.Type == METSalesOrderGuideType::OnlySellTo
+                && salesOrderGuideItemSiteOnlySellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemSiteOnlySellTo.Reference != ''
+            outer join RecId from salesOrderGuideItemStateOnlySellTo
+                where salesOrderGuideItemStateOnlySellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemStateOnlySellTo.ReferenceType == METSalesOrderGuideReferenceType::State
+                && salesOrderGuideItemStateOnlySellTo.Reference == deliveryAddress.State
+                && salesOrderGuideItemStateOnlySellTo.Type == METSalesOrderGuideType::OnlySellTo
+                && salesOrderGuideItemStateOnlySellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemStateOnlySellTo.Reference != ''
+            outer join RecId from salesOrderGuideItemCustomerDoNotSellTo
+                where salesOrderGuideItemCustomerDoNotSellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemCustomerDoNotSellTo.ReferenceType == METSalesOrderGuideReferenceType::Customer
+                && salesOrderGuideItemCustomerDoNotSellTo.Reference == salesLine.CustAccount
+                && salesOrderGuideItemCustomerDoNotSellTo.Type == METSalesOrderGuideType::DoNotSellTo
+                && salesOrderGuideItemCustomerDoNotSellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemCustomerDoNotSellTo.Reference != ''
+            outer join RecId from salesOrderGuideItemCustomerOperationsGroupDoNotSellTo
+                where salesOrderGuideItemCustomerOperationsGroupDoNotSellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemCustomerOperationsGroupDoNotSellTo.ReferenceType == METSalesOrderGuideReferenceType::CustomerOperationsGroup
+                && salesOrderGuideItemCustomerOperationsGroupDoNotSellTo.Reference == custTable.METCustOperGroupId
+                && salesOrderGuideItemCustomerOperationsGroupDoNotSellTo.Type == METSalesOrderGuideType::DoNotSellTo
+                && salesOrderGuideItemCustomerOperationsGroupDoNotSellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemCustomerOperationsGroupDoNotSellTo.Reference != ''
+            outer join RecId from salesOrderGuideItemSiteDoNotSellTo
+                where salesOrderGuideItemSiteDoNotSellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemSiteDoNotSellTo.ReferenceType == METSalesOrderGuideReferenceType::Site
+                && salesOrderGuideItemSiteDoNotSellTo.Reference == inventDim.InventSiteId
+                && salesOrderGuideItemSiteDoNotSellTo.Type == METSalesOrderGuideType::DoNotSellTo
+                && salesOrderGuideItemSiteDoNotSellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemSiteDoNotSellTo.Reference != ''
+            outer join RecId from salesOrderGuideItemStateDoNotSellTo
+                where salesOrderGuideItemStateDoNotSellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemStateDoNotSellTo.ReferenceType == METSalesOrderGuideReferenceType::State
+                && salesOrderGuideItemStateDoNotSellTo.Reference == deliveryAddress.State
+                && salesOrderGuideItemStateDoNotSellTo.Type == METSalesOrderGuideType::DoNotSellTo
+                && salesOrderGuideItemStateDoNotSellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemStateDoNotSellTo.Reference != ''
+        {
+            if (metInventItemOrderSetup.RecId
+                && metInventItemOrderSetup.ItemStatus != METConstants::Active
+                && metSalesLine.ReasonId != METConstants::NewReasonCode 
+                && metSalesLine.ReasonId != METConstants::DEL)
+            {
+                this.ttsBeginTrace();
+
+                metSalesLine.selectForUpdate(true);
+                metSalesLine.ReasonId = METConstants::NewReasonCode;
+                metSalesLine.update();
+
+                if (procMetrics)
+                {
+                    procMetrics.incDescription2Count(1);
+                }
+
+                this.ttsCommitTrace();
+
+                continue;
+            }
+
+            // 1st priority: Customer only sell-to
+            if (salesOrderGuideItemCustomerOnlySellTo.RecId) 
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
+                {
+                    this.ttsBeginTrace();
+
+                    metSalesLine.selectForUpdate(true);
+                    metSalesLine.ReasonId = '';
+                    metSalesLine.update();
+
+                    this.ttsCommitTrace();
+
+                    if (procMetrics)
+                    {
+                        procMetrics.incDescription2Count(1);
+                    }
+                }
+                
+                continue;
+            }
+
+            // 2nd priority: Customer do not sell-to
+            if (salesOrderGuideItemCustomerDoNotSellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != METConstants::NIRReasonCode)
+                {
+                    this.ttsBeginTrace();
+
+                    salesLine.selectForUpdate(true);
+                    metSalesLine.selectForUpdate(true);
+                    metSalesLine.ReasonId = METConstants::NIRReasonCode;
+                    metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                    metSalesLine.update();
+
+                    if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+                    {
+                        this.salesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+                    }
+                    else
+                    {
+                        this.salesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
+                    }
+
+                    this.ttsCommitTrace();
+
+                    if (procMetrics)
+                    {
+                        procMetrics.incDescription2Count(1);
+                    }
+                }
+                
+                continue;
+            }
+
+            // 3rd priority: Customer operations group only sell-to
+            if (salesOrderGuideItemCustomerOperationsGroupOnlySellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
+                {
+                    this.ttsBeginTrace();
+
+                    metSalesLine.selectForUpdate(true);
+                    metSalesLine.ReasonId = '';
+                    metSalesLine.update();
+
+                    this.ttsCommitTrace();
+
+                    if (procMetrics)
+                    {
+                        procMetrics.incDescription2Count(1);
+                    }
+                }
+                
+                continue;
+            }
+
+            // 4th priority: Customer operations group do not sell-to
+            if (salesOrderGuideItemCustomerOperationsGroupDoNotSellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != METConstants::NIRReasonCode)
+                {
+                    this.ttsBeginTrace();
+
+                    salesLine.selectForUpdate(true);
+                    metSalesLine.selectForUpdate(true);
+                    metSalesLine.ReasonId = METConstants::NIRReasonCode;
+                    metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                    metSalesLine.update();
+
+                    if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+                    {
+                        this.salesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+                    }
+                    else
+                    {
+                        this.salesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
+                    }
+
+                    this.ttsCommitTrace();
+
+                    if (procMetrics)
+                    {
+                        procMetrics.incDescription2Count(1);
+                    }
+                }
+                
+                continue;
+            }
+
+            // 5th priority: Site only sell-to
+            if (salesOrderGuideItemSiteOnlySellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
+                {
+                    this.ttsBeginTrace();
+
+                    metSalesLine.selectForUpdate(true);
+                    metSalesLine.ReasonId = '';
+                    metSalesLine.update();
+
+                    this.ttsCommitTrace();
+
+                    if (procMetrics)
+                    {
+                        procMetrics.incDescription2Count(1);
+                    }
+                }
+                
+                continue;
+            }
+               
+            // 6th priority: Site do not sell-to
+            if (salesOrderGuideItemSiteDoNotSellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != METConstants::NIRReasonCode)
+                {
+                    this.ttsBeginTrace();
+
+                    salesLine.selectForUpdate(true);
+
+                    metSalesLine.selectForUpdate(true);
+                    metSalesLine.ReasonId = METConstants::NIRReasonCode;
+                    metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                    metSalesLine.update();
+
+                    if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+                    {
+                        this.salesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+                    }
+                    else
+                    {
+                        this.salesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
+                    }
+
+                    this.ttsCommitTrace();
+
+                    if (procMetrics)
+                    {
+                        procMetrics.incDescription2Count(1);
+                    }
+                }
+                
+                continue;
+            }
+
+            // 7th priority: State only sell-to
+            if (salesOrderGuideItemStateOnlySellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
+                {
+                    this.ttsBeginTrace();
+
+                    metSalesLine.selectForUpdate(true);
+                    metSalesLine.ReasonId = '';
+                    metSalesLine.update();
+
+                    this.ttsCommitTrace();
+
+                    if (procMetrics)
+                    {
+                        procMetrics.incDescription2Count(1);
+                    }
+                }
+                
+                continue;
+            }
+
+            // 8th priority: State do not sell-to
+            if (salesOrderGuideItemStateDoNotSellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != METConstants::NIRReasonCode)
+                {
+                    this.ttsBeginTrace();
+
+                    salesLine.selectForUpdate(true);
+                    metSalesLine.selectForUpdate(true);
+                    metSalesLine.ReasonId = METConstants::NIRReasonCode;
+                    metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                    metSalesLine.update();
+
+                    if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+                    {
+                        this.salesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+                    }
+                    else
+                    {
+                        this.salesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
+                    }
+
+                    this.ttsCommitTrace();
+
+                    if (procMetrics)
+                    {
+                        procMetrics.incDescription2Count(1);
+                    }
+                }
+                
+                continue;
+            }
+
+            if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
+            {
+                this.ttsBeginTrace();
+
+                metSalesLine.selectForUpdate(true);
+                metSalesLine.ReasonId = '';
+                metSalesLine.update();
+
+                this.ttsCommitTrace();
+
+                if (procMetrics)
+                {
+                    procMetrics.incDescription2Count(1);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ttsBeginTrace</Name>
+				<Source><![CDATA[
+    public void ttsBeginTrace()
+    {
+        if (procMetrics)
+        {
+            procMetrics.ttsBeginTrace();
+        }
+        else
+        {
+            ttsbegin;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>ttsCommitTrace</Name>
+				<Source><![CDATA[
+    public void ttsCommitTrace()
+    {
+        if (procMetrics)
+        {
+            procMetrics.ttsCommitTrace();
+        }
+        else
+        {
+            ttscommit;
+        }
     }
 
 ]]></Source>
