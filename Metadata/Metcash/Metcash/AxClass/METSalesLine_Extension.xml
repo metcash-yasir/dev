@@ -16,64 +16,77 @@ final class METSalesLine_Extension
 				<Name>metSetReturnUnitPriceAndDiscount</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Recalculate and update the sales unit price and line discount
+    /// Calculates and sets the return unit price and discount for the sales line based on the original invoice line when the sales order is of type ReturnItem.
     /// </summary>
     private void metSetReturnUnitPriceAndDiscount()
     {
-        METSalesTable metSalesTable = this.salesTable().metSalesTable();
-        SalesPrice retPrice = this.SalesPrice;
-        SalesLineDisc retLineDisc = this.LineDisc;
+        SalesQty            quantity;
+        SalesLine           salesLine, salesLineOrig;
+        METSalesTable       metSalesTable = this.salesTable().metSalesTable();
+        CustInvoiceTrans    custInvoiceTrans;
 
-        if(metSalesTable && metSalesTable.OriginalInvoice != '')
+        salesLine = SalesLine::findRecId(this.RecId);
+
+        select firstonly salesLineOrig
+            join SalesId, ItemId, RecId from custInvoiceTrans
+                where custInvoiceTrans.InventTransId == salesLineOrig.InventTransId
+                && custInvoiceTrans.InvoiceId == metSalesTable.OriginalInvoice
+                && custInvoiceTrans.LineNum == this.LineNum
+                && custInvoiceTrans.ItemId == this.ItemId;
+
+        if (custInvoiceTrans.RecId)
         {
-            SalesTable salesTableOrig = SalesTable::find(metSalesTable.OriginalInvoice);
+            real        convFactor  = 1;
+            PdsCWUnitId pdsCWUnitId = this.pdsCWUnitId();
 
-            if (salesTableOrig.RecId)
+            if (!pdsCWUnitId && salesLineOrig.SalesUnit !=  this.SalesUnit)
             {
-                SalesLine salesLineOrig;
-
-                select firstonly RecId, SalesUnit, SalesPrice, LineDisc from salesLineOrig
-                    where salesLineOrig.SalesId == salesTableOrig.SalesId
-                    && salesLineOrig.ItemId == this.ItemId;
-
-                if (!salesLineOrig)
-                {
-                    CustInvoiceJour custInvoiceJour;
-                    METSalesTable metSalesTableOrig;
-                    SalesTable salesTableOrigTmp;
-
-                    select firstOnly SalesId from custInvoiceJour
-                        order by InvoiceDate desc
-                    where custInvoiceJour.InvoiceId == metSalesTable.OriginalInvoice
-                        exists join salesTableOrigTmp
-                    where custInvoiceJour.InvoiceAccount == salesTableOrig.CustAccount
-                        && custInvoiceJour.SalesId == salesTableOrig.SalesId
-                        && salesTableOrigTmp.RecId == metSalesTable.SalesTable;
-
-                    select firstonly RecId, SalesUnit, SalesPrice, LineDisc from salesLineOrig
-                        where salesLineOrig.SalesId == custInvoiceJour.SalesId
-                            && salesLineOrig.ItemId == this.ItemId;
-                }
-
-                if(salesLineOrig.SalesUnit !=  this.SalesUnit)
-                {
-                    real convFactor = 1;
-
-                    convFactor = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(this.itemId,
-                                                                        this.InventDimId,
-                                                                        1,
-                                                                        salesLineOrig.SalesUnit,
-                                                                        this.SalesUnit,
-                                                                        NoYes::Yes);
-
-                    retPrice = salesLineOrig.SalesPrice / convFactor;
-                    retLineDisc = salesLineOrig.LineDisc / convFactor;
-                    this.SalesPrice = retPrice;
-                    this.LineDisc = retLineDisc;
-                }
-
+                convFactor = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(this.itemId,
+                                                                            this.InventDimId,
+                                                                            1,
+                                                                            salesLineOrig.SalesUnit,
+                                                                            this.SalesUnit,
+                                                                            NoYes::Yes);
             }
+
+
+            if (pdsCWUnitId)
+            {
+                quantity = SalesParmLine::isCWClaimCreditApplicable(this) ? this.metSalesLine().CWReturnWeight : this.PdsCWExpectedRetQty;
+            }
+            else
+            {
+                quantity = this.ExpectedRetQty;
+            }
+        
+            this.SalesPrice    = convFactor ? salesLineOrig.SalesPrice / convFactor : salesLineOrig.SalesPrice;
+            this.LineDisc      = this.getLineDiscountAmount();
+            
+            this.calcLineAmount(quantity);
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLineDiscountAmount</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the line discount amount.
+    /// </summary>
+    public AmountCur getLineDiscountAmount()
+    {
+        METComponentCode            metComponentCode;
+        METSalesLinePriceComponent  metSalesLinePriceComponent;
+
+        select InventTransId, sum(Value) from metSalesLinePriceComponent
+            group by InventTransId
+                join metComponentCode
+                    where metSalesLinePriceComponent.Component == metComponentCode.Component
+                        && metSalesLinePriceComponent.InventTransId == this.InventTransId
+                        && metComponentCode.PriceComponent == METPriceComponent::Discounts;
+
+        return metSalesLinePriceComponent.Value;
     }
 
 ]]></Source>
@@ -162,13 +175,13 @@ final class METSalesLine_Extension
 
         intercompanyTransferFulfillment = this.updateIntercompanySODetails();
 
-        this.metSetReturnUnitPriceAndDiscount();
-
         if (this.METCWActualWeight)
         {
             this.LineAmount = this.calcLineAmount(this.METCWActualWeight);
         }
-        this.METSalesUnit = this.metGetDefaultOrderUnit();
+        this.METSalesUnit = this.metGetDefaultOrderUnit();            
+        this.metSetReturnUnitPriceAndDiscount();
+
         next insert(_dropInvent, _findMarkup, _childBuffer, _skipCreditLimitCheck, _skipWHSProcesses, _interCompanyInventTransId );
 
         metSalesLine = this.metSalesLine();
