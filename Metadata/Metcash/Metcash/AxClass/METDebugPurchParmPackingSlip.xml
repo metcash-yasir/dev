@@ -1,0 +1,751 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METDebugPurchParmPackingSlip</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class METDebugPurchParmPackingSlip extends RunBase
+{
+    DialogField parmIdField;
+    ParmId parmId;
+    PurchParmTable  purchParmTable;
+    boolean         postRegisteredQuantity;
+    //METPurchParmPackingSlipContract contract;
+    //SRSPrintDestinationSettings printDestinationSettings;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    public Object dialog()
+    {
+        Dialog dialog = super();
+
+        dialog.caption("Select PurchParmTable.ParmId to execute");
+        parmIdField = dialog.addField(extendedTypeStr(ParmId));
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    public boolean getFromDialog()
+    {
+        parmId = parmIdField.value();
+        return super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        if (parmId)
+        {
+            ttsbegin;
+            select firstOnly pessimisticlock purchParmTable
+                where purchParmTable.parmId == parmId
+                &&    purchParmTable.METIsIntegration == NoYes::Yes
+                &&    (purchParmTable.ParmJobStatus == ParmJobStatus::Waiting
+                ||    purchParmTable.ParmJobStatus == ParmJobStatus::ContainErrors);
+
+            if (purchParmTable)
+            {
+                this.execute();
+                //CB369 -ImportedItemsReceiving - start
+                purchParmTable.ParmJobStatus = ParmJobStatus::Executed;
+                purchParmTable.update();
+
+                METExciseRegisterEntryAIS::moveEntriesToRegisterEntry(purchParmTable.ParmId);
+                //CB369 -ImportedItemsReceiving - end
+            }
+            ttscommit;
+
+            //CB256, CB257, CB260 – Purchase Order Receipt Details- new changes w.r.t cancel PO lines
+            if (purchParmTable && !METPurchTable::find(purchParmTable.PurchId).POBackOrderSetting)
+            {
+                this.cancelPOLinesForZeroQtyAndSubmitToWorkfLow(purchParmTable.PurchId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    private void execute()
+    {
+        parmId = purchParmTable.ParmId;
+        PurchStatus status =  PurchTable::find(purchParmTable.PurchId).PurchStatus;
+
+        //CB369 -ImportedItemsReceiving - start
+        if (status == PurchStatus::Invoiced)
+        {
+            this.findMatchingPOLinesAgainstGITOrderAndPost();
+        }
+        else if (status == PurchStatus::Received)
+        {
+            return;
+        }
+        //CB369 -ImportedItemsReceiving - end
+        else
+        {
+            this.registerPurchLine();
+            this.postPackingSlip();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateOnError</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates <c>PurchParmTable</c> on error.
+    /// </summary>
+    protected void updateOnError()
+    {
+        PurchParmTable  purchParmTableUpdate;
+        ParmJobStatus   jobStatus;
+        int             retryCount,
+                        maxRetry;
+        
+        purchParmTableUpdate = PurchParmTable::find(parmId, parmId);
+
+        if (purchParmTableUpdate)
+        {
+            jobStatus = purchParmTableUpdate.ParmJobStatus;
+            maxRetry = PurchParameters::find().METPOReceiptPostingRetiries;
+
+            retryCount++;
+
+            if (retryCount >= maxRetry)
+            {
+                jobStatus = ParmJobStatus::ContainErrors;
+            }
+
+            ttsbegin;
+
+            purchParmTableUpdate.selectForUpdate(true);
+        
+            purchParmTableUpdate.METIntegrationRetries = retryCount;
+            purchParmTableUpdate.ParmJobStatus = jobStatus;
+            purchParmTableUpdate.update();
+        
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>registerPurchLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Registers <c>PurchLine</c>.
+    /// </summary>
+    private void registerPurchLine()
+    {
+        METInventTransRegisterService   registerService;
+        PurchParmLine                   parmLine;
+        PurchLine                       purchLine;
+        InventQty                       qtyReceiveNow;
+        PurchTable                      purchTable;
+        METPurchTable                   metPurchTable;
+
+        postRegisteredQuantity = false;
+
+        // Loop through all lines for given ParmId and TableRefId
+        while select parmLine
+            where parmLine.ParmId == purchParmTable.ParmId
+            &&    parmLine.TableRefId == purchParmTable.TableRefId
+        join purchLine
+            where purchLine.RecId == parmLine.PurchLineRecId
+        join RecId from purchTable
+            where purchTable.PurchId == purchLine.PurchId
+        join VendorReturn from metPurchTable
+            where metPurchTable.PurchTable == purchTable.RecId
+        {
+            boolean isCWItem = this.isCWItemLine(parmLine.PurchLineRecId);
+            qtyReceiveNow = parmLine.InventNow;
+
+            // Registration logic (only for Backorder lines)
+            if (purchLine.PurchStatus == PurchStatus::Backorder)
+            {
+                // Handle over-delivery case
+                if (METPurchParmPackingSlipTaskService::isOverDelivered(metPurchTable.VendorReturn, purchLine, qtyReceiveNow))
+                {
+                    this.deleteParmLineAndExcise(parmLine);
+                    continue;
+                }
+
+                if (qtyReceiveNow != 0 && parmLine.PdsCWPreviousReceiveNow != 0)
+                {
+                    registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, qtyReceiveNow, parmLine.PdsCWPreviousReceiveNow);
+                    registerService.register();
+                }
+                else if (qtyReceiveNow != 0 && parmLine.PdsCWPreviousReceiveNow == 0)
+                {
+                    registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, !isCWItem ? qtyReceiveNow : 0, isCWItem ? qtyReceiveNow : 0);
+                    registerService.register();
+                }
+                else if (qtyReceiveNow == 0 && parmLine.PdsCWPreviousReceiveNow != 0)
+                {
+                    registerService = METInventTransRegisterService::contruct(parmLine.InventTransId, qtyReceiveNow, parmLine.PdsCWPreviousReceiveNow);
+                    registerService.register();
+                }
+            }
+            else
+            {
+                // For non-Backorder lines, delete parmLine + excise entries
+                this.deleteParmLineAndExcise(parmLine);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isCWItemLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the line is for catch weight item.
+    /// </summary>
+    /// <param name = "_purchlineRecID">RecId of <c>PurchLine</c>.</param
+    /// <returns>
+    /// true if the line is for catch weight item, false otherwise.
+    /// </returns>
+    private boolean isCWItemLine(RecId _purchlineRecID)
+    {
+        boolean             isCWItemLine;
+        PdsCatchWeightItem  pdsCatchWeightItem = PdsCatchWeightItem::find(PurchLine::findRecId(_purchlineRecID).ItemId);
+
+        if (pdsCatchWeightItem.RecId)
+        {
+            isCWItemLine = true;
+            postRegisteredQuantity = true;
+        }
+        else
+        {
+            isCWItemLine = false;
+        }
+
+        return isCWItemLine;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postPackingSlip</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Posts packing slip.
+    /// </summary>
+    private void postPackingSlip()
+    {
+        PurchFormLetter         purchFormLetter;
+        PurchParmUpdate         purchParmUpdate;
+        PurchTable              purchTable;
+
+        purchTable = PurchTable::find(purchParmTable.PurchId);
+        purchParmUpdate = this.createPurchParmUpdate();
+
+        purchFormLetter = PurchFormLetter::construct(DocumentStatus::PackingSlip);
+        
+        purchFormLetter.transDate(purchParmTable.TransDate);
+        purchFormLetter.proforma(false);
+
+        //BUG 345456: Over-receipt in Dallas within tolerance
+        // Set PurchParmUpdate to post only registered quantity
+        purchParmUpdate.SpecQty = PurchUpdate::Recorded;
+        purchParmUpdate.update();
+
+        // Re-select PurchParmUpdate to get the updated value
+        // This will reset PurchParmLine table with registered quantity
+        purchFormLetter.reSelect(purchParmUpdate);
+
+        //BUG 2783619 Set to post only registered quantity if any CW item line was processed.
+        if (postRegisteredQuantity)
+        {
+            // Update PurchParmLine with registered quantity
+            this.updatePurchParmLineWithRegisteredQty(purchParmTable.ParmId);
+        }
+        //BUG 2783619
+
+        purchFormLetter.specQty(PurchUpdate::Recorded);
+        //BUG 345456: Over-receipt in Dallas within tolerance
+        purchFormLetter.purchTable(purchTable);
+        purchFormLetter.parmParmTableNum(purchParmTable.ParmId);
+        purchFormLetter.parmId(purchParmTable.ParmId);
+        purchFormLetter.purchParmUpdate(purchParmUpdate);
+        purchFormLetter.run();
+        
+        // skip for debug
+        /*if (contract.parmIsAutoGenerateCPNotice())
+        {
+            this.printVendorCPNReport(purchTable);
+        }*/
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPurchParmUpdate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates <c>PurhcParmUpdate</c> record before posting.
+    /// </summary>
+    /// <returns>
+    /// <c>PurchParmUpdate</c>.
+    /// </returns>
+    private PurchParmUpdate createPurchParmUpdate()
+    {
+        PurchParmUpdate purchParmUpdate;
+        PurchParameters purchParameters;
+        VendParameters  vendParameters;
+
+        purchParameters = PurchParameters::find();
+        vendParameters  = VendParameters::find();
+
+        purchParmUpdate = PurchParmUpdate::find(purchParmTable.ParmId);
+
+        if (!purchParmUpdate.RecId)
+        {
+            purchParmUpdate.ParmId            = purchParmTable.ParmId;
+            purchParmUpdate.DocumentStatus    = purchParmTable.Ordering;
+            purchParmUpdate.SumBy             = purchParameters.SummaryUpdateBy;
+            purchParmUpdate.SumPurchId        = '';
+            purchParmUpdate.SumNum            = '';
+            purchParmUpdate.SumIncludePending = NoYes::Yes;
+            purchParmUpdate.CheckCreditMax    = vendParameters.CreditMaxCheck;
+            purchParmUpdate.Storno            = vendParameters.CreditError;
+            purchParmUpdate.LateSelection     = false;
+            purchParmUpdate.CreditRemaining   = false;
+            purchParmUpdate.Proforma          = false;
+
+            purchParmUpdate.insert();
+        }
+
+        return purchParmUpdate;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findMatchingPOLinesAgainstGITOrderAndPost</Name>
+				<Source><![CDATA[
+    /// CB369 -ImportedItemsReceiving
+    /// <summary>
+    /// Find the matching PO lines in parm lines to get goods transist orders and post if found
+    /// </summary>
+    private void findMatchingPOLinesAgainstGITOrderAndPost()
+    {
+        PurchParmLine           purchParmLine;
+        PurchLine               purchLine;
+        ITMGoodsInTransitOrder  goodsInTransitOrder;
+               
+        while select purchParmLine
+            where purchParmLine.OrigPurchId == purchParmTable.purchId
+         join purchLine
+            where purchLine.ItemId == purchParmLine.ItemId
+            && purchLine.LineNumber == purchParmLine.LineNum
+            && purchLine.PurchId == purchParmTable.purchId
+        join goodsInTransitOrder
+            where goodsInTransitOrder.InventTransIdRef == purchLine.InventTransId
+            && goodsInTransitOrder.Status == ITMGoodsInTransitStatus::InTransit
+        {
+            if (goodsInTransitOrder)
+            {
+                
+                if (purchLine.PurchUnit == "@MET:UOMEachUpperCase" || purchLine.PurchUnit == "@MET:UOMEachLowerCase")
+                {
+                    this.postGoodsInTransitOrder(goodsInTransitOrder);
+                }
+                else
+                {
+                    
+
+                    PurchPrice convertedPurchPrice = UnitOfMeasureConversion::findByConversion(UnitOfMeasure::findBySymbol(purchLine.PurchUnit).RecId,
+                                                      UnitOfMeasure::findBySymbol("@MET:UOMEachUpperCase").RecId,
+                                                      EcoResProduct::findByProductNumber(purchLine.ItemId).RecId).Factor;
+
+                   
+                    ttsbegin;
+                    goodsInTransitOrder.selectForUpdate(true);
+                    goodsInTransitOrder.Qty = convertedPurchPrice * goodsInTransitOrder.Qty;
+                    goodsInTransitOrder.update();
+                    ttscommit;
+
+                    this.postGoodsInTransitOrder(goodsInTransitOrder);
+                }
+            }
+            else
+            {
+                throw error(strFmt("@MET:NoGITOrdersAgainstPO", purchParmTable.PurchId));
+            }
+            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postGoodsInTransitOrder</Name>
+				<Source><![CDATA[
+    /// CB369 -ImportedItemsReceiving - start
+    /// <summary>
+    /// Post GIT orders
+    /// </summary>
+    /// <param name = "_goodsInTransitOrder">GIT order</param>
+    private void postGoodsInTransitOrder(ITMGoodsInTransitOrder _goodsInTransitOrder)
+    {
+        ITMGoodsInTransitUpdateReceived updateReceived = ITMGoodsInTransitUpdateReceived::newGITOrder(_goodsInTransitOrder, _goodsInTransitOrder.Qty,
+                                                                                                                  DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone()));
+        
+        updateReceived.run();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelPOLinesForZeroQtyAndSubmitToWorkfLow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancel PO lines for zero qty on parm lines and submit to workflow
+    /// </summary>
+    /// <param name = "_purchId">PurchId</param>
+    public void cancelPOLinesForZeroQtyAndSubmitToWorkfLow(PurchId _purchId)
+    {
+        #OCCRetryCount
+
+        try
+        {
+            PurchParmLine   purchParmLine;
+            PurchLine       purchLine,purchLineUpdate;
+            PurchTable      purchTable;
+
+            if (!purchParmTable.PurchId)
+            {
+                throw error("@MET:PurchParmTableMissingPurchId");
+            }
+                
+            purchTable = PurchTable::find(purchParmTable.PurchId, true);
+
+            if (purchTable && !purchTable.SkipVersioning && purchTable.ChangeRequestRequired)
+            {
+                ttsbegin;
+                purchTable.SkipVersioning = true;
+                purchTable.ChangeRequestRequired = NoYes::No;
+                purchTable.update();
+                ttscommit;
+            }
+
+            PurchCancel purchCancel = PurchCancel::METconstruct();
+            
+            ttsbegin;
+            while select LineNum, ItemId from purchParmLine
+                where purchParmLine.ParmId ==  purchParmTable.ParmId
+                && purchParmLine.PdsCWPreviousReceiveNow == 0
+                && purchParmLine.PdsCWReceiveNow == 0
+                && purchParmLine.ReceiveNow == 0
+            join purchLine
+                where purchLine.PurchId == purchParmTable.PurchId
+                && purchLine.LineNumber == purchParmLine.LineNum
+                && purchLine.ItemId == purchParmLine.ItemId
+                && purchLine.IsDeleted == NoYes::No
+                && purchLine.PurchStatus != PurchStatus::Canceled
+            {
+                purchLineUpdate = PurchLine::findRecId(purchLine.RecId,true);
+                purchCancel.metCancelPurchLine(purchLineUpdate);
+            }
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Error)
+        {
+            throw error("@SYS93835");
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updatePurchParmLineWithRegisteredQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initiates the printing or batch scheduling of the Vendor Continuing Permission Notice (CPN) report
+    /// for a given purchase order, based on specific business conditions.
+    /// </summary>
+    /// <param name="_purchTable">The PurchTable record representing the purchase order.</param>
+    /// <remarks>
+    /// This method checks if the purchase order is marked as 'UnderBond' and 'VendorReturn',
+    /// and if it contains at least one line with a negative quantity. If these conditions are met,
+    /// it either adds the report to an existing batch (if executing in batch mode),
+    /// or creates a new batch header and schedules the report for execution.
+    /// </remarks>
+    /*private void printVendorCPNReport(PurchTable _purchTable)
+    {
+        METPurchTable metPurchTable = METPurchTable::find(_purchTable.PurchId);
+        
+        if (metPurchTable.UnderBond && metPurchTable.VendorReturn)
+        {
+            PurchLine purchLineNegative;
+
+            select firstonly RecId from purchLineNegative
+                    where purchLineNegative.PurchId == _purchTable.PurchId
+                    && purchLineNegative.PurchQty < 0;
+
+            if (purchLineNegative.RecId)
+            {
+                args args = new Args();
+                args.record(_purchTable);
+                if (isExecutingInBatch)
+                {
+                    batchHeader.addRuntimeTask(this.getVendorCPNController(args), headerTaskId);
+                    batchHeader.save();
+                }
+                else
+                {
+                    BatchHeader cpnBatch = BatchHeader::construct();
+                    cpnBatch.parmCaption(strFmt("@MET:VendorCPNPurchID", _purchTable.PurchId));
+                    cpnBatch.addTask(this.getVendorCPNController(args));
+                    cpnBatch.save();
+                }
+            }
+        }
+    }*/
+
+    /// <summary>
+    /// Constructs and configures the report controller for the Vendor Continuing Permission Notice (CPN) report.
+    /// </summary>
+    /// <param name="_args">An Args object containing the PurchTable record to be passed to the report.</param>
+    /// <returns>
+    /// A fully configured instance of METPOContinuingPermissionNoticeController,
+    /// with the report name, dialog settings, and data contract parameters set.
+    /// </returns>
+    /// <remarks>
+    /// This method retrieves the appropriate PrintMgmtReportFormat for the CPN report,
+    /// suppresses the dialog for automated execution, and sets the PurchId on the data contract.
+    /// </remarks>
+    /*private METPOContinuingPermissionNoticeController getVendorCPNController(Args _args)
+    {
+        METPOContinuingPermissionNoticeController controller =
+            METPOContinuingPermissionNoticeController::construct();
+        
+        PrintMgmtDocumentType type =  PrintMgmtDocumentType::METPOContinuingPermissionNote;
+        PrintMgmtReportFormat printMgmtReportFormat = PrintMgmtReportFormat::findSystem(type);
+
+        if (!printMgmtReportFormat.RecId)
+        {
+            select Name from printMgmtReportFormat
+                where printMgmtReportFormat.DocumentType == type;
+        }
+
+        controller.parmReportName(printMgmtReportFormat.Name);
+        controller.parmArgs(_args);
+        controller.parmShowDialog(false);
+        controller.parmLoadFromSysLastValue(false);
+        controller.parmDialogCaption("@MET:METCPNotice");
+
+        if (printDestinationSettings)
+        {
+            controller.parmReportContract().parmPrintSettings(printDestinationSettings);
+        }
+
+        METPOContinuingPermissionNoticeContract contractLoc = controller.getDataContractObject();
+        PurchTable purchTable = _args.record();
+        contractLoc.parmPurchId(purchTable.PurchId);
+
+        return controller;
+    }*/
+
+    /// <summary>
+    /// Updates PurchParmLine with registered quantity
+    /// This method works only for catch weight items. Do not call for non-CW items.
+    /// </summary>
+    public void updatePurchParmLineWithRegisteredQty(ParmId _parmId)
+    {
+        PurchParmLine       purchParmLine;
+        PurchLine           purchLine;
+        InventTrans         inventTrans;
+        InventTransOrigin   inventTransOrigin;
+        Map                 qtyMap = new Map(Types::String, Types::Real);
+
+        // First, collect all registered CW quantities
+        while select sum(PdsCWQty) from inventTrans
+          where inventTrans.StatusReceipt == StatusReceipt::Registered
+             && inventTrans.StatusIssue == StatusIssue::None
+          join inventTransOrigin
+              where inventTransOrigin.RecId == inventTrans.InventTransOrigin
+          join purchLine
+            group by purchLine.InventTransId
+              where purchLine.InventTransId == inventTransOrigin.InventTransId
+          join purchParmLine
+              where purchParmLine.ParmId == _parmId
+                 && purchParmLine.PurchLineRecId == purchLine.RecId
+        {
+            qtyMap.insert(purchLine.InventTransId, inventTrans.PdsCWQty);
+        }
+
+        // Update PurchParmLine records
+        ttsbegin;
+
+        while select forupdate purchParmLine
+          where purchParmLine.ParmId == _parmId
+          join purchLine
+              where purchLine.RecId == purchParmLine.PurchLineRecId
+        {
+            if (qtyMap.exists(purchLine.InventTransId))
+            {
+                Real registeredCWQty = qtyMap.lookup(purchLine.InventTransId);
+
+                // Check if this is a CW item
+                if (PdsGlobal::pdsIsCWItem(purchLine.ItemId))
+                {
+                    // Convert from CW unit to purchase unit
+                    Real registeredQtyPurchUnit = UnitOfMeasureConverter::convert(
+                                                      registeredCWQty,
+                                                      UnitOfMeasure::unitOfMeasureIdBySymbol(purchLine.pdsCWUnitId()),
+                                                      UnitOfMeasure::unitOfMeasureIdBySymbol(purchLine.PurchUnit),
+                                                      NoYes::Yes,
+                                                      purchLine.inventTable().Product);
+
+                    purchParmLine.ReceiveNow = registeredQtyPurchUnit;
+                    purchParmLine.RemainAfter = purchParmLine.RemainBefore - registeredQtyPurchUnit;
+                    purchParmLine.setLineAmount();
+                    purchParmLine.update();
+                }
+            }
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isOverDelivered</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether a purchase line is over-delivered based on the quantity being received.
+    /// </summary>
+    /// <param name="_purchLine">
+    /// The purchase line record containing ordered quantity and over-delivery percentage.
+    /// </param>
+    /// <param name="_qtyReceiveNow">
+    /// The quantity that is currently being received.
+    /// </param>
+    /// <returns>
+    /// Returns true if the received quantity exceeds the allowed maximum (ordered quantity plus over-delivery percentage),
+    /// otherwise returns false.
+    /// </returns>
+    /// <remarks>
+    /// This method calculates the maximum allowed quantity by applying the over-delivery percentage to the ordered quantity.
+    /// If the quantity being received now is greater than this allowed maximum, the method flags it as over-delivered.
+    /// </remarks>
+    public static boolean isOverDelivered(METVendorReturn _vendorReturn, PurchLine _purchLine, Qty _qtyReceiveNow)
+    {
+        boolean overDelivered = false;
+
+        // Bug 378911: E2E - CB118 D365 failed to update the Product receipt & Invoice
+        if (!_vendorReturn && _purchLine)
+        {
+            // Calculate allowed maximum quantity
+            real allowedQty = _purchLine.QtyOrdered * (1 + (_purchLine.OverDeliveryPct / 100));
+
+            if (_qtyReceiveNow > allowedQty)
+            {
+                overDelivered = true;
+            }
+        }
+
+        return overDelivered;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteParmLineAndExcise</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Deletes a PurchParmLine record and its related excise register entries.
+    /// </summary>
+    /// <param name="_parmLine">
+    /// The PurchParmLine record to delete. Related entries in METExciseRegisterEntryAIS
+    /// and METExciseRegisterEntry will also be removed based on ParmId and ItemId.
+    /// </param>
+    /// <remarks>
+    /// This method ensures transactional consistency by wrapping deletes in ttsbegin/ttscommit.
+    /// </remarks>
+    private void deleteParmLineAndExcise(PurchParmLine _parmLine)
+    {
+        METExciseRegisterEntryAIS registerEntryAIS;
+
+        ttsbegin;
+        _parmLine.selectForUpdate(true);
+        _parmLine.delete();
+
+        // Delete related excise register entries
+        delete_from registerEntryAIS
+        where registerEntryAIS.AISIntegrationId == _parmLine.ParmId
+           && registerEntryAIS.ItemId == _parmLine.ItemId;
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Class entry point. The system will call this method when a designated menu
+    /// is selected or when execution starts and this class is set as the startup class.
+    /// </summary>
+    /// <param name = "_args">The specified arguments.</param>
+    public static void main(Args _args)
+    {
+        METDebugPurchParmPackingSlip debug = new METDebugPurchParmPackingSlip();
+        
+        if (debug.prompt())
+        {
+            debug.run();
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
