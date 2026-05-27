@@ -5,21 +5,97 @@
 		<Declaration><![CDATA[
 public class METStocktakeVarianceDetails extends common
 {
-
 }
 ]]></Declaration>
 		<Methods>
 			<Method>
-				<Name>getPhysicalAvailable</Name>
+				<Name>updateAdditionalData</Name>
 				<Source><![CDATA[
-    private InventQty getPhysicalAvailable(ItemId _itemId, InventDim _inventDim)
+    /// <summary>
+    /// Update additional field information on post load
+    /// </summary>
+    /// <param name = "_staging">Entity name</param>
+    private void updateAdditionalData(METStocktakeVarianceDetails _staging)
     {
-        InventDimParm dimParm;
+        #Define.SalesUnitEA('EA')
+        #Define.SalesUnitKG('KG')
+        #Define.SalesUnitCS('CS')
 
-        dimParm.clear();
-        dimParm.initFromInventDim(_inventDim);
+        InventTable inventTable = InventTable::find(_staging.ItemId);
+        UnitOfMeasureConversion     unitOfMeasureConversion;
+        METExciseSiteDutySetup      siteDutySetup;
+        InventItemPrices            itemPrice;
+        InventDim                   itemPriceDim;
+        InventItemSalesSetup        inventItemSalesSetup;
 
-        return InventOnhand::newParameters(_itemId, _inventDim, dimParm).availPhysical();
+        _staging.selectForUpdate(true);
+        
+        _staging.ProductName = inventTable.productNameInUserLanguage(_staging.InventDimId);
+        _staging.IsCatchWeightProduct = inventTable.pdsCWItem();
+
+        if (_staging.IsCatchWeightProduct)
+        {
+            // EA to KG conversion factor
+            unitOfMeasureConversion = UnitOfMeasureConversion::findByConversion(
+                    UnitOfMeasure::findBySymbol(#SalesUnitEA).RecId,
+                    UnitOfMeasure::findBySymbol(#SalesUnitKG).RecId,
+                    EcoResProduct::findByProductNumber(_staging.ItemId).RecId);
+
+            _staging.Factor = decRound((unitOfMeasureConversion.Factor ? unitOfMeasureConversion.Factor : 0.00), 2);
+        }
+
+        select firstonly ExcisePerCase from siteDutySetup
+            where siteDutySetup.SiteId  == _staging.InventSiteId
+            &&    siteDutySetup.ItemId  == _staging.ItemId;
+
+        _staging.ExcisePerCase = decRound(siteDutySetup.ExcisePerCase, 2);
+
+        // Latest item price
+        select firstonly itemPrice
+            order by itemPrice.ActivationDate desc
+            where itemPrice.ItemId == _staging.ItemId
+            outer join itemPriceDim
+                where itemPriceDim.inventDimId    == itemPrice.InventDimId
+                &&    itemPriceDim.InventSiteId   == _staging.InventSiteId;
+
+        if (itemPrice)
+        {
+            _staging.Price = decRound(itemPrice.Price, 2);
+        }
+
+            
+        // Sales unit setup
+        inventItemSalesSetup = InventItemSalesSetup::find(_staging.ItemId, _staging.InventDimId);
+        // AltSalesUnit logic
+        if (_staging.IsCatchWeightProduct)
+        {
+            _staging.AltSalesUnit = #SalesUnitKG;
+        }
+        else if (inventItemSalesSetup.METAltSalesUnit)
+        {
+            _staging.AltSalesUnit = #SalesUnitEA;
+        }
+        else
+        {
+            _staging.AltSalesUnit = #SalesUnitCS;
+        }
+
+        // CaseQty logic
+        if (inventItemSalesSetup.METSalesUnit == #SalesUnitEA)
+        {
+            _staging.CaseQty = 1;
+        }
+        else
+        {
+            // SalesUnit to EA conversion for CaseQty
+            unitOfMeasureConversion = UnitOfMeasureConversion::findByConversion(
+                    UnitOfMeasure::findBySymbol(inventItemSalesSetup.METSalesUnit).RecId,
+                    UnitOfMeasure::findBySymbol(#SalesUnitEA).RecId,
+                    EcoResProduct::findByProductNumber(_staging.ItemId).RecId);
+
+            _staging.Factor = decRound((unitOfMeasureConversion.Factor ? unitOfMeasureConversion.Factor : 0.00), 2);
+            _staging.CaseQty = decRound(unitOfMeasureConversion.Factor, 2);
+        }
     }
 
 ]]></Source>
@@ -32,91 +108,13 @@ public class METStocktakeVarianceDetails extends common
     /// </summary>
     public void postLoad()
     {
-        super();
-
-        // Loading the data entity with the values from the company of the record
+        str item = this.ItemId;
         changecompany(this.DataAreaId)
         {
-            #Define.SalesUnitEA('EA')
-            #Define.SalesUnitKG('KG')
-            #Define.SalesUnitCS('CS')
-
-            EcoResProductTranslation ecoResProductTranslation;
-            InventTable inventTable;
-            EcoResProduct ecoresProduct;
-        
-            select firstonly Name from ecoResProductTranslation
-            join PdsCWProduct from ecoresProduct
-            where ecoResProductTranslation.Product == ecoresProduct.RecId
-            exists join inventTable
-            where inventTable.Product == ecoresProduct.RecId
-            && inventTable.ItemId == this.ItemId;
-
-            this.ProductName = ecoResProductTranslation.Name;
-            
-            this.IsCatchWeightProduct = ecoresProduct.PdsCWProduct;
-
-            this.Price = decRound(this.Price, 2);
-
-            UnitOfMeasureConversion unitOfMeasureConversion = UnitOfMeasureConversion::findByConversion(
-                            UnitOfMeasure::findBySymbol(#SalesUnitEA).RecId,
-                            UnitOfMeasure::findBySymbol(#SalesUnitKG).RecId,
-                            EcoResProduct::findByProductNumber(this.ItemId).RecId);
-
-            this.Factor = decRound((unitOfMeasureConversion.Factor ? unitOfMeasureConversion.Factor : 1), 2);
-
-            METExciseSiteDutySetup siteDutySetup;
-            InventLocation inventLocation = InventLocation::find(this.InventLocationId);
-
-            select firstonly ExcisePerCase from siteDutySetup
-            where siteDutySetup.SiteId == inventLocation.InventSiteId
-            && siteDutySetup.ItemId == this.ItemId;
-
-            this.ExcisePerCase = decRound(siteDutySetup.ExcisePerCase, 2);
-
-            InventItemSalesSetup inventItemSalesSetup;
-            InventDim inventDim;
-
-            select firstonly * from inventItemSalesSetup
-            where inventItemSalesSetup.ItemId == this.ItemId
-            exists join inventDim
-            where inventItemSalesSetup.InventDimId == inventDim.inventDimId
-            && inventDim.InventSiteId == this.InventSiteId;
-
-
-
-            if (this.IsCatchWeightProduct)
-            {
-                this.AltSalesUnit = #SalesUnitKG;
-            }
-            else
-            {
-                if (inventItemSalesSetup.METAltSalesUnit)
-                {
-                    this.AltSalesUnit = #SalesUnitEA;
-                }
-                else
-                {
-                    this.AltSalesUnit = #SalesUnitCS;
-                }
-            }
-
-            if (inventItemSalesSetup.METSalesUnit == #SalesUnitEA)
-            {
-                this.Factor = 1;
-            }
-            else
-            {
-                unitOfMeasureConversion = UnitOfMeasureConversion::findByConversion(
-                            UnitOfMeasure::findBySymbol(inventItemSalesSetup.METSalesUnit).RecId,
-                            UnitOfMeasure::findBySymbol(#SalesUnitEA).RecId,
-                            EcoResProduct::findByProductNumber(this.ItemId).RecId);
-
-                this.Factor = decRound(unitOfMeasureConversion.Factor, 2);
-            }
-
-            this.CaseQty = this.getPhysicalAvailable(this.ItemId, InventDim::find(this.CovInventDimId)) / this.Factor;
+            this.updateAdditionalData(this);
         }
+
+        super();
     }
 
 ]]></Source>
@@ -186,12 +184,6 @@ public class METStocktakeVarianceDetails extends common
 			<DataSource>METReqItemTable</DataSource>
 		</AxDataEntityViewField>
 		<AxDataEntityViewField xmlns=""
-			i:type="AxDataEntityViewMappedField">
-			<Name>Price</Name>
-			<DataField>Price</DataField>
-			<DataSource>InventItemPrices</DataSource>
-		</AxDataEntityViewField>
-		<AxDataEntityViewField xmlns=""
 			i:type="AxDataEntityViewUnmappedFieldString">
 			<Name>ProductName</Name>
 			<ExtendedDataType>EcoResProductName</ExtendedDataType>
@@ -229,15 +221,21 @@ public class METStocktakeVarianceDetails extends common
 		</AxDataEntityViewField>
 		<AxDataEntityViewField xmlns=""
 			i:type="AxDataEntityViewMappedField">
-			<Name>InventSiteId</Name>
-			<DataField>InventSiteId</DataField>
-			<DataSource>InventDim</DataSource>
+			<Name>InventDimId</Name>
+			<DataField>CovInventDimId</DataField>
+			<DataSource>ReqItemTable</DataSource>
+		</AxDataEntityViewField>
+		<AxDataEntityViewField xmlns=""
+			i:type="AxDataEntityViewUnmappedFieldReal">
+			<Name>Price</Name>
+			<ExtendedDataType>Price</ExtendedDataType>
+			<IsComputedField>No</IsComputedField>
 		</AxDataEntityViewField>
 		<AxDataEntityViewField xmlns=""
 			i:type="AxDataEntityViewMappedField">
-			<Name>CovInventDimId</Name>
-			<DataField>CovInventDimId</DataField>
-			<DataSource>ReqItemTable</DataSource>
+			<Name>InventSiteId</Name>
+			<DataField>InventSiteId</DataField>
+			<DataSource>InventDim</DataSource>
 		</AxDataEntityViewField>
 	</Fields>
 	<Keys>
@@ -306,49 +304,6 @@ public class Metadata extends QueryRun
 							<AxQuerySimpleDataSourceRelation>
 								<Name>QueryDataSourceRelation1</Name>
 								<JoinRelationName>ReqItemTable</JoinRelationName>
-							</AxQuerySimpleDataSourceRelation>
-						</Relations>
-					</AxQuerySimpleEmbeddedDataSource>
-					<AxQuerySimpleEmbeddedDataSource>
-						<Name>InventItemPrices</Name>
-						<DynamicFields>Yes</DynamicFields>
-						<Table>InventItemPrices</Table>
-						<DataSources>
-							<AxQuerySimpleEmbeddedDataSource>
-								<Name>InventItemPricesInventDim</Name>
-								<DynamicFields>Yes</DynamicFields>
-								<Table>InventDim</Table>
-								<DataSources />
-								<DerivedDataSources />
-								<Fields />
-								<Ranges />
-								<JoinMode>OuterJoin</JoinMode>
-								<Relations>
-									<AxQuerySimpleDataSourceRelation>
-										<Name>QueryDataSourceRelation1</Name>
-										<Field>inventDimId</Field>
-										<JoinDataSource>InventItemPrices</JoinDataSource>
-										<RelatedField>inventDimId</RelatedField>
-									</AxQuerySimpleDataSourceRelation>
-									<AxQuerySimpleDataSourceRelation>
-										<Name>QueryDataSourceRelation2</Name>
-										<Field>InventSiteId</Field>
-										<JoinDataSource>InventDim</JoinDataSource>
-										<RelatedField>InventSiteId</RelatedField>
-									</AxQuerySimpleDataSourceRelation>
-								</Relations>
-							</AxQuerySimpleEmbeddedDataSource>
-						</DataSources>
-						<DerivedDataSources />
-						<Fields />
-						<Ranges />
-						<JoinMode>OuterJoin</JoinMode>
-						<Relations>
-							<AxQuerySimpleDataSourceRelation>
-								<Name>QueryDataSourceRelation1</Name>
-								<Field>ItemId</Field>
-								<JoinDataSource>ReqItemTable</JoinDataSource>
-								<RelatedField>ItemId</RelatedField>
 							</AxQuerySimpleDataSourceRelation>
 						</Relations>
 					</AxQuerySimpleEmbeddedDataSource>
