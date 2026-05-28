@@ -18,6 +18,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     //CB123_SalesOrderExtractScreenforCSD -end
     boolean                                         skipTMSProcess;
     NoYes                                           useLegacyMode;  
+    int                                             batchTransactionCommit;        
     Map                                             reservedQtyInSalesUnitMap = new Map(Types::Int64, Types::Real);
     METProcMetrics                                  procMetrics;
     SalesUpdateRemain                               salesUpdateRemain;
@@ -138,7 +139,9 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
            
             using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
             {
-                useLegacyMode = METCustParameters::Find().SalesExtractionPerfMode;
+                METCustParameters metCustParameters = METCustParameters::find();
+                useLegacyMode = metCustParameters.SalesExtractionPerfMode;
+                batchTransactionCommit = metCustParameters.SalesExtractionBatchTransactionCommit;
                 this.processPickingList(_dataContract);
 
                 METBatchMonitoringStatus batchStatus = isError ? METBatchMonitoringStatus::Failed : METBatchMonitoringStatus::Completed;
@@ -240,7 +243,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         {
             if (procMetrics)
             {
-                procMetrics.startDescription2Time("SO Guide Check");
+                procMetrics.startDescription2Time("@MET:METSOExtractSOGuideCheck");
             }
 
             this.performSOGuideCheck();
@@ -278,6 +281,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                 if (procMetrics)
                 {
+                    procMetrics.incDescription3Count(1);
                     procMetrics.endDescription3Time();
                 }
 
@@ -301,24 +305,25 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 {
                     this.postPickingList(salesTable);
                 }
-                else 
+                else
                 {
                     this.postPickingListV2(salesTable);
                 }
-                
-                //Intercompany picking list. 
+
+                //Intercompany picking list.
                 this.postIntercompanyPickingList();
 
                 if (procMetrics)
                 {
-                    procMetrics.startDescription7Time("@MET:METSOExtractCrossDockTransferOrder");
+                    procMetrics.startDescription10Time("@MET:METSOExtractCrossDockTransferOrder");
                 }
 
                 METCrossDockTransferOrderProcessorBase::construct(salesTable).CreateTransferOrder();
 
                 if (procMetrics)
                 {
-                    procMetrics.endDescription7Time();
+                    procMetrics.incDescription10Count(1);
+                    procMetrics.endDescription10Time();
                 }
             }
             else if (actionToPerform == METConstants::SOExtractOrderedSOPickOnly)
@@ -432,7 +437,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         {
             if (procMetrics)
             {
-                procMetrics.startDescription9Time("@MET:METSOExtractIntercompanyPickingList");
+                procMetrics.startDescription11Time("@MET:METSOExtractIntercompanyPickingList");
             }
 
             changeCompany(purchTable_Reference.InterCompanyCompanyId)
@@ -453,7 +458,8 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
             if (procMetrics)
             {
-                procMetrics.endDescription9Time();
+                procMetrics.incDescription11Count(1);
+                procMetrics.endDescription11Time();
             }
         }
 
@@ -773,6 +779,8 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         InventLocation          inventLocationLoc;
         InventDim               inventDim;
         List                    qualifyingSalesLines = new List(Types::Int64);
+        int                     batchCount = 0;
+        boolean                 batchOpen  = false;
 
         while select forupdate salesLine
             where salesLine.SalesId == _salesTable.SalesId
@@ -800,8 +808,19 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 && _salesTable.METIntercompanyTransferFulfillment == NoYes::Yes
                 && _salesTable.InterCompanyOrigin != InterCompanyOrigin::Derived)
             {
+                if (procMetrics)
+                {
+                    procMetrics.startDescription4Time("@MET:METSOExtractICPOCreation");
+                }
+
                 METSalesOrderProcessHelper::createPOForIntercompanyFulfillment(_salesTable, salesLine);
                 interCompanyPOCreated = true;
+
+                if (procMetrics)
+                {
+                    procMetrics.incDescription4Count(1);
+                    procMetrics.endDescription4Time();
+                }
             }
             else if (purchLineRef.RecId != 0)
             {
@@ -811,7 +830,16 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             {
                 if (this.cancelSalesLineV2(_salesTable, salesLine, _pickListOrderedQty))
                 {
-                    this.ttsBeginTrace();
+                    if (procMetrics)
+                    {
+                        procMetrics.startDescription5Time("@MET:METSOExtractDeliverRemainderCancel");
+                    }
+
+                    if (!batchOpen)
+                    {
+                        this.ttsBeginTrace();
+                        batchOpen = true;
+                    }
 
                     if (metSalesLineNotExtracted.OrderExtractStatus != METOrderExtractStatus::Extracted)
                     {
@@ -830,11 +858,18 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                     info(strFmt("@MET:NoStock", salesLine.SalesId, salesLine.ItemId));
 
-                    this.ttsCommitTrace();
+                    batchCount++;
+                    if (batchTransactionCommit > 0 && batchCount >= batchTransactionCommit)
+                    {
+                        this.ttsCommitTrace();
+                        batchOpen = false;
+                        batchCount = 0;
+                    }
 
                     if (procMetrics)
                     {
-                        procMetrics.incDescription4Count(1);
+                        procMetrics.incDescription5Count(1);
+                        procMetrics.endDescription5Time();
                     }
                 }
                 else
@@ -846,12 +881,29 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                         continue;
                     }
 
+                    if (procMetrics)
+                    {
+                        procMetrics.startDescription6Time("@MET:METSOExtractQualifyingLines");
+                    }
+
                     processExtraction = true;
                     qualifyingSalesLines.addEnd(salesLine.RecId);
+
+                    if (procMetrics)
+                    {
+                        procMetrics.incDescription6Count(1);
+                        procMetrics.endDescription6Time();
+                    }
                 }
             }
         }
 
+        if (batchOpen)
+        {
+            this.ttsCommitTrace();
+        }
+
+        /**
         if (salesUpdateRemain)
         {
             // Recalculating Sales totals if any line is cancelled due to no stock availability as we are skipping it in SalesUpdateRemain class. so need to explicitly call the update to recalculate the totals and other related fields which are normally calculated in updateCorrespondingSalesOrder method of SalesUpdateRemain class.
@@ -865,7 +917,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             }
 
             this.ttsCommitTrace();
-        }
+        }**/
 
         return qualifyingSalesLines;
     }
@@ -1163,27 +1215,24 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                 if (procMetrics)
                 {
-                    procMetrics.startDescription4Time("@MET:METSOExtractDeliverRemainderCancel");
+                    procMetrics.startDescription7Time("@MET:METSOExtractCalcQualifyingLines");
                 }
 
-                this.salesUpdateRemain().resetOrderCheckUpdate();
-
                 qualifyingSalesLineRecIds = this.calcQueryV2(_salesTable, _pickListOrderedQty);
-                
+
                 if (procMetrics)
                 {
-                    procMetrics.endDescription4Time();
+                    procMetrics.incDescription7Count(qualifyingSalesLineRecIds.elements());
+                    procMetrics.endDescription7Time();
                 }
 
                 if (processExtraction == true)
                 {
-                    this.salesUpdateRemain().resetOrderCheckUpdate();
-
                     this.ttsBeginTrace();
 
                     if (procMetrics)
                     {
-                        procMetrics.startDescription5Time("@MET:METSOExtractPickingListCreation");
+                        procMetrics.startDescription8Time("@MET:METSOExtractPickingListCreation");
                     }
 
                     this.postPickingListDirect(_salesTable, _pickListOrderedQty, qualifyingSalesLineRecIds);
@@ -1199,7 +1248,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                     if (procMetrics)
                     {
-                        procMetrics.endDescription5Time();
+                        procMetrics.endDescription8Time();
                     }
 
                     this.ttsCommitTrace();
@@ -1266,7 +1315,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             {
                 if (procMetrics)
                 {
-                    procMetrics.startDescription6Time("@MET:METSOExtractTMSEngineOrderProcess");
+                    procMetrics.startDescription9Time("@MET:METSOExtractTMSEngineOrderProcess");
                 }
 
                 METTMSEngineOrderProccess  metTMSEngineOrderProccess = METTMSEngineOrderProccess::construct(METTMSEngineExecutionMode::SalesOrderPickingList, wmsPickingRoute, wmsPickingRoute.PickingRouteID);
@@ -1274,8 +1323,8 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                 if (procMetrics)
                 {
-                    procMetrics.incDescription6Count(1);
-                    procMetrics.endDescription6Time();
+                    procMetrics.incDescription9Count(1);
+                    procMetrics.endDescription9Time();
                 }
             }
         }
@@ -1382,7 +1431,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                 if (procMetrics)
                 {
-                    procMetrics.incDescription5Count(1);
+                    procMetrics.incDescription8Count(1);
                 }
             }
         }
@@ -1594,6 +1643,8 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             METSalesLine metSalesLineBatch;
             SalesLine    salesLineStatus;
 
+            metSalesLineBatch.skipDataMethods(true);
+
             update_recordset metSalesLineBatch
               setting OrderExtractStatus = METOrderExtractStatus::Extracted
             exists join salesLineStatus
@@ -1762,6 +1813,9 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         LogisticsPostalAddress  deliveryAddress;
         METSalesOrderGuideItem  salesOrderGuideItemCustomerOnlySellTo, salesOrderGuideItemCustomerOperationsGroupOnlySellTo, salesOrderGuideItemSiteOnlySellTo, salesOrderGuideItemStateOnlySellTo, salesOrderGuideItemCustomerDoNotSellTo, salesOrderGuideItemCustomerOperationsGroupDoNotSellTo, salesOrderGuideItemSiteDoNotSellTo, salesOrderGuideItemStateDoNotSellTo;
 
+        int batchCount = 0;
+        boolean batchOpen = false;
+
         salesTable.reread();
 
         if (salesTable.METOrderExtractStatus != METOrderExtractStatus::Open && salesTable.METOrderExtractStatus != METOrderExtractStatus::ReadyForExtract)
@@ -1847,7 +1901,11 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 && metSalesLine.ReasonId != METConstants::NewReasonCode 
                 && metSalesLine.ReasonId != METConstants::DEL)
             {
-                this.ttsBeginTrace();
+                if (!batchOpen)
+                {
+                    this.ttsBeginTrace();
+                    batchOpen = true;
+                }
 
                 metSalesLine.selectForUpdate(true);
                 metSalesLine.ReasonId = METConstants::NewReasonCode;
@@ -1858,23 +1916,39 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                     procMetrics.incDescription2Count(1);
                 }
 
-                this.ttsCommitTrace();
+                batchCount++;
+                if (batchTransactionCommit > 0 && batchCount >= batchTransactionCommit)
+                {
+                    this.ttsCommitTrace();
+                    batchOpen = false;
+                    batchCount = 0;
+                }
 
                 continue;
             }
 
             // 1st priority: Customer only sell-to
-            if (salesOrderGuideItemCustomerOnlySellTo.RecId) 
+            if (salesOrderGuideItemCustomerOnlySellTo.RecId)
             {
                 if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
                 {
-                    this.ttsBeginTrace();
+                    if (!batchOpen)
+                    {
+                        this.ttsBeginTrace();
+                        batchOpen = true;
+                    }
 
                     metSalesLine.selectForUpdate(true);
                     metSalesLine.ReasonId = '';
                     metSalesLine.update();
 
-                    this.ttsCommitTrace();
+                    batchCount++;
+                    if (batchTransactionCommit > 0 && batchCount >= batchTransactionCommit)
+                    {
+                        this.ttsCommitTrace();
+                        batchOpen = false;
+                        batchCount = 0;
+                    }
 
                     if (procMetrics)
                     {
@@ -1890,7 +1964,11 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             {
                 if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != METConstants::NIRReasonCode)
                 {
-                    this.ttsBeginTrace();
+                    if (!batchOpen)
+                    {
+                        this.ttsBeginTrace();
+                        batchOpen = true;
+                    }
 
                     salesLine.selectForUpdate(true);
                     metSalesLine.selectForUpdate(true);
@@ -1907,7 +1985,13 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                         this.salesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
                     }
 
-                    this.ttsCommitTrace();
+                    batchCount++;
+                    if (batchTransactionCommit > 0 && batchCount >= batchTransactionCommit)
+                    {
+                        this.ttsCommitTrace();
+                        batchOpen = false;
+                        batchCount = 0;
+                    }
 
                     if (procMetrics)
                     {
@@ -1923,13 +2007,23 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             {
                 if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
                 {
-                    this.ttsBeginTrace();
+                    if (!batchOpen)
+                    {
+                        this.ttsBeginTrace();
+                        batchOpen = true;
+                    }
 
                     metSalesLine.selectForUpdate(true);
                     metSalesLine.ReasonId = '';
                     metSalesLine.update();
 
-                    this.ttsCommitTrace();
+                    batchCount++;
+                    if (batchTransactionCommit > 0 && batchCount >= batchTransactionCommit)
+                    {
+                        this.ttsCommitTrace();
+                        batchOpen = false;
+                        batchCount = 0;
+                    }
 
                     if (procMetrics)
                     {
@@ -1945,7 +2039,11 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             {
                 if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != METConstants::NIRReasonCode)
                 {
-                    this.ttsBeginTrace();
+                    if (!batchOpen)
+                    {
+                        this.ttsBeginTrace();
+                        batchOpen = true;
+                    }
 
                     salesLine.selectForUpdate(true);
                     metSalesLine.selectForUpdate(true);
@@ -1962,7 +2060,13 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                         this.salesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
                     }
 
-                    this.ttsCommitTrace();
+                    batchCount++;
+                    if (batchTransactionCommit > 0 && batchCount >= batchTransactionCommit)
+                    {
+                        this.ttsCommitTrace();
+                        batchOpen = false;
+                        batchCount = 0;
+                    }
 
                     if (procMetrics)
                     {
@@ -1978,13 +2082,23 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             {
                 if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
                 {
-                    this.ttsBeginTrace();
+                    if (!batchOpen)
+                    {
+                        this.ttsBeginTrace();
+                        batchOpen = true;
+                    }
 
                     metSalesLine.selectForUpdate(true);
                     metSalesLine.ReasonId = '';
                     metSalesLine.update();
 
-                    this.ttsCommitTrace();
+                    batchCount++;
+                    if (batchTransactionCommit > 0 && batchCount >= batchTransactionCommit)
+                    {
+                        this.ttsCommitTrace();
+                        batchOpen = false;
+                        batchCount = 0;
+                    }
 
                     if (procMetrics)
                     {
@@ -2000,7 +2114,11 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             {
                 if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != METConstants::NIRReasonCode)
                 {
-                    this.ttsBeginTrace();
+                    if (!batchOpen)
+                    {
+                        this.ttsBeginTrace();
+                        batchOpen = true;
+                    }
 
                     salesLine.selectForUpdate(true);
 
@@ -2018,7 +2136,13 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                         this.salesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
                     }
 
-                    this.ttsCommitTrace();
+                    batchCount++;
+                    if (batchTransactionCommit > 0 && batchCount >= batchTransactionCommit)
+                    {
+                        this.ttsCommitTrace();
+                        batchOpen = false;
+                        batchCount = 0;
+                    }
 
                     if (procMetrics)
                     {
@@ -2034,13 +2158,23 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             {
                 if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
                 {
-                    this.ttsBeginTrace();
+                    if (!batchOpen)
+                    {
+                        this.ttsBeginTrace();
+                        batchOpen = true;
+                    }
 
                     metSalesLine.selectForUpdate(true);
                     metSalesLine.ReasonId = '';
                     metSalesLine.update();
 
-                    this.ttsCommitTrace();
+                    batchCount++;
+                    if (batchTransactionCommit > 0 && batchCount >= batchTransactionCommit)
+                    {
+                        this.ttsCommitTrace();
+                        batchOpen = false;
+                        batchCount = 0;
+                    }
 
                     if (procMetrics)
                     {
@@ -2056,7 +2190,11 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             {
                 if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != METConstants::NIRReasonCode)
                 {
-                    this.ttsBeginTrace();
+                    if (!batchOpen)
+                    {
+                        this.ttsBeginTrace();
+                        batchOpen = true;
+                    }
 
                     salesLine.selectForUpdate(true);
                     metSalesLine.selectForUpdate(true);
@@ -2073,7 +2211,13 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                         this.salesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
                     }
 
-                    this.ttsCommitTrace();
+                    batchCount++;
+                    if (batchTransactionCommit > 0 && batchCount >= batchTransactionCommit)
+                    {
+                        this.ttsCommitTrace();
+                        batchOpen = false;
+                        batchCount = 0;
+                    }
 
                     if (procMetrics)
                     {
@@ -2086,19 +2230,34 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
             if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
             {
-                this.ttsBeginTrace();
+                if (!batchOpen)
+                {
+                    this.ttsBeginTrace();
+                    batchOpen = true;
+                }
 
                 metSalesLine.selectForUpdate(true);
                 metSalesLine.ReasonId = '';
                 metSalesLine.update();
 
-                this.ttsCommitTrace();
+                batchCount++;
+                if (batchTransactionCommit > 0 && batchCount >= batchTransactionCommit)
+                {
+                    this.ttsCommitTrace();
+                    batchOpen = false;
+                    batchCount = 0;
+                }
 
                 if (procMetrics)
                 {
                     procMetrics.incDescription2Count(1);
                 }
             }
+        }
+
+        if (batchOpen)
+        {
+            this.ttsCommitTrace();
         }
     }
 
