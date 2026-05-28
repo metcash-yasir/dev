@@ -266,70 +266,6 @@ public class METReturnOrderCopyChargesHelper
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>updateSalesLinePrices</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Update sales line prices for the specified METSalesLine based on the original invoice line.
-    /// </summary>
-    /// <param name = "_metSalesLine">The METSalesLine.</param>
-    /// <param name = "_originalSalesId">The original SalesId.</param>
-    /// <param name = "_salesLine">The SalesLine.</param>
-    public static void updateSalesLinePrices(METSalesLine _metSalesLine, 
-        SalesId _originalSalesId, 
-        SalesLine _salesLine = null)
-    {
-        CustInvoiceTrans    custInvoiceTrans;
-        SalesLine           salesLine, salesLineOrig;
-
-        ttsbegin;
-        salesLine = _salesLine ? _salesLine : _metSalesLine.salesLine();
-        salesLine.selectForUpdate(true);
-
-        select firstonly salesLineOrig
-            join SalesId, ItemId from custInvoiceTrans
-                where custInvoiceTrans.InventTransId == salesLineOrig.InventTransId
-                && (!_metSalesLine.InvoiceNumber || custInvoiceTrans.InvoiceId == _metSalesLine.InvoiceNumber)
-                && custInvoiceTrans.SalesId == _originalSalesId
-            && ((!_metSalesLine.InvoiceLineNumber || custInvoiceTrans.LineNum == _metSalesLine.InvoiceLineNumber) && custInvoiceTrans.ItemId == salesLine.ItemId);
-        
-        if (salesLineOrig)
-        {
-            real convFactor = 1;
-            PdsCWUnitId pdsCWUnitId = salesLine.pdsCWUnitId();
-
-            if(!pdsCWUnitId && salesLine.SalesUnit != salesLineOrig.SalesUnit)
-            {
-                convFactor = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(salesLine.itemId,
-                                                                            salesLine.InventDimId,
-                                                                            1,
-                                                                            salesLineOrig.SalesUnit,
-                                                                            salesLine.SalesUnit,
-                                                                            NoYes::Yes);
-            }
-
-            SalesQty quantity;
-
-            if (pdsCWUnitId)
-            {
-                quantity = SalesParmLine::isCWClaimCreditApplicable(salesLine) ? salesLine.metSalesLine().CWReturnWeight : salesLine.PdsCWExpectedRetQty;
-            }
-            else
-            {
-                quantity = salesLine.ExpectedRetQty;
-            }
-
-            salesLine.SalesPrice = convFactor ? CurrencyExchange::round(salesLineOrig.SalesPrice / convFactor, salesLine.CurrencyCode) : salesLineOrig.SalesPrice;
-            salesLine.LineDisc = convFactor ? CurrencyExchange::round(salesLineOrig.LineDisc / convFactor, salesLine.CurrencyCode) : salesLineOrig.LineDisc;
-            salesLine.LineAmount = salesLine.calcLineAmount(quantity);
-            salesLine.update();
-        }
-
-        ttscommit;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
 				<Name>syncSalesHeaderInvoice</Name>
 				<Source><![CDATA[
     public static SalesId syncSalesHeaderInvoice(METSalesLine _metSalesLine, SalesLine _salesLine)
@@ -453,6 +389,91 @@ public class METReturnOrderCopyChargesHelper
                 throw Exception::UpdateConflict;
             }
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getLineDiscountAmount</Name>
+				<Source><![CDATA[
+    public static AmountCur getLineDiscountAmount(InventTransId _inventTransId)
+    {
+        METComponentCode            metComponentCode;
+        METSalesLinePriceComponent  metSalesLinePriceComponent;
+
+        select InventTransId, sum(Value) from metSalesLinePriceComponent
+            group by InventTransId
+                join metComponentCode
+                    where metSalesLinePriceComponent.Component == metComponentCode.Component
+                        && metSalesLinePriceComponent.InventTransId == _inventTransId
+                        && metComponentCode.PriceComponent == METPriceComponent::Discounts;
+
+        return metSalesLinePriceComponent.Value;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSalesQty</Name>
+				<Source><![CDATA[
+    public static METGrossWeight getSalesQty(SalesLine _salesLine,
+                           SalesLine _orgSalesLine)
+    {
+        METGrossWeight actualWeight;
+
+        // Cache flags to avoid repeated static method calls
+        boolean isCWItem = PdsGlobal::pdsIsCWItem(_salesLine.ItemId);
+        boolean isPricedByWeight = SalesLineSalesPurchLine::getPricedByWeightAttributeValue(_salesLine.ItemId);
+
+        // If item is Catch Weight (CW), use actual weight from sales line
+        if (isCWItem)
+        {
+            actualWeight = _salesLine.displayMETActualWeight();
+        }
+
+        // Retrieve physical dimensions (weight per UOM for site)
+        METWHSPhysDimUOMSite metWHSPhysDimUOMSite;
+        InventDim inventDim = _salesLine.inventDim();
+        UnitOfMeasureSymbol unitSales = _salesLine.SalesUnit;
+
+        select firstonly weight, NetWeight from metWHSPhysDimUOMSite
+            where metWHSPhysDimUOMSite.ItemId == _salesLine.ItemId
+            && metWHSPhysDimUOMSite.UOM == unitSales
+            && metWHSPhysDimUOMSite.SiteId == inventDim.InventSiteId;
+
+        // If item is priced by weight, calculate actual weight = NetWeight × SalesQty
+        if (isPricedByWeight)
+        {
+            actualWeight = metWHSPhysDimUOMSite.NetWeight * _salesLine.SalesQty;
+        }
+
+        // If item is CW or priced by weight, check warehouse transactions
+        if (isCWItem || isPricedByWeight)
+        {
+            WMSOrderTrans wmsOrderTrans;
+
+            // Get warehouse transaction qty (only if expedition is complete or activated)
+            select firstonly Qty from wmsOrderTrans
+                where wmsOrderTrans.InventTransId == _salesLine.InventTransId
+                && (wmsOrderTrans.expeditionStatus == WMSExpeditionStatus::Complete
+                   || wmsOrderTrans.expeditionStatus == WMSExpeditionStatus::Activated);
+
+            if (wmsOrderTrans.Qty)
+            {
+                // If priced by weight but not CW, multiply qty by NetWeight
+                actualWeight = (!isCWItem && isPricedByWeight)
+                ? wmsOrderTrans.Qty * metWHSPhysDimUOMSite.NetWeight
+                : wmsOrderTrans.Qty;
+            }
+        }
+    
+        // Final extended value calculation
+        if (actualWeight)
+        {
+            return actualWeight *-1;
+        }
+
+        return _orgSalesLine.SalesQty*-1;
     }
 
 ]]></Source>
