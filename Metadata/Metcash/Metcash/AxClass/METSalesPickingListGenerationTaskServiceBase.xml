@@ -844,7 +844,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                     if (metSalesLineNotExtracted.OrderExtractStatus != METOrderExtractStatus::Extracted)
                     {
                         metSalesLineNotExtracted.OrderExtractStatus = METOrderExtractStatus::Extracted;
-                        metSalesLineNotExtracted.update();
+                        metSalesLineNotExtracted.doUpdate();
                     }
 
                     if (salesLine.inventTable().pdsCWItem())
@@ -902,6 +902,8 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         {
             this.ttsCommitTrace();
         }
+
+        salesTable.updateBackStatus();
 
         /**
         if (salesUpdateRemain)
@@ -1342,6 +1344,9 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         WMSPickingRouteID   pickingRouteId  = NumberSeq::newGetNum(WMSParameters::numRefWMSPickingRouteId()).num();
         boolean             useQualityManagement = InventParameters::find().UseQualityManagement;
 
+        // Skip business events
+        this.salesUpdateRemain().parmSkipBusinessEvents(true);
+
         // Create shipment and picking route headers
         WMSShipment wmsShipment = this.createWMSShipment();
         this.initWMSPickingRoute(_salesTable, inventLoc, pickingRouteId, wmsShipment);
@@ -1407,19 +1412,22 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
                 if (!_salesTable.METAllowBackOrders && !metSalesTable.InternalCrossDockOrder)
                 {
-                    InventQty shipQtySales = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
-                        salesLine.ItemId,
-                        salesLine.InventDimId,
-                        shipQty,
-                        salesLine.inventTable().inventUnitId(),
-                        salesLine.SalesUnit,
-                        NoYes::Yes);
+                    if (shipQty < inventNow)  // only short picks need remainder cancellation
+                    {
+                        InventQty shipQtySales = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+                            salesLine.ItemId,
+                            salesLine.InventDimId,
+                            shipQty,
+                            salesLine.inventTable().inventUnitId(),
+                            salesLine.SalesUnit,
+                            NoYes::Yes);
 
-                    this.salesUpdateRemain().updateExtractionDeliverRemainder(
-                        salesLine, 
-                        shipQtySales,
-                        shipQty,
-                        cwQty);
+                        this.salesUpdateRemain().updateExtractionDeliverRemainder(
+                            salesLine,
+                            shipQtySales,
+                            shipQty,
+                            cwQty);
+                    }
                 }
                 if (_salesTable.METAllowBackOrders)
                 {
@@ -1462,6 +1470,9 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         {
             procMetrics.incProcessedCount(1);
         }
+
+        // reset business event
+        this.salesUpdateRemain().parmSkipBusinessEvents(false);
     }
 
 ]]></Source>
@@ -1554,12 +1565,19 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
           ? _salesLine.SalesQty
           : this.getSalesLineReservPhysicalInSalesUnit(_salesLine);
 
+        UnitOfMeasureSymbol inventUnit = _salesLine.inventTable().inventUnitId();
+
+        if (_salesLine.SalesUnit == inventUnit)
+        {
+            return sourceQty;
+        }
+
         return EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
-            _salesLine.ItemId,  
+            _salesLine.ItemId,
             _salesLine.InventDimId,
             sourceQty,
             _salesLine.SalesUnit,
-            _salesLine.inventTable().inventUnitId(),
+            inventUnit,
             NoYes::Yes);
     }
 
@@ -1629,14 +1647,16 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
         // Clear deliver-now quantities
         SalesLine salesLineDeliverNow;
-        salesLineDeliverNow.skipDataMethods(true);
 
-        update_recordset salesLineDeliverNow
-          setting SalesDeliverNow       = 0,
-                  InventDeliverNow      = 0,
-                  PdsCWInventDeliverNow = 0
-          where salesLineDeliverNow.SalesId    == _salesTable.SalesId
-             && salesLineDeliverNow.SalesStatus != SalesStatus::Canceled;
+        while select forupdate salesLineDeliverNow
+            where salesLineDeliverNow.SalesId    == _salesTable.SalesId
+               && salesLineDeliverNow.SalesStatus != SalesStatus::Canceled
+        {
+            salesLineDeliverNow.SalesDeliverNow       = 0;
+            salesLineDeliverNow.InventDeliverNow      = 0;
+            salesLineDeliverNow.PdsCWInventDeliverNow = 0;
+            salesLineDeliverNow.doUpdate();
+        }
 
         if (!_salesTable.METAllowBackOrders)
         {
