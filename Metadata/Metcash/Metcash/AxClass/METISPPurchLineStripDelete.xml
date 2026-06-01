@@ -4,12 +4,13 @@
 	<SourceCode>
 		<Declaration><![CDATA[
 /// <summary>
-/// Bug 231840: CB501 - Disable Remove button for PO lines for ISP users
+/// Handles processing of selected purchase order lines to determine whether they belong
+/// to a confirmed purchase order version. No deletion is performed; only warnings are issued.
 /// </summary>
 internal final class METISPPurchLineStripDelete
 {
     List poLinesToDelete;
-    
+
 }
 ]]></Declaration>
 		<Methods>
@@ -17,10 +18,10 @@ internal final class METISPPurchLineStripDelete
 				<Name>construct</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Construct method
+    /// Factory method to create an instance of this class.
     /// </summary>
-    /// <param name = "_poLinesToDelete"><c>List</c> of po lines to delete</param>
-    /// <returns></returns>
+    /// <param name="_poLinesToDelete">List of PurchLine records to process.</param>
+    /// <returns>Instance of METISPPurchLineStripDelete.</returns>
     public static METISPPurchLineStripDelete construct(List _poLinesToDelete)
     {
         return new METISPPurchLineStripDelete(_poLinesToDelete);
@@ -32,9 +33,9 @@ internal final class METISPPurchLineStripDelete
 				<Name>new</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// New method
+    /// Initializes the instance with the provided list of purchase lines.
     /// </summary>
-    /// <param name = "_poLinesToDelete"><c>List</c> of po lines to delete</param>
+    /// <param name="_poLinesToDelete">List of PurchLine records.</param>
     protected void new(List _poLinesToDelete)
     {
         poLinesToDelete = _poLinesToDelete;
@@ -46,60 +47,48 @@ internal final class METISPPurchLineStripDelete
 				<Name>main</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Main method
+    /// Entry point when executed from a menu item.
+    /// Collects selected PO lines, processes them, and marks confirmed lines on the form.
     /// </summary>
-    /// <param name = "_args">Args</param>
+    /// <param name="_args">Arguments containing the PurchLine record context.</param>
     public static void main(Args _args)
     {
-        if (_args)
-        {
-            PurchLine purchLine = _args.record();
-            FormDataSource fds = FormDataUtil::getFormDataSource(purchLine);
-        
-            if (purchLine)
-            {
-                boolean canDelete = true;
-
-                // copied from Form\PurchTable\PurchLine_ds\validateDelete
-                // validateDelete() will be triggered in METISPPurchLineStripDelete\deletePOLines
-                str warning = purchLine.type(purchLine.purchTable()).getDeleteWarning();
-
-                if (warning != "")
-                {
-                    canDelete = (Box::yesNo(warning, DialogButton::No) == DialogButton::Yes);
-                }
-                else
-                {
-                    // to simulate the FormDataSource\validateDelete call to Box::callSysBoxFormWait()
-                    canDelete = (Box::yesNo("@GLS93975", DialogButton::No, "@SYS28002") == DialogButton::Yes);
-                }
-                
-                if (canDelete)
-                {                   
-                    PurchLine purchLineDelete;
-                    List list = new List(Types::Record);
-
-                    for (purchLineDelete = fds.getFirst(1) ? fds.getFirst(1) : fds.cursor(); purchLineDelete; purchLineDelete = fds.getNext())
-                    {
-                        list.addEnd(purchLineDelete);
-                    }
-
-                    METISPPurchLineStripDelete metISPPurchLineStripDelete = METISPPurchLineStripDelete::construct(list);
-                    metISPPurchLineStripDelete.run();                    
-                }
-            }
-            else
-            {
-                ttsbegin;
-                purchLine.delete();
-                ttscommit;
-            }
-
-            fds.research(true);
-        }
-        else
+        if (!_args)
         {
             throw error(Error::wrongUseOfFunction(funcName()));
+        }
+
+        PurchLine purchLine = _args.record();
+        FormDataSource fds = FormDataUtil::getFormDataSource(purchLine);
+
+        if (purchLine && fds)
+        {
+            List list = new List(Types::Record);
+            PurchLine purchLineDelete;
+
+            for (purchLineDelete = fds.getFirst(1) ? fds.getFirst(1) : fds.cursor();
+            purchLineDelete;
+            purchLineDelete = fds.getNext())
+            {
+                list.addEnd(purchLineDelete);
+            }
+
+            METISPPurchLineStripDelete del = METISPPurchLineStripDelete::construct(list);
+            del.run();
+
+            for (purchLineDelete = fds.getFirst(1) ? fds.getFirst(1) : fds.cursor();
+            purchLineDelete;
+            purchLineDelete = fds.getNext())
+            {
+                PurchLineAllVersions purchLineAllVersions = del.getPurchLineAllVersions(purchLineDelete);
+
+                if (purchLineAllVersions.RecId)
+                {
+                    fds.markRecord(purchLineDelete, 0);
+                }
+            }
+            
+            fds.getFirst(1);
         }
     }
 
@@ -109,13 +98,13 @@ internal final class METISPPurchLineStripDelete
 				<Name>run</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Run method
+    /// Executes validation and processing of the purchase lines.
     /// </summary>
     protected void run()
     {
         if (this.validate())
         {
-            this.deletePOLines();
+            this.processPOLines();
         }
     }
 
@@ -125,57 +114,71 @@ internal final class METISPPurchLineStripDelete
 				<Name>validate</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Validate the list is not empty
+    /// Validates that at least one purchase line has been selected.
     /// </summary>
-    /// <returns>True if validation successful; otherwise, false.</returns>
+    /// <returns>True if valid; otherwise false.</returns>
     protected boolean validate()
     {
-        boolean ret = true;
-
         if (poLinesToDelete.empty())
         {
-            ret = checkFailed("@MET:NoPOLineSelectedDelete");
-        }        
-
-        return ret;
+            return checkFailed("@MET:NoPOLineSelectedDelete");
+        }
+        return true;
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>deletePOLines</Name>
+				<Name>getPurchLineAllVersions</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Delete selected PO lines
+    /// Retrieves the PurchLineAllVersions record for the given PurchLine,
+    /// but only if it belongs to a confirmed purchase order version.
     /// </summary>
-    protected void deletePOLines()
+    /// <param name="_purchLine">The PurchLine to evaluate.</param>
+    /// <returns>Matching PurchLineAllVersions record, or an empty buffer if none found.</returns>
+    protected PurchLineAllVersions getPurchLineAllVersions(PurchLine _purchLine)
+    {
+        PurchLineAllVersions purchLineAllVersions;
+        PurchTableVersion    purchTableVersion;
+        VendPurchOrderJour   vendPurchOrderJour;
+
+        select firstonly RecId from purchLineAllVersions
+            where purchLineAllVersions.InventTransId == _purchLine.InventTransId
+        exists join purchTableVersion
+             where purchTableVersion.RecId == purchLineAllVersions.PurchTableVersionRecId
+        exists join vendPurchOrderJour
+            where vendPurchOrderJour.PurchTableVersion == purchTableVersion.RecId;
+
+        return purchLineAllVersions;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processPOLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes each selected purchase line and issues warnings for lines
+    /// that belong to confirmed purchase order versions. No deletion occurs.
+    /// </summary>
+    protected void processPOLines()
     {
         ListEnumerator le = poLinesToDelete.getEnumerator();
         PurchLine purchLine;
         PurchLineAllVersions purchLineAllVersions;
-        
+
         while (le.moveNext())
         {
+            purchLine = le.current();
+
             try
             {
                 ttsbegin;
-                purchLine = le.current();
 
-                // if the PO line is confirmed, ISP user cannot delete it
-                select firstonly RecId from purchLineAllVersions where purchLineAllVersions.InventTransId == purchLine.InventTransId;
+                purchLineAllVersions = this.getPurchLineAllVersions(purchLine);
 
-                if (!purchLineAllVersions)
-                {
-                    if (purchLine.validateDelete())
-                    {
-                        purchLine.delete();
-                    }
-                    else
-                    {
-                        warning(strFmt("@MET:CannotDeletePOLine", purchLine.LineNumber, purchLine.ItemId));
-                    }
-                }
-                else
+                if (purchLineAllVersions.RecId)
                 {
                     warning(strFmt("@MET:CannotDeletePOLineConfirmed", purchLine.LineNumber, purchLine.ItemId));
                 }

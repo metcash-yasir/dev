@@ -1,0 +1,295 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METReturnOrderDispositionCodeUpdTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// CB197_salesOrderReturnsAndClaims
+/// Batch service class for updating the disposition code on empty return order lines
+/// </summary>
+public class METReturnOrderDispositionCodeUpdTaskService extends METSysOperationTaskService
+{
+    guid                         topPickingProcessId;
+    SalesId                      salesId;
+    ReturnDispositionCodeId      returnDispositionCodeId;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main process.
+    /// </summary>
+    /// <param name = "_contract">
+    /// <c>METReturnOrderDispositionCodeUpdContract</c>.
+    /// </param>
+    public void process(METReturnOrderDispositionCodeUpdContract _contract)
+    {
+        this.processInternal(_contract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Process the batch tasks.
+    /// </summary>
+    /// <param name = "_readPast">Read past table setting.</param>
+    public void processTask(boolean _readPast)
+    {
+        while (this.getSalesIdFromTopPickingQueue(topPickingProcessId, _readPast))
+        {
+            if (this.salesId)
+            {
+                this.applyDispositionCodeOnReturnOrderLines(salesId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Initializes the object.
+    /// </summary>
+    protected void initialise()
+    {
+        super();
+
+        // get the topPickingProcessId from the contract
+        METReturnOrderDispositionCodeUpdContract contract = dataContract as METReturnOrderDispositionCodeUpdContract;
+        topPickingProcessId = contract.parmTopPickingProcessId();
+        returnDispositionCodeId = contract.parmDispositionCode();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>applyDispositionCodeOnReturnOrderLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Executes the main processes applying disposition code.
+    /// </summary>
+    /// <param name = "_salesId">Sales order to process.</param>
+    public void applyDispositionCodeOnReturnOrderLines(SalesId _salesId)
+    {
+        #OCCRetryCount      
+
+        SalesReturnOrderLineRegister salesReturnOrderLineRegister;
+        TradeOrderLineRegister       tradeOrderlineRegister;
+        InventTransWMS_Register      inventTransWMS_register;
+        TmpInventTransWMS            TmpInventTransWMS;
+        InventTransOrigin            inventTransOrigin;
+        InventTrans                  inventTrans;
+        SalesLine                    salesLine;
+ 
+        try
+        {
+            ttsbegin;
+
+            while select forupdate salesline
+            where salesline.SalesId == _salesId
+            && salesline.ReturnDispositionCodeId == ''
+            {
+                Args registrationArgs = new Args();
+                tradeOrderLineRegister = SalesReturnOrderLineRegister::construct();
+            
+                registrationArgs.record(salesline);
+                tradeOrderLineRegister.parmArgs(registrationArgs);
+                tradeOrderLineRegister.init();
+            
+                salesReturnOrderLineRegister = tradeOrderLineRegister;
+                salesReturnOrderLineRegister.runPreSuper();
+
+                //update returnDisposioncode
+                salesline.ReturnDispositionCodeId = returnDispositionCodeId;
+                salesline.update();
+
+                Info(strFmt("@MET:UpdatedDispositionCode", salesLine.SalesId, salesLine.LineNum));
+
+                select firstOnly crossCompany inventTrans
+                join RecId, InventTransId from inventTransOrigin
+                    where inventTransOrigin.InventTransId == salesline.InventTransId
+                        && inventTrans.InventTransOrigin == inventTransOrigin.RecId;
+
+                inventTransWMS_register = inventTransWMS_register::newStandard(tmpInventTransWMS);
+            
+                tmpInventTransWMS.clear();
+                tmpInventTransWMS.initFromInventTrans(inventTrans);
+            
+                tmpInventTransWMS.InventDimId = inventTrans.InventDimId;
+                tmpInventTransWMS.initFromInventTransOrigin(inventTrans.inventTransOrigin());
+                tmpInventTransWMS.insert();
+            
+                inventTransWMS_register.writeTmpInventTransWMS(tmpInventTransWMS,
+                                                               inventTrans,
+                                                               inventTrans.inventDim());
+            
+                inventTransWMS_register.updateInvent(salesline);
+
+                Info(strFmt("@MET:ReturnOrderLineStatus", salesLine.SalesId, salesLine.LineNum, salesLine.ReturnStatus));
+               
+            }
+
+            RefRecId salesTableRecId = salesTable::find(salesId).RecId;
+
+            if (salesTableRecId)
+            {
+                METSalesTable metSalesTable = METSalesTable::findByRefRecId(salesTableRecId, true);
+
+                if (metSalesTable)
+                {
+                    metSalesTable.OrderProcessingStatus = METSalesOrderProcessingStatus::ReadyForPricing;
+                    metSalesTable.update();
+
+                    Info(strFmt("@MET:OrderProcessingStatusUpdate", salesLine.SalesId, METSalesOrderProcessingStatus::ReadyForPricing));
+                }
+            }
+       
+            ttscommit;
+        }    
+
+        catch (Exception::Deadlock)
+        {
+            // Retry logic for deadlocks
+            if (xSession::currentRetryCount() < #RetryNum)
+            {
+                retry;
+            }
+            else
+            {
+                throw Exception::Deadlock;
+            }
+        }
+        catch (Exception::UpdateConflict)
+        {
+            // Retry logic for update conflicts
+            if (appl.ttsLevel() == 0 && xSession::currentRetryCount() < #RetryNum)
+            {
+                retry;
+            }
+            else
+            {
+                throw Exception::UpdateConflictNotRecovered;
+            }
+        }
+        catch (Exception::Error)
+        {
+            error(strFmt(literalStr("@MET:FailedToApplyDispositionCode"), this.SalesId));
+
+            // Catch-all for unexpected errors
+            Global::exceptionTextFallThrough();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSalesIdFromTopPickingQueue</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get sales order id to substitute from the top picking queue <c>METReturnOrderDispositionCodeUpdQueue</c>
+    /// </summary>
+    /// <param name = "_processId">Guid created and added in the contract <c>METReturnOrderDispositionCodeUpdContract</c></param>
+    /// <param name = "_readPast">boolean to read past records or not</param>
+    /// <returns>Get sales order id to substitute</returns>
+    private SalesId getSalesIdFromTopPickingQueue(guid _processId, boolean _readPast)
+    {
+        METReturnOrderDispositionCodeUpdQueue postQueue;
+        
+        #OCCRetryCount
+        int backOffWait;
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockException;
+        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
+        Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
+        
+        postQueue.readPast(_readPast);
+
+        try
+        {
+            ttsbegin;
+    
+            select firstonly pessimisticlock SalesId
+                from postQueue
+                    where postQueue.ProcessId == _processId;
+
+            if (postQueue.RecId)
+            {
+                this.salesId = postQueue.SalesId;
+
+                postQueue.delete();
+            }
+            else
+            {
+                // no sales order id found from top picking queue
+                this.salesId = '';
+            }
+
+            ttscommit;
+        }
+        catch (deadLockException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw deadLockException;
+                }
+            }
+            else
+            {
+                throw deadLockException;
+            }
+        }
+        catch (updateConflictException)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() < #RetryNum)
+                {
+                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                    sleep(xSession::currentRetryCount() * backOffWait);
+                    retry;
+                }
+                else
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+            }
+            else
+            {
+                throw updateConflictException;
+            }
+        }
+        catch (transientSqlConnectionError)
+        {
+            if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+            else
+            {
+                throw transientSqlConnectionError;
+            }
+        }
+
+        return this.salesId;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

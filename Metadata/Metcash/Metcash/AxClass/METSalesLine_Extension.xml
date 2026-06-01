@@ -16,63 +16,60 @@ final class METSalesLine_Extension
 				<Name>metSetReturnUnitPriceAndDiscount</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Recalculate and update the sales unit price and line discount
+    /// Calculates and sets the return unit price and discount for the sales line based on the original invoice line when the sales order is of type ReturnItem.
     /// </summary>
     private void metSetReturnUnitPriceAndDiscount()
     {
-        METSalesTable metSalesTable = this.salesTable().metSalesTable();
-        SalesPrice retPrice = this.SalesPrice;
-        SalesLineDisc retLineDisc = this.LineDisc;
+        SalesQty            quantity;
+        SalesLine           salesLine, salesLineOrig;
+        METSalesTable       metSalesTable = this.salesTable().metSalesTable();
+        CustInvoiceTrans    custInvoiceTrans;
 
-        if(metSalesTable && metSalesTable.OriginalInvoice != '')
+        salesLine = SalesLine::findRecId(this.RecId);
+        METSalesLine metSalesLine = salesLine.metSalesLine();
+        SalesId originalSalesId = metSalesTable.ClaimSalesId ? metSalesTable.ClaimSalesId : metSalesTable.OriginalSalesId;
+
+        select firstonly salesLineOrig
+            join SalesId, ItemId from custInvoiceTrans
+                where custInvoiceTrans.InventTransId == salesLineOrig.InventTransId
+                && (!metSalesLine.InvoiceNumber || custInvoiceTrans.InvoiceId == metSalesLine.InvoiceNumber)
+                && custInvoiceTrans.SalesId == originalSalesId
+            && ((!metSalesLine.InvoiceLineNumber || custInvoiceTrans.LineNum == metSalesLine.InvoiceLineNumber) && custInvoiceTrans.ItemId == salesLine.ItemId);
+        
+        if (salesLineOrig)
         {
-            SalesTable salesTableOrig = SalesTable::find(metSalesTable.OriginalInvoice);
+            real        convFactor  = 1;
+            PdsCWUnitId pdsCWUnitId = this.pdsCWUnitId();
 
-            if (salesTableOrig.RecId)
+            if (!pdsCWUnitId && salesLineOrig.SalesUnit !=  this.SalesUnit)
             {
-                SalesLine salesLineOrig;
-
-                select firstonly RecId, SalesUnit, SalesPrice, LineDisc from salesLineOrig
-                    where salesLineOrig.SalesId == salesTableOrig.SalesId
-                    && salesLineOrig.ItemId == this.ItemId;
-
-                if (!salesLineOrig)
-                {
-                    CustInvoiceJour custInvoiceJour;
-                    METSalesTable metSalesTableOrig;
-                    SalesTable salesTableOrigTmp;
-
-                    select firstOnly SalesId from custInvoiceJour
-                        order by InvoiceDate desc
-                    where custInvoiceJour.InvoiceId == metSalesTable.OriginalInvoice
-                        exists join salesTableOrigTmp
-                    where custInvoiceJour.InvoiceAccount == salesTableOrig.CustAccount
-                        && custInvoiceJour.SalesId == salesTableOrig.SalesId
-                        && salesTableOrigTmp.RecId == metSalesTable.SalesTable;
-
-                    select firstonly RecId, SalesUnit, SalesPrice, LineDisc from salesLineOrig
-                        where salesLineOrig.SalesId == custInvoiceJour.SalesId
-                            && salesLineOrig.ItemId == this.ItemId;
-                }
-
-                if(salesLineOrig.SalesUnit !=  this.SalesUnit)
-                {
-                    real convFactor = 1;
-
-                    convFactor = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(this.itemId,
-                                                                        this.InventDimId,
-                                                                        1,
-                                                                        salesLineOrig.SalesUnit,
-                                                                        this.SalesUnit,
-                                                                        NoYes::Yes);
-
-                    retPrice = salesLineOrig.SalesPrice / convFactor;
-                    retLineDisc = salesLineOrig.LineDisc / convFactor;
-                    this.SalesPrice = retPrice;
-                    this.LineDisc = retLineDisc;
-                }
-
+                convFactor = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(this.itemId,
+                                                                            this.InventDimId,
+                                                                            1,
+                                                                            salesLineOrig.SalesUnit,
+                                                                            this.SalesUnit,
+                                                                            NoYes::Yes);
             }
+
+            if (salesLine.SalesType == SalesType::ReturnItem)
+            {
+                if (pdsCWUnitId)
+                {
+                    quantity = SalesParmLine::isCWClaimCreditApplicable(this) ? this.metSalesLine().CWReturnWeight : this.PdsCWExpectedRetQty;
+                }
+                else
+                {
+                    quantity = this.ExpectedRetQty;
+                }
+            }
+            else
+            {
+                quantity = this.SalesQty;
+            }
+        
+            this.SalesPrice    = convFactor ? salesLineOrig.SalesPrice / convFactor : salesLineOrig.SalesPrice;
+            this.LineDisc      = METReturnOrderCopyChargesHelper::getLineDiscountAmount(salesLine.InventTransId);
+            this.LineAmount    = this.calcLineAmount(quantity);
         }
     }
 
@@ -162,13 +159,13 @@ final class METSalesLine_Extension
 
         intercompanyTransferFulfillment = this.updateIntercompanySODetails();
 
-        this.metSetReturnUnitPriceAndDiscount();
-
         if (this.METCWActualWeight)
         {
             this.LineAmount = this.calcLineAmount(this.METCWActualWeight);
         }
-        this.METSalesUnit = this.metGetDefaultOrderUnit();
+        this.METSalesUnit = this.metGetDefaultOrderUnit();            
+        //this.metSetReturnUnitPriceAndDiscount();
+
         next insert(_dropInvent, _findMarkup, _childBuffer, _skipCreditLimitCheck, _skipWHSProcesses, _interCompanyInventTransId );
 
         metSalesLine = this.metSalesLine();
@@ -352,6 +349,7 @@ final class METSalesLine_Extension
         METSalesTable   metSalesTable;
         METSalesLinePriceComponent metSalesLinePriceComponent;
         METSalesLinePriceComponentDetail metSalesLinePriceComponentDetail;
+        NoYes           skipPriceCompDeletion = this.METSkipPriceCompDeletion;
 
         if (this.SalesUnit != salesLineOrig.SalesUnit ||  this.InventDimId != salesLineOrig.InventDimId)
         {
@@ -430,7 +428,8 @@ final class METSalesLine_Extension
         // CB796 Send PE pricing purge value for custom tables
         if (!this.SalesPrice
             && salesLineOrig.SalesPrice
-            && metSalesTable.OrderProcessingStatus != METSalesOrderProcessingStatus::PricingCompleted)
+            && metSalesTable.OrderProcessingStatus != METSalesOrderProcessingStatus::PricingCompleted
+            && skipPriceCompDeletion != NoYes::Yes)
         {
             // Purge the data in custom tables
             delete_from METSalesLinePriceComponent
@@ -1761,7 +1760,14 @@ final class METSalesLine_Extension
     /// <returns>Picked cases</returns>
     public display METCase metDisplayPickedCases()
     {
-        return 0;
+        WMSOrderTrans wmsOrderTrans;
+
+        select METPickedCases from wmsOrderTrans
+            order by CreatedDateTime desc
+            where wmsOrderTrans.InventTransId == this.InventTransId &&
+                 wmsOrderTrans.expeditionStatus != WMSExpeditionStatus::Cancelled;
+
+        return wmsOrderTrans.METPickedCases;
     }
 
 ]]></Source>
@@ -1775,7 +1781,14 @@ final class METSalesLine_Extension
     /// <returns>Picked broken cases</returns>
     public display METCase metDisplayPickedBrokenCases()
     {
-        return 0;
+        WMSOrderTrans wmsOrderTrans;
+
+        select METPickedBrokenCases from wmsOrderTrans
+            order by CreatedDateTime desc
+            where wmsOrderTrans.InventTransId == this.InventTransId &&
+                 wmsOrderTrans.expeditionStatus != WMSExpeditionStatus::Cancelled;
+
+        return wmsOrderTrans.METPickedBrokenCases;
     }
 
 ]]></Source>
