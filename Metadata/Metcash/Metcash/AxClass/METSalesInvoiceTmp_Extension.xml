@@ -46,12 +46,24 @@ final class METSalesInvoiceTmp_Extension
 				<Name>metInsertPickedCaseLine</Name>
 				<Source><![CDATA[
     private void metInsertPickedCaseLine(SalesInvoiceTmp     _salesInvoiceTmpBase,
-                                      CustInvoiceTrans    _custInvoiceTrans,
-                                      SalesLine           _salesLine,
-                                      METCase             _qty,
-                                      boolean             _isBrokenCase)
+                                     CustInvoiceTrans    _custInvoiceTrans,
+                                     SalesLine           _salesLine,
+                                     METCase             _qty,
+                                     boolean             _isBrokenCase)
     {
         SalesInvoiceTmp caseLine;
+
+        EcoResProduct product;
+        RecId         caseUom;
+        RecId         eaUom;
+
+        Qty          pickedCases;
+        Qty          pickedBrokenCases;
+        Qty          brokenQtyInCaseUnit;
+        Qty          currentQtyInCaseUnit;
+        Qty          totalPickedQtyInCaseUnit;
+
+        real         allocationFactor;
 
         // Copy all fields from base line - carries over ItemId, description,
         // prices, charges, tax groups, and all other mapped fields.
@@ -60,51 +72,103 @@ final class METSalesInvoiceTmp_Extension
         // Clear RecId to force a new insert rather than updating existing record.
         caseLine.RecId = 0;
 
+        product = EcoResProduct::findByProductNumber(_salesLine.ItemId);
+        caseUom = UnitOfMeasure::unitOfMeasureIdBySymbol(_salesLine.SalesUnit);
+        eaUom   = UnitOfMeasure::unitOfMeasureIdBySymbol(METConstants::unitEach);
+
+        pickedCases       = _custInvoiceTrans.METPickedCases;
+        pickedBrokenCases = _custInvoiceTrans.METPickedBrokenCases;
+
+        // Convert broken EA quantity back to sales-line unit/case unit.
+        if (pickedBrokenCases && product.RecId && caseUom && eaUom)
+        {
+            brokenQtyInCaseUnit = UnitOfMeasureConverter::convert(
+                                pickedBrokenCases,
+                                eaUom,
+                                caseUom,
+                                NoYes::No,
+                                product.RecId,
+                                NoYes::No);
+        }
+        else
+        {
+            brokenQtyInCaseUnit = 0;
+        }
+
+        // Total supplied quantity in the same unit as the original sales line.
+        totalPickedQtyInCaseUnit = pickedCases + brokenQtyInCaseUnit;
+
         if (_isBrokenCase)
         {
-            // --- Broken cases line overrides (mapping sheet - bug 351188) ---
+            // --- Broken cases line overrides - Bug 351188 ---
 
-            // Qty Supplied = picked broken cases value
-            caseLine.Qty            = _qty;
+            // Qty Supplied = picked broken cases value. 
+            caseLine.Qty = _qty;
 
-            // Qty Ordered = 0 for broken case lines
-            caseLine.METOrderedQty  = 0;
-             
+            // Qty Ordered = 0 for broken case/EA line.
+            caseLine.METOrderedQty = 0;
 
-            // UOM = EA for broken case lines
-            caseLine.SalesUnitTxt   = METConstants::unitEach;
+            // UOM = EA for broken case line.
+            caseLine.SalesUnitTxt = METConstants::unitEach;
 
-            EcoResProduct product = EcoResProduct::findByProductNumber(_salesLine.itemid);
-            Recid toUom = UnitOfMeasure::unitOfMeasureIdBySymbol(_salesLine.SalesUnit);
-            Recid eaUOM = UnitOfMeasure::unitOfMeasureIdBySymbol(METConstants::unitEach);
+            // Current line quantity in case unit for amount/GST allocation.
+            currentQtyInCaseUnit = brokenQtyInCaseUnit;
 
-            Qty qtyInCase = UnitOfMeasureConverter::convert(caseLine.Qty , eaUOM, toUom, NoYes::No, product.RecId, NoYes::No);
-
-            if(qtyInCase > 0)
+            if (totalPickedQtyInCaseUnit)
             {
-                caseLine.METCost = caseLine.METCost * qtyInCase;
-                _salesInvoiceTmpBase.METLucInclGST = _salesInvoiceTmpBase.metcaseCost * qtyInCase;
+                allocationFactor = currentQtyInCaseUnit / totalPickedQtyInCaseUnit;
+            }
+            else
+            {
+                allocationFactor = 0;
+            }
 
-                caseLine.METGSTTotal = _salesInvoiceTmpBase.METGSTTotal * qtyInCase;
+            if (currentQtyInCaseUnit > 0)
+            {
+                // CHANGE:
+                // Cost and LUC for broken line should be based on broken quantity converted to case unit.
+                caseLine.METCost = _salesInvoiceTmpBase.METCost * currentQtyInCaseUnit;
+
+                // Update the inserted caseLine, not the base line, because base line is deleted later.
+                caseLine.METLucInclGST = _salesInvoiceTmpBase.metcaseCost * currentQtyInCaseUnit;
+                 
+                caseLine.METGSTTotal = _salesInvoiceTmpBase.METGSTTotal * allocationFactor;
+            }
+            else
+            {
+                caseLine.METCost       = 0;
+                caseLine.METLucInclGST = 0;
+                caseLine.METGSTTotal   = 0;
             }
         }
         else
         {
-            // --- Picked cases line overrides (mapping sheet - bug 351188) ---
+            // --- Picked cases line overrides - Bug 351188 ---
 
-            // Qty Supplied = picked cases value
-            caseLine.Qty            = _qty;
+            // Qty Supplied = picked cases value. 
+            caseLine.Qty = _qty;
 
-            // Qty Ordered = sales line SalesQty
-            caseLine.METOrderedQty  = _salesLine.SalesQty;
+            // Qty Ordered = original sales order quantity.
+            caseLine.METOrderedQty = _salesLine.SalesQty;
 
-            // UOM = sales order line unit
-            caseLine.SalesUnitTxt   = _custInvoiceTrans.SalesUnit;
+            // UOM = original sales order/invoice unit. outer6
+            caseLine.SalesUnitTxt = _custInvoiceTrans.SalesUnit;
 
+            currentQtyInCaseUnit = caseLine.Qty;
+
+            if (totalPickedQtyInCaseUnit)
+            {
+                allocationFactor = currentQtyInCaseUnit / totalPickedQtyInCaseUnit;
+            }
+            else
+            {
+                allocationFactor = 0;
+            }
+
+            // This part was already conceptually correct.
             caseLine.METLucInclGST = _salesInvoiceTmpBase.metcaseCost * caseLine.Qty;
-
-            caseLine.METGSTTotal = (_salesInvoiceTmpBase.METGSTTotal/caseLine.Qty) * caseLine.Qty;
-
+             
+            caseLine.METGSTTotal = _salesInvoiceTmpBase.METGSTTotal * allocationFactor;
         }
 
         ttsbegin;
