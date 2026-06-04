@@ -1,0 +1,336 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METBatchMonitoringLogProgressQuery_Extension</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+[ExtensionOf(ClassStr(METBatchMonitoringLogProgressQuery))]
+final class METBatchMonitoringLogProgressQuery_Extension
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public str run(METBatchMonitoringLog _log)
+    {
+        str ret;
+
+        next run(_log);
+
+        changecompany(_log.CompanyId)
+        {
+            switch (_log.Operation)
+            {
+                case METBatchLogOperation::BasePriceCalculation:
+                case METBatchLogOperation::BasePriceActivation_ActivateCurrentPrice:
+                    ret =  this.basePriceActivation(str2Guid(_log.Details2), _log.Operation, _log.StartDateTime, _log.EndDateTime);
+                    break;
+                default:
+                    return 'No monitoring query for this operation.';
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>basePriceActivation</Name>
+				<Source><![CDATA[
+    private str basePriceActivation(SysGuid _sessionGuid, METBatchLogOperation _operation, TransDateTime _startDateTime, TransDateTime _endDateTime)
+    {
+        if (!_sessionGuid)
+            return "@MET:METBatchMonitoringLogProgressQueryEmptyGuid";
+
+        str nl  = '\n';
+        str sep = '------------------------------';
+
+        // Phase 1-3: items still queued for price calculation
+        int64   taskCount       = 0;
+
+        // Phase 4: dirty vendor price records awaiting cleanup
+        int64   dirtyCount      = 0;
+        // Phase 4: total dirty records in scope for this session
+        int64   dirtyTotal      = 0;
+
+        // Phase 5: base price records created in this session
+        int64   basePriceTotal  = 0;
+        // Phase 5: base price records that have expired
+        int64   basePriceExpired = 0;
+
+        // Phase 6: activation outcomes on GUPItemBasePrice
+        int64   statusNone      = 0;  // not yet processed
+        int64   statusCompleted = 0;  // sim created and activated
+        int64   statusFailed    = 0;  // activation failed
+        int64   statusSkipped   = 0;  // duplicate, bypassed
+
+        // Phase 6: cost price sims pending activation
+        int64   simCount        = 0;
+        // Phase 6: InventItemPrice records activated this session
+        int64   activatedCount  = 0;
+
+        // -------------------------------------------------------
+        // Queries — each count assigned immediately after select
+        // -------------------------------------------------------
+        UserConnection              userCon = new UserConnection();
+        GUPBasePriceCalcItemTask    taskRec;
+        GUPBasePriceCalcItemTask    taskJoin;
+        GUPVendPriceAdmTrans        vendTrans;
+        GUPVendPriceAdmTable        vendTable;
+        GUPItemBasePrice            itemBasePrice;
+        GUPItemBasePrice            basePriceJoin;
+        InventItemPriceSim          sim;
+        InventItemPrice             inventItemPrice;
+
+        str queryError = '';
+        try
+        {
+            taskRec.setConnection(userCon);
+            taskJoin.setConnection(userCon);
+            vendTrans.setConnection(userCon);
+            vendTable.setConnection(userCon);
+            itemBasePrice.setConnection(userCon);
+            basePriceJoin.setConnection(userCon);
+            sim.setConnection(userCon);
+            inventItemPrice.setConnection(userCon);
+
+            // Read uncommitted — allows monitoring to see in-progress batch task data
+            // (equivalent to NOLOCK in SQL; batch task rows are uncommitted until each task completes)
+            Statement isolationStmt = userCon.createStatement();
+            isolationStmt.executeUpdate('SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED');
+            isolationStmt.close();
+
+            // How many calculation tasks are still queued?
+            // Zero means calculation is done or tasks were cleaned up.
+            select count(RecId) from taskRec
+                where taskRec.SessionGuid == _sessionGuid;
+            taskCount = taskRec.RecId;
+
+            // How many vendor price records are still marked dirty?
+            // Dirty records need cleanup before activation can complete.
+            select count(RecId) from vendTrans
+                where vendTrans.IsDirty == GUPNoYesMarked::Yes
+                exists join vendTable
+                    where vendTable.JournalNum == vendTrans.JournalNum
+                       && vendTable.Status     == GUPDisabledEnabled::Enabled
+                exists join taskJoin
+                    where taskJoin.ItemId      == vendTrans.ItemNum
+                       && taskJoin.SessionGuid == _sessionGuid;
+            dirtyCount = vendTrans.RecId;
+
+            // How many vendor price records were in scope for cleanup?
+            // Used to calculate how many have been cleared so far.
+            select count(RecId) from vendTrans
+                exists join vendTable
+                    where vendTable.JournalNum == vendTrans.JournalNum
+                       && vendTable.Status     == GUPDisabledEnabled::Enabled
+                exists join taskJoin
+                    where taskJoin.ItemId      == vendTrans.ItemNum
+                       && taskJoin.SessionGuid == _sessionGuid;
+            dirtyTotal = vendTrans.RecId;
+
+            // How many base price records were created in this session?
+            select count(RecId) from itemBasePrice
+                where itemBasePrice.OperationGuid == _sessionGuid;
+            basePriceTotal = itemBasePrice.RecId;
+
+            // How many of those base price records have expired?
+            select count(RecId) from itemBasePrice
+                where itemBasePrice.OperationGuid == _sessionGuid
+                  && itemBasePrice.IsExpired      == NoYes::Yes;
+            basePriceExpired = itemBasePrice.RecId;
+
+            // How many base prices are still waiting to be activated?
+            select count(RecId) from itemBasePrice
+                where itemBasePrice.OperationGuid                == _sessionGuid
+                   && itemBasePrice.METItemPriceActivationStatus == METItemPriceActivationStatus::None;
+            statusNone = itemBasePrice.RecId;
+
+            // How many base prices were successfully activated?
+            select count(RecId) from itemBasePrice
+                where itemBasePrice.OperationGuid                == _sessionGuid
+                   && itemBasePrice.METItemPriceActivationStatus == METItemPriceActivationStatus::Completed;
+            statusCompleted = itemBasePrice.RecId;
+
+            // How many base prices failed during activation?
+            select count(RecId) from itemBasePrice
+                where itemBasePrice.OperationGuid                == _sessionGuid
+                   && itemBasePrice.METItemPriceActivationStatus == METItemPriceActivationStatus::Failed;
+            statusFailed = itemBasePrice.RecId;
+
+            // How many base prices were skipped (duplicate item/dim)?
+            select count(RecId) from itemBasePrice
+                where itemBasePrice.OperationGuid                == _sessionGuid
+                   && itemBasePrice.METItemPriceActivationStatus == METItemPriceActivationStatus::Skipped;
+            statusSkipped = itemBasePrice.RecId;
+
+            // How many cost price sims exist but are not yet activated?
+            select count(RecId) from sim
+                exists join basePriceJoin
+                    where basePriceJoin.RecId         == sim.METGUPItemBasePriceId
+                       && basePriceJoin.OperationGuid == _sessionGuid;
+            simCount = sim.RecId;
+
+            // How many standard cost prices were activated?
+            select count(RecId) from inventItemPrice
+                exists join basePriceJoin
+                    where basePriceJoin.RecId         == inventItemPrice.METGUPItemBasePriceId
+                       && basePriceJoin.OperationGuid == _sessionGuid;
+            activatedCount = inventItemPrice.RecId;
+        }
+        catch
+        {
+            // Swallow — do not propagate monitoring errors to the UI.
+            // Counts remain at zero defaults; error message is shown instead of output.
+            queryError = "@MET:METBatchMonitoringLogProgressQueryError";
+        }
+        finally
+        {
+            userCon.finalize();
+        }
+
+        if (queryError)
+            return queryError;
+
+        // -------------------------------------------------------
+        // Status assessment
+        // -------------------------------------------------------
+        str statusLine1;
+        str statusLine2 = '';
+
+        if (basePriceTotal == 0 && taskCount == 0)
+        {
+            statusLine1 = 'Not started';
+            statusLine2 = 'No records for this session';
+        }
+        else if (taskCount > 0 && basePriceTotal > 0)
+        {
+            // CalcTask records still exist but UpdateValidJob has already started inserting
+            // GUPItemBasePrice rows — calculation is done, price update is in progress
+            statusLine1 = 'In Progress';
+            statusLine2 = 'Updating prices';
+        }
+        else if (taskCount > 0)
+        {
+            statusLine1 = 'In Progress';
+            statusLine2 = strFmt('Calculating (%1 queued)', taskCount);
+        }
+        else if (basePriceTotal > 0 && statusNone > 0 && statusCompleted == 0 && statusFailed == 0)
+        {
+            statusLine1 = 'In Progress';
+            statusLine2 = 'Activation starting';
+        }
+        else if (taskCount == 0 && simCount == 0 && statusNone > 0 && statusCompleted > 0
+                 && _endDateTime != DateTimeUtil::minValue())
+        {
+            // Job has an EndDateTime — it has fully finished.
+            // Remaining None records were outside the activation date range and intentionally skipped.
+            statusLine1 = 'Partially completed';
+            statusLine2 = strFmt('%1 activated, %2 outside activation range', statusCompleted, statusNone);
+        }
+        else if (basePriceTotal > 0 && (statusNone > 0 || simCount > 0))
+        {
+            statusLine1 = 'In Progress';
+            statusLine2 = strFmt('Activating (%1%)', real2int((statusCompleted * 100.0) / basePriceTotal));
+        }
+        else if (basePriceTotal > 0 && statusNone == 0 && statusFailed == 0 && simCount == 0)
+        {
+            statusLine1 = 'Complete';
+            if (statusCompleted == 0)
+                statusLine2 = 'No records activated (all skipped)';
+        }
+        else if (basePriceTotal > 0 && statusNone == 0 && statusFailed > 0)
+        {
+            statusLine1 = 'Complete with errors';
+            statusLine2 = strFmt('%1 record(s) failed', statusFailed);
+        }
+        else
+        {
+            statusLine1 = 'Unknown';
+        }
+
+        // -------------------------------------------------------
+        // Output — target max ~40 chars per line
+        // -------------------------------------------------------
+
+        // E5: Elapsed time since job start
+        str elapsedStr = '';
+        if (_startDateTime)
+        {
+            int64 totalSeconds = max(0, DateTimeUtil::getDifference(DateTimeUtil::utcNow(), _startDateTime));
+            int   elapsedHr    = any2int(totalSeconds / 3600);
+            int   elapsedMin   = any2int((totalSeconds mod 3600) / 60);
+            int   elapsedSec   = any2int(totalSeconds mod 60);
+            elapsedStr = strFmt('%1 hr %2 min %3 sec', elapsedHr, elapsedMin, elapsedSec);
+        }
+
+        // E4: Calculation task record cleanup status
+        str cleanupResult = taskCount > 0 ? 'Pending' : 'Done';
+
+        str calcResult  = taskCount == 0
+            ? 'Done'
+            : strFmt('In Progress (%1 queued)', taskCount);
+
+        // E1: Note when dirty cleanup and price update are running in parallel (step 3)
+        boolean isUpdatingPrices = taskCount > 0 && basePriceTotal > 0;
+
+        str cleanResult = dirtyTotal == 0 ? 'N/A'
+                        : dirtyCount == 0 ? 'Done'
+                        : strFmt('In Progress (%1 left)', dirtyCount);
+
+        // E2: Active base price count (Created minus Superseded)
+        int64 basePriceActive = basePriceTotal - basePriceExpired;
+
+        boolean jobEnded = _endDateTime != DateTimeUtil::minValue();
+        str activResult = basePriceTotal == 0
+                            ? 'Not started'
+                        : statusNone == 0 && statusFailed == 0 && simCount == 0
+                            ? 'Done'
+                        : jobEnded && statusNone == 0 && statusFailed > 0
+                            ? strFmt('Done (%1 failed)', statusFailed)
+                        : jobEnded && statusNone > 0
+                            ? strFmt('Partial (%1 of %2 activated)', statusCompleted, basePriceTotal)
+                        : strFmt('In Progress (%1%)', real2int((statusCompleted * 100.0) / basePriceTotal));
+
+        return  sep                                                                           + nl +
+                strFmt(' %1', enum2Str(_operation))                                           + nl +
+                strFmt(' At      :  %1', DateTimeUtil::toStr(DateTimeUtil::utcNow()))         + nl +
+                (elapsedStr != '' ? strFmt(' Elapsed :  %1', elapsedStr) + nl : '')          +
+                sep                                                                           + nl +
+                strFmt(' STATUS : %1', statusLine1)                                           + nl +
+                (statusLine2 != '' ? strFmt(' %1', statusLine2) + nl : '')                   +
+                sep                                                                           + nl + nl +
+                ' CALCULATION'                                                                + nl +
+                strFmt(' Queued     :  %1', taskCount)                                        + nl +
+                strFmt(' Cleanup    :  %1', cleanupResult)                                    + nl +
+                strFmt(' Result     :  %1', calcResult)                                       + nl + nl +
+                ' DIRTY CLEANUP'                                                              + nl +
+                (isUpdatingPrices ? ' Phase      :  Running in parallel with price update'  + nl : '') +
+                strFmt(' Remaining  :  %1', dirtyCount)                                       + nl +
+                strFmt(' Already clean :  %1 of %2', dirtyTotal - dirtyCount, dirtyTotal)    + nl +
+                strFmt(' Result     :  %1', cleanResult)                                      + nl + nl +
+                ' BASE PRICES'                                                                + nl +
+                strFmt(' Created    :  %1', basePriceTotal)                                   + nl +
+                strFmt(' Active     :  %1', basePriceActive)                                  + nl +
+                strFmt(' Superseded :  %1', basePriceExpired)                                 + nl + nl +
+                ' ACTIVATION'                                                                 + nl +
+                strFmt(' Total      :  %1', basePriceTotal)                                   + nl +
+                strFmt(' Completed  :  %1  (%2%)', statusCompleted, basePriceTotal > 0 ? real2int((statusCompleted * 100.0) / basePriceTotal) : 0) + nl +
+                strFmt(' Pending    :  %1', statusNone)                                       + nl +
+                strFmt(' Failed     :  %1', statusFailed)                                     + nl +
+                strFmt(' Skipped    :  %1', statusSkipped)                                    + nl +
+                strFmt(' Result     :  %1', activResult)                                      + nl + nl +
+                ' PENDING PRICE CREATION'                                                     + nl +
+                strFmt(' Pending    :  %1', simCount)                                         + nl + nl +
+                ' ACTIVATED PRICES'                                                           + nl +
+                strFmt(' Count      :  %1', activatedCount)                                   + nl + nl +
+                sep;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
