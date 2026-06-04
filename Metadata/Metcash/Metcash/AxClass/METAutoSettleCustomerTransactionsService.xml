@@ -19,160 +19,85 @@ class METAutoSettleCustomerTransactionsService
     /// </summary>
     /// <param name="_contract">Contract containing the query to execute.</param>
     public void process(METAutoSettleCustomerTransactionsContract _contract)
-    {
-        try
+    {        
+        // Initialize query runner from the packed query in the contract
+        QueryRun queryRun = new QueryRun(_contract.getQuery());        
+
+        // Iterate through each invoice record returned by the query
+        while (queryRun.next())
         {
-            // Initialize query runner from the packed query in the contract
-            QueryRun queryRun = new QueryRun(_contract.getQuery());
+            try
+            {                
+                ttsbegin;
+                
+                // Retrieve CustTrans and CustTransOpen invoice records from the query
+                CustTrans custTrans = queryRun.get(tableNum(CustTrans));
+                CustTransOpen custTransOpen = queryRun.get(tableNum(CustTransOpen));
 
-            str currentInvoice = '';
-            List custTransOpenBuffer = new List(Types::Record);
+                setPrefix(strFmt("@MET:AutoSettlementPrefix", custTrans.AccountNum, custTrans.Invoice));
 
-            // Iterate through each record returned by the query
-            while (queryRun.next())
-            {
-                // Retrieve CustTrans and CustTransOpen records from the query
-                CustTrans custTransTmp = queryRun.get(tableNum(CustTrans));
-                CustTransOpen custTransOpenTmp = queryRun.get(tableNum(CustTransOpen));
-
-                // Skip records with missing invoice numbers
-                if (!custTransTmp || custTransTmp.Invoice == '')
-                {
-                    continue;
-                }
-
-                // If invoice changes, settle the previous group
-                if (currentInvoice != '' && custTransTmp.Invoice != currentInvoice)
-                {
-                    this.settleInvoiceGroup(custTransOpenBuffer, currentInvoice);
-                    custTransOpenBuffer = new List(Types::Record);
-                }
-
-                // Update current invoice and buffer the open transaction
-                currentInvoice = custTransTmp.Invoice;
-                custTransOpenBuffer.addEnd(custTransOpenTmp);
+                this.processOpenInvoice(custTrans, custTransOpen);
+                
+                ttscommit;
             }
-
-            // Settle the final group after loop ends
-            if (custTransOpenBuffer.elements() > 0)
+            catch (Exception::CLRError)
             {
-                this.settleInvoiceGroup(custTransOpenBuffer, currentInvoice);
+                // Log CLR exceptions
+                System.Exception clrEx = CLRInterop::getLastException();
+                error(strFmt("@MET:CLRAutoSettlement", clrEx.get_Message()));
             }
-        }
-        catch (Exception::CLRError)
-        {
-            // Log CLR exceptions
-            System.Exception clrEx = CLRInterop::getLastException();
-            error(strFmt("@MET:CLRAutoSettlement", clrEx.get_Message()));
-        }
-        catch (Exception::Error)
-        {
-            // Log X++ exceptions
-            error("@MET:XPPAutoSettlement");
-        }
+            catch (Exception::Error)
+            {
+                // Log X++ exceptions
+                error("@MET:XPPAutoSettlement");
+            }
+        }       
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>settleInvoiceGroup</Name>
+				<Name>processOpenInvoice</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Settles a group of transactions for a specific invoice.
+    /// Bug 383147: E2E EOD Payment Summary file_CCC-0048 to auto settle invoices against payments
+    /// Processes open invoices for settlement.
     /// </summary>
-    /// <param name="custTransOpenBuffer">List of CustTransOpen records.</param>
-    /// <param name="invoice">Invoice number for logging.</param>
-    private void settleInvoiceGroup(List custTransOpenBuffer, str invoice)
+    /// <param name = "_custTrans">Customer transaction record.</param>
+    /// <param name = "_custTransOpen">Open customer transaction record.</param>
+    void processOpenInvoice(CustTrans _custTrans, CustTransOpen _custTransOpen)
     {
-        try
-        {
-            // Retrieve the customer record from the first transaction in the buffer
-            CustTable custTable = this.getCustomerFromBuffer(custTransOpenBuffer);
+        // Retrieve the corresponding open payment for that invoice
+        CustTrans custTransPayment;
+        CustTransOpen custTransOpenPayment;
 
-            // If customer not found, log warning and exit
-            if (!custTable)
+        select firstonly custTransOpenPayment
+             exists join custTransPayment
+                   where custTransPayment.AccountNum == _custTrans.AccountNum
+                      && custTransPayment.Invoice == _custTrans.Invoice
+                      && custTransPayment.TransType == LedgerTransType::GeneralJournal
+                      && custTransOpenPayment.AccountNum == custTransPayment.AccountNum
+                      && custTransOpenPayment.RefRecId == custTransPayment.RecId;
+
+        // if payment is found
+        if (custTransOpenPayment)
+        {            
+            // mark both transactions
+            Common originator = CustTable::find(_custTrans.AccountNum);
+            CustVendOpenTransManager manager = CustVendOpenTransManager::construct(originator);
+            manager.updateTransMarked(_custTransOpen, NoYes::Yes); // invoice
+            manager.updateTransMarked(custTransOpenPayment, NoYes::Yes); // payment
+
+            // settle the invoice with the payment
+            if (manager.validateMarkedTotalWithinOverUnder() && manager.validateMarkedWithCrossRate()) // CustOpenTrans.canSettle()
             {
-                warning(strFmt("@MET:CustomerNotFoundInvoice", invoice));
-                return;
+                // CustOpenTrans.doSettlement()
+                manager.updateSpecTransWithSelectedDate();
+                manager.settleMarkedTrans();
+
+                info(strFmt("@MET:InvoiceSettled"));
             }
-
-            // Begin transaction for settlement
-            ttsbegin;
-
-            // Initialize settlement manager for the customer
-            CustVendOpenTransManager settleManager = CustVendOpenTransManager::construct(custTable);
-            settleManager.parmSettlePostingDate(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
-            settleManager.parmSettlePostingType(SettleDatePrinc::DaysDate);
-
-            // Iterate through buffered transactions and mark valid ones for settlement
-            ListEnumerator bufferEnum = custTransOpenBuffer.getEnumerator();
-            while (bufferEnum.moveNext())
-            {
-                CustTransOpen bufferedTransOpen = bufferEnum.current();
-                CustTrans bufferedTrans;
-
-                // Retrieve the corresponding CustTrans record
-                select firstOnly RecId, CurrencyCode from bufferedTrans
-                    where bufferedTrans.RecId == bufferedTransOpen.RefRecId;
-
-                // Skip invalid or incomplete transactions
-                if (!bufferedTrans || bufferedTrans.CurrencyCode == '')
-                {
-                    continue;
-                }
-
-                // Mark transaction for settlement
-                settleManager.updateTransMarked(bufferedTransOpen, true);
-            }
-
-            // Finalize settlement and log success
-            settleManager.settleMarkedTrans();
-            info(strFmt("@MET:InvoiceSettleForCustomer", invoice, custTable.AccountNum));
-
-            // Commit transaction
-            ttscommit;
         }
-        catch (Exception::CLRError)
-        {
-            // Log CLR exceptions and abort transaction
-            System.Exception clrEx = CLRInterop::getLastException();
-            error(strFmt("@MET:CLRSettleInvoice", invoice, clrEx.get_Message()));
-        }
-        catch (Exception::Error)
-        {
-            // Log X++ exceptions and abort transaction
-            error(strFmt("@MET:XPPSettleInvoice", invoice));
-        }
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>getCustomerFromBuffer</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Retrieves the customer record from the first transaction in the buffer.
-    /// </summary>
-    /// <param name="custTransOpenBuffer">List of CustTransOpen records.</param>
-    /// <returns>CustTable record or null.</returns>
-    private CustTable getCustomerFromBuffer(List custTransOpenBuffer)
-    {
-        CustTransOpen firstTransOpen;
-        CustTable custTable;
-
-        // Get the first transaction in the buffer to identify the customer
-        ListEnumerator bufferEnum = custTransOpenBuffer.getEnumerator();
-
-        if (bufferEnum.moveNext())
-        {
-            firstTransOpen = bufferEnum.current();
-
-            // Select the customer record based on AccountNum
-            select firstOnly AccountNum, RecId from custTable
-                where custTable.AccountNum == firstTransOpen.AccountNum;
-        }
-
-        return custTable;
     }
 
 ]]></Source>
