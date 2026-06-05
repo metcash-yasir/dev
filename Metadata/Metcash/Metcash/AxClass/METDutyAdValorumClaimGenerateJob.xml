@@ -16,6 +16,8 @@ class METDutyAdValorumClaimGenerateJob
     NumberSeq        numberSeqClaimLine,
                      numberSeqClaimInvoice;
 
+    Set              setSite;
+
 }
 ]]></Declaration>
 		<Methods>
@@ -35,6 +37,8 @@ class METDutyAdValorumClaimGenerateJob
             ttsbegin;
 
             METDutyAdValorumClaimTmp dutyAdValorumClaimTmp;
+
+            setSite = new Set(Types::String);
         
             dutyBySite       = _contract.parmDutyValuesBySite();
             generateClaim    = _contract.parmGenerateClaims();
@@ -54,6 +58,8 @@ class METDutyAdValorumClaimGenerateJob
 
                 this.processItems(dutyAdValorumClaimTmp.Site, dutyAdValorumClaimTmp.ItemId);
             }
+
+            this.updateCalcDateForExistingRecord(); // Mass update calc date to current date without triggering data events
 
             recordInsertList.insertDatabase();
 
@@ -89,6 +95,37 @@ class METDutyAdValorumClaimGenerateJob
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>updateCalcDateForExistingRecord</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update calc Date for existing record to make sure the record will be processed in next run.
+    /// </summary>
+    /// <param name = "_siteId">Site Id.</param>
+    public void updateCalcDateForExistingRecord()
+    {
+        SetEnumerator setEnumerator = setSite.getEnumerator();
+
+        TransDate currentDate = DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone());
+
+        METExciseSiteDutySetup  exciseSiteDutySetup;
+        METDutyRollValuesLine   dutyRollValuesLine;
+
+        if (setEnumerator.moveNext())
+        {
+            exciseSiteDutySetup.skipBusinessEvents(true);
+            exciseSiteDutySetup.skipDataMethods(true);
+
+            update_recordset exciseSiteDutySetup
+                setting CalcDate = currentDate
+                    exists join dutyRollValuesLine
+                    where dutyRollValuesLine.RecId == exciseSiteDutySetup.DutyRollValuesLine
+                        && dutyRollValuesLine.Site == setEnumerator.current();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>processItems</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -105,28 +142,37 @@ class METDutyAdValorumClaimGenerateJob
         
         if (dutyBySite)
         {
+            if (!setSite.in(_siteId))
+            {
+                setSite.add(_siteId);
+            }
+
             METExciseSiteDutySetup  exciseSiteDutySetup;
             METDutyRollValuesLine dutyRollValuesLine;
             utcdatetime currentDateTime = DateTimeUtil::utcNow();
+            TransDate currentDate = DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone());
 
             select firstonly forupdate validtimestate(currentDateTime) AverageVFD, TotalDutyPerCase, ExcisePerCase, ValidFrom from dutyRollValuesLine
                 where dutyRollValuesLine.Site == _siteId
-                    && dutyRollValuesLine.ItemId == _itemId;
+                    && dutyRollValuesLine.ItemId == _itemId
+                notexists join exciseSiteDutySetup
+                    where exciseSiteDutySetup.DutyRollValuesLine == dutyRollValuesLine.RecId;
 
             if (dutyRollValuesLine.RecId)
             {
                 metInventTable = metInventTable::find(_itemId);
-                exciseSiteDutySetup = METExciseSiteDutySetup::find(dutyRollValuesLine.Site, dutyRollValuesLine.ItemId);
+                exciseSiteDutySetup = METExciseSiteDutySetup::find(_siteId, _itemId);
 
                 exciseSiteDutySetup.ValueForDuty    = dutyRollValuesLine.AverageVFD;
                 tariffItemCode  = METTariffItemCode::findRecId(metInventTable.METTariffItemCodeBaseRecid);
                 //Duty amount = (pack size * Bottlesize * (AlcStrn/100) * Duty-LAL) + (VFD * (Adval Rate/100))
 
                 exciseSiteDutySetup.DutyTotal       = dutyRollValuesLine.TotalDutyPerCase;
-                exciseSiteDutySetup.CalcDate        = DateTimeUtil::getSystemDate(DateTimeUtil::getCompanyTimeZone());
+                exciseSiteDutySetup.CalcDate        = currentDate;
                 exciseSiteDutySetup.RunBy           = curUserId();
                 exciseSiteDutySetup.ValidFrom       = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(dutyRollValuesLine.ValidFrom, InventSite::find(exciseSiteDutySetup.SiteId).Timezone));
                 exciseSiteDutySetup.ExcisePerCase   = dutyRollValuesLine.ExcisePerCase;
+                exciseSiteDutySetup.DutyRollValuesLine = dutyRollValuesLine.RecId;
 
                 if (exciseSiteDutySetup.RecId)
                 {
