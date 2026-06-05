@@ -43,7 +43,8 @@ final class METWMSOrderTrans_Extension
 			</Method>
 			<Method>
 				<Name>update</Name>
-				<Source><![CDATA[
+				<Source>
+			<![CDATA[
     /// <summary>
     /// Coc for update
     /// </summary>
@@ -51,7 +52,7 @@ final class METWMSOrderTrans_Extension
     {
         METWMSOrderTrans    metWMSOrderTrans;
         WMSOrderTrans       wmsOrderTrans = this.orig();
-        METSalesOrderShipmentLoadLines      metSalesOrderShipmentLoadLines;        
+        METSalesOrderShipmentLoadLines      metSalesOrderShipmentLoadLines;
         SalesLine salesLine = SalesLine::findInventTransId(this.inventTransId);
 
         // Bug 350326: E2E CSD Perishable Partial pick not updating TO picked qty to completed
@@ -86,7 +87,7 @@ final class METWMSOrderTrans_Extension
             update_recordset metSalesOrderShipmentLoadLines
                 setting PickedQty = this.qty
                     where metSalesOrderShipmentLoadLines.WMSOrderTransRecId == this.RecId;
-        }        
+        }
 
         ttscommit;
 
@@ -104,7 +105,7 @@ final class METWMSOrderTrans_Extension
             this.propcessCancelledTOLines(wmsOrderTrans);
         }
         //BUG 298479 - CB238 - NDC & Int xDock warehouse processing; Canceclled transfer order lines are showing in the transfer order finalisation screen.
-        salesLine.reread();
+		salesLine.reread();
         this.updateSalesLineAmount(salesLine);
 
         this.SysExtensionSerializerMap::postUpdate();
@@ -138,43 +139,40 @@ final class METWMSOrderTrans_Extension
     {
         if (this.inventTransType == InventTransType::Sales)
         {
-            SalesLine salesLine = SalesLine::findInventTransId(this.inventTransId);
-            METSalesLine metSalesLine = salesLine.metSalesLine();
-            SalesTable salesTable = salesLine.salesTable();
-            InventLocation inventLocation = InventLocation::find(salesTable.InventLocationId);
+            SalesTable salesTable;
 
-            if (salesTable.METAllowBackOrders == NoYes::Yes)
+            select firstonly salesTable
+                where salesTable.salesId == this.inventTransRefId
+                && salesTable.METAllowBackOrders == NoYes::Yes;
+
+            if (salesTable)
             {
-                METOrderExtractStatus orderExtractStatusUpdate = metSalesLine.OrderExtractStatus;
-                
-                METWMSOrderTrans metWMSOrderTrans = METWMSOrderTrans::find(this.RecId);
-                if (metWMSOrderTrans)
+                METWMSOrderTrans metWMSOrderTrans;
+
+                select firstonly qtyOrig, RecId from metWMSOrderTrans
+                        where metWMSOrderTrans.WMSOrderTrans == this.RecId;
+
+                if (metWMSOrderTrans.RecId)
                 {
-                    // Open - if picking list is partially registered
-                    if (metWMSOrderTrans.qtyOrig > this.qty)
+                    METOrderExtractStatus newStatus = (metWMSOrderTrans.qtyOrig > this.qty) ? METOrderExtractStatus::Open : METOrderExtractStatus::Extracted;
+
+                    SalesLine salesLine = SalesLine::findInventTransId(this.inventTransId);
+           
+                    METSalesLine metSalesLine = salesLine.metSalesLine();
+
+                    if (newStatus != metSalesLine.OrderExtractStatus)
                     {
-                        orderExtractStatusUpdate = METOrderExtractStatus::Open;
+                        ttsbegin;
+
+                        metSalesLine.selectForUpdate(true);
+                        metSalesLine.OrderExtractStatus = newStatus;
+                        metSalesLine.update();
+
+                        salesTable.selectForUpdate(true);
+                        salesTable.metUpdateExtractStatus();
+
+                        ttscommit;
                     }
-                    // Extracted - if picking list is fully registered
-                    else if (metWMSOrderTrans.qtyOrig == this.qty)
-                    {
-                        orderExtractStatusUpdate = METOrderExtractStatus::Extracted;
-                    }
-                }
-
-                if (orderExtractStatusUpdate != metSalesLine.OrderExtractStatus)
-                {
-                
-                    ttsbegin;
-
-                    metSalesLine.selectForUpdate(true);
-                    metSalesLine.OrderExtractStatus = orderExtractStatusUpdate;
-                    metSalesLine.update();
-
-                    salesTable.selectForUpdate(true);
-                    salesTable.metUpdateExtractStatus();
-
-                    ttscommit;
                 }
             }
         }
@@ -258,7 +256,8 @@ final class METWMSOrderTrans_Extension
             //If the sales order is not a back order and the sales line is short picked i.e the picked quantity from dallas
             //is less than the pick quantity in D365 FO, system to automatically reduce the delivery remainder of the sales line by short-picked quantity
             case InventTransType::Sales:
-                if (metWMSOrderTrans.qtyOrig > this.qty)
+                WMSPickingLineQty    qtyOrig    = METWMSOrderTrans::find(this.RecId).qtyOrig;
+                if (qtyOrig > this.qty)
                 {
                     //update cases, weight and volume when it's for sales line
                     salesLine   = SalesLine::findInventTransId(this.inventTransId);
@@ -331,7 +330,7 @@ final class METWMSOrderTrans_Extension
                         ttscommit;
                     }
                 }
-                break;  
+                break;
             case InventTransType::TransferOrderShip:
                 //Transfer order delivery reminder reduced to Dallas picking qty if it is less then Transfer order picking qty
                 //Transfer order is not backorder
@@ -458,7 +457,7 @@ final class METWMSOrderTrans_Extension
         }
 
         select sum(qty) from wmsOrderTrans
-            where wmsOrderTrans.inventTransId == this.inventTransId;;
+            where wmsOrderTrans.inventTransId == this.inventTransId;
 
         update_recordset salesLine
             setting METCWActualWeight = wmsOrderTrans.qty
@@ -493,7 +492,15 @@ final class METWMSOrderTrans_Extension
 
             this.removeLineFromShipmentAndLoad(_orderTrans);
 
-            metInventTransferTableExt = METInventTransferTableExt::findByTransferId(_orderTrans.inventTransRefId);
+            select firstonly TransferType, AllowBackorder, RecId from metInventTransferTableExt
+                exists join inventTransferTable
+                    where inventTransferTable.RecId == metInventTransferTableExt.InventTransferTable
+                    &&    inventTransferTable.TransferId == _orderTrans.inventTransRefId;
+
+            if (!metInventTransferTableExt.RecId)
+            {
+                return;
+            }
 
             select firstonly * from metInventTransferLine
                 exists join inventTransferLine
@@ -501,13 +508,18 @@ final class METWMSOrderTrans_Extension
                         && inventTransferLine.TransferId == _orderTrans.inventTransRefId
                         && metInventTransferLine.InventTransferLine == inventTransferLine.RecId;
 
-            if (metInventTransferLine.SalesId != ''
-                    && (metInventTransferTableExt.TransferType == MetCrossdocKTransferType::CrossDock
+            if (!metInventTransferLine.RecId)
+            {
+                return;
+            }
+
+            if (metInventTransferLine.SalesId
+                && (metInventTransferTableExt.TransferType == MetCrossdocKTransferType::CrossDock
                     || metInventTransferTableExt.TransferType == MetCrossdocKTransferType::CSD))
             {
                 salesLine = salesLine::findInventTransId(metInventTransferLine.SalesLineTransId,true);
 
-                if(SalesTable::find(metInventTransferLine.SalesId).METAllowBackOrders == NoYes::Yes)
+                if (SalesTable::find(metInventTransferLine.SalesId).METAllowBackOrders == NoYes::Yes)
                 {
                     if (salesLine.inventTable().pdsCWItem())
                     {
@@ -525,21 +537,17 @@ final class METWMSOrderTrans_Extension
                     metSalesLine.update();
                 }
             }
-            else
+
+            if (metInventTransferTableExt.AllowBackorder == NoYes::Yes
+                && (metInventTransferTableExt.TransferType == MetCrossdocKTransferType::None
+                    || metInventTransferTableExt.TransferType == MetCrossdocKTransferType::CSD))
             {
-                if(metInventTransferTableExt.TransferType == MetCrossdocKTransferType::None
-                    || metInventTransferTableExt.TransferType == MetCrossdocKTransferType::CSD)
-                {
-                    if(metInventTransferTableExt.AllowBackorder == NoYes::Yes)
-                    {
-                        metInventTransferLine.selectForUpdate(true);
-                        metInventTransferLine.OrderExtractStatus = METOrderExtractStatus::Open;
-                        metInventTransferLine.update();
-                    }
-                }
+                metInventTransferLine.selectForUpdate(true);
+                metInventTransferLine.OrderExtractStatus = METOrderExtractStatus::Open;
+                metInventTransferLine.update();
             }
-        
-            ttscommit;  
+                    
+            ttscommit;
         }
         catch(Exception::Deadlock)
         {
@@ -576,7 +584,7 @@ final class METWMSOrderTrans_Extension
     /// <param name = "_orderTrans">Order trans reference</param>
     public void removeLineFromShipmentAndLoad(WMSOrderTrans _orderTrans)
     {
-        METSalesOrderShipmentLoadHeader TOShipmentLoadHeader, otherShipmentInLoadExist;
+        METSalesOrderShipmentLoadHeader TOShipmentLoadHeader;
         METSalesOrderShipmentLoadLines  TOShipmentLoadLine, otherTOInShipmentExist;
         WMSOrderTrans                   wmsOrderTransLocal;
         MetShipmentId                   shipmentId;
@@ -589,36 +597,45 @@ final class METWMSOrderTrans_Extension
 
         if (wmsOrderTransLocal.RecId)
         {
-            ttsbegin;
+            boolean foundTOShipmentLoadLines = false;
+
             // Remove only the current line with zero qty
-            while select forupdate TOShipmentLoadLine
+            while select TOShipmentLoadLine
                 where TOShipmentLoadLine.WMSOrderTransRecId == _orderTrans.RecId
             {
-                 toIdsInShipment += TOShipmentLoadHeader.ShipmentId;
-                 TOShipmentLoadLine.delete();
+                toIdsInShipment += TOShipmentLoadHeader.ShipmentId;
+                foundTOShipmentLoadLines = true;
             }
 
-            METSalesOrderShipmentLoadHeader::cleanShipmentIfNoLines(toIdsInShipment);
-            ttscommit;
+            if (foundTOShipmentLoadLines)
+            {
+                ttsbegin;
+
+                delete_from TOShipmentLoadLine
+                    where TOShipmentLoadLine.WMSOrderTransRecId == _orderTrans.RecId;
+
+                METSalesOrderShipmentLoadHeader::cleanShipmentIfNoLines(toIdsInShipment);
+                ttscommit;
+            }
+           
             return;
         }
 
-        select firstonly forupdate TOShipmentLoadHeader
-            join TOShipmentLoadLine
+        select firstonly TOShipmentLoadHeader
+            exists join TOShipmentLoadLine
             where TOShipmentLoadHeader.ShipmentId == TOShipmentLoadLine.ShipmentId
                 && TOShipmentLoadLine.WMSOrderTransRecId == _orderTrans.RecId;
+       
 
-        shipmentId = TOShipmentLoadHeader.ShipmentId;
-        loadId = TOShipmentLoadHeader.LoadId;
-
-        if (strLen(shipmentId) == 0 || strLen(loadId) == 0)
+        if (!TOShipmentLoadHeader.ShipmentId || !TOShipmentLoadHeader.LoadId)
         {
             return;
         }
 
-        ttsbegin;
+        boolean foundTOShipmentLoadLines = false;
+
         // Delete all lines for this TO with qty == 0.00
-        while select forupdate TOShipmentLoadLine
+        while select TOShipmentLoadLine
             exists join wmsOrderTransLocal
                 where TOShipmentLoadLine.OrderNum == wmsOrderTransLocal.inventTransRefId
                     && wmsOrderTransLocal.inventTransRefId == _orderTrans.inventTransRefId
@@ -626,11 +643,23 @@ final class METWMSOrderTrans_Extension
         {
 
             toIdsInShipment += TOShipmentLoadHeader.ShipmentId;
-            TOShipmentLoadLine.delete();
+            foundTOShipmentLoadLines = true;
         }
-        METSalesOrderShipmentLoadHeader::cleanShipmentIfNoLines(toIdsInShipment);
 
-        ttscommit;
+        if (foundTOShipmentLoadLines)
+        {
+            ttsbegin;
+
+            delete_from TOShipmentLoadLine
+                exists join wmsOrderTransLocal
+                where TOShipmentLoadLine.OrderNum == wmsOrderTransLocal.inventTransRefId
+                   && wmsOrderTransLocal.inventTransRefId == _orderTrans.inventTransRefId
+                   && wmsOrderTransLocal.qty == 0;
+
+            METSalesOrderShipmentLoadHeader::cleanShipmentIfNoLines(toIdsInShipment);
+
+            ttscommit;
+        }
 
         // Check for other TOs in the same shipment
         select firstonly RecId from otherTOInShipmentExist
@@ -640,7 +669,10 @@ final class METWMSOrderTrans_Extension
         // Delete header if no other TOs in shipment.
         if (!otherTOInShipmentExist.RecId)
         {
+            ttsbegin;
+            TOShipmentLoadHeader.selectForUpdate(true);
             TOShipmentLoadHeader.delete();
+            ttscommit;
         }
     }
 
@@ -674,7 +706,7 @@ final class METWMSOrderTrans_Extension
 				<Name>setPickedCases</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Sets the picked cases and picked broken cases based on the quantity picked and the case quantity for the item. 
+    /// Sets the picked cases and picked broken cases based on the quantity picked and the case quantity for the item.
     /// This method is called after the picking list registration to update the picked cases and picked broken cases for the sales line in the METWMSOrderTrans table which will be used for reporting and analytics purposes.
     /// </summary>
     public void setPickedCases(SalesLine _salesLine)
