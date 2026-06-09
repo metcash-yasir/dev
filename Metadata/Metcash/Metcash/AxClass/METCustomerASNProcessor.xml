@@ -1,0 +1,215 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METCustomerASNProcessor</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Processes customer ASNs by validating CCR data, triggering the despatch advice event, and marking CCR records as received.
+/// Task 355193: PB168 - E2E - SO ASN to Ampol - D365
+/// </summary>
+public class METCustomerASNProcessor
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>processSalesOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates CCR data for the sales order and, when everything matches,
+    /// triggers the business event and marks CCR Received = Yes.
+    /// </summary>
+    /// <param name = "_salesId">Sales order to process.</param>
+    /// <returns>true if the event was triggered; false if data is not ready.</returns>
+    public boolean processSalesOrder(SalesId _salesId)
+    {
+        SalesTable              salesTable = SalesTable::find(_salesId);
+        WMSPickingRoute         pickingRoute = this.findSalesPickingRoute(_salesId);
+        InventLocation          inventLocation;
+        WMSPickingRouteID       ccrPickingRouteId;
+        METWMSPicklistNumber    wmsPicklistNumber;
+
+        if (!salesTable.RecId || !pickingRoute.RecId)
+        {
+            return false;
+        }
+
+        inventLocation = InventLocation::find(pickingRoute.inventLocationId);
+
+        if (inventLocation.METCCR == NoYes::Yes && inventLocation.METPickDirector == NoYes::No)
+        {
+            wmsPicklistNumber = this.getSourceTOWMSPicklistNumber(pickingRoute.METTransferOrderPickingRouteId);
+            ccrPickingRouteId = wmsPicklistNumber;
+        }
+        else if (inventLocation.METCCR == NoYes::No && inventLocation.METPickDirector == NoYes::Yes)
+        {
+            ccrPickingRouteId = _salesId;
+        }
+
+        if (!ccrPickingRouteId || !this.validateCCRData(salesTable, ccrPickingRouteId))
+        {
+            return false;
+        }
+
+        this.triggerBusinessEvent(salesTable, wmsPicklistNumber);
+        this.markCCRReceived(ccrPickingRouteId);
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findSalesPickingRoute</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds the picking route attached to the sales order.
+    /// </summary>
+    /// <param name = "_salesId">Sales order.</param>
+    /// <returns>The sales order's picking route record.</returns>
+    private WMSPickingRoute findSalesPickingRoute(SalesId _salesId)
+    {
+        WMSPickingRoute pickingRoute;
+
+        select firstonly pickingRoute
+            where pickingRoute.transType  == InventTransType::Sales
+               && pickingRoute.transRefId == _salesId;
+
+        return pickingRoute;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSourceTOWMSPicklistNumber</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the WMS picklist number for the Source TO picking route.
+    /// </summary>
+    /// <param name = "_sourceWMSPickingRouteNumber">Source TO picking route id.</param>
+    /// <returns>WMS picklist number, or blank when there is no Source TO route.</returns>
+    private METWMSPicklistNumber getSourceTOWMSPicklistNumber(METWMSPicklistNumber _sourceWMSPickingRouteNumber)
+    {
+        WMSPickingRoute         sourceWMSPickingRoute;
+        METPicklistReference    picklistReference;
+
+        if (!_sourceWMSPickingRouteNumber)
+        {
+            return '';
+        }
+
+        select firstonly RecId from sourceWMSPickingRoute
+            where sourceWMSPickingRoute.transType      == InventTransType::TransferOrderShip
+               && sourceWMSPickingRoute.pickingRouteID == _sourceWMSPickingRouteNumber
+            join WMSPicklistNumber from picklistReference
+            where picklistReference.D365FOPicklistNumber == sourceWMSPickingRoute.pickingRouteID;
+
+        return picklistReference.WMSPicklistNumber;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateCCRData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates METCCRTable against WMSOrderTrans picked cases.
+    /// </summary>
+    /// <param name = "_salesTable">Sales order being processed.</param>
+    /// <param name = "_ccrPickingRouteId">Key used to look up the CCR records.</param>
+    /// <returns>true when every item matches in both tables; otherwise false.</returns>
+    private boolean validateCCRData(SalesTable _salesTable, WMSPickingRouteID _ccrPickingRouteId)
+    {
+        METCCRTable     ccrAgg;
+        WMSOrderTrans   wmsOrderTrans;
+        Map             ccrQtyByItem = new Map(Types::String, Types::Real);
+        Map             wmsQtyByItem = new Map(Types::String, Types::Real);
+
+        while select ItemId, sum(UOIPickedQty) from ccrAgg
+            group by ccrAgg.ItemId
+            where ccrAgg.PickingRouteId == _ccrPickingRouteId
+               && ccrAgg.CCRReceived    == NoYes::No
+        {
+            ccrQtyByItem.insert(ccrAgg.ItemId, ccrAgg.UOIPickedQty);
+        }
+
+        if (!ccrQtyByItem.elements())
+        {
+            return false;
+        }
+
+        while select ItemId, sum(METPickedCases) from wmsOrderTrans
+            group by wmsOrderTrans.ItemId
+            where wmsOrderTrans.inventTransType  == InventTransType::Sales
+               && wmsOrderTrans.inventTransRefId == _salesTable.SalesId
+        {
+            wmsQtyByItem.insert(wmsOrderTrans.ItemId, wmsOrderTrans.METPickedCases);
+        }
+
+        if (ccrQtyByItem.elements() != wmsQtyByItem.elements())
+        {
+            return false;
+        }
+
+        MapEnumerator mapEnum = wmsQtyByItem.getEnumerator();
+
+        while (mapEnum.moveNext())
+        {
+            ItemId itemId = mapEnum.currentKey();
+
+            if (!ccrQtyByItem.exists(itemId)
+             || ccrQtyByItem.lookup(itemId) != mapEnum.currentValue())
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markCCRReceived</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Marks all unreceived CCR records for the key as CCR Received = Yes.
+    /// </summary>
+    /// <param name = "_ccrPickingRouteId">Key identifying the CCR records.</param>
+    private void markCCRReceived(WMSPickingRouteID _ccrPickingRouteId)
+    {
+        METCCRTable ccrTable;
+
+        ttsbegin;
+        update_recordset ccrTable
+            setting CCRReceived = NoYes::Yes
+            where ccrTable.PickingRouteId == _ccrPickingRouteId
+               && ccrTable.CCRReceived    == NoYes::No;
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>triggerBusinessEvent</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds the event payload and sends the despatch advice business event.
+    /// </summary>
+    /// <param name = "_salesTable">Sales order being processed.</param>
+    /// <param name = "_wmsPicklistNumber">WMS picklist number for the payload.</param>
+    private void triggerBusinessEvent(SalesTable _salesTable, METWMSPicklistNumber _wmsPicklistNumber)
+    {
+        METDespatchAdviceEvent event = METDespatchAdviceEvent::newFromSalesOrder(
+            _salesTable.dataAreaId,
+            _salesTable.SalesId,
+            _wmsPicklistNumber);
+
+        event.send();
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
