@@ -64,13 +64,15 @@ class METCPIRepricingTaskService extends METSysOperationTaskService
             try
             {
                 ttsbegin;
+
                 this.execute();
+
                 ttscommit;
             }
             catch (Exception::Error)
             {
-                // Catch any exception so that one error won't stop the entire repricing process.
-                Global::exceptionTextFallThrough();
+                // FIX: do NOT swallow errors after dequeue
+                throw error(strFmt("CPI Repricing failed for SalesId %1", salesId));
             }
         }
     }
@@ -90,85 +92,63 @@ class METCPIRepricingTaskService extends METSysOperationTaskService
     private boolean getDataFromTopPickingQueue(guid _processId, boolean _readPast)
     {
         #OCCRetryCount
-    
+
         METCPIRepricingQueue topPickingQueue;
         int backOffWait;
-    
-        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockException;
-        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
-        Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
-        
+
         topPickingQueue.readPast(_readPast);
 
         try
         {
             ttsbegin;
-    
+
             select firstonly pessimisticlock topPickingQueue
-                where topPickingQueue.ProcessId == _processId;
+            where topPickingQueue.ProcessId == _processId;
 
             if (topPickingQueue.RecId)
             {
+                // FIX: only read, DO NOT delete here
                 salesId = topPickingQueue.SalesId;
-                topPickingQueue.delete();
             }
             else
             {
                 salesId = METConstants::emptyString;
             }
-           
+
             ttscommit;
         }
-        catch (deadLockException)
+        catch (Exception::Deadlock)
         {
-            if (appl.ttsLevel() == 0)
+            if (appl.ttsLevel() == 0
+            && xSession::currentRetryCount() < #RetryNum)
             {
-                if (xSession::currentRetryCount() < #RetryNum)
-                {
-                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
-                    sleep(xSession::currentRetryCount() * backOffWait);
-                    retry;
-                }
-                else
-                {
-                    throw deadLockException;
-                }
+                backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                sleep(xSession::currentRetryCount() * backOffWait);
+                retry;
             }
-            else
-            {
-                throw deadLockException;
-            }
+
+            throw;
         }
-        catch (updateConflictException)
+        catch (Exception::UpdateConflict)
         {
-            if (appl.ttsLevel() == 0)
+            if (appl.ttsLevel() == 0
+            && xSession::currentRetryCount() < #RetryNum)
             {
-                if (xSession::currentRetryCount() < #RetryNum)
-                {
-                    backOffWait = RandomGenerate::construct().randomInt(100, 5000);
-                    sleep(xSession::currentRetryCount() * backOffWait);
-                    retry;
-                }
-                else
-                {
-                    throw Exception::UpdateConflictNotRecovered;
-                }
+                backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                sleep(xSession::currentRetryCount() * backOffWait);
+                retry;
             }
-            else
-            {
-                throw updateConflictException;
-            }
+
+            throw Exception::UpdateConflictNotRecovered;
         }
-        catch (transientSqlConnectionError)
+        catch (Exception::TransientSqlConnectionError)
         {
             if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
             {
                 retry;
             }
-            else
-            {
-                throw transientSqlConnectionError;
-            }
+
+            throw;
         }
 
         return (salesId != METConstants::emptyString);
@@ -187,22 +167,21 @@ class METCPIRepricingTaskService extends METSysOperationTaskService
     private void execute()
     {
         #OCCRetryCount
-        METInventTransReserveService reserveService;
-        SalesLine                    salesLine;
-        METSalesLine                 metSalesLine;
+
+        METCPIRepricingQueue queueRec;
+        SalesLine salesLine;
+        METSalesLine metSalesLine;
 
         try
         {
             ttsbegin;
 
-            // Process SalesLines linked to the current SalesId
             while select forupdate salesLine
-                where salesLine.SalesId == salesId
+            where salesLine.SalesId == salesId
             {
                 salesLine.SalesPrice = 0;
                 salesLine.update();
-                
-                // Delete the components after line is reserved for event orders
+
                 salesLine.metDeletePriceComponents();
 
                 if (salesLine.metSalesLine().BonusType == METBonusType::DiscountBonus)
@@ -211,17 +190,16 @@ class METCPIRepricingTaskService extends METSysOperationTaskService
                 }
 
                 select firstonly forupdate metSalesLine
-                    where metSalesLine.salesLine == salesLine.RecId;
+                where metSalesLine.salesLine == salesLine.RecId;
 
-                if (metSalesLine.RecId && metSalesLine.OrderedQuantity < salesLine.SalesQty)
+                if (metSalesLine.RecId
+                && metSalesLine.OrderedQuantity < salesLine.SalesQty)
                 {
                     metSalesLine.OrderedQuantity = salesLine.SalesQty;
                     metSalesLine.update();
                 }
-
             }
 
-            // Update SalesTable header
             SalesTable salesTable = SalesTable::find(salesId);
             METSalesTable metSalesTable = salesTable.metSalesTable();
 
@@ -230,36 +208,41 @@ class METCPIRepricingTaskService extends METSysOperationTaskService
             metSalesTable.CPIRepriced = NoYes::Yes;
             metSalesTable.update();
 
+            // FIX: dequeue ONLY after successful execution
+            select firstonly forupdate queueRec
+            where queueRec.ProcessId == topPickingProcessId
+               && queueRec.SalesId   == salesId;
+
+            if (queueRec.RecId)
+            {
+                queueRec.delete();
+            }
+
             ttscommit;
         }
         catch (Exception::Deadlock)
         {
-            // Retry logic for deadlocks
             if (xSession::currentRetryCount() < #RetryNum)
             {
                 retry;
             }
-            else
-            {
-                throw Exception::Deadlock;
-            }
+
+            throw Exception::Deadlock;
         }
         catch (Exception::UpdateConflict)
         {
-            // Retry logic for update conflicts
-            if (appl.ttsLevel() == 0 && xSession::currentRetryCount() < #RetryNum)
+            if (appl.ttsLevel() == 0
+            && xSession::currentRetryCount() < #RetryNum)
             {
                 retry;
             }
-            else
-            {
-                throw Exception::UpdateConflictNotRecovered;
-            }
+
+            throw Exception::UpdateConflictNotRecovered;
         }
         catch (Exception::Error)
         {
-            // Catch-all for unexpected errors
-            Global::exceptionTextFallThrough();
+            // FIX: no silent loss
+            throw error(strFmt("CPI Repricing failed for SalesId %1", salesId));
         }
     }
 
