@@ -118,7 +118,14 @@ class METSendPEPricingEngine extends SysOperationServiceBase
         {
             METSendPricingLineContract              sendPricingLineContract;
             boolean                                 avoidNegativeQtySalesId = false;
-           
+            SalesLine                               saleslinePre;
+            WMSLocationId                           firstLineWMSLocationId;
+
+            select firstonly InventDimId from saleslinePre
+                order by saleslinePre.LineNum asc
+                where saleslinePre.SalesId == salesTable.SalesId;
+            firstLineWMSLocationId = InventDim::find(saleslinePre.InventDimId).wMSLocationId;
+
             lineEnumerator = lines.getEnumerator();
             while (lineEnumerator.moveNext())
             {
@@ -132,7 +139,7 @@ class METSendPEPricingEngine extends SysOperationServiceBase
                 {   
                     continue;
                 }
-                resultCon = this.createUpdateSalesLine(_sendPEPricingRequest, sendPricingLineContract, salesTable);
+                resultCon = this.createUpdateSalesLine(_sendPEPricingRequest, sendPricingLineContract, salesTable, firstLineWMSLocationId);
                 result = conPeek(resultCon, 1);
                 messageLoc = conPeek(resultCon, 2);
                 if (result == METProcessingStatus::Error)
@@ -230,19 +237,19 @@ class METSendPEPricingEngine extends SysOperationServiceBase
     /// <returns>Container</returns>
     public container createUpdateSalesLine(METSendPEPricingRequest _sendPEPricingRequest,
                                             METSendPricingLineContract _sendPEPricingLineClass,
-                                             SalesTable _salesTable)
+                                            SalesTable _salesTable,
+                                            WMSLocationId _firstLineWMSLocationId)
     {
         List                             priceComponents, markupTransRecords;
         ListEnumerator                   priceComponentEnumerator, markupTransEnumerator;
-        SalesLine                        salesLineBuf, saleslinePre;
+        SalesLine                        salesLineBuf;
         InventDim                        inventDim;
-        METSalesLine                     metSalesLine, metSaleslineWeight;
+        METSalesLine                     metSalesLineBuf;
         METPriceComponentContract 	     priceComponentContract;
         METSendPricingMarkupDetailContract  markupTransContract;
         METProcessingStatus              result;
         Description255                   message;
         METSendPricingHeaderContract     sendPEPricingHeaderClass = _sendPEPricingRequest.parmSendPricingHeaderContract();
-        SalesTable                       salesTable = SalesTable::find(_sendPEPricingLineClass.parmSalesId());
         container                        resultCon;
         InventTransId                    preInventTransId;
         real                             actualWeight;
@@ -250,13 +257,7 @@ class METSendPEPricingEngine extends SysOperationServiceBase
         #OCCRetryCount
 
         salesLineBuf =  SalesLine::findInventTransId(_sendPEPricingLineClass.parmInventTransId(), true);
-       
-        // To Fetch the salesline Linenum 1st record based on salesId
-        select firstonly InventDimId from saleslinePre
-            order by saleslinePre.LineNum asc
-            where saleslinePre.SalesId == _salesTable.SalesId;
-      
-	  
+
         if (salesLineBuf.RecId == 0)
         {
             salesLineBuf.clear();
@@ -269,7 +270,7 @@ class METSendPEPricingEngine extends SysOperationServiceBase
             //Setting and creating inventory dimensions
             inventdim.InventSiteId = _salesTable.InventSiteId;
             inventdim.InventLocationId = _salesTable.InventLocationId;
-            inventdim.wmsLocationId = InventDim::find(saleslinePre.InventDimId).wMSLocationId;
+            inventdim.wmsLocationId = _firstLineWMSLocationId;
             inventdim.inventBatchId = METConstants::defaultval;
 
             salesLineBuf.InventDimId = InventdIm::findOrCreate(inventDim).inventDimId;
@@ -340,20 +341,23 @@ class METSendPEPricingEngine extends SysOperationServiceBase
 
        
 
-        // Update the actual weight based on the incoming message
-        metSaleslineWeight = METSalesLine::find(salesLineBuf.RecId, true);
-        if (metSaleslineWeight.RecId !=0)
+        // Fetch METSalesLine once for weight and bonus type updates
+        metSalesLineBuf = METSalesLine::find(salesLineBuf.RecId, true);
+        boolean metSalesLineChanged = false;
+
+        if (metSalesLineBuf.RecId != 0)
         {
             actualWeight = _sendPEPricingLineClass.parmActualWeight();
             if (actualWeight != 0)
             {
-                metSaleslineWeight.AISWeight = actualWeight;
-                metSaleslineWeight.update();
+                metSalesLineBuf.AISWeight = actualWeight;
+                metSalesLineChanged = true;
             }
         }
+
         // price component insert or update
-       priceComponents = _sendPEPricingLineClass.parmsendPEPriceComponetClassArray();
-            
+        priceComponents = _sendPEPricingLineClass.parmsendPEPriceComponetClassArray();
+
         if (priceComponents)
         {
             priceComponentEnumerator = priceComponents.getEnumerator();
@@ -363,37 +367,35 @@ class METSendPEPricingEngine extends SysOperationServiceBase
                 resultCon = this.createUpdatePriceComponent(priceComponentContract, salesLineBuf);
                 result = conPeek(resultCon, 1);
                 message = conPeek(resultCon, 2);
-                
+
                 if (result == METProcessingStatus::Error)
                 {
                     return [result, message];
                 }
 
-                // Update the bonus Type value based on the bonustype value
-                if (priceComponentContract.parmComponent() == #Bonus)
+                if (priceComponentContract.parmComponent() == #Bonus && metSalesLineBuf.RecId != 0)
                 {
-                    metSalesLine = METSalesLine::find(salesLineBuf.RecId, true);
-                    
-                    if (metSalesLine.RecId !=0)
-                    {
-                        metSalesLine.BonusType = priceComponentContract.parmPriceCodeRef() != '' ? METBonusType::DiscountBonus : METBonusType::Bonus;
-                        metSalesLine.update();
-                    }
+                    metSalesLineBuf.BonusType = priceComponentContract.parmPriceCodeRef() != '' ? METBonusType::DiscountBonus : METBonusType::Bonus;
+                    metSalesLineChanged = true;
                 }
-
             }
         }
-    
+
+        if (metSalesLineChanged)
+        {
+            metSalesLineBuf.update();
+        }
+
         // Markuptrans record update insert based on salesline level
         markupTransRecords = _sendPEPricingLineClass.parmsendPEMarkupTransClassArray();
- 
+
         if (markupTransRecords)
         {
             markupTransEnumerator = markupTransRecords.getEnumerator();
             while (markupTransEnumerator.moveNext())
             {
                 markupTransContract = markupTransEnumerator.current();
-                resultCon = this.createUpdateMarkupTrans(markupTransContract, salesLineBuf, salesTable);
+                resultCon = this.createUpdateMarkupTrans(markupTransContract, salesLineBuf, _salesTable);
                 result = conPeek(resultCon, 1);
                 message = conPeek(resultCon, 2);
                 if (result == METProcessingStatus::Error)
