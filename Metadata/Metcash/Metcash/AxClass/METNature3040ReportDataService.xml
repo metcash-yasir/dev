@@ -11,6 +11,10 @@ public class METNature3040ReportDataService
     METNature3040ReportContract     contract;
     METNature3040ReportsTable       metNature3040ReportsTable;
     Query                           reportQuery;
+    Map                             infoTableMap;
+    Set                             missingItemSetups; 
+    boolean                         isExecutingWithoutFromDate;
+    #OCCRetryCount
 
     #define.Tariff('001')
     #define.LALSUnit('EA')
@@ -40,13 +44,31 @@ public class METNature3040ReportDataService
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>generateReportData</Name>
+				<Name>generateData</Name>
 				<Source><![CDATA[
     /// <summary>
     /// generate report data
     /// </summary>
     /// <returns>True if <c>metNature3040ReportsTable</c> records are inserted; otherwise, false.</returns>
-    public boolean generateReportData()
+    public boolean generateData()
+    {
+        boolean ret = this.generateReportData(true); // Generate report data with date range filter to capture relevant transactions for the report run.
+        ret = ret && this.generateReportData(false); // Generate report data without date range filter to capture any late updates to excise information table after the initial run.
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateReportData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Generates data for the NAT30/NAT40 report by querying the METExciseInformationTable based on the specified criteria, calculating necessary fields, and inserting records into the METNature3040ReportsTable staging table. The method can be executed in two passes: first with a date range filter to capture transactions within the report period, and then without the date range to include any relevant transactions that were updated after the initial data generation. The method returns true if any records were inserted into the staging table; otherwise, it returns false.
+    /// </summary>
+    /// <param name = "_applyDateRange">Indicates whether to apply the date range filter.</param>
+    /// <returns>True if <c>metNature3040ReportsTable</c> records are inserted; otherwise, false.</returns>
+    public boolean generateReportData(boolean _applyDateRange)
     {
         METExciseInformationTable       metExciseInformationTable, metExciseInformationTablePurch;
         METExciseInformationTable       metExciseInformationTableSum;
@@ -60,9 +82,14 @@ public class METNature3040ReportDataService
 
         boolean                         isReportDataGenerated;
 
+        isExecutingWithoutFromDate = !_applyDateRange;
+
         METExciseRegisterOriginTypes    originTypes;
 
-        Query                           query = new Query(this.buildQuery());
+        infoTableMap = new Map(Types::Int64, Types::Enum);
+        missingItemSetups = new Set(Types::String);
+
+        Query                           query = new Query(this.buildQuery(_applyDateRange));
 
         query.dataSourceTable(tableNum(METExciseInformationTable)).addGroupByAndSelectionField(fieldNum(METExciseInformationTable, ItemId));
 
@@ -70,82 +97,128 @@ public class METNature3040ReportDataService
 
         while (queryRun.next())
         {
-            metExciseInformationTable = queryRun.get(tableNum(METExciseInformationTable));
+            try
+            {
+                ttsbegin;
+                metExciseInformationTable = queryRun.get(tableNum(METExciseInformationTable));
 
-            metNature3040ReportsTable.clear();
+                metNature3040ReportsTable.clear();
 
-            metNature3040ReportsTable.ItemId = metExciseInformationTable.ItemId;
-            metNature3040ReportsTable.FromDateTime = contract.parmFromDate();
-            metNature3040ReportsTable.ToDateTime = contract.parmToDate();   
-            metNature3040ReportsTable.SiteId = contract.parmSite();
-            metNature3040ReportsTable.Nat3040ReportNumber = contract.parmNat30Number();
-            metNature3040ReportsTable.ItemDescription = InventTable::find(metExciseInformationTable.ItemId).itemName();
+                metNature3040ReportsTable.ItemId = metExciseInformationTable.ItemId;
+                metNature3040ReportsTable.FromDateTime = contract.parmFromDate();
+                metNature3040ReportsTable.ToDateTime = contract.parmToDate();   
+                metNature3040ReportsTable.SiteId = contract.parmSite();
+                metNature3040ReportsTable.Nat3040ReportNumber = contract.parmNat30Number();
+                metNature3040ReportsTable.ItemDescription = InventTable::find(metExciseInformationTable.ItemId).itemName();
 
-            select firstonly metTariffItemCodeBase
-                exists join metInventTable
-                    where metTariffItemCodeBase.RecId == metInventTable.METTariffItemCodeBaseRecid  &&
-                        metInventTable.ItemId == metExciseInformationTable.ItemId;
+                select firstonly metTariffItemCodeBase
+                    exists join metInventTable
+                        where metTariffItemCodeBase.RecId == metInventTable.METTariffItemCodeBaseRecid  &&
+                            metInventTable.ItemId == metExciseInformationTable.ItemId;
 
-            metNature3040ReportsTable.TariffItem  = metTariffItemCodeBase.TariffItem;
-            metNature3040ReportsTable.TariffItemDescription = metTariffItemCodeBase.Description;
-            metNature3040ReportsTable.StatCode    = metTariffItemCodeBase.StatCode;
-            metNature3040ReportsTable.DutyLAL     = METTariffItemCode::findRecId(metTariffItemCodeBase.RecId).DutyLAL;
+                metNature3040ReportsTable.TariffItem  = metTariffItemCodeBase.TariffItem;
+                metNature3040ReportsTable.TariffItemDescription = metTariffItemCodeBase.Description;
+                metNature3040ReportsTable.StatCode    = metTariffItemCodeBase.StatCode;
+                metNature3040ReportsTable.DutyLAL     = METTariffItemCode::findRecId(metTariffItemCodeBase.RecId).DutyLAL;
 
-            calculatedValues = this.getCasesSold(metExciseInformationTable.ItemId);
-            metNature3040ReportsTable.CasesSold = conPeek(calculatedValues, 1);
+                calculatedValues = this.getCasesSold(metExciseInformationTable.ItemId);
+                metNature3040ReportsTable.CasesSold = conPeek(calculatedValues, 1);
 
-            metNature3040ReportsTable.LALSQuantity = this.getLALSQty(metExciseInformationTable.ItemId, metTariffItemCodeBase, contract.parmMETNat3040(), metNature3040ReportsTable);
+                metNature3040ReportsTable.LALSQuantity = this.getLALSQty(metExciseInformationTable.ItemId, metTariffItemCodeBase, contract.parmMETNat3040(), metNature3040ReportsTable);
            
-            InventQty originalQty;
+                InventQty originalQty;
 
-            metInventTableLoc =  METInventTable::find(metNature3040ReportsTable.ItemId);
+                metInventTableLoc =  METInventTable::find(metNature3040ReportsTable.ItemId);
 
-            if (contract.parmMETNat3040() == METNAT3040::NAT30)
-            {
-                metNature3040ReportsTable.TIUV = conPeek(calculatedValues, 2);
-
-                metNature3040ReportsTable.TariffRate = #Tariff;
-
-                metNature3040ReportsTable.OriginCountryCode   = metInventTableLoc.CountryCode;
-                metNature3040ReportsTable.PreferenceRule      = metInventTableLoc.PreferenceRule;
-                metNature3040ReportsTable.PreferenceScheme    = metInventTableLoc.PreferenceScheme;
-                metNature3040ReportsTable.InvoiceAlcohol      = metInventTableLoc.AlcoholContent;
-                metNature3040ReportsTable.LALSUnit = #LALSUnit;
-
-                metNature3040ReportsTable.CustomsValue = conPeek(calculatedValues, 3); // VFD
-
-                if (metInventTableLoc.beerallowance())
+                if (contract.parmMETNat3040() == METNAT3040::NAT30)
                 {
-                    metNature3040ReportsTable.LQuantity = metInventTableLoc.ItemPack * metInventTableLoc.BottleSize * metNature3040ReportsTable.CasesSold;
+                    metNature3040ReportsTable.TIUV = conPeek(calculatedValues, 2);
+
+                    metNature3040ReportsTable.TariffRate = #Tariff;
+
+                    metNature3040ReportsTable.OriginCountryCode   = metInventTableLoc.CountryCode;
+                    metNature3040ReportsTable.PreferenceRule      = metInventTableLoc.PreferenceRule;
+                    metNature3040ReportsTable.PreferenceScheme    = metInventTableLoc.PreferenceScheme;
+                    metNature3040ReportsTable.InvoiceAlcohol      = metInventTableLoc.AlcoholContent;
+                    metNature3040ReportsTable.LALSUnit = #LALSUnit;
+
+                    metNature3040ReportsTable.CustomsValue = conPeek(calculatedValues, 3); // VFD
+
+                    if (metInventTableLoc.beerallowance())
+                    {
+                        metNature3040ReportsTable.LQuantity = metInventTableLoc.ItemPack * metInventTableLoc.BottleSize * metNature3040ReportsTable.CasesSold;
+                    }
+
+                    metNature3040ReportsTable.ExciseAmount = metNature3040ReportsTable.LALSQuantity * metNature3040ReportsTable.DutyLAL + (metNature3040ReportsTable.CustomsValue * metInventTableLoc.metGetAdValoremRate());
+
+                    metNature3040ReportsTable.LUnit = #LALSUnit30;
+                    originalQty = metNature3040ReportsTable.LALSQuantity;
                 }
-
-                metNature3040ReportsTable.ExciseAmount = metNature3040ReportsTable.LALSQuantity * metNature3040ReportsTable.DutyLAL + (metNature3040ReportsTable.CustomsValue * metInventTableLoc.metGetAdValoremRate());
-
-                metNature3040ReportsTable.LUnit = #LALSUnit30;
-                originalQty = metNature3040ReportsTable.LALSQuantity;
-            }
-            else
-            {
-                metNature3040ReportsTable.LUnit = #LALSUnit30;
-                originalQty = metNature3040ReportsTable.LALSQuantity;
-                metNature3040ReportsTable.OriginCountryCode   = metInventTableLoc.CountryCode;
-                metNature3040ReportsTable.InvoiceAlcohol      = metInventTableLoc.AlcoholContent;
-                metNature3040ReportsTable.ExciseAmount = metNature3040ReportsTable.LALSQuantity * metNature3040ReportsTable.DutyLAL;
-            }
+                else
+                {
+                    metNature3040ReportsTable.LUnit = #LALSUnit30;
+                    originalQty = metNature3040ReportsTable.LALSQuantity;
+                    metNature3040ReportsTable.OriginCountryCode   = metInventTableLoc.CountryCode;
+                    metNature3040ReportsTable.InvoiceAlcohol      = metInventTableLoc.AlcoholContent;
+                    metNature3040ReportsTable.ExciseAmount = metNature3040ReportsTable.LALSQuantity * metNature3040ReportsTable.DutyLAL;
+                }
             
-            if (originalQty > 0)
+                if (originalQty > 0)
+                {
+                    noOfRecords++;
+                    recordInsertListTmp.add(metNature3040ReportsTable);
+                }
+                ttscommit;
+                this.updateExciseInformationTable(contract, metExciseInformationTable.ItemId);
+            }
+            catch (Exception::UpdateConflict)
             {
-                noOfRecords++;
-                recordInsertListTmp.add(metNature3040ReportsTable);
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        error(strFmt("@MET:METNAT3040Error", metExciseInformationTable.ItemId));
+                        this.updateExciseInformationTable(contract, metExciseInformationTable.ItemId, true);
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+            catch(Exception::DuplicateKeyException)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        error(strFmt("@MET:METNAT3040Error", metExciseInformationTable.ItemId));
+                        this.updateExciseInformationTable(contract, metExciseInformationTable.ItemId, true);
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::DuplicateKeyException;
+                }
+            }
+            catch
+            {
+                error(strFmt("@MET:METNAT3040Error", metExciseInformationTable.ItemId));
+                this.updateExciseInformationTable(contract, metExciseInformationTable.ItemId, true);
             }
         }
 
         if (noOfRecords > 0)
         {
             recordInsertListTmp.insertDatabase();
-
-            this.updateExciseInformationTable(contract);
-
             isReportDataGenerated = true;
         }
 
@@ -172,8 +245,6 @@ public class METNature3040ReportDataService
         InventQty remainingQty = _saleQty;
         METDutyCreditTable dutyCreditTable;
 
-        ttsbegin;
-    
         while select forupdate dutyCreditTable order by RecId asc
             where dutyCreditTable.ItemId == _itemId &&
               dutyCreditTable.SiteId == _siteId &&
@@ -200,8 +271,6 @@ public class METNature3040ReportDataService
                 dutyCreditTable.update();
             }
         }
-
-        ttscommit;
 
         return remainingQty;
     }
@@ -275,6 +344,15 @@ public class METNature3040ReportDataService
                 itemPackQtyPerLodgement = METNature3040ReportDataService::consumeDutyCredit(_exciseInfoTable.ItemId,
                                                                           _exciseInfoTable.SiteId,
                                                                           abs(itemPackQtyPerLodgement));
+
+                if (itemPackQtyPerLodgement == 0 && !infoTableMap.exists(_exciseInfoTable.RecId))
+                {
+                    infoTableMap.insert(_exciseInfoTable.RecId, METNatureReportStatus::DutyCreditDepleted);
+                }
+                else if (abs(itemPackQtyPerLodgement) > 0 && !infoTableMap.exists(_exciseInfoTable.RecId))
+                {
+                    infoTableMap.insert(_exciseInfoTable.RecId, METNatureReportStatus::PartiallyReported);
+                }
             }
             else
             {
@@ -364,6 +442,14 @@ public class METNature3040ReportDataService
         {
             lalsQty = itemPackQty * metInventTable.ItemPack * metInventTable.BottleSize * metInventTable.AlcoholContent/100;
         }
+
+        if (itemPackQty != 0 && lalsQty == 0)
+        {
+            if (!missingItemSetups.in(_itemId))
+            {
+                missingItemSetups.add(_itemId);
+            }
+        }
         return abs(lalsQty);
     }
 
@@ -388,6 +474,10 @@ public class METNature3040ReportDataService
         {
             if (InventCountingReasonCode::find(InventJournalTrans::findInventTransId(metExciseInformationTable.InventTransId).CountingReasonCode).METExemptFromDuty)
             {
+                if (!infoTableMap.exists(metExciseInformationTable.RecId))
+                {
+                    infoTableMap.insert(metExciseInformationTable.RecId, METNatureReportStatus::Exempted);
+                }
                 //Skipping transaction if reason code for counting journal matches with the parameter
                 return false;
             }
@@ -414,6 +504,10 @@ public class METNature3040ReportDataService
 
             if (customerAttributeValueEntity.BooleanValue)
             {
+                if (!infoTableMap.exists(metExciseInformationTable.RecId))
+                {
+                    infoTableMap.insert(metExciseInformationTable.RecId, METNatureReportStatus::DutyFree);
+                }
                 return false;
             }
         }
@@ -430,26 +524,102 @@ public class METNature3040ReportDataService
     /// update Excise Information Table
     /// </summary>
     /// <param name = "_contract">contract</param>
-    public void updateExciseInformationTable(METNature3040ReportContract    _contract)
+    public void updateExciseInformationTable(METNature3040ReportContract    _contract, ItemId   _itemId, boolean _isError = false)
     {
+        #define.prefix('History ')
         Query           query = new Query(reportQuery);
+       
+        SysQuery::findOrCreateRange(query.dataSourceTable(tableNum(METExciseInformationTable)), fieldNum(METExciseInformationTable, ItemId)).value(queryValue(_itemId));
+
         QueryRun        queryRun = new QueryRun(query);
 
         METExciseRegisterOriginTypes    originTypes;
 
-        while (queryRun.next())
+        str getStatus(ErrorMsg    _value)
         {
-            METExciseInformationTable   metExciseInformationTable = queryRun.get(tableNum(METExciseInformationTable));
-
-            if (!this.checkValidRecord(metExciseInformationTable))
+            str errorTxt = _value;
+          
+            if (isExecutingWithoutFromDate)
             {
-                continue;
+                errorTxt = #prefix + errorTxt;
             }
 
-            metExciseInformationTable.selectForUpdate(true);
-            metExciseInformationTable.NAT3040 = _contract.parmMETNat3040();
-            metExciseInformationTable.Nat3040ReportNumber = _contract.parmNat30Number();
-            metExciseInformationTable.update();
+            return errorTxt;
+        }
+
+        while (queryRun.next())
+        {
+            try
+            {
+                ttsbegin;
+                METExciseInformationTable   metExciseInformationTable = queryRun.get(tableNum(METExciseInformationTable));
+
+                metExciseInformationTable.selectForUpdate(true);
+                metExciseInformationTable.NAT3040 = _contract.parmMETNat3040();
+                metExciseInformationTable.Nat3040ReportNumber = _contract.parmNat30Number();
+
+                if (_isError)
+                {
+                    metExciseInformationTable.NAT3040ReportStatus = getStatus(enum2Str(METNatureReportStatus::Error));
+                }
+                else
+                {
+                    metExciseInformationTable.Nat3040ReportNumber = _contract.parmNat30Number();
+                    if (infoTableMap.exists(metExciseInformationTable.RecId))
+                    {
+                        metExciseInformationTable.NAT3040ReportStatus = getStatus(enum2Str(infoTableMap.lookup(metExciseInformationTable.RecId)));
+                    }
+                    else
+                    {
+                        if (missingItemSetups.in(metExciseInformationTable.ItemId))
+                        {
+                            metExciseInformationTable.NAT3040ReportStatus = getStatus(enum2Str(METNatureReportStatus::DataMissing));
+                        }
+                        else
+                        {
+                            metExciseInformationTable.NAT3040ReportStatus = getStatus(enum2Str(METNatureReportStatus::Reported));
+                        }
+                    }
+                }
+                metExciseInformationTable.update();
+                ttscommit;
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+            catch(Exception::DuplicateKeyException)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::DuplicateKeyExceptionNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::DuplicateKeyException;
+                }
+            }
         }
     }
 
@@ -533,7 +703,7 @@ public class METNature3040ReportDataService
     /// get data query
     /// </summary>
     /// <returns>query</returns>
-    public Query buildQuery()
+    public Query buildQuery(boolean  _applyDateRange = true)
     {
         METExciseRegisterOriginTypes    originTypes;
         str                             range;
@@ -559,8 +729,17 @@ public class METNature3040ReportDataService
 
         if (contract.parmNat30Number())
         {
+            utcdatetime fromDateTime;
+            if (_applyDateRange)
+            {
+                fromDateTime = contract.parmFromDate();
+            }
+            else
+            {
+                fromDateTime = DateTimeUtil::minValue();
+            }
+
             UtcDateTime toDateTime = contract.parmToDate();
-            utcdatetime fromDateTime = contract.parmFromDate();
             qbds.addRange(fieldNum(METExciseInformationTable, CreatedDateTime)).value(SysQuery::range(fromDateTime, toDateTime));
 
             if (contract.parmSite())
