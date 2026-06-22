@@ -4,10 +4,14 @@
 	<SourceCode>
 		<Declaration><![CDATA[
 /// <summary>
-/// Script to clear security configuration objects from the xml file.
+/// Script to clear security configuration objects from a Security and Compliance Studio XML export.
+/// Reads Role names from UserSecGovProcessRoleView/Field[@Name='Name'] and
+/// Duty names from UserSecGovTaskScriptView/Field[@Name='SecurityDuty'], then
+/// deletes matching SecurityDuty, SecurityPrivilege and SecurityRole records.
 /// </summary>
 final class METClearSecurityConfigScript
 {
+    
 }
 ]]></Declaration>
 		<Methods>
@@ -15,12 +19,12 @@ final class METClearSecurityConfigScript
 				<Name>main</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Main method.
+    /// Entry point.
     /// </summary>
     /// <param name = "_args">The specified arguments.</param>
     public static void main(Args _args)
     {
-        METClearSecurityConfigScript script= new METClearSecurityConfigScript();
+        METClearSecurityConfigScript script = new METClearSecurityConfigScript();
         script.run();
     }
 
@@ -34,7 +38,6 @@ final class METClearSecurityConfigScript
     /// </summary>
     public void run()
     {
-        // Prompt the user to select the XML file from the client machine.
         str filePath = this.selectFile();
 
         if (!filePath)
@@ -52,12 +55,11 @@ final class METClearSecurityConfigScript
 				<Name>selectFile</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Selects file.
+    /// Prompts the user to select an XML file using the standard D365 FO upload dialog.
+    /// Returns the temporary HTTPS download URL, or empty string if cancelled.
     /// </summary>
-    /// <returns>File.</returns>
     private str selectFile()
     {
-        // The file is staged in temporary blob storage; retrieve the URL / path.
         FileUploadTemporaryStorageResult result = File::GetFileFromUser();
 
         if (!result || !result.getUploadStatus())
@@ -74,24 +76,28 @@ final class METClearSecurityConfigScript
 				<Name>parseAndDelete</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Parses and deletes objects.
+    /// Loads the XML export, iterates every Role and its child Duty/Task rows,
+    /// and deletes matching SecurityDuty, SecurityPrivilege and SecurityRole records.
     /// </summary>
-    /// <param name = "_filePathOrUrl">Path.</param>
+    /// <param name = "_filePathOrUrl">HTTPS temp-storage URL or UNC path to the XML file.</param>
     private void parseAndDelete(str _filePathOrUrl)
     {
-        XmlDocument  xmlDoc  = new XmlDocument();
-        XmlNodeList  roleNodes;
-        XmlNode      roleNode;
-        XmlNode      taskNode;
-        XmlNodeList  taskNodes;
+        XmlDocument xmlDoc    = new XmlDocument();
+        XmlNodeList roleNodes;
+        XmlNodeList taskNodes;
+        XmlNode     roleNode;
+        XmlNode     taskNode;
 
-        str          roleName;
-        str          dutyName;
-        int          roleCount;
-        int          dutyCount;
-        SecurityDuty duty;
-        SecurityRole role;
+        str roleName;
+        str dutyName;
+        str taskName;
+        int roleCount;
+        int dutyCount;
+        int dutyDeleted;
+        int privilegeDeleted;
+        int roleDeleted;
 
+        // ── Load XML ──────────────────────────────────────────────────────────
         if (strStartsWith(_filePathOrUrl, "https://") ||
             strStartsWith(_filePathOrUrl, "http://"))
         {
@@ -110,8 +116,8 @@ final class METClearSecurityConfigScript
             return;
         }
 
-        roleNodes = xmlDoc.selectNodes(
-            "//Record[@Name='UserSecGovProcessRoleView']");
+        // ── Select all Role nodes ─────────────────────────────────────────────
+        roleNodes = xmlDoc.selectNodes("//Record[@Name='UserSecGovProcessRoleView']");
 
         if (!roleNodes || roleNodes.length() == 0)
         {
@@ -119,21 +125,20 @@ final class METClearSecurityConfigScript
             return;
         }
 
-        info(strFmt("Processing file – found %1 Process Role record(s).",
-                    roleNodes.length()));
+        info(strFmt("Processing file - found %1 Process Role record(s).", roleNodes.length()));
         info("=============================================================");
 
+        // ── Iterate Roles ─────────────────────────────────────────────────────
         for (int i = 0; i < roleNodes.length(); i++)
         {
-            roleNode  = roleNodes.item(i);
-            roleName  = this.getFieldValue(roleNode, "Name");
+            roleNode = roleNodes.item(i);
+            roleName = this.getFieldValue(roleNode, "Name");
             roleCount++;
 
             info(strFmt("ROLE [%1]: %2", roleCount, roleName));
 
-            // ----- XPath: child <Record Name="UserSecGovTaskScriptView"> -----
-            taskNodes = roleNode.selectNodes(
-                "Record[@Name='UserSecGovTaskScriptView']");
+            // ── Iterate child Task/Duty rows ──────────────────────────────────
+            taskNodes = roleNode.selectNodes("Record[@Name='UserSecGovTaskScriptView']");
 
             if (taskNodes && taskNodes.length() > 0)
             {
@@ -141,25 +146,172 @@ final class METClearSecurityConfigScript
                 {
                     taskNode = taskNodes.item(j);
                     dutyName = this.getFieldValue(taskNode, "SecurityDuty");
-                    dutyCount++;
-
-                    delete_from duty 
-                        where duty.Name == dutyName;
-
+                    
                     if (dutyName)
                     {
-                        info(strFmt("    DUTY [%1]: %2", dutyCount, dutyName));
-                    }
+                        dutyCount++;
 
+                        info(strFmt("    DUTY [%1]: %2", dutyCount, dutyName));
+
+                        // Delete SecurityDuty
+                        int deletedDutyRows = this.deleteSecurityDuty(dutyName);
+                        if (deletedDutyRows > 0)
+                        {
+                            dutyDeleted += deletedDutyRows;
+                            info(strFmt("        >> SecurityDuty deleted (%1 row(s)): %2", deletedDutyRows, dutyName));
+                        }
+                        else if (deletedDutyRows == 0)
+                        {
+                            warning(strFmt("        -- SecurityDuty does not exist (skipped): %1", dutyName));
+                        }
+
+                        // Delete SecurityPrivilege
+                        int deletedPrivRows = this.deleteSecurityPrivilege(dutyName);
+                        if (deletedPrivRows > 0)
+                        {
+                            privilegeDeleted += deletedPrivRows;
+                            info(strFmt("        >> SecurityPrivilege deleted (%1 row(s)): %2", deletedPrivRows, dutyName));
+                        }
+                        else if (deletedPrivRows == 0)
+                        {
+                            warning(strFmt("        -- SecurityPrivilege does not exist (skipped): %1", dutyName));
+                        }
+                    }
+                    
                 }
             }
+            else
+            {
+                info("    (No task/duty records under this role)");
+            }
+
+            // ── Delete SecurityRole - inside loop so every role is processed ──
+            if (roleName)
+            {
+                int deletedRoleRows = this.deleteSecurityRole(roleName);
+                if (deletedRoleRows > 0)
+                {
+                    roleDeleted += deletedRoleRows;
+                    info(strFmt("    >> SecurityRole deleted (%1 row(s)): %2", deletedRoleRows, roleName));
+                }
+                else if (deletedRoleRows == 0)
+                {
+                    warning(strFmt("    -- SecurityRole does not exist (skipped): %1", roleName));
+                }
+            }
+
+            info("-------------------------------------------------------------");
         }
 
-        delete_from role
-             where role.Name == roleName;
+        info(strFmt("Done. Roles processed: %1 | Duty rows processed: %2 | SecurityDuty rows deleted: %3 | SecurityPrivilege rows deleted: %4 | SecurityRole rows deleted: %5",
+                    roleCount, dutyCount, dutyDeleted, privilegeDeleted, roleDeleted));
+    }
 
-        info(strFmt("Done. Total roles: %1 | Total task/duty rows: %2",
-                    roleCount, dutyCount));
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteSecurityDuty</Name>
+				<Source><![CDATA[
+    /// Checks existence then deletes ALL SecurityDuty records whose Name matches _dutyName.
+    /// Returns the number of rows deleted, 0 if none exist, or -1 on error.
+    /// </summary>
+    private int deleteSecurityDuty(str _dutyName)
+    {
+        SecurityDuty duty;
+
+        // Existence check - avoids an unnecessary delete_from when nothing matches
+        select firstonly RecId from duty where duty.Name == _dutyName;
+        if (!duty.RecId)
+        {
+            return 0;
+        }
+
+        try
+        {
+            ttsbegin;
+            delete_from duty
+                where duty.Name == _dutyName;
+            ttscommit;
+            return duty.rowCount();
+        }
+        catch (Exception::Error)
+        {
+            ttsabort;
+            error(strFmt("Failed to delete SecurityDuty '%1'. Transaction rolled back.", _dutyName));
+            return -1;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteSecurityPrivilege</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks existence then deletes ALL SecurityPrivilege records whose Name matches _dutyName.
+    /// Returns the number of rows deleted, 0 if none exist, or -1 on error.
+    /// </summary>
+    private int deleteSecurityPrivilege(str _dutyName)
+    {
+        SecurityPrivilege privilege;
+
+        // Existence check - avoids an unnecessary delete_from when nothing matches
+        select firstonly RecId from privilege where privilege.Name == _dutyName;
+        if (!privilege.RecId)
+        {
+            return 0;
+        }
+
+        try
+        {
+            ttsbegin;
+            delete_from privilege
+                where privilege.Name == _dutyName;
+            ttscommit;
+            return privilege.rowCount();
+        }
+        catch (Exception::Error)
+        {
+            ttsabort;
+            error(strFmt("Failed to delete SecurityPrivilege '%1'. Transaction rolled back.", _dutyName));
+            return -1;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>deleteSecurityRole</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks existence then deletes ALL SecurityRole records whose Name matches _roleName.
+    /// Returns the number of rows deleted, 0 if none exist, or -1 on error.
+    /// </summary>
+    private int deleteSecurityRole(str _roleName)
+    {
+        SecurityRole role;
+
+        // Existence check - avoids an unnecessary delete_from when nothing matches
+        select firstonly RecId from role where role.Name == _roleName;
+        if (!role.RecId)
+        {
+            return 0;
+        }
+
+        try
+        {
+            ttsbegin;
+            delete_from role
+                where role.Name == _roleName;
+            ttscommit;
+            return role.rowCount();
+        }
+        catch (Exception::Error)
+        {
+            ttsabort;
+            error(strFmt("Failed to delete SecurityRole '%1'. Transaction rolled back.", _roleName));
+            return -1;
+        }
     }
 
 ]]></Source>
@@ -168,11 +320,12 @@ final class METClearSecurityConfigScript
 				<Name>getFieldValue</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Returns field value.
+    /// Returns the inner text of the first Field[@Name='_fieldName'] child
+    /// of the supplied XmlNode. Returns empty string if not found.
     /// </summary>
-    /// <param name = "_parentNode">Parent.</param>
-    /// <param name = "_fieldName">Field name.</param>
-    /// <returns>Field name.</returns>
+    /// <param name = "_parentNode">Parent XML node to search within.</param>
+    /// <param name = "_fieldName">Value of the Name attribute to match.</param>
+    /// <returns>Field text value, or empty string.</returns>
     private str getFieldValue(XmlNode _parentNode, str _fieldName)
     {
         XmlNode fieldNode = _parentNode.selectSingleNode(
