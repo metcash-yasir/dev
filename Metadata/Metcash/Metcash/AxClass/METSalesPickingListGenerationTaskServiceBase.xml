@@ -20,6 +20,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     NoYes                                           useLegacyMode;  
     int                                             batchTransactionCommit;        
     Map                                             reservedQtyInSalesUnitMap = new Map(Types::Int64, Types::Real);
+    Map                                             reservedQtyInInventUnitMap = new Map(Types::Int64, Types::Real);
     METProcMetrics                                  procMetrics;
     SalesUpdateRemain                               salesUpdateRemain;
     boolean                                         isError;
@@ -877,9 +878,26 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 }
                 else
                 {
-                    SalesQtyReservPhysical reservQty = salesLine.metReservedPhysicalInSalesUnit();
-                    reservedQtyInSalesUnitMap.add(salesLine.RecId, reservQty);
-                    if (_pickListOrderedQty == false && reservQty == 0)
+                    SalesQtyReservPhysical reservQtyinSalesUnit;
+                    SalesQtyReservPhysical reservQtyinInventUnit;
+
+                    if (reservedQtyInSalesUnitMap.exists(salesLine.RecId))
+                    {
+                        reservQtyinSalesUnit = reservedQtyInSalesUnitMap.lookup(salesLine.RecId);
+                        reservQtyinInventUnit = reservedQtyInInventUnitMap.lookup(salesLine.RecId);
+                    }
+                    else
+                    {
+                        container reservedQty = salesLine.metReservedPhysicalInSalesInventUnit();
+
+                        reservQtyinSalesUnit = conPeek(reservedQty, 1);
+                        reservQtyinInventUnit = conPeek(reservedQty, 2);
+
+                        reservedQtyInSalesUnitMap.add(salesLine.RecId, reservQtyinSalesUnit);
+                        reservedQtyInInventUnitMap.add(salesLine.RecId, reservQtyinInventUnit);
+                    }
+
+                    if (_pickListOrderedQty == false && reservQtyinSalesUnit == 0)
                     {
                         continue;
                     }
@@ -1206,6 +1224,9 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         {
             if (_salesTable.SalesStatus != SalesStatus::Canceled)
             {
+                reservedQtyInSalesUnitMap  = new Map(Types::Int64, Types::Real);
+                reservedQtyInInventUnitMap = new Map(Types::Int64, Types::Real);
+
                 processExtraction = false;
 
                 if (procMetrics)
@@ -1413,7 +1434,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                             shipQty,
                             salesLine.inventTable().inventUnitId(),
                             salesLine.SalesUnit,
-                            NoYes::Yes);
+                            NoYes::No);
 
                         salesLine.skipBusinessEvents(true);
 
@@ -1552,27 +1573,36 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 			<Method>
 				<Name>calcInventNow</Name>
 				<Source><![CDATA[
-    // Returns qty to pick in inventory unit (converts from sales unit)
+    // Returns qty to pick in inventory unit
     private InventQty calcInventNow(SalesLine _salesLine, boolean _pickListOrderedQty)
     {
-        InventQty sourceQty = _pickListOrderedQty
-          ? _salesLine.SalesQty
-          : this.getSalesLineReservPhysicalInSalesUnit(_salesLine);
+        InventQty sourceQty;
 
-        UnitOfMeasureSymbol inventUnit = _salesLine.inventTable().inventUnitId();
-
-        if (_salesLine.SalesUnit == inventUnit)
+        if (_pickListOrderedQty)
         {
-            return sourceQty;
+            sourceQty = _salesLine.SalesQty;
+
+            UnitOfMeasureSymbol inventUnit = _salesLine.inventTable().inventUnitId();
+
+            if (_salesLine.SalesUnit == inventUnit)
+            {
+                return sourceQty;
+            }
+
+            sourceQty = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+                                                                                    _salesLine.ItemId,
+                                                                                    _salesLine.InventDimId,
+                                                                                    sourceQty,
+                                                                                    _salesLine.SalesUnit,
+                                                                                    inventUnit,
+                                                                                    NoYes::No);
+        }
+        else
+        {
+            sourceQty = this.getSalesLineReservPhysicalInInventUnit(_salesLine);
         }
 
-        return EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
-            _salesLine.ItemId,
-            _salesLine.InventDimId,
-            sourceQty,
-            _salesLine.SalesUnit,
-            inventUnit,
-            NoYes::Yes);
+        return sourceQty;
     }
 
 ]]></Source>
@@ -1816,10 +1846,52 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     {
         SalesQtyReservPhysical reservPhysical;
 
-        reservPhysical = reservedQtyInSalesUnitMap.exists(_salesLine.RecId) ?
-            reservedQtyInSalesUnitMap.lookup(_salesLine.RecId) :
-            _salesLine.metReservedPhysicalInSalesUnit();
-        
+        if (reservedQtyInSalesUnitMap.exists(_salesLine.RecId))
+        {
+            reservPhysical = reservedQtyInSalesUnitMap.lookup(_salesLine.RecId);
+        }
+        else
+        {
+            container reservedQty = _salesLine.metReservedPhysicalInSalesInventUnit();
+
+            SalesQtyReservPhysical reservQtyinSalesUnit = conPeek(reservedQty, 1);
+            SalesQtyReservPhysical reservQtyinInventUnit = conPeek(reservedQty, 2);
+
+            reservedQtyInSalesUnitMap.add(_salesLine.RecId, reservQtyinSalesUnit);
+            reservedQtyInInventUnitMap.add(_salesLine.RecId, reservQtyinInventUnit);
+
+            reservPhysical = reservQtyinSalesUnit;
+        }
+
+        return reservPhysical;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSalesLineReservPhysicalInInventUnit</Name>
+				<Source><![CDATA[
+    public SalesQtyReservPhysical getSalesLineReservPhysicalInInventUnit(SalesLine _salesLine)
+    {
+        SalesQtyReservPhysical reservPhysical;
+
+        if (reservedQtyInInventUnitMap.exists(_salesLine.RecId))
+        {
+            reservPhysical = reservedQtyInInventUnitMap.lookup(_salesLine.RecId);
+        }
+        else
+        {
+            container reservedQty = _salesLine.metReservedPhysicalInSalesInventUnit();
+
+            SalesQtyReservPhysical reservQtyinSalesUnit = conPeek(reservedQty, 1);
+            SalesQtyReservPhysical reservQtyinInventUnit = conPeek(reservedQty, 2);
+
+            reservedQtyInSalesUnitMap.add(_salesLine.RecId, reservQtyinSalesUnit);
+            reservedQtyInInventUnitMap.add(_salesLine.RecId, reservQtyinInventUnit);
+
+            reservPhysical = reservQtyinInventUnit;
+        }
+
         return reservPhysical;
     }
 
