@@ -1,0 +1,383 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesOrderExtractionPendingProcess</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class METSalesOrderExtractionPendingProcess
+{
+    SalesUpdateRemain   salesUpdateRemain;
+    int                 batchTransactionCommit;
+    int                 totalCancelledLineCount;
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static METSalesOrderExtractionPendingProcess construct()
+    {
+        METSalesOrderExtractionPendingProcess instance = new METSalesOrderExtractionPendingProcess();
+        instance.batchTransactionCommit = METCustParameters::find().SalesExtractionBatchTransactionCommit;
+        return instance;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processRecord</Name>
+				<Source><![CDATA[
+    public void processRecord(METOrderExtractionPendingProcess _pendingRecord)
+    {
+        METOrderExtractionPendingProcess pendingRecordUpd;
+        boolean                          skipRecord    = false;
+        boolean                          isError       = false;
+
+        // Optimistic locking — claim the record for processing
+        ttsbegin;
+        select forupdate pendingRecordUpd
+            where pendingRecordUpd.RecId == _pendingRecord.RecId;
+
+        if (pendingRecordUpd.RecVersion == _pendingRecord.RecVersion)
+        {
+            if (pendingRecordUpd.Status == METOrderExtractionPendingProcessStatus::Pending  ||
+                pendingRecordUpd.Status == METOrderExtractionPendingProcessStatus::Failed)
+            {
+                xSession xSession = new xSession(sessionid());
+                pendingRecordUpd.Status               = METOrderExtractionPendingProcessStatus::Processing;
+                pendingRecordUpd.ProcessStartDateTime = DateTimeUtil::getSystemDateTime();
+                pendingRecordUpd.SessionId            = xSession.sessionId();
+                pendingRecordUpd.SessionLoginDateTime = xSession.loginDateTime();
+                pendingRecordUpd.update();
+            }
+            else
+            {
+                skipRecord = true;
+            }
+        }
+        else
+        {
+            skipRecord = true;
+        }
+        ttscommit;
+
+        if (skipRecord)
+        {
+            return;
+        }
+
+        try
+        {
+            this.processSalesOrder(_pendingRecord.SalesId, _pendingRecord.PickingRouteID, _pendingRecord.ActionToPerform);
+
+            ttsbegin;
+            select forupdate pendingRecordUpd
+                where pendingRecordUpd.RecId == _pendingRecord.RecId;
+            pendingRecordUpd.Status                      = METOrderExtractionPendingProcessStatus::Completed;
+            pendingRecordUpd.ProcessEndDateTime          = DateTimeUtil::getSystemDateTime();
+            pendingRecordUpd.TotalCancelledLineCount     = totalCancelledLineCount;
+            pendingRecordUpd.update();
+            ttscommit;
+        }
+        catch (Exception::Deadlock)
+        {
+            isError = true;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                isError = true;
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::UpdateConflictNotRecovered)
+        {
+            isError = true;
+        }
+        catch (Exception::Error)
+        {
+            isError = true;
+        }
+        catch
+        {
+            isError = true;
+        }
+
+        if (isError)
+        {
+            ttsbegin;
+            select forupdate pendingRecordUpd
+                where pendingRecordUpd.RecId == _pendingRecord.RecId;
+            pendingRecordUpd.Status             = METOrderExtractionPendingProcessStatus::Failed;
+            pendingRecordUpd.RetryCount++;
+            pendingRecordUpd.ProcessEndDateTime = DateTimeUtil::getSystemDateTime();
+            pendingRecordUpd.update();
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processSalesOrder</Name>
+				<Source><![CDATA[
+    private void processSalesOrder(SalesId _salesId, WMSPickingRouteID _pickingRouteId = '', str _actionToPerform = '')
+    {
+        // Fresh SalesUpdateRemain per SalesId — resets orderCheckUpdateDone cache
+        salesUpdateRemain        = null;
+        totalCancelledLineCount  = 0;
+
+        SalesTable salesTable = SalesTable::find(_salesId);
+
+        if (!salesTable.RecId)
+        {
+            return;
+        }
+
+        this.cancelZeroStockLines(salesTable);
+        this.cancelShortPickLines(salesTable);
+        this.updateSalesTableStatus(salesTable);
+        this.processTMSOrder(_pickingRouteId, salesTable);
+
+        if (_actionToPerform == METConstants::SOExtractReservedSOPickAndTO)
+        {
+            this.processCrossDockTransferOrder(salesTable);
+        }
+
+        info(strFmt("@MET:METExtractionPendingProcessCompleted", _salesId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelZeroStockLines</Name>
+				<Source><![CDATA[
+    // Full cancellation: lines with no WMS order created (zero reserved stock)
+    private void cancelZeroStockLines(SalesTable _salesTable)
+    {
+        SalesLine    salesLine;
+        METSalesLine metSalesLine;
+        WMSOrder     wmsOrder;
+        boolean      batchOpen   = false;
+        int          batchCount  = 0;
+        int          cancelCount = 0;
+
+        while select forupdate salesLine
+            where salesLine.SalesId          == _salesTable.SalesId
+               && salesLine.SalesStatus      != SalesStatus::Canceled
+               && salesLine.InventRefType    != InventRefType::Purch
+               && salesLine.RemainSalesPhysical > 0
+            join metSalesLine
+                where metSalesLine.SalesLine          == salesLine.RecId
+                   && metSalesLine.OrderExtractStatus == METOrderExtractStatus::Extracted
+            notexists join wmsOrder
+                where wmsOrder.inventTransId == salesLine.InventTransId
+                   && wmsOrder.type          == WMSOrderType::OrderPick
+        {
+            if (!batchOpen)
+            {
+                ttsbegin;
+                batchOpen = true;
+            }
+
+            if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+            {
+                this.salesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+            }
+            else
+            {
+                this.salesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0);
+            }
+
+            info(strFmt("@MET:METNoStockPendingProcess", salesLine.SalesId, salesLine.ItemId));
+
+            totalCancelledLineCount++;
+            cancelCount++;
+            batchCount++;
+            if (batchCount >= batchTransactionCommit)
+            {
+                ttscommit;
+                batchOpen  = false;
+                batchCount = 0;
+            }
+        }
+
+        if (batchOpen)
+        {
+            ttscommit;
+        }
+
+        info(strFmt("@MET:METZeroStockCancellationCompleted", _salesTable.SalesId, cancelCount));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelShortPickLines</Name>
+				<Source><![CDATA[
+    // Partial cancellation: lines where cumulative WMS shipped qty is less than remaining inventory qty
+    private void cancelShortPickLines(SalesTable _salesTable)
+    {
+        SalesLine    salesLine;
+        METSalesLine metSalesLine;
+        WMSOrder     wmsOrder;
+        boolean      batchOpen   = false;
+        int          batchCount  = 0;
+        int          cancelCount = 0;
+
+        while select forupdate salesLine
+            where salesLine.SalesId              == _salesTable.SalesId
+               && salesLine.SalesStatus          != SalesStatus::Canceled
+               && salesLine.InventRefType        != InventRefType::Purch
+               && salesLine.RemainInventPhysical  > 0
+            join metSalesLine
+                where metSalesLine.SalesLine          == salesLine.RecId
+                   && metSalesLine.OrderExtractStatus == METOrderExtractStatus::Extracted
+            exists join wmsOrder
+                where wmsOrder.inventTransId == salesLine.InventTransId
+                   && wmsOrder.type          == WMSOrderType::OrderPick
+        {
+            // Sum across all pick lines for this salesLine (split picklist registrations)
+            WMSOrder wmsOrderSum;
+            select sum(qty), sum(qtyNoShipment), sum(PdsCWQty), sum(PdsCWQtyNoShipment)
+                from wmsOrderSum
+                where wmsOrderSum.inventTransId == salesLine.InventTransId
+                   && wmsOrderSum.type          == WMSOrderType::OrderPick;
+
+            InventQty      shipQty   = abs(wmsOrderSum.qty) - wmsOrderSum.qtyNoShipment;
+            PdsCWInventQty cwShipQty = PdsGlobal::pdsIsCWItem(salesLine.ItemId)
+                                        ? abs(wmsOrderSum.PdsCWQty) - wmsOrderSum.PdsCWQtyNoShipment
+                                        : 0;
+
+            if (shipQty < salesLine.RemainInventPhysical)
+            {
+                InventQty shipQtySales = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+                    salesLine.ItemId,
+                    salesLine.InventDimId,
+                    shipQty,
+                    salesLine.inventTable().inventUnitId(),
+                    salesLine.SalesUnit,
+                    NoYes::No,
+                    NoYes::No);
+
+                if (!batchOpen)
+                {
+                    ttsbegin;
+                    batchOpen = true;
+                }
+
+                salesLine.skipBusinessEvents(true);
+
+                this.salesUpdateRemain().updateExtractionDeliverRemainder(
+                    salesLine,
+                    shipQtySales,
+                    shipQty,
+                    cwShipQty);
+
+                totalCancelledLineCount++;
+                cancelCount++;
+                batchCount++;
+                if (batchCount >= batchTransactionCommit)
+                {
+                    ttscommit;
+                    batchOpen  = false;
+                    batchCount = 0;
+                }
+            }
+        }
+
+        if (batchOpen)
+        {
+            ttscommit;
+        }
+
+        info(strFmt("@MET:METShortPickCancellationCompleted", _salesTable.SalesId, cancelCount));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSalesTableStatus</Name>
+				<Source><![CDATA[
+    private void updateSalesTableStatus(SalesTable _salesTable)
+    {
+        SalesTable salesTableUpd;
+
+        ttsbegin;
+        salesTableUpd = SalesTable::find(_salesTable.SalesId, true);
+        salesTableUpd.updateBackStatus();
+        salesTableUpd.updateSalesType();
+        ttscommit;
+
+        info(strFmt("@MET:METSalesTableStatusUpdateCompleted", _salesTable.SalesId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTMSOrder</Name>
+				<Source><![CDATA[
+    private void processTMSOrder(WMSPickingRouteID _pickingRouteId, SalesTable _salesTable)
+    {
+        if (!_pickingRouteId)
+        {
+            return;
+        }
+
+        _salesTable.reread();
+
+        WMSPickingRoute wmsPickingRoute = WMSPickingRoute::find(_pickingRouteId);
+
+        if (wmsPickingRoute.RecId
+            && _salesTable.METOrderExtractStatus == METOrderExtractStatus::Extracted
+            && _salesTable.SalesStatus           != SalesStatus::Delivered
+            && _salesTable.SalesStatus           != SalesStatus::Invoiced)
+        {
+            // TMS manages its own transaction; run outside any tts scope
+            METTMSEngineOrderProccess metTMSEngineOrderProccess = METTMSEngineOrderProccess::construct(
+                METTMSEngineExecutionMode::SalesOrderPickingList,
+                wmsPickingRoute,
+                _pickingRouteId);
+            metTMSEngineOrderProccess.run();
+
+            info(strFmt("@MET:METTMSEngineOrderProcessCompleted", _salesTable.SalesId));
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCrossDockTransferOrder</Name>
+				<Source><![CDATA[
+    // Runs only for SOExtractReservedSOPickAndTO. CreateTransferOrder manages its own tts + internal TMS.
+    private void processCrossDockTransferOrder(SalesTable _salesTable)
+    {
+        _salesTable.reread();
+        METCrossDockTransferOrderProcessorBase::construct(_salesTable).CreateTransferOrder();
+
+        info(strFmt("@MET:METCrossDockTOProcessCompleted", _salesTable.SalesId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>salesUpdateRemain</Name>
+				<Source><![CDATA[
+    private SalesUpdateRemain salesUpdateRemain()
+    {
+        if (salesUpdateRemain == null)
+        {
+            salesUpdateRemain = SalesUpdateRemain::construct();
+            salesUpdateRemain.metParmIsExtraction(true);
+        }
+        return salesUpdateRemain;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

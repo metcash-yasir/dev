@@ -1,0 +1,394 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesOrderExtractionPendingProcessor</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class METSalesOrderExtractionPendingProcessor extends RunBaseBatch implements BatchRetryable
+{
+    DialogField     dlgMaxRetryCount;
+    int             dlgMaxRetryCountValue;
+    DialogField     dlgMaxTaskCount;
+    int             dlgMaxTaskCountValue;
+    Range           batchIdentifier;
+    BatchHeader     batchHeader;
+    QueryRun        queryRun;
+
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        batchIdentifier,
+        dlgMaxRetryCountValue,
+        dlgMaxTaskCountValue
+    #endmacro
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    public Object dialog()
+    {
+        DialogRunbase dialog = super();
+        ;
+        dlgMaxRetryCount = dialog.addFieldValue(extendedtypestr(Integer), dlgMaxRetryCountValue, "@MET:METMaxRetryCount");
+        dlgMaxTaskCount  = dialog.addFieldValue(extendedtypestr(Integer), dlgMaxTaskCountValue,  "@MET:METMaxParallelTasks");
+
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    public boolean isRetryable()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    public boolean getFromDialog()
+    {
+        ;
+        dlgMaxRetryCountValue = dlgMaxRetryCount.value();
+        dlgMaxTaskCountValue  = dlgMaxTaskCount.value();
+
+        this.initQuery();
+
+        return super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initParmDefault</Name>
+				<Source><![CDATA[
+    public void initParmDefault()
+    {
+        this.initQuery();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initQuery</Name>
+				<Source><![CDATA[
+    public void initQuery()
+    {
+        Query                   query = new Query();
+        QueryBuildDataSource    qbds = query.addDataSource(tablenum(METOrderExtractionPendingProcess));
+        QueryBuildRange         qBR;
+        ;
+        qBR = SysQuery::findOrCreateRange(qbds, fieldnum(METOrderExtractionPendingProcess, Status));
+        qBR.value(strFmt('%1,%2', METOrderExtractionPendingProcessStatus::Pending, METOrderExtractionPendingProcessStatus::Failed));
+        qBR.status(RangeStatus::Locked);
+        qBR = SysQuery::findOrCreateRange(qbds, fieldnum(METOrderExtractionPendingProcess, RetryCount));
+        qBR.value(strFmt('<=%1', dlgMaxRetryCountValue));
+        
+        queryRun = new QueryRun(query);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList, queryRun.pack()];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container _packedClass)
+    {
+        Version   version = RunBase::getVersion(_packedClass);
+        container queryCon;
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList, queryCon] = _packedClass;
+                if (SysQuery::isPackedOk(queryCon))
+                {
+                    queryRun = new QueryRun(queryCon);
+                }
+                else
+                {
+                    this.initQuery();
+                }
+                break;
+            default:
+                return false;
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queryRun</Name>
+				<Source><![CDATA[
+    public QueryRun queryRun()
+    {
+        return queryRun;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        if (batchIdentifier) // child task — process its slice
+        {
+            this.runThreadTask();
+        }
+        else // parent task — split records and spawn runtime tasks
+        {
+            int totalRecords = SysQuery::countTotal(new QueryRun(queryRun.query()));
+
+            if (!totalRecords)
+            {
+                return;
+            }
+
+            int maxTasks = dlgMaxTaskCountValue > 0 ? dlgMaxTaskCountValue : totalRecords;
+
+            container batchIdentifierCon = this.getBatchIdentifiersRangeCon(maxTasks);
+
+            for (int i = 1; i <= conLen(batchIdentifierCon); i++)
+            {
+                batchIdentifier = conPeek(batchIdentifierCon, i);
+                this.processThreadItem();
+            }
+
+            if (this.isInBatch() && batchHeader)
+            {
+                batchHeader.save();
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processThreadItem</Name>
+				<Source><![CDATA[
+    protected void processThreadItem()
+    {
+        METSalesOrderExtractionPendingProcessor childThread;
+        ;
+        if (!batchIdentifier)
+        {
+            return;
+        }
+
+        // Resolve SalesId range for the caption (batchIdentifier is a RecId range "from..to")
+        METOrderExtractionPendingProcess captionFirst, captionLast;
+        int                              dotDotPos  = strFind(batchIdentifier, '..', 1, strLen(batchIdentifier));
+        RecId                            fromRecId  = str2int64(subStr(batchIdentifier, 1, dotDotPos - 1));
+        RecId                            toRecId    = str2int64(subStr(batchIdentifier, dotDotPos + 2, strLen(batchIdentifier)));
+
+        select firstonly SalesId from captionFirst order by captionFirst.RecId asc
+            where captionFirst.RecId >= fromRecId && captionFirst.RecId <= toRecId;
+        select firstonly SalesId from captionLast order by captionLast.RecId desc
+            where captionLast.RecId >= fromRecId && captionLast.RecId <= toRecId;
+
+        str batchCaption = captionFirst.SalesId == captionLast.SalesId
+            ? captionFirst.SalesId
+            : captionFirst.SalesId + '..' + captionLast.SalesId;
+
+        childThread = RunBase::makeObject(classIdGet(this));
+        childThread.batchInfo().resetBatchHeader();
+        childThread.batchInfo().parmGroupId(this.parmCurrentBatch().GroupId);
+        childThread.batchInfo().parmConstraintType(BatchConstraintType::And);
+        childThread.batchInfo().parmDataareaId(this.parmCurrentBatch().Company);
+        childThread.batchInfo().parmCaption(batchCaption);
+        childThread.unpack(this.pack());
+        childThread.parmBatchIdentifier(batchIdentifier);
+
+        if (this.isInBatch())
+        {
+            if (!batchHeader)
+            {
+                batchHeader = BatchHeader::construct(this.parmCurrentBatch().BatchJobId);
+            }
+            batchHeader.addRuntimeTask(childThread, this.parmCurrentBatch().RecId);
+        }
+        else
+        {
+            childThread.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBatchIdentifiersRangeCon</Name>
+				<Source><![CDATA[
+    public container getBatchIdentifiersRangeCon(int _maxTaskCount)
+    {
+        container  res;
+        QueryRun   queryRunLocal = new QueryRun(queryRun.query());
+
+        QueryBuildDataSource qBDS = queryRunLocal.query().dataSourceTable(tableNum(METOrderExtractionPendingProcess));
+        int                  totalRecords, curRecord, recordsPerBatch;
+        RecId                fromRecId, toRecId;
+
+        qBDS.sortClear();
+        qBDS.addSortField(fieldNum(METOrderExtractionPendingProcess, RecId));
+        qBDS.addSelectionField(fieldNum(METOrderExtractionPendingProcess, RecId));
+
+        totalRecords    = SysQuery::countTotal(queryRunLocal);
+        queryRunLocal   = new QueryRun(queryRunLocal.query()); // reset after count
+
+        recordsPerBatch = _maxTaskCount > 0 ? totalRecords div _maxTaskCount : totalRecords;
+        if (!recordsPerBatch)
+        {
+            recordsPerBatch = 1;
+        }
+
+        while (queryRunLocal.next())
+        {
+            METOrderExtractionPendingProcess pendingLocal = queryRunLocal.get(tableNum(METOrderExtractionPendingProcess));
+
+            if (!fromRecId)
+            {
+                fromRecId = pendingLocal.RecId;
+            }
+            curRecord++;
+            toRecId = pendingLocal.RecId;
+
+            if ((curRecord mod recordsPerBatch) == 0)
+            {
+                res       += SysQuery::range(fromRecId, toRecId);
+                fromRecId  = 0;
+                curRecord  = 0;
+            }
+        }
+
+        if (curRecord && fromRecId && toRecId)
+        {
+            res += SysQuery::range(fromRecId, toRecId);
+        }
+
+        return res;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runThreadTask</Name>
+				<Source><![CDATA[
+    public void runThreadTask()
+    {
+        METSalesOrderExtractionPendingProcess processor = METSalesOrderExtractionPendingProcess::construct();
+        METOrderExtractionPendingProcess      pendingRecord;
+        int                                   processedCount;
+
+        if (batchIdentifier)
+        {
+            QueryBuildDataSource qBDS = queryRun.query().dataSourceTable(tableNum(METOrderExtractionPendingProcess));
+            qBDS.addRange(fieldNum(METOrderExtractionPendingProcess, RecId)).value(batchIdentifier);
+        }
+
+        while (queryRun.next())
+        {
+            pendingRecord = queryRun.get(tableNum(METOrderExtractionPendingProcess));
+            processor.processRecord(pendingRecord);
+            processedCount++;
+        }
+
+        info(strFmt("@MET:METExtractionPendingRecordsProcessed", processedCount));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmBatchIdentifier</Name>
+				<Source><![CDATA[
+    public Range parmBatchIdentifier(Range _batchIdentifier = batchIdentifier)
+    {
+        batchIdentifier = _batchIdentifier;
+        return batchIdentifier;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static METSalesOrderExtractionPendingProcessor construct()
+    {
+        return new METSalesOrderExtractionPendingProcessor();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    static ClassDescription description()
+    {
+        return "@MET:METSalesOrderExtractionPendingProcess";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    public static void main(Args _args)
+    {
+        METSalesOrderExtractionPendingProcessor runObject = METSalesOrderExtractionPendingProcessor::construct();
+        ;
+        if (runObject.prompt())
+        {
+            runObject.runOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    public boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showQueryValues</Name>
+				<Source><![CDATA[
+    public boolean showQueryValues()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustGoBatch</Name>
+				<Source><![CDATA[
+    public boolean mustGoBatch()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
