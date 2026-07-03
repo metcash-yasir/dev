@@ -18,11 +18,13 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     //CB123_SalesOrderExtractScreenforCSD -end
     boolean                                         skipTMSProcess;
     NoYes                                           useLegacyMode;  
+    NoYes                                           useLegacyPostProcessMode;
     int                                             batchTransactionCommit;        
     Map                                             reservedQtyInSalesUnitMap = new Map(Types::Int64, Types::Real);
     Map                                             reservedQtyInInventUnitMap = new Map(Types::Int64, Types::Real);
     METProcMetrics                                  procMetrics;
     SalesUpdateRemain                               salesUpdateRemain;
+    str                                             actionToPerform;
     boolean                                         isError;
     #OCCRetryCount
 }
@@ -142,6 +144,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             {
                 METCustParameters metCustParameters = METCustParameters::find();
                 useLegacyMode = metCustParameters.SalesExtractionPerfMode;
+                useLegacyPostProcessMode = metCustParameters.SalesExtractionPostProcessPerfMode;
                 batchTransactionCommit = metCustParameters.SalesExtractionBatchTransactionCommit;
                 this.processPickingList(_dataContract);
 
@@ -228,7 +231,6 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
     /// <param name = "_dataContract">Data contract reference</param>
     public void processPickingList(METSalesPickingListGenerationTaskContract _dataContract)
     {
-        str         actionToPerform;
         boolean     pickListForOrderedQty = false;
         companyInfo  = CompanyInfo::find();
         this.initParms(_dataContract);
@@ -314,17 +316,20 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                 //Intercompany picking list.
                 this.postIntercompanyPickingList();
 
-                if (procMetrics)
+                if (useLegacyPostProcessMode)
                 {
-                    procMetrics.startDescriptionTime(9, "@MET:METSOExtractCrossDockTransferOrder");
-                }
+                    if (procMetrics)
+                    {
+                        procMetrics.startDescriptionTime(9, "@MET:METSOExtractCrossDockTransferOrder");
+                    }
 
-                METCrossDockTransferOrderProcessorBase::construct(salesTable).CreateTransferOrder();
+                    METCrossDockTransferOrderProcessorBase::construct(salesTable).CreateTransferOrder();
 
-                if (procMetrics)
-                {
-                    procMetrics.incDescriptionCount(9, 1);
-                    procMetrics.endDescriptionTime(9);
+                    if (procMetrics)
+                    {
+                        procMetrics.incDescriptionCount(9, 1);
+                        procMetrics.endDescriptionTime(9);
+                    }
                 }
             }
             else if (actionToPerform == METConstants::SOExtractOrderedSOPickOnly)
@@ -829,51 +834,83 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
             }
             else
             {
-                if (this.cancelSalesLineV2(_salesTable, salesLine, _pickListOrderedQty))
+                if (useLegacyPostProcessMode)
                 {
-                    if (procMetrics)
+                    if (this.cancelSalesLineV2(_salesTable, salesLine, _pickListOrderedQty))
                     {
-                        procMetrics.startDescriptionTime(5, "@MET:METSOExtractDeliverRemainderCancel");
-                    }
+                        if (procMetrics)
+                        {
+                            procMetrics.startDescriptionTime(5, "@MET:METSOExtractDeliverRemainderCancel");
+                        }
 
-                    if (!batchOpen)
-                    {
-                        this.ttsBeginTrace();
-                        batchOpen = true;
-                    }
+                        if (!batchOpen)
+                        {
+                            this.ttsBeginTrace();
+                            batchOpen = true;
+                        }
 
-                    if (metSalesLineNotExtracted.OrderExtractStatus != METOrderExtractStatus::Extracted)
-                    {
-                        metSalesLineNotExtracted.skipBusinessEvents(true);
-                        metSalesLineNotExtracted.OrderExtractStatus = METOrderExtractStatus::Extracted;
-                        metSalesLineNotExtracted.doUpdate();
-                    }
+                        if (metSalesLineNotExtracted.OrderExtractStatus != METOrderExtractStatus::Extracted)
+                        {
+                            metSalesLineNotExtracted.skipBusinessEvents(true);
+                            metSalesLineNotExtracted.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                            metSalesLineNotExtracted.doUpdate();
+                        }
 
-                    if (salesLine.inventTable().pdsCWItem())
-                    {
-                        this.salesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+                        if (salesLine.inventTable().pdsCWItem())
+                        {
+                            this.salesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+                        }
+                        else
+                        {
+                            this.salesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0);
+                        }
+
+                        info(strFmt("@MET:NoStock", salesLine.SalesId, salesLine.ItemId));
+
+                        batchCount++;
+
+                        if (batchCount >= batchTransactionCommit)
+                        {
+                            this.ttsCommitTrace(5);
+
+                            batchOpen = false;
+                            batchCount = 0;
+                        }
+
+                        if (procMetrics)
+                        {
+                            procMetrics.incDescriptionCount(5, 1);
+                            procMetrics.endDescriptionTime(5);
+                        }
                     }
                     else
                     {
-                        this.salesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0);
-                    }
+                        SalesQtyReservPhysical reservQtyinSalesUnit;
+                        SalesQtyReservPhysical reservQtyinInventUnit;
 
-                    info(strFmt("@MET:NoStock", salesLine.SalesId, salesLine.ItemId));
+                        if (reservedQtyInSalesUnitMap.exists(salesLine.RecId))
+                        {
+                            reservQtyinSalesUnit = reservedQtyInSalesUnitMap.lookup(salesLine.RecId);
+                            reservQtyinInventUnit = reservedQtyInInventUnitMap.lookup(salesLine.RecId);
+                        }
+                        else
+                        {
+                            container reservedQty = salesLine.metReservedPhysicalInSalesInventUnit();
 
-                    batchCount++;
+                            reservQtyinSalesUnit = conPeek(reservedQty, 1);
+                            reservQtyinInventUnit = conPeek(reservedQty, 2);
 
-                    if (batchCount >= batchTransactionCommit)
-                    {
-                        this.ttsCommitTrace(5);
+                            reservedQtyInSalesUnitMap.add(salesLine.RecId, reservQtyinSalesUnit);
+                            reservedQtyInInventUnitMap.add(salesLine.RecId, reservQtyinInventUnit);
+                        }
 
-                        batchOpen = false;
-                        batchCount = 0;
-                    }
+                        if (_pickListOrderedQty == false && reservQtyinSalesUnit == 0)
+                        {
+                            continue;
+                        }
 
-                    if (procMetrics)
-                    {
-                        procMetrics.incDescriptionCount(5, 1);
-                        procMetrics.endDescriptionTime(5);
+                        processExtraction = true;
+                        qualifyingSalesLines.addEnd(salesLine.RecId);
                     }
                 }
                 else
@@ -1271,6 +1308,11 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                     {
                         procMetrics.endDescriptionTime(7);
                     }
+
+                    if (!useLegacyPostProcessMode)
+                    {
+                        this.insertPendingProcessRecord(_salesTable.SalesId);
+                    }
                 }
             }
         }
@@ -1330,7 +1372,7 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
 
         if (!isError && !skipTMSProcess)
         {
-            if (_salesTable.METOrderExtractStatus == METOrderExtractStatus::Extracted)
+            if (useLegacyPostProcessMode && _salesTable.METOrderExtractStatus == METOrderExtractStatus::Extracted)
             {
                 if (procMetrics)
                 {
@@ -1424,11 +1466,13 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                     SalesLineType::construct(salesLine).interCompanyResetDeliverNow();
                 }
 
-                if (!_salesTable.METAllowBackOrders && !metSalesTable.InternalCrossDockOrder)
+                if (useLegacyPostProcessMode)
                 {
-                    if (shipQty < salesLine.RemainInventPhysical)  // only short picks need remainder cancellation
+                    if (!_salesTable.METAllowBackOrders && !metSalesTable.InternalCrossDockOrder)
                     {
-                        InventQty shipQtySales = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
+                        if (shipQty < salesLine.RemainInventPhysical)  // only short picks need remainder cancellation
+                        {
+                            InventQty shipQtySales = EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
                             salesLine.ItemId,
                             salesLine.InventDimId,
                             shipQty,
@@ -1437,15 +1481,17 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
                             NoYes::No,
                             NoYes::No);
 
-                        salesLine.skipBusinessEvents(true);
+                            salesLine.skipBusinessEvents(true);
 
-                        this.salesUpdateRemain().updateExtractionDeliverRemainder(
+                            this.salesUpdateRemain().updateExtractionDeliverRemainder(
                             salesLine,
                             shipQtySales,
                             shipQty,
                             cwQty);
+                        }
                     }
                 }
+
                 if (_salesTable.METAllowBackOrders)
                 {
                     METOrderExtractStatus lineStatus = this.resolveLineStatus(_salesTable, salesLine, shipQty, pickedQtyMap);
@@ -2414,6 +2460,24 @@ abstract class METSalesPickingListGenerationTaskServiceBase extends SysOperation
         {
             ttscommit;
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertPendingProcessRecord</Name>
+				<Source><![CDATA[
+    private void insertPendingProcessRecord(SalesId _salesId)
+    {
+        METOrderExtractionPendingProcess pendingRecord;
+
+        ttsbegin;
+        pendingRecord.SalesId         = _salesId;
+        pendingRecord.Status          = METOrderExtractionPendingProcessStatus::Pending;
+        pendingRecord.ActionToPerform = actionToPerform;
+        pendingRecord.PickingRouteID  = wmsPickingRoute.PickingRouteID;
+        pendingRecord.insert();
+        ttscommit;
     }
 
 ]]></Source>
