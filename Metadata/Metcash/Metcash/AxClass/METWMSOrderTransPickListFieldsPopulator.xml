@@ -1,0 +1,376 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METWMSOrderTransPickListFieldsPopulator</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class METWMSOrderTransPickListFieldsPopulator
+{
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>initBondedWarehouse</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets BondedWarehouse = Yes when the item has a tariff code entry (METTariffItemCodeBaseRecid != 0).
+    /// Only called for legal entity 2000.
+    /// </summary>
+    public static void initBondedWarehouse(METWMSOrderTrans _metWmsOrderTrans, ItemId _itemId)
+    {
+        METInventTable metInventTable = METInventTable::find(_itemId);
+
+        _metWmsOrderTrans.BondedWarehouse = metInventTable.METTariffItemCodeBaseRecid ? NoYes::Yes : NoYes::No;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initPickEaches</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets PickEaches = Yes when both the customer and the warehouse require eaches picking.
+    /// Handles intercompany orders by resolving the originating customer account.
+    /// </summary>
+    public static void initPickEaches(METWMSOrderTrans _metWmsOrderTrans, WMSOrderTrans _wmsOrderTrans, SalesTable _salesTable, InventLocationId _inventLocationId)
+    {
+        CustAccount custAccount;
+
+        if (_wmsOrderTrans.inventTransType == InventTransType::Sales)
+        {
+            if (_salesTable.InterCompanyOrder == NoYes::Yes && _salesTable.InterCompanyOrigin == InterCompanyOrigin::Derived)
+            {
+                custAccount = _salesTable.InterCompanyOriginalCustAccount;
+            }
+            else
+            {
+                custAccount = _salesTable.CustAccount;
+            }
+        }
+        else if (_wmsOrderTrans.inventTransType == InventTransType::TransferOrderShip)
+        {
+            METInventTransferTableExt transferExt;
+            InventTransferTable       transferTable;
+
+            select firstonly InternalCustomer from transferExt
+                join RecId from transferTable
+                where transferTable.TransferId         == _wmsOrderTrans.inventTransRefId
+                    && transferExt.InventTransferTable == transferTable.RecId;
+
+            custAccount = transferExt.InternalCustomer;
+        }
+
+        if (custAccount)
+        {
+            METCustTable metCustTable;
+
+            select PickEaches from metCustTable
+                where metCustTable.AccountNum == custAccount;
+
+            if (metCustTable.PickEaches == NoYes::Yes)
+            {
+                InventLocation    inventLocation;
+                METInventLocation metInventLocation;
+
+                select PickEaches from metInventLocation
+                    join RecId from inventLocation
+                    where inventLocation.RecId            == metInventLocation.InventLocation
+                        && inventLocation.InventLocationId == _inventLocationId;
+
+                if (metInventLocation.PickEaches == NoYes::Yes)
+                {
+                    _metWmsOrderTrans.PickEaches = NoYes::Yes;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initUnitShipCaseQty</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets UnitShipCaseQty: the conversion factor from the item's ship unit to EA,
+    /// driven by METInventLocation.ExternalWMSUnit at the pick warehouse.
+    /// Returns 1 for DefaultInventoryUnit or when the unit is already EA.
+    /// Must be called before initReservedQuantity.
+    /// </summary>
+    public static void initUnitShipCaseQty(METWMSOrderTrans _metWmsOrderTrans, WMSOrderTrans _wmsOrderTrans, InventDim _wmsOrderTransDim)
+    {
+        #define.EAUnit('EA')
+
+        InventLocation    inventLocation;
+        METInventLocation metInventLocation;
+
+        select firstonly ExternalWMSUnit from metInventLocation
+            join RecId from inventLocation
+            where inventLocation.InventLocationId == _wmsOrderTransDim.InventLocationId
+                && inventLocation.RecId            == metInventLocation.InventLocation;
+
+        if (metInventLocation.ExternalWMSUnit == METExtWMSUnit::DefaultInventoryUnit)
+        {
+            _metWmsOrderTrans.UnitShipCaseQty = 1;
+            return;
+        }
+
+        str fromUnitSymbol;
+
+        if (metInventLocation.ExternalWMSUnit == METExtWMSUnit::DefaultSellUnit)
+        {
+            InventItemSalesSetup iiss;
+            InventDim            iissDim;
+
+            select firstonly METSalesUnit from iiss
+                join iissDim
+                where iissDim.InventDimId  == iiss.InventDimId
+                    && iissDim.InventSiteId == _wmsOrderTransDim.InventSiteId
+                    && iiss.ItemId          == _wmsOrderTrans.ItemId
+                    && iiss.DataAreaId      == _wmsOrderTrans.DataAreaId;
+
+            fromUnitSymbol = iiss.METSalesUnit;
+        }
+        else // DefaultPurchaseUnit
+        {
+            InventItemPurchSetup iips;
+            InventDim            iipsDim;
+
+            select firstonly METPurchUnit from iips
+                join iipsDim
+                where iipsDim.InventDimId  == iips.InventDimId
+                    && iipsDim.InventSiteId == _wmsOrderTransDim.InventSiteId
+                    && iips.ItemId          == _wmsOrderTrans.ItemId
+                    && iips.DataAreaId      == _wmsOrderTrans.DataAreaId;
+
+            fromUnitSymbol = iips.METPurchUnit;
+        }
+
+        if (!fromUnitSymbol || fromUnitSymbol == #EAUnit)
+        {
+            _metWmsOrderTrans.UnitShipCaseQty = 1;
+            return;
+        }
+
+        UnitOfMeasureFromRecId fromRecId    = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(fromUnitSymbol);
+        UnitOfMeasureFromRecId toRecId      = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(#EAUnit);
+        RecId                  productRecId = EcoResProduct::findByProductNumber(_wmsOrderTrans.ItemId).RecId;
+
+        UnitOfMeasureConversion conv = UnitOfMeasureConversion::findByConversion(fromRecId, toRecId, productRecId);
+        _metWmsOrderTrans.UnitShipCaseQty = conv.RecId ? conv.Factor : 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initPdsCWConversion</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets PdsCWConversion: the UoM factor from the item's catch-weight unit to its inventory unit.
+    /// Zero for non-catch-weight items.
+    /// </summary>
+    public static void initPdsCWConversion(METWMSOrderTrans _metWmsOrderTrans, WMSOrderTrans _wmsOrderTrans)
+    {
+        PdsCatchWeightItem pcw;
+
+        select firstonly PdsCWUnitId from pcw
+            where pcw.ItemId     == _wmsOrderTrans.ItemId
+                && pcw.DataAreaId == _wmsOrderTrans.DataAreaId;
+
+        if (!pcw.PdsCWUnitId)
+        {
+            _metWmsOrderTrans.PdsCWConversion = 0;
+            return;
+        }
+
+        InventTableModule itm;
+        select firstonly UnitId from itm
+            where itm.ItemId     == _wmsOrderTrans.ItemId
+                && itm.ModuleType == ModuleInventPurchSales::Invent;
+
+        UnitOfMeasureFromRecId fromUnit    = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(pcw.PdsCWUnitId);
+        UnitOfMeasureFromRecId toUnit      = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(itm.UnitId);
+        RecId                  productRecId = EcoResProduct::findByProductNumber(_wmsOrderTrans.ItemId).RecId;
+
+        _metWmsOrderTrans.PdsCWConversion = UnitOfMeasureConversion::findByConversion(fromUnit, toUnit, productRecId).Factor;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initCaseUOM</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets CaseUOM: the UoM factor from the item's sales unit (at the shipping site) to EA.
+    /// Returns 0 when no sales setup exists; 1 when the unit is already EA.
+    /// </summary>
+    public static void initCaseUOM(METWMSOrderTrans _metWmsOrderTrans, WMSOrderTrans _wmsOrderTrans, InventDim _wmsOrderTransDim)
+    {
+        #define.DefaultUnit('EA')
+
+        InventItemSalesSetup inventItemSalesSetup;
+        InventDim            inventDim;
+
+        select firstonly inventItemSalesSetup
+            where inventItemSalesSetup.ItemId     == _wmsOrderTrans.ItemId
+                && inventItemSalesSetup.DataAreaId == _wmsOrderTrans.DataAreaId
+            exists join inventDim
+                where inventItemSalesSetup.InventDimId == inventDim.inventDimId
+                    && inventDim.InventSiteId           == _wmsOrderTransDim.InventSiteId;
+
+        UnitOfMeasureFromRecId fromUnit = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(inventItemSalesSetup.METSalesUnit);
+        UnitOfMeasureFromRecId toUnit   = EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(#DefaultUnit);
+
+        if (!fromUnit || !toUnit)
+        {
+            _metWmsOrderTrans.CaseUOM = 0;
+        }
+        else if (fromUnit == toUnit)
+        {
+            _metWmsOrderTrans.CaseUOM = 1;
+        }
+        else
+        {
+            _metWmsOrderTrans.CaseUOM = UnitOfMeasureConversion::findByConversion(
+                fromUnit, toUnit, EcoResProduct::findByProductNumber(_wmsOrderTrans.ItemId).RecId).Factor;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initReservedQuantity</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets ReservedQuantity: ABS pick quantity divided by UnitShipCaseQty.
+    /// Uses PdsCWQty for catch-weight items; qty otherwise.
+    /// Must be called after initUnitShipCaseQty.
+    /// </summary>
+    public static void initReservedQuantity(METWMSOrderTrans _metWmsOrderTrans, WMSOrderTrans _wmsOrderTrans)
+    {
+        boolean isCWItem = EcoResProduct::findByProductNumber(_wmsOrderTrans.ItemId).PdsCWProduct;
+        real    pickQty  = isCWItem ? abs(_wmsOrderTrans.PdsCWQty) : abs(_wmsOrderTrans.qty);
+        real    usc      = _metWmsOrderTrans.UnitShipCaseQty;
+
+        _metWmsOrderTrans.ReservedQuantity = usc ? (pickQty / usc) : pickQty;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initInternalCustPaymMethod</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets InternalCustPaymMethod: the payment mode of the resolved internal customer.
+    /// Always empty for Sales Orders (matches entity computed column behaviour).
+    /// For Transfer Orders, resolves the internal customer via METCampbellsInternalExternalCustomerSiteMap,
+    /// falling back to METInventTransferTableExt.InternalCustomer when no mapping exists.
+    /// </summary>
+    public static void initInternalCustPaymMethod(METWMSOrderTrans _metWmsOrderTrans, WMSOrderTrans _wmsOrderTrans, InventDim _wmsOrderTransDim)
+    {
+        if (_wmsOrderTrans.inventTransType != InventTransType::TransferOrderShip)
+        {
+            _metWmsOrderTrans.InternalCustPaymMethod = '';
+            return;
+        }
+
+        METInventTransferTableExt transferExt;
+        InventTransferTable       transferTable;
+
+        select firstonly InternalCustomer from transferExt
+            join RecId from transferTable
+            where transferTable.TransferId         == _wmsOrderTrans.inventTransRefId
+                && transferExt.InventTransferTable == transferTable.RecId;
+
+        if (!transferExt.InternalCustomer)
+        {
+            return;
+        }
+
+        // Map TO InternalCustomer + Warehouse → mapped InternalCustomer (4-row table)
+        METCampbellsInternalExternalCustomerSiteMap siteMap;
+
+        select firstonly InternalCustomer from siteMap
+            where siteMap.ExternalCustomer == transferExt.InternalCustomer
+                && siteMap.Warehouse        == _wmsOrderTransDim.InventLocationId;
+
+        CustAccount resolvedCustomer = siteMap.InternalCustomer ? siteMap.InternalCustomer : transferExt.InternalCustomer;
+
+        CustTable custTable;
+
+        select firstonly PaymMode from custTable
+            where custTable.AccountNum == resolvedCustomer
+                && custTable.DataAreaId == _wmsOrderTrans.DataAreaId;
+
+        _metWmsOrderTrans.InternalCustPaymMethod = custTable.PaymMode;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populate</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Populates all pre-computed picklist fields on the METWMSOrderTrans companion record.
+    /// Call initReservedQuantity last — it reads UnitShipCaseQty set by initUnitShipCaseQty.
+    /// BondedWarehouse is only evaluated for legal entity 2000.
+    /// </summary>
+    public static void populate(SalesTable _salesTable,
+        WMSOrderTrans    _wmsOrderTrans,
+        METWMSOrderTrans _metWmsOrderTrans,
+        InventDim        _wmsOrderTransDim,
+        boolean          _update = NoYes::No)
+    {
+        #define.LegalEntity('2000')
+
+        METWMSOrderTransPickListFieldsPopulator::initPickEaches(_metWmsOrderTrans, _wmsOrderTrans, _salesTable, _wmsOrderTransDim.InventLocationId);
+        METWMSOrderTransPickListFieldsPopulator::initUnitShipCaseQty(_metWmsOrderTrans, _wmsOrderTrans, _wmsOrderTransDim);
+        METWMSOrderTransPickListFieldsPopulator::initPdsCWConversion(_metWmsOrderTrans, _wmsOrderTrans);
+        METWMSOrderTransPickListFieldsPopulator::initCaseUOM(_metWmsOrderTrans, _wmsOrderTrans, _wmsOrderTransDim);
+        METWMSOrderTransPickListFieldsPopulator::initReservedQuantity(_metWmsOrderTrans, _wmsOrderTrans);
+        METWMSOrderTransPickListFieldsPopulator::initInternalCustPaymMethod(_metWmsOrderTrans, _wmsOrderTrans, _wmsOrderTransDim);
+
+        if (_wmsOrderTrans.DataAreaId == #LegalEntity)
+        {
+            METWMSOrderTransPickListFieldsPopulator::initBondedWarehouse(_metWmsOrderTrans, _wmsOrderTrans.ItemId);
+        }
+
+        if (_update)
+        {
+            _metWmsOrderTrans.doUpdate();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateMETWMSOrderTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Re-populates all picklist fields for every METWMSOrderTrans row on the given picklist route.
+    /// Uses an outer join to SalesTable so Transfer Order lines are not silently skipped.
+    /// </summary>
+    public static void updateMETWMSOrderTrans(WMSPickingRouteID _wmsPickingRouteID)
+    {
+        WMSOrderTrans    wmsOrderTrans;
+        METWMSOrderTrans metWMSOrderTrans;
+        SalesTable       salesTable;
+        InventDim        inventDim;
+
+        while select wmsOrderTrans
+            where wmsOrderTrans.routeId == _wmsPickingRouteID
+        join forupdate metWMSOrderTrans
+            where metWMSOrderTrans.WMSOrderTrans == wmsOrderTrans.RecId
+        outer join CustAccount, InterCompanyOriginalCustAccount, InterCompanyOrder, InterCompanyOrigin from salesTable
+            where salesTable.SalesId             == wmsOrderTrans.inventTransRefId
+                && wmsOrderTrans.inventTransType   == InventTransType::Sales
+        join InventLocationId, InventSiteId from inventDim
+            where inventDim.InventDimId == wmsOrderTrans.inventDimId
+        {
+            METWMSOrderTransPickListFieldsPopulator::populate(salesTable, wmsOrderTrans, metWMSOrderTrans, inventDim, true);
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
