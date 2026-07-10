@@ -1510,11 +1510,14 @@ final class METSalesLine_Extension
     /// </summary>
     /// <param name = "_inventTransId">sales line inventTransId</param>
     /// <param name = "_includeInRebatesOrFees">true or false</param>
+    /// <param name = "_salesLine">salesline buffer</param>
     /// <returns>value</returns>
-    public Amount metgetSalesLinePriceComponent(InventTransId _inventTransId, boolean _includeInRebatesOrFees)
+    public Amount metgetSalesLinePriceComponent(InventTransId _inventTransId, boolean _includeInRebatesOrFees, SalesLine _salesLine = null)
     {
         METComponentCode metComponentCode;
         METSalesLinePriceComponent  metSalesLinePriceComponent;
+        Amount finalValue;
+        METGrossWeight actualWeight;
 
         if (_includeInRebatesOrFees)
         {
@@ -1524,18 +1527,81 @@ final class METSalesLine_Extension
                     where metSalesLinePriceComponent.Component == metComponentCode.Component
                     && metSalesLinePriceComponent.InventTransId == _inventTransId
                     && metComponentCode.IncludeInRebatesOrFees == _includeInRebatesOrFees;
+
+            finalValue = metSalesLinePriceComponent.Value;
         }
         else
         {
-            select InventTransId, sum(value) from metSalesLinePriceComponent
-                group by InventTransId
+
+            select InventTransId,value from metSalesLinePriceComponent
                 join metComponentCode
                     where metSalesLinePriceComponent.Component == metComponentCode.Component
                     && metSalesLinePriceComponent.InventTransId == _inventTransId
+                    && metComponentCode.PriceComponent == METPriceComponent::BasePrice
                     && metComponentCode.IncludeInCostOrBaseCost == NoYes::Yes;
-        }
 
-        return metSalesLinePriceComponent.Value;
+            finalValue = metSalesLinePriceComponent.Value;
+
+            // Cache flags to avoid repeated static method calls
+            boolean isCWItem = PdsGlobal::pdsIsCWItem(_salesLine.ItemId);
+            boolean isPricedByWeight = SalesLineSalesPurchLine::getPricedByWeightAttributeValue(_salesLine.ItemId);
+
+            // If item is Catch Weight (CW), use actual weight from sales line
+            if (isCWItem)
+            {
+                actualWeight = _salesLine.displayMETActualWeight();
+            }
+
+            // Retrieve physical dimensions (weight per UOM for site)
+            METWHSPhysDimUOMSite metWHSPhysDimUOMSite;
+            InventDim inventDim = _salesLine.inventDim();
+            UnitOfMeasureSymbol unitSales = _salesLine.SalesUnit;
+
+            select firstonly weight, NetWeight from metWHSPhysDimUOMSite
+                     where metWHSPhysDimUOMSite.ItemId == _salesLine.ItemId
+                     && metWHSPhysDimUOMSite.UOM == unitSales
+                     && metWHSPhysDimUOMSite.SiteId == inventDim.InventSiteId;
+
+            // If item is priced by weight, calculate actual weight = NetWeight × SalesQty
+            if (isPricedByWeight)
+            {
+                actualWeight = metWHSPhysDimUOMSite.NetWeight * _salesLine.SalesQty;
+            }
+
+            // If item is CW or priced by weight, check warehouse transactions
+            if (isCWItem || isPricedByWeight)
+            {
+                WMSOrderTrans wmsOrderTrans;
+
+                // Get warehouse transaction qty (only if expedition is complete or activated)
+                select firstonly Qty from wmsOrderTrans
+                     where wmsOrderTrans.InventTransId == _salesLine.InventTransId
+                     && (wmsOrderTrans.expeditionStatus == WMSExpeditionStatus::Complete
+                        || wmsOrderTrans.expeditionStatus == WMSExpeditionStatus::Activated);
+
+                if (wmsOrderTrans.Qty)
+                {
+                    // If priced by weight but not CW, multiply qty by NetWeight
+                    actualWeight = (!isCWItem && isPricedByWeight)
+                             ? wmsOrderTrans.Qty * metWHSPhysDimUOMSite.NetWeight
+                             : wmsOrderTrans.Qty;
+                }
+            }
+    
+            // Final extended value calculation
+            if (actualWeight)
+            {
+                finalValue = finalValue * actualWeight;
+            }
+            else
+            {
+                // Fallback: use original sales line quantity
+                finalValue = finalValue * _salesLine.SalesQty;
+            }
+
+        }
+        
+        return finalValue;
     }
 
 ]]></Source>
