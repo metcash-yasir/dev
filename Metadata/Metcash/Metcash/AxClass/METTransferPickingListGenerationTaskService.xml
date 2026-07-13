@@ -199,6 +199,34 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>resetProcessingFlag</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resets the processing flag in case of failure or successful batch job execution
+    /// </summary>
+    /// <param name = "_transferId">Transfer Id</param>
+    private void resetProcessingFlag(InventTransferId _transferId)
+    {
+        METInventTransferTableExt inventTransferTableExtLoc;
+        InventTransferTable inventTransferTableLoc;
+
+        ttsbegin;
+        select forupdate inventTransferTableExtLoc
+            join RecId from inventTransferTableLoc
+                where inventTransferTableLoc.RecId == inventTransferTableExtLoc.InventTransferTable
+                && inventTransferTableLoc.TransferId == _transferId;
+
+        if (inventTransferTableExtLoc.RecId && inventTransferTableExtLoc.Processing == NoYes::Yes)
+        {
+            inventTransferTableExtLoc.Processing = NoYes::No;
+            inventTransferTableExtLoc.update();
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>process</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -211,10 +239,11 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
         InventTransferJour inventTransferJour;
         InventTransferParmTable inventTransferParmTable;
         container shipmentIdList = _dataContract.parmShipmentIdList();
-
+        InventTransferId transferId = _dataContract.parmTransferId();
+ 
         try
         {
-            
+             
             //CB929 - Create final leg TO's for cross dock transfer order
             InventTransferTable transferTable = InventTransferTable::find(_dataContract.parmTransferId());
             if(extractFinalLegTO == false && transferTable.metInventTransferTableExt().InternalCrossDock)
@@ -222,7 +251,7 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
                 ttsbegin;
                 METCrossDockTransferOrderProcessorBase::construct(transferTable).CreateTransferOrder();
                 ttscommit;
-
+ 
                 return;
             }
             ttsbegin;
@@ -233,44 +262,44 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
             if(!extractFinalLegTO)
             {
                 this.applySubstitutions(_dataContract.parmTransferId());
-
+ 
                 this.applyTransferOrderReservation(_dataContract.parmTransferId()); //CB678 reservation for TO
             }
-
+ 
             [InventTransferJour, inventTransferParmTable] = this.pick(_dataContract);
-
+ 
             WMSPickingRoute wmsPickingRoute;
-
+ 
             select firstonly wmsPickingRoute
                 where wmsPickingRoute.parmid == inventTransferParmTable.ParmId;
-
+ 
             WMSPickingRouteID pickRouteId;
-
+ 
             if (wmsPickingRoute)
             {
                 METOrderShipmentLoadCreation metOrderShipmentloadCreation;
-
+ 
                 if (_dataContract.parmSkipFinalisationProcess() == false)
                 {
                     metOrderShipmentloadCreation = METOrderShipmentLoadCreation::construct(METOrderTransactionType::TransferOrder,
                                                                                             _dataContract.parmTransferId());
                     shipmentIdList += metOrderShipmentloadCreation.createShippmentLoad(true, false);
                 }
-
+ 
                 pickRouteId = wmsPickingRoute.pickingRouteID;
-
+ 
                 METWMSOrderTransPickListFieldsPopulator::updateMETWMSOrderTrans(pickRouteId);
-
+ 
                 //CB238 - xDock perform sales reservation once the transfer order picking list is created.
                 //this.postSalesOrder(_dataContract.parmTransferId());
-
+ 
                 if (_dataContract.parmTriggerBusinessEvent()) //In case of multithread execution this will be true only on last thread
                 {
                     if (conLen(shipmentIdList) != 0 && _dataContract.parmSkipFinalisationProcess() == false)
                     {
                         METSalesOrderShipmentLoadHeader::cleanShipmentIfNoLines(shipmentIdList);
                     }
-
+ 
                     if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METPicklistExtractionBusinessEvent)))
                     {
                         METPicklistExtractionBusinessEvent::newFromWMSPickingRoute(wmsPickingRoute).send();
@@ -281,11 +310,12 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
                     }
                 }
             }
-
+ 
             ttscommit;
-
+ 
             //CB628 - Send order to TMS after the pick list is posted.
             METTMSEngineOrderProccess::construct(METTMSEngineExecutionMode::TransferOrderPickinglist, wmsPickingRoute, wmsPickingRoute.pickingRouteID, true).run();
+            
         }
         catch (Exception::Deadlock)
         {
@@ -330,6 +360,10 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
         catch
         {
             error ("@WAX:UpdateCancelled");
+        }
+        finally
+        {
+            this.resetProcessingFlag(transferId);
         }
 
         if (!inventTransferJour)
