@@ -481,8 +481,10 @@ class METVendorChangeRequestService
         {
             if (cControllingSiteSetup.IsControllingSite == NoYes::No && _cascadeCSubordinateSite == false)
             {
-                vendorChangerequestsProcessed.add(_metVendorChangeRequest.RecId);
-                return;
+                if (!this.validateControllingSiteCompletion(_metVendorChangeRequest, cControllingSiteSetup))
+                {
+                    return;
+                }
             }
         }
         //CB915_CampbellsSupplierChangeProcess - end
@@ -571,12 +573,13 @@ class METVendorChangeRequestService
 
             this.updateVendorChangeRequestStatus(_metVendorChangeRequest);
 
-            while select subordinateVendorRequest
+            while select forupdate subordinateVendorRequest
                 where subordinateVendorRequest.ItemId == itemNumber
                 exists join subordinateSetup
                     where subordinateSetup.SiteId == subordinateVendorRequest.SiteId
                     &&    subordinateSetup.IsControllingSite == NoYes::No
                     &&    subordinateSetup.ControllingSiteId == cControllingSiteSetup.SiteId
+                    &&    subordinateVendorRequest.Status != METVendChangeReqStatus::Completed
             {
                 ReqItemTable reqItemTableCSite;
                 InventDim inventDimCSite;
@@ -597,6 +600,7 @@ class METVendorChangeRequestService
                 {
                     this.processNoErrorRecords(subordinateVendorRequest, reqItemTableCSite, itemNumber, true);
                     this.updateVendorChangeRequestStatus(subordinateVendorRequest);
+                    this.updateChangeReqForParentChildItem(subordinateVendorRequest);
                 }
             }
             //CB915_CampbellsSupplierChangeProcess - end
@@ -987,7 +991,7 @@ class METVendorChangeRequestService
             {
                 //Modified the below condition to fix the Bug 280999 - CB886 - Supplier Change not processed for Child Codes
                 this.processNoErrorRecords(_metVendorChangeRequest, childReqItem, childReqItem.ItemId);
-            }
+            }            
         }
     }
 
@@ -1258,6 +1262,73 @@ class METVendorChangeRequestService
         // Set the batch alert configurations
         header.parmAlerts(NoYes::No, NoYes::Yes, NoYes::No, NoYes::Yes, NoYes::No);
         header.save();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateControllingSiteCompletion</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates if the controlling site has completed its own vendor change request.
+    /// </summary>
+    /// <param name = "_metVendorChangeRequest">The vendor change request to validate.</param>
+    /// <param name = "_cSiteSetup">The controlling and subordinate site setup.</param>
+    /// <returns>True if the controlling site has completed its change, false otherwise.</returns>
+    private boolean validateControllingSiteCompletion(
+    METVendorChangeRequest                 _metVendorChangeRequest,
+    METSIteControllingAndSubOrdinateSetup  _cSiteSetup)
+    {
+        boolean                 ret = true;
+        InventSiteId            controllingSiteId;
+        ReqItemTable            reqItemTableCSite;
+        METReqItemTable         metReqItemTableCSite;
+        InventDim               inventDimCSite;
+        METVendorChangeRequest  openRequestCSite;
+
+        // Pull the Controlling site directly from the subordinate's own setup record
+        controllingSiteId = _cSiteSetup.ControllingSiteId;
+
+        if (!controllingSiteId)
+        {
+            // No controlling site mapped - nothing to validate against, allow it through
+            return true;
+        }
+
+        // Check 1: Is there still a Pending vendor on the Item coverage record
+        // for this item at the Controlling site? (FSD assumption: one main warehouse per site)
+        select firstonly RecId from reqItemTableCSite
+        join InventLocationId, InventSiteId from inventDimCSite
+            where inventDimCSite.InventDimId == reqItemTableCSite.CovInventDimId
+                && reqItemTableCSite.ItemId == _metVendorChangeRequest.ItemId
+                && inventDimCSite.InventSiteId == controllingSiteId
+        join PendingVendAccountNumber from metReqItemTableCSite
+            where metReqItemTableCSite.RefRecId == reqItemTableCSite.RecId;
+
+        // Check 2: Is there an open (non-completed) vendor change request for this item,
+        // at this Controlling site, for the same effective date? (Reference pattern)
+        select firstonly openRequestCSite
+        where openRequestCSite.Status != METVendChangeReqStatus::Completed
+            && openRequestCSite.ChangeReqEffectiveDate == _metVendorChangeRequest.ChangeReqEffectiveDate
+            && openRequestCSite.InventLocationId == inventDimCSite.InventLocationId
+            && openRequestCSite.SiteId == controllingSiteId
+            && openRequestCSite.ItemId == _metVendorChangeRequest.ItemId;
+
+        if (metReqItemTableCSite.PendingVendAccountNumber || openRequestCSite.RecId)
+        {
+            // Controlling site hasn't completed its own change yet - block and log per FSD
+            if (!vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
+            {
+                _metVendorChangeRequest.selectForUpdate(true);
+                _metVendorChangeRequest.Status           = METVendChangeReqStatus::Error;
+                _metVendorChangeRequest.ChangeRequestLog += "@MET:SupplierChangeSubordinateSiteError";
+                _metVendorChangeRequest.update();
+                vendorChangerequestsProcessed.add(_metVendorChangeRequest.RecId);
+            }
+            ret = false;
+        }
+
+        return ret;
     }
 
 ]]></Source>
