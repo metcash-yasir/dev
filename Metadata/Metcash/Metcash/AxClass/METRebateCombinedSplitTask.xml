@@ -1,0 +1,361 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METRebateCombinedSplitTask</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class METRebateCombinedSplitTask extends RunBaseBatch implements BatchRetryable
+{
+    private BatchHeader batchHeader;
+    private int maxBatchTaskNum;
+    private container dealRecIds;
+    private TAMRebateFromDate fromDate;
+    private TAMRebateToDate toDate;
+    private TransDate transDate;
+    private boolean processRebate;
+    private boolean processWriteOff;
+
+    #DEFINE.MaxNumberOfBatchSessions(64)
+    #DEFINE.DefaultNumberOfBatchSessions(8)
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    internal static METRebateCombinedSplitTask construct(int _tasks)
+    {
+        METRebateCombinedSplitTask t = new METRebateCombinedSplitTask();
+        t.maxBatchTaskNum = _tasks;
+        t.batchHeader = BatchHeader::getCurrentBatchHeader();
+
+        return t;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmDates</Name>
+				<Source><![CDATA[
+    public void parmDates(TAMRebateFromDate _f, TAMRebateToDate _t, TransDate _td)
+    {
+        fromDate = _f;
+        toDate = _t;
+        transDate = _td;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>parmScope</Name>
+				<Source><![CDATA[
+    public void parmScope(boolean _r, boolean _w)
+    {
+        processRebate = _r;
+        processWriteOff = _w;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDeals</Name>
+				<Source><![CDATA[
+    public void addDeals(container _dealRecIds)
+    {
+        dealRecIds = _dealRecIds;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>spawnCombinedBatchTasks</Name>
+				<Source><![CDATA[
+    internal void spawnCombinedBatchTasks()
+    {
+        if (conLen(dealRecIds) == 0)
+        {
+            return;
+        }
+
+        // Must run in batch — batchHeader comes from the executing batch job.
+        batchHeader = BatchHeader::getCurrentBatchHeader();
+
+        Batchable rebatePostTask;
+
+        if (processRebate)
+        {
+            // Phase 1: parallel Rebate create-trans over all deals (bucketed, LPT-balanced).
+            List rebateCreateTasks = this.queueCreateTasks(TAMRebateTransactionType::Rebate, dealRecIds);
+
+            // Phase 2: single-threaded Rebate post over all deals, gated on ALL Phase-1 tasks.
+            // Posting is single-threaded by design: it writes shared ledger / subledger / voucher
+            // number sequences that are not partitioned by deal and cannot run concurrently.
+            rebatePostTask = METRebatePostTask::construct(
+                TAMRebateTransactionType::Rebate, dealRecIds, fromDate, toDate, transDate);
+            this.queueRuntimeTask(rebatePostTask);
+            this.addDependencies(rebatePostTask, rebateCreateTasks);
+        }
+
+        if (processWriteOff)
+        {
+            // Standard excludes RebateOutputType::Item for non-Rebate types (the packed-records path
+            // bypasses the controller's query lock, so we apply the filter here).
+            container writeOffDeals = METRebateCombinedFlow::filterNonItemOutput(dealRecIds);
+            if (conLen(writeOffDeals) > 0)
+            {
+                // Phase 3: parallel Write-off create-trans. Write-off references previously-posted
+                // rebate amounts, so it must start only AFTER Rebate post has finished.
+                List writeOffCreateTasks = this.queueCreateTasks(TAMRebateTransactionType::WriteOff, writeOffDeals);
+                if (rebatePostTask)
+                {
+                    ListEnumerator le = writeOffCreateTasks.getEnumerator();
+                    while (le.moveNext())
+                    {
+                        batchHeader.addDependency(le.current(), rebatePostTask, BatchDependencyStatus::FinishedOrError);
+                    }
+                }
+
+                // Phase 4: single-threaded Write-off post, gated on ALL Phase-3 tasks.
+                Batchable writeOffPostTask = METRebatePostTask::construct(
+                    TAMRebateTransactionType::WriteOff, writeOffDeals, fromDate, toDate, transDate);
+                this.queueRuntimeTask(writeOffPostTask);
+                this.addDependencies(writeOffPostTask, writeOffCreateTasks);
+            }
+        }
+
+        batchHeader.save();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queueCreateTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Bucket the given deals (LPT-balanced) and queue one parallel create-trans task per bucket.
+    /// Returns the queued tasks so the caller can wire the post barrier onto them.
+    /// </summary>
+    private List queueCreateTasks(TAMRebateTransactionType _type, container _deals)
+    {
+        List createTasks = new List(Types::Class);
+
+        Map weightByDeal = this.buildWeightMap(_deals);
+        List buckets = METRebateCombinedSplitTask::computeLPTBuckets(weightByDeal, min(this.effectiveMaxTasks(), conLen(_deals)));
+
+        ListEnumerator le = buckets.getEnumerator();
+        while (le.moveNext())
+        {
+            container bucketDeals = le.current();
+            if (conLen(bucketDeals) == 0)
+            {
+                continue;
+            }
+
+            METRebateCreateTask task = METRebateCreateTask::construct(_type, bucketDeals, fromDate, toDate);
+            this.queueRuntimeTask(task);
+            createTasks.addEnd(task);
+        }
+
+        return createTasks;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queueRuntimeTask</Name>
+				<Source><![CDATA[
+    private void queueRuntimeTask(Batchable _task)
+    {
+        _task.batchInfo().parmGroupId(this.parmCurrentBatch().GroupId);
+        batchHeader.addRuntimeTask(_task, this.parmCurrentBatch().BatchJobId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>effectiveMaxTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resolves the parallel-task count: 0 (auto) uses all available batch sessions;
+    /// an explicit value is capped at the available sessions so we never oversubscribe the cluster.
+    /// </summary>
+    private int effectiveMaxTasks()
+    {
+        int sessions = this.numberOfBatchSessions();
+
+        return maxBatchTaskNum <= 0 ? sessions : min(maxBatchTaskNum, sessions);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>numberOfBatchSessions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Total batch sessions available across batch-enabled AOS servers (capped), mirroring the
+    /// standard pattern used by GUPDiscountClaimProcessBatchHandler / BOMCalcJobItemTaskBatchManager.
+    /// </summary>
+    private int numberOfBatchSessions()
+    {
+        SysServerConfig serverConfig;
+        BatchServerConfig batchServerConfig;
+
+        int sessions = 0;
+
+        select sum(MaxBatchSessions) from batchServerConfig
+            exists join serverConfig
+                where serverConfig.ServerId == batchServerConfig.ServerId
+                   && serverConfig.EnableBatch == NoYes::Yes;
+
+        if (batchServerConfig.MaxBatchSessions)
+        {
+            // Cap total sessions - very high counts cause BatchConstraints blocking overhead.
+            sessions = min(batchServerConfig.MaxBatchSessions, #MaxNumberOfBatchSessions);
+        }
+
+        if (sessions == 0)
+        {
+            sessions = #DefaultNumberOfBatchSessions;
+        }
+
+        return sessions;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addDependencies</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Make <c>_taskToRun</c> wait until every task in <c>_prerequisites</c> has reached a terminal
+    /// state. Uses FinishedOrError so a single failed create task does not block posting of the deals
+    /// that succeeded — the post phase still runs for everything that was created.
+    /// </summary>
+    private void addDependencies(Batchable _taskToRun, List _prerequisites)
+    {
+        ListEnumerator le = _prerequisites.getEnumerator();
+        while (le.moveNext())
+        {
+            batchHeader.addDependency(_taskToRun, le.current(), BatchDependencyStatus::FinishedOrError);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildWeightMap</Name>
+				<Source><![CDATA[
+    private Map buildWeightMap(container _deals)
+    {
+        Map m = new Map(Types::Int64, Types::Integer);
+        for (int i = 1; i <= conLen(_deals); i++)
+        {
+            RefRecId dealRecId = conPeek(_deals, i);
+            TAMRebateTable rt;
+            select count(RecId) from rt where rt.RebateDeal == dealRecId;
+            m.insert(dealRecId, max(1, any2Int(rt.RecId)));
+        }
+
+        return m;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>computeLPTBuckets</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Longest-Processing-Time greedy bin-packing (self-contained; standard computeLPTBuckets is
+    /// 'internal' to RebatesAndDeductions and keyed differently).
+    /// </summary>
+    internal static List computeLPTBuckets(Map _weightByDeal, int _numBuckets)
+    {
+        List buckets = new List(Types::Container);
+        int n = _weightByDeal.elements();
+        if (n == 0 || _numBuckets <= 0)
+        {
+            return buckets;
+        }
+
+        System.Int32[] sortKeys = new System.Int32[n]();   // negated weights =&gt; descending sort
+        System.Int64[] recIds   = new System.Int64[n]();
+        int idx = 0;
+        MapEnumerator me = _weightByDeal.getEnumerator();
+        while (me.moveNext())
+        {
+            sortKeys.SetValue(-(any2Int(me.currentValue())), idx);
+            recIds.SetValue(me.currentKey(), idx);
+            idx++;
+        }
+        System.Array::Sort(sortKeys, recIds);
+
+        container bucketLoads;
+        container bucketCons;
+        for (int b = 1; b <= _numBuckets; b++)
+        {
+            bucketLoads += 0;
+            bucketCons  += [conNull()];
+        }
+
+        for (int r = 0; r < n; r++)
+        {
+            int weight = -(any2Int(CLRInterop::getAnyTypeForObject(sortKeys.GetValue(r))));
+            RefRecId dealRecId = CLRInterop::getAnyTypeForObject(recIds.GetValue(r));
+
+            int target = 1, minLoad = conPeek(bucketLoads, 1);
+            for (int b = 2; b <= _numBuckets; b++)
+            {
+                if (conPeek(bucketLoads, b) < minLoad)
+                {
+                    minLoad = conPeek(bucketLoads, b);
+                    target = b;
+                }
+            }
+            bucketCons  = conPoke(bucketCons, target, conPeek(bucketCons, target) + [dealRecId]);
+            bucketLoads = conPoke(bucketLoads, target, minLoad + weight);
+        }
+
+        for (int b = 1; b <= _numBuckets; b++)
+        {
+            buckets.addEnd(conPeek(bucketCons, b));
+        }
+
+        return buckets;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    internal static ClassDescription description()
+    {
+        return "@MET:RebateCombinedSplitTaskTitle";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRetryable</Name>
+				<Source><![CDATA[
+    [Hookable(false)]
+    public final boolean isRetryable()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    protected boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
