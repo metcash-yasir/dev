@@ -54,10 +54,12 @@ class METSendPEPricingEngine extends SysOperationServiceBase
         METProcessingStatus result;
         Description255      message = "@MET:NoRecordsUpdated";
         container           resultCon;
-
+        boolean             enableStagedCommit = SalesParameters::find().METEnableStagedCommitForPEPricingUpdate;
        
-        ttsbegin;
-        resultCon = this.sendPEHeaderPricing(_sendPEPricingRequest.parmSendPricingHeaderContract(), _sendPEPricingRequest);
+        if(!enableStagedCommit)
+            ttsbegin;
+
+        resultCon = this.sendPEHeaderPricing(_sendPEPricingRequest.parmSendPricingHeaderContract(), _sendPEPricingRequest, enableStagedCommit);
         result = conPeek(resultCon, 1);
         message = conPeek(resultCon, 2);
 
@@ -67,7 +69,9 @@ class METSendPEPricingEngine extends SysOperationServiceBase
         {
             throw Error (message);
         }
-        ttscommit;
+
+        if(!enableStagedCommit)
+            ttscommit;        
     }
 
 ]]></Source>
@@ -82,7 +86,8 @@ class METSendPEPricingEngine extends SysOperationServiceBase
     /// <param name="_sendPEPricingRequest">List of contracts</param>
     /// <returns>Container</returns>
     public container sendPEHeaderPricing(METSendPricingHeaderContract _metSendPricingHeader,
-                                            METSendPEPricingRequest _sendPEPricingRequest)
+                                            METSendPEPricingRequest _sendPEPricingRequest,
+                                            boolean _enableStagedCommit = false)
     {
         SalesTable                              salesTable;
         METProcessingStatus                     result;
@@ -105,10 +110,10 @@ class METSendPEPricingEngine extends SysOperationServiceBase
         {
             throw error ("@MET:METOrderNotFound");
         }
-   
+
         // Update the PE External orderId as a refrence from upstream
-        select firstonly forupdate metSalesTable
-            where metSalesTable.SalesTable == salesTable.RecId;
+        select firstonly metSalesTable
+                where metSalesTable.SalesTable == salesTable.RecId;
 
         //Create update salesLine
         lines = _sendPEPricingRequest.parmsendPEPricingLineClassArray();
@@ -127,36 +132,49 @@ class METSendPEPricingEngine extends SysOperationServiceBase
             firstLineWMSLocationId = InventDim::find(saleslinePre.InventDimId).wMSLocationId;
 
             lineEnumerator = lines.getEnumerator();
-            while (lineEnumerator.moveNext())
-            {
-                sendPricingLineContract = lineEnumerator.current();
-                avoidNegativeQtySalesId = avoidNegativeQtySalesId || (sendPricingLineContract.parmSalesQty() < 0);
 
-                // Kept the condition outside for better understanding/Redability
-                if (sendPricingLineContract.parmInventTransId() == '' &&
+            if(_enableStagedCommit) //Stage#1
+                ttsbegin;
+
+            if (metSalesTable.OrderProcessingStatus == METSalesOrderProcessingStatus::ReadyForPricing ||
+                    metSalesTable.OrderProcessingStatus == METSalesOrderProcessingStatus::RepriceRequired)
+            {
+                while (lineEnumerator.moveNext())
+                {
+                    sendPricingLineContract = lineEnumerator.current();
+                    avoidNegativeQtySalesId = avoidNegativeQtySalesId || (sendPricingLineContract.parmSalesQty() < 0);
+
+                    // Kept the condition outside for better understanding/Redability
+                    if (sendPricingLineContract.parmInventTransId() == '' &&
                     salesTable.SalesType == SalesType::ReturnItem &&
                     metSalesOrderTypes.ExternalInvoiceNumber)
-                {   
-                    continue;
+                    {
+                        continue;
+                    }
+                    resultCon = this.createUpdateSalesLine(_sendPEPricingRequest, sendPricingLineContract, salesTable, firstLineWMSLocationId);
+                    result = conPeek(resultCon, 1);
+                    messageLoc = conPeek(resultCon, 2);
+                    if (result == METProcessingStatus::Error)
+                    {
+                        return [result, messageLoc];
+                    }
                 }
-                resultCon = this.createUpdateSalesLine(_sendPEPricingRequest, sendPricingLineContract, salesTable, firstLineWMSLocationId);
-                result = conPeek(resultCon, 1);
-                messageLoc = conPeek(resultCon, 2);
-                if (result == METProcessingStatus::Error)
-                {
-                    return [result, messageLoc];
-                }
+
+                //Bulk insert records
+                salesLinePriceComList.insertDatabase(); // Bulk insert priceComponent
+                insertCompDetailList.insertDatabase(); // Bulk insert compDetailRecords
+                insertMarkupList.insertDatabase(); // Bulk insert Markup records
             }
 
-            //Bulk insert records
-            salesLinePriceComList.insertDatabase(); // Bulk insert priceComponent
-            insertCompDetailList.insertDatabase(); // Bulk insert compDetailRecords
-            insertMarkupList.insertDatabase(); // Bulk insert Markup records
+            if(_enableStagedCommit) //Stage#1
+                ttscommit;
+
+            
+            if(_enableStagedCommit) //Stage#2
+                ttsbegin;
 
             if (metSalesTable.RecId != 0)
-            {
-                metSalesTable.ExternalOrderNumber = externalPEorderId;
-
+            {              
                 if (metSalesTable.OrderProcessingStatus == METSalesOrderProcessingStatus::RepriceRequired)
                 {
                     WMSPickingRoute  wmsPickingRoute;
@@ -169,6 +187,9 @@ class METSendPEPricingEngine extends SysOperationServiceBase
                     custMDFCalculation.parmWMSPickingRouteID(wmsPickingRoute.pickingRouteID);
                     custMDFCalculation.process();
                 }
+
+                metSalesTable.selectForUpdate(true);
+                metSalesTable.ExternalOrderNumber = externalPEorderId;
 
                 // Added if condition to avoid any edge scenario wrong status update on different status
                 if (metSalesTable.OrderProcessingStatus == METSalesOrderProcessingStatus::ReadyForPricing ||
@@ -185,10 +206,19 @@ class METSendPEPricingEngine extends SysOperationServiceBase
                 metSalesTable.update();
             }
 
+            if(_enableStagedCommit) //Stage#2
+                ttscommit;
+
             // Generate picking list if required
             if (!avoidNegativeQtySalesId) //  Avoid the picking list generation if the sales qty negative which is not expected but added this check to avoid any edge case scenario
-            {
+            {  
+                if(_enableStagedCommit) //Stage#3
+                    ttsbegin;
+
                 this.generatePickingListAndRegister(salesTable);
+                
+                if(_enableStagedCommit) //Stage#3
+                    ttscommit;
             }
 
             // Cancell the salesline post picking list generation if the sales qty is negative which is not expected but added this check to avoid any edge case scenario
@@ -196,20 +226,25 @@ class METSendPEPricingEngine extends SysOperationServiceBase
                 && salesTable.METAllowBackOrders == NoYes::No)
             {
                 SalesLine salesLineLoc;
+
+                if(_enableStagedCommit) //Stage#4
+                    ttsbegin;
+
                 while select forupdate salesLineLoc
                     where salesLineLoc.SalesId == salesTable.SalesId 
                     && salesLineLoc.SalesStatus != SalesStatus::Canceled
                     && salesLineLoc.LineAmount == 0
                 {
                     if (salesLineLoc.pickedInTotalInventUnit() == 0)
-                    {
-                        salesLineLoc.metCancelSalesOrderLine();
+                    {                        
+                        salesLineLoc.metCancelSalesOrderLine();            
                     } 
                 }
-            }
 
-            
-             
+                if(_enableStagedCommit) //Stage#4
+                    ttscommit;
+            }
+           
             result      = METProcessingStatus::Success;
             messageLoc  = "@MET:METPricingSucessfullyProcessed";
  
