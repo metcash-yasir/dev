@@ -597,6 +597,48 @@ public class METOrderExtractScreen extends FormRun
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>clearTmpTable</Name>
+				<Source><![CDATA[
+    public void clearTmpTable()
+    {
+        delete_from metOrderExtractScreenTmp;
+
+        METOrderExtractScreenTmpDS_DS.research();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setTmpSelection</Name>
+				<Source><![CDATA[
+    public void setTmpSelection(SalesId _salesId, NoYes _selected)
+    {
+        ttsbegin;
+
+        if (_selected)
+        {
+            select firstonly forupdate metOrderExtractScreenTmp
+                where metOrderExtractScreenTmp.SalesId == _salesId
+                && metOrderExtractScreenTmp.Selection == NoYes::No;
+        }
+        else
+        {
+            select firstonly forupdate metOrderExtractScreenTmp
+                where metOrderExtractScreenTmp.SalesId == _salesId
+                    && metOrderExtractScreenTmp.Selection == NoYes::Yes;
+        }
+
+        if (metOrderExtractScreenTmp.RecId)
+        {
+            metOrderExtractScreenTmp.Selection = _selected;
+            metOrderExtractScreenTmp.update();
+        }
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>enableOrDisableButtons</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -611,18 +653,15 @@ public class METOrderExtractScreen extends FormRun
         boolean anyProcessing = false;
         if (hasSelection)
         {
-            SalesTable salesTableLoc;
-            MapEnumerator mapEnum = paMarked.getEnumerator();
-            while (mapEnum.moveNext())
-            {
-                select firstonly METProcessing from salesTableLoc
-                    where salesTableLoc.RecId == mapEnum.currentKey();
-                if (salesTableLoc.METProcessing == NoYes::Yes)
-                {
-                    anyProcessing = true;
-                    break;
-                }
-            }
+            SalesTable                  salesTableLoc;
+
+            select firstonly RecId from salesTableLoc
+                where salesTableLoc.METProcessing == NoYes::Yes
+                exists join metOrderExtractScreenTmp
+                    where metOrderExtractScreenTmp.SalesId == salesTableLoc.SalesId
+                    && metOrderExtractScreenTmp.Selection == NoYes::Yes;
+
+            anyProcessing = (salesTableLoc.RecId != 0);
         }
 
         // Enable or disable controls based on selection status
@@ -646,39 +685,24 @@ public class METOrderExtractScreen extends FormRun
     /// <returns>true if none of the marked orders have a picklist; otherwise, false.</returns>
     private boolean checkMarkedOrdersPicklist()
     {
-        str             salesId;
-        str             picklistNumber;
-        SalesTable      salesTableLoc;
-        MapEnumerator   mapEnumerator = paMarked.getEnumerator();
+        SalesTable                  salesTableLoc;
+        WMSPickingRoute             wmsPickingRoute;
 
         if (paMarked.empty())
         {
             return false;
         }
 
-        while (mapEnumerator.moveNext())
-        {
-            salesId = mapEnumerator.currentValue();
-
-            picklistNumber = element.getPickingRouteId(salesId);
-
-            if (picklistNumber)
-            {
-                salesTableLoc = SalesTable::find(salesId);
-
-                if (salesTableLoc.METOrderExtractStatus == METOrderExtractStatus::Open && salesTableLoc.METAllowBackOrders)
-                {
-                    continue;
-                }
-                else
-                {
-                    return false;
-                }
-            }
-        }
-
-        // No picklists found for any marked orders -> UpdateStatus can be enabled
-        return true;
+        select firstonly RecId from metOrderExtractScreenTmp
+                where metOrderExtractScreenTmp.Selection == NoYes::Yes
+            exists join salesTableLoc
+                where salesTableLoc.SalesId == metOrderExtractScreenTmp.SalesId
+                && (salesTableLoc.METOrderExtractStatus != METOrderExtractStatus::Open || salesTableLoc.METAllowBackOrders == NoYes::No)
+            exists join wmsPickingRoute
+                where wmsPickingRoute.transRefId == metOrderExtractScreenTmp.SalesId
+                && wmsPickingRoute.transType == InventTransType::Sales;
+        
+        return metOrderExtractScreenTmp.RecId == 0;
     }
 
 ]]></Source>
@@ -774,6 +798,8 @@ public class METOrderExtractScreen extends FormRun
                     {
                         paMarked.remove(_salesTable.RecId);
                     }
+
+                    element.setTmpSelection(_salesTable.SalesId, NoYes::No);
                 }
                 else
                 {
@@ -781,17 +807,19 @@ public class METOrderExtractScreen extends FormRun
 
                     // To validate any sales order selected which is already Extracted throw an error
                     if (_salesTable.METOrderExtractStatus == METOrderExtractStatus::Extracted)
-                    {   
+                    {
                         error(strFmt("@MET:METSalesOrderAlreadyExtracted", _salesTable.SalesId));
                     }
                     else if (_salesTable.METProcessing == NoYes::Yes)
                     {
                         warning(strFmt("@MET:METOrderExtractingWarning", _salesTable.SalesId));
                         paMarked.insert(_salesTable.RecId, _salesTable.SalesId);
+                        element.setTmpSelection(_salesTable.SalesId, NoYes::Yes);
                     }
                     else
                     {
                         paMarked.insert(_salesTable.RecId, _salesTable.SalesId);
+                        element.setTmpSelection(_salesTable.SalesId, NoYes::Yes);
                     }
 
                 }
@@ -815,6 +843,15 @@ public class METOrderExtractScreen extends FormRun
             if (!selectAll)
             {
                 paMarked = new Map(Types::Int64, Types::String);
+
+                // Keep METOrderExtractScreenTmp.Selection in sync with paMarked's reset here too - this
+                // reset is filter-blind (clears all of paMarked regardless of any grid filter), so the
+                // Selection reset must be equally filter-blind to avoid leaving stale Selection = Yes rows
+                // that main() would still pick up even though the grid shows nothing marked.
+                ttsbegin;
+                update_recordset metOrderExtractScreenTmp
+                    setting Selection = NoYes::No;
+                ttscommit;
             }
             super();
         }
@@ -1117,6 +1154,7 @@ public class METOrderExtractScreen extends FormRun
                     if(!paMarked.exists(salesTableLoc.RecId))
                     {
                         paMarked.insert(salesTableLoc.RecId, salesTableLoc.SalesId);
+                        element.setTmpSelection(salesTableLoc.SalesId, NoYes::Yes);
                         selectAll = true;
                         if (salesTableLoc.METProcessing == NoYes::Yes)
                         {
@@ -1129,14 +1167,15 @@ public class METOrderExtractScreen extends FormRun
                     if(paMarked.exists(salesTableLoc.RecId))
                     {
                         paMarked.remove(salesTableLoc.RecId);
+                        element.setTmpSelection(salesTableLoc.SalesId, NoYes::No);
                     }
                 }
-                // commented below line because we are setting the mark based on the map and not directly marking the record in the grid, 
+                // commented below line because we are setting the mark based on the map and not directly marking the record in the grid,
                 //this is to avoid the refresh issue in the grid when we mark the record which causes issue in selecting multiple records in the grid
                 //SalesTable_ds.editMarkTrans(true, salesTableLoc, NoYes::Yes);
             }
             super();
-            
+
             element.task(#taskRefresh);
             SalesTable_ds.refresh();
             element.enableOrDisableButtons();
@@ -1160,21 +1199,15 @@ public class METOrderExtractScreen extends FormRun
         public void clicked()
         {
             paMarked = new Map(Types::Int64, Types::String);
-            QueryRun qr = SalesTable_ds.queryRun();
-            qr.reset();
 
-            while (qr.next())
-            {
-                SalesTable salesTableLoc = qr.get(tableNum(SalesTable));
-                if(pamarked.exists(salesTableLoc.RecId))
-                {
-                    paMarked.remove(salesTableLoc.RecId);
-                }
-                // commented below line because we are setting the mark based on the map and not directly marking the record in the grid,
-                //SalesTable_ds.editMarkTrans(true, salesTableLoc, NoYes::No);
-            }
+            ttsbegin;
+            update_recordset metOrderExtractScreenTmp
+                setting Selection = NoYes::No;
+            ttscommit;
+
             super();
             element.task(#taskRefresh);
+            SalesTable_ds.refresh();
             element.enableOrDisableButtons();
         }
 
@@ -1328,9 +1361,10 @@ public class METOrderExtractScreen extends FormRun
         /// Clicked method for button
         /// </summary>
         public void clicked()
-        {           
+        {
             super();
-            
+
+            element.clearTmpTable();
             element.cleanupMarkMap(paMarked);
         }
 
