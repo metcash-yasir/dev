@@ -137,9 +137,9 @@ final class METPurchPurchaseOrderLineV2Entity_Extension
         PurchPurchaseOrderLineV2Staging    metStaging;
         DMFEntity                          dmfEntity, dmfParentEntity;
 
-        select firstonly RecId from dmfEntity
+        select firstonly RecId, ParentEntityName from dmfEntity
                 where dmfEntity.EntityName == _dmfDefinitionGroupExecution.Entity
-            join RecId from dmfParentEntity
+            exists join dmfParentEntity
                 where dmfParentEntity.EntityName == dmfEntity.ParentEntityName
                    && dmfParentEntity.EntityType == DMFEntityTypes::CompositEntity;
          
@@ -156,59 +156,64 @@ final class METPurchPurchaseOrderLineV2Entity_Extension
 
             if (!metStaging.RecId)
             {
-                PurchPurchaseOrderHeaderV2Entity::metProcessDataForCompositeEntity(_dmfDefinitionGroupExecution);
-                
+                PurchPurchaseOrderHeaderV2Entity::metProcessDataForCompositeEntity(_dmfDefinitionGroupExecution);                
             } 
         }
 
         PurchLine   purchLine;
         PurchTable  purchTable;
         
-        while select metStaging
+         while select metStaging
+            group by metStaging.PurchaseOrderNumber
             where metStaging.DefinitionGroup == _dmfDefinitionGroupExecution.DefinitionGroup
                 && metStaging.ExecutionId == _dmfDefinitionGroupExecution.ExecutionId
                 && metStaging.TransferStatus == DMFTransferStatus::Completed
+            exists join purchTable
+                where purchTable.PurchId == metStaging.PurchaseOrderNumber
+                && (!purchTable.METIntercompanyTransferReplenishment
+                    || purchTable.InterCompanyOrigin != InterCompanyOrigin::Derived)
+           
         { 
-            purchTable = PurchTable::find(metStaging.PurchaseOrderNumber);
-            // below condition is added to update the PurchUnit only for non intercompany replenishment orders
-            if (metStaging.RecId && (!purchTable.METIntercompanyTransferReplenishment || purchTable.InterCompanyOrigin != InterCompanyOrigin::Derived))
-            {
-                select firstonly forupdate purchLine
-                    where purchLine.ItemId == metStaging.ItemNumber && purchLine.LineNumber == metStaging.LineNumber
-                        && purchLine.PurchId == metStaging.PurchaseOrderNumber;
-             
-                if (purchLine)
-                {
-                    ttsbegin;
-                    // caching the calculated standard price before modifiedField unit price blanks it
-                    PurchPrice  importedPrice       = purchLine.PurchPrice;
-                    LineAmount  importedLineAmount  = purchLine.LineAmount;
-                    DiscPct     importedLinePercent = purchLine.LinePercent;
-                    AmountCur   importedLineDisc    = purchLine.LineDisc;
+            PurchPurchaseOrderLineV2Staging    metStagingLine;
 
-                    if (metStaging.PurchaseUnitSymbol)
-                    {
-                        purchLine.PurchUnit = metStaging.PurchaseUnitSymbol;
-                    }
-                    else
-                    {
-                        purchLine.modifiedField(fieldNum(PurchLine, ItemId));
-                    }
-                    purchLine.modifiedField(fieldNum(PurchLine, PurchUnit));
-                    PurchLine::modifyPurchQty(purchLine, purchLine.inventDim());
-                     
-                    // 2. restoring the price right in case the unit price overrides the unit price
-                    if (importedPrice && purchLine.PurchPrice == 0)
-                    {
-                        purchLine.PurchPrice  = importedPrice;
-                        purchLine.LineAmount  = importedLineAmount;
-                        purchLine.LinePercent = importedLinePercent;
-                        purchLine.LineDisc    = importedLineDisc;
-                    }
-                    purchLine.update();
-                    ttscommit;
+            ttsbegin;
+
+            while select forupdate purchLine
+                join metStagingLine
+                where metStagingLine.DefinitionGroup == _dmfDefinitionGroupExecution.DefinitionGroup
+                    && metStagingLine.ExecutionId    == _dmfDefinitionGroupExecution.ExecutionId
+                    && metStagingLine.TransferStatus == DMFTransferStatus::Completed
+                    && metStagingLine.PurchaseOrderNumber == purchTable.PurchId
+                    && purchLine.PurchId    == metStagingLine.PurchaseOrderNumber
+                    && purchLine.ItemId     == metStagingLine.ItemNumber
+                    && purchLine.LineNumber == metStagingLine.LineNumber
+            {
+                PurchPrice  importedPrice       = purchLine.PurchPrice;
+                LineAmount  importedLineAmount  = purchLine.LineAmount;
+                DiscPct     importedLinePercent = purchLine.LinePercent;
+                AmountCur   importedLineDisc    = purchLine.LineDisc;
+
+                if (metStagingLine.PurchaseUnitSymbol)
+                {
+                    purchLine.PurchUnit = metStagingLine.PurchaseUnitSymbol;
                 }
+                else
+                {
+                    purchLine.modifiedField(fieldNum(PurchLine, ItemId));
+                }
+                purchLine.modifiedField(fieldNum(PurchLine, PurchUnit));
+                PurchLine::modifyPurchQty(purchLine, purchLine.inventDim());
+
+                if (importedPrice && purchLine.PurchPrice == 0)
+                {
+                    purchLine.PurchPrice  = importedPrice;
+                    purchLine.LineAmount  = importedLineAmount;
+                    purchLine.LinePercent = importedLinePercent;
+                    purchLine.LineDisc    = importedLineDisc;
+                }
+                purchLine.update();
             }
+            ttscommit;
         }
         // Update PurchTable manual submission flag after processing the purchase order lines
         PurchPurchaseOrderLineV2Entity::postTargetProcessUpdatePurchTable(_dmfDefinitionGroupExecution);
@@ -232,14 +237,16 @@ final class METPurchPurchaseOrderLineV2Entity_Extension
             from metStaging
             group by PurchaseOrderNumber
             where metStaging.DefinitionGroup == _dmfDefinitionGroupExecution.DefinitionGroup
-               && metStaging.ExecutionId == _dmfDefinitionGroupExecution.ExecutionId              
+               && metStaging.ExecutionId == _dmfDefinitionGroupExecution.ExecutionId 
+               && metStaging.TransferStatus == DMFTransferStatus::Completed
         {             
-            metPurchTable = METPurchTable::find(metStaging.PurchaseOrderNumber);
+            metPurchTable = METPurchTable::find(metStaging.PurchaseOrderNumber, true);
 
             if (metPurchTable.RecId)
             {
+                metPurchTable.skipBusinessEvents(true);          
+ 
                 ttsbegin;
-                metPurchTable.selectForUpdate(true);
                 metPurchTable.setSubmissionFlag();
                 metPurchTable.update();
                 ttscommit;
