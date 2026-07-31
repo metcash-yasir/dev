@@ -284,6 +284,9 @@ final class KPMGSalesInvoiceDP_Extension
         salesInvoiceTmp.METDeliveryFee          =   metSalesLinePriceComponentloc.Value;
         salesInvoiceTmp.METDeliveryFeeExt       =   metSalesLinePriceComponentloc.Value * _custInvoiceTrans.Qty;
 
+        //Bug 405074 - CR - UAT - DEMAND - LIQUOR - Validate that PE Pricing - Raise a manual order in PE as a Bonus Stock Override - did not invoice correctly - start.
+        salesInvoiceTmp.METINDS                 =   salesLine.getSalesLineInvoiceIndicator(true);
+        //Bug 405074 - CR - UAT - DEMAND - LIQUOR - Validate that PE Pricing - Raise a manual order in PE as a Bonus Stock Override - did not invoice correctly - end.
 
         select firstonly TaxValue from metTaxTransStd
             where metTaxTransStd.InventTransId == _custInvoiceTrans.InventTransId;
@@ -442,16 +445,28 @@ final class KPMGSalesInvoiceDP_Extension
 
                 salesInvoiceTmp.lineAmount          = -1 * (abs(_custInvoiceTrans.LineAmount) + salesInvoiceTmp.METRebatesFees);
                 salesInvoiceTmp.LineAmountInclTax   = -1 * lineAmtInclTax;
-                salesInvoiceTmp.METLucInclGST       = (lineAmtInclTax/_custInvoiceTrans.Qty)/salesInvoiceTmp.METPackQty;
+                //salesInvoiceTmp.METLucInclGST       = (lineAmtInclTax/_custInvoiceTrans.Qty)/salesInvoiceTmp.METPackQty;
+                salesInvoiceTmp.METLucExclGST       = -1 * abs(_custInvoiceTrans.LineAmount + salesInvoiceTmp.METRebatesFees);
+                salesInvoiceTmp.METLucInclGST       = -1 * abs(salesInvoiceTmp.METLucExclGST + salesInvoiceTmp.metgstvalue);
             }
             else
             {
                 salesInvoiceTmp.lineAmount          = _custInvoiceTrans.LineAmount + salesInvoiceTmp.METRebatesFees;
                 salesInvoiceTmp.LineAmountInclTax   = salesInvoiceTmp.LineAmount + salesInvoiceTmp.metgstvalue;
 
-                salesInvoiceTmp.METLucInclGST       = (salesInvoiceTmp.LineAmountInclTax/_custInvoiceTrans.Qty)/salesInvoiceTmp.METPackQty;
+                if (_custInvoiceTrans.Qty && salesInvoiceTmp.METPackQty)
+                {
+                    salesInvoiceTmp.METLucInclGST   = (salesInvoiceTmp.LineAmountInclTax/_custInvoiceTrans.Qty)/salesInvoiceTmp.METPackQty;
+                    salesInvoiceTmp.METLucExclGST   = (salesInvoiceTmp.LineAmount/_custInvoiceTrans.Qty)/salesInvoiceTmp.METPackQty;
+                }
+                else
+                {
+                    salesInvoiceTmp.METLucInclGST   = 0;
+                    salesInvoiceTmp.METLucExclGST   = 0;
+                }
             }
         }
+
         else
         {
             salesInvoiceTmp.LineAmountInclTax   = salesInvoiceTmp.LineAmount + salesInvoiceTmp.TaxAmount;
@@ -486,28 +501,31 @@ final class KPMGSalesInvoiceDP_Extension
 
             if (_custInvoiceTrans.SalesUnit == METConstants::unitEach && uomConversion != 0)
             {
-                salesInvoiceTmp.METLucInclGST = (salesInvoiceTmp.metcaseCost * _custInvoiceTrans.METPickedBrokenCases)/ uomConversion;
+                salesInvoiceTmp.METLucInclGST = (salesInvoiceTmp.metcaseCost * salesInvoiceTmp.Qty)/ uomConversion;
                 //salesInvoiceTmp.METLucInclGST = (salesInvoiceTmp.metcaseCost * salesLine.SalesQty)/ uomConversion;
             }
             else
             {
-                salesInvoiceTmp.METLucInclGST = salesInvoiceTmp.metcaseCost * _custInvoiceTrans.METPickedCases;//salesLine.SalesQty;
+                salesInvoiceTmp.METLucInclGST = salesInvoiceTmp.metcaseCost * salesInvoiceTmp.Qty;//salesLine.SalesQty;
             }
             // change value to -ve for return type
             if (salestableloc.SalesType == SalesType::ReturnItem)
             {
-                METComponentCode            componentCode;
-                METSalesLinePriceComponent  priceComponent;
+                METSalesLinePriceComponentTmp priceComponentTmp;
 
-                select firstonly priceComponent
-                    where priceComponent.InventTransId == salesLine.InventTransId
-                    join componentCode
-                    where componentCode.Component == priceComponent.Component
-                    && componentCode.PriceComponent == METPriceComponent::BasePrice;
+                priceComponentTmp.linkPhysicalTableInstance(METSalesPriceComponents::construct(salesLine.salesTable().SalesType).insertTmp(salesLine));
 
-                if (priceComponent.RecId)
+                select firstonly priceComponentTmp
+                    where priceComponentTmp.PriceComponent == METPriceComponent::NetAmount;
+
+                select sum(value) from metSalesLinePriceComponentloc
+                    where metSalesLinePriceComponentloc.Component == METConstants::brokenCaseFee && metSalesLinePriceComponentloc.InventTransId == salesLine.inventtransid;
+
+                if (priceComponentTmp.RecId)
                 {
-                    salesInvoiceTmp.METLucInclGST = -1 * abs(salesLine.QtyOrdered * priceComponent.Value);
+                    salesInvoiceTmp.METLucInclGST = -1 * abs(priceComponentTmp.ExtValue + salesInvoiceTmp.METWETValue + salesInvoiceTmp.METDeliveryFee + salesInvoiceTmp.METGSTTotal + metSalesLinePriceComponentloc.Value);
+
+                    salesInvoiceTmp.METLucExclGST = -1 * abs(salesInvoiceTmp.METLucInclGST - salesInvoiceTmp.METGSTTotal);
                 }
 
                 //salesInvoiceTmp.METLucInclGST = -1 * abs(salesInvoiceTmp.METLucInclGST);
@@ -516,8 +534,17 @@ final class KPMGSalesInvoiceDP_Extension
             if(salesInvoiceTmp.Qty && salesInvoiceTmp.METPackQty)
             {
                 real totalPriceExclGSTForLUC = salesInvoiceTmp.METLucInclGST - salesInvoiceTmp.METGSTTotal;
-                salesInvoiceTmp.METLucExclGST = (totalPriceExclGSTForLUC / salesInvoiceTmp.Qty) / salesInvoiceTmp.METPackQty;
-                // salesInvoiceTmp.METLucExclGST       = (totalPriceExclGST/salesInvoiceTmp.Qty)/salesInvoiceTmp.METPackQty;
+                
+                if (!salesInvoiceTmp.METLucExclGST)
+                {
+                    salesInvoiceTmp.METLucExclGST = (totalPriceExclGSTForLUC / salesInvoiceTmp.Qty) / salesInvoiceTmp.METPackQty;
+                    // salesInvoiceTmp.METLucExclGST       = (totalPriceExclGST/salesInvoiceTmp.Qty)/salesInvoiceTmp.METPackQty;
+
+                    if (salestableloc.SalesType == SalesType::ReturnItem)
+                    {
+                        salesInvoiceTmp.METLucExclGST = -1 * abs(salesInvoiceTmp.METLucExclGST);
+                    }
+                }
             }
             else
             {
@@ -534,6 +561,16 @@ final class KPMGSalesInvoiceDP_Extension
                 where metTaxTransStd.InventTransId == _custInvoiceTrans.InventTransId && (metTaxTransStd.TaxCode == METConstants::WEG || metTaxTransStd.TaxCode == METConstants::GST);
             salesInvoiceTmp.METSupplierInvoiceGST =  abs(metTaxTransStd.SourceTaxAmountCur);
         }
+
+        //Bug 405074 - CR - UAT - DEMAND - LIQUOR - Validate that PE Pricing - Raise a manual order in PE as a Bonus Stock Override - did not invoice correctly - start.
+        if (salesInvoiceTmp.METINDS == METConstants::BonusInd)
+        {
+            salesInvoiceTmp.METCaseCost = 0;
+            salesInvoiceTmp.METLucInclGST = (salestableloc.SalesType == SalesType::ReturnItem) ? salesInvoiceTmp.METLucInclGST : salesInvoiceTmp.METDeliveryFee;
+            salesInvoiceTmp.METLucExclGST = 0;
+        }
+        //Bug 405074 - CR - UAT - DEMAND - LIQUOR - Validate that PE Pricing - Raise a manual order in PE as a Bonus Stock Override - did not invoice correctly - end.
+
     }
 
 ]]></Source>
