@@ -13,7 +13,8 @@ class METStockReservation
     METCustParameters metCustParameters;
     CustGroupId       custGroupId;
     boolean           lineSubstituted;
-    
+    METSalesOrderExtractionId extractionId;
+
     //CB238 - xDock
     InventParameters inventParameter;
     boolean isCrossDockOrCSDOrder;
@@ -534,6 +535,8 @@ class METStockReservation
         if (lineSubstituted)
         {
             ttsbegin;
+            //update recordset
+
             METSalesTable metSalesTable = METSalesTable::findByRefRecId(salesTable.RecId, true);
             if (metSalesTable)
             {
@@ -545,6 +548,29 @@ class METStockReservation
             // Step 4: Call TMS engine
             METTMSEngineOrderProccess  METTMSEngineOrderProccess = METTMSEngineOrderProccess::construct(METTMSEngineExecutionMode::SalesOrderCreation, salesTable);
             METTMSEngineOrderProccess.run();
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>endProcessForLines</Name>
+				<Source><![CDATA[
+    private void endProcessForLines()
+    {
+        if (lineSubstituted)
+        {
+            METSalesOrderExtractionLine extractionLine;
+
+            ttsbegin;
+
+            update_recordset extractionLine
+                setting LineSubstituted = NoYes::Yes
+                where extractionLine.SalesId == salesTable.SalesId
+                && extractionLine.ExtractionId == extractionId
+                && extractionLine.LineSubstituted == NoYes::No;
+
             ttscommit;
         }
     }
@@ -632,6 +658,246 @@ class METStockReservation
         else
         {
             ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processV2ForLines</Name>
+				<Source><![CDATA[
+    public void processV2ForLines(container _salesLineRecIdList, METSalesOrderExtractionId _extractionId = '')
+    {
+        try
+        {
+            extractionId = _extractionId;
+            procMetrics = METProcMetricsScope::current();
+
+            //Reserves stock.
+            this.reserveStockV2ForLines(_salesLineRecIdList);
+
+            //CB238 - if the sales order is an internal cross dock order or the warehouse is a CSD warehouse
+            //then do not perform substitution, the substitution will be performed during transfer order extraction.
+            if(!isCrossDockOrCSDOrder
+                && !isIntercompanyTransferFulfillment)
+            {
+                //Optimises sales order.
+                this.optimiseSalesOrderForLines(_salesLineRecIdList);
+
+                if (lineSubstituted)
+                {
+                    //Re-reserves after sales order optimization.
+                    this.reserveStockV2ForLines(_salesLineRecIdList);
+                }
+            }
+            else
+            {
+                //if the Sales order is internal cross dock order and the parameter reserve item automatically is enabled, then attempt reservation .
+                if(inventParameter.InventTransferAutoReservation == NoYes::Yes
+                    && !isIntercompanyTransferFulfillment)
+                {
+                    //Optimises sales order.
+                    this.optimiseSalesOrderForLines(_salesLineRecIdList);
+
+                    if (lineSubstituted)
+                    {
+                        //Re-reserves after sales order optimization.
+                        this.reserveStockV2ForLines(_salesLineRecIdList);
+                    }
+                }
+
+            }
+            //Ends process update
+            this.endProcessForLines();
+
+            Info("@MET:StockReserved");
+        }
+        catch
+        {
+            warning("@MET:METStockReservationError");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reserveStockV2ForLines</Name>
+				<Source><![CDATA[
+    private void reserveStockV2ForLines(container _salesLineRecIdList)
+    {
+        this.reserveV2ForLines(_salesLineRecIdList);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>reserveV2ForLines</Name>
+				<Source><![CDATA[
+    private void reserveV2ForLines(container _salesLineRecIdList)
+    {
+        SalesLine                salesLine;
+        METSalesLine             metSalesLine;
+        InventTrans              inventTrans;
+        InventTransOrigin        inventTransOrigin;
+        InventDim                inventDim;
+        InventMovement           inventMovement;
+        InventUpd_WHSReservation whsReservation;
+        InventSum                availSum;
+        InventDim                whsCheckDim;
+        int                      batchCount;
+        boolean                  batchOpen;
+        int                      i;
+
+        for (i = 1; i <= conLen(_salesLineRecIdList); i++)
+        {
+            RefRecId lineRecId = conPeek(_salesLineRecIdList, i);
+
+            select firstonly salesLine
+                    where salesLine.RecId       == lineRecId
+                    &&    salesLine.SalesId     == salesTable.SalesId
+                    &&    salesLine.SalesStatus == SalesStatus::Backorder
+                join inventDim
+                    where inventDim.InventDimId == salesLine.InventDimId
+                join inventTrans
+                    where inventTrans.StatusIssue == StatusIssue::OnOrder
+                join RecId from inventTransOrigin
+                    where inventTransOrigin.RecId == inventTrans.InventTransOrigin
+                    &&    inventTransOrigin.InventTransId == salesLine.InventTransId
+                exists join metSalesLine
+                    where metSalesLine.SalesLine == salesLine.RecId
+                    &&    (metSalesLine.ReasonId  != METConstants::NIRReasonCode
+                    &&     metSalesLine.ReasonId  != METConstants::NewReasonCode);
+
+            if (!salesLine.RecId)
+            {
+                continue;
+            }
+
+            if (!batchOpen)
+            {
+                this.ttsBeginTrace();
+                batchOpen = true;
+            }
+
+            if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+            {
+                select sum(AvailPhysical), sum(pdsCWAvailPhysical) from availSum
+                  exists join whsCheckDim
+                      where whsCheckDim.inventDimId      == availSum.inventDimId
+                      &&    whsCheckDim.InventSiteId     == inventDim.InventSiteId
+                      &&    whsCheckDim.InventLocationId == inventDim.InventLocationId
+                      &&    availSum.ItemId              == salesLine.ItemId;
+
+                if (availSum.pdsCWAvailPhysical > 0)
+                {
+                    InventQty      reserveQty   = -min(abs(inventTrans.Qty),      availSum.AvailPhysical);
+                    PdsCWInventQty reserveCWQty = -min(abs(inventTrans.PdsCWQty), availSum.pdsCWAvailPhysical);
+
+                    inventMovement = inventMovement::constructNoThrow(salesLine);
+                    whsReservation = InventUpd_Reservation::newMovement(inventMovement, reserveQty, true, false, false, reserveCWQty);
+                    whsReservation.parmPdsCWForceActual(true);
+                    whsReservation.updateNow();
+
+                    if (procMetrics)
+                    {
+                        procMetrics.incDescriptionCount(3, 1);
+                    }
+                }
+            }
+            else
+            {
+                inventMovement = inventMovement::constructNoThrow(salesLine);
+                whsReservation = InventUpd_Reservation::newMovement(inventMovement, inventTrans.Qty, true);
+                whsReservation.updateNow();
+
+                if (procMetrics)
+                {
+                    procMetrics.incDescriptionCount(3, 1);
+                }
+            }
+
+            batchCount++;
+
+            if (batchCount >= batchTransactionCommit)
+            {
+                this.ttsCommitTrace(3);
+                batchOpen = false;
+                batchCount = 0;
+            }
+        }
+
+        if (batchOpen)
+        {
+            this.ttsCommitTrace(3);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>optimiseSalesOrderForLines</Name>
+				<Source><![CDATA[
+    private void optimiseSalesOrderForLines(container _salesLineRecIdList)
+    {
+        ttsbegin;
+        this.substituteSalesLineForLines(_salesLineRecIdList);
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>substituteSalesLineForLines</Name>
+				<Source><![CDATA[
+    private void substituteSalesLineForLines(container _salesLineRecIdList)
+    {
+        METSubstitutionSalesLineProcess subSalesLineProcess;
+        SalesLine                       salesLine;
+        METSalesLine                    metSalesLine;
+        InventTransOrigin               inventTransOrigin;
+        InventTrans                     inventTrans, inventTransReserved;
+        int                              i;
+
+        for (i = 1; i <= conLen(_salesLineRecIdList); i++)
+        {
+            RefRecId lineRecId = conPeek(_salesLineRecIdList, i);
+
+            select firstonly salesLine
+                where salesLine.RecId       == lineRecId
+                &&    salesLine.SalesId     == salesTable.SalesId
+                &&    salesLine.SalesStatus == SalesStatus::Backorder
+             join RecId from  metSalesLine
+                where metSalesLine.SalesLine == salesLine.RecId
+                &&    (metSalesLine.ReasonId  != METConstants::NIRReasonCode
+                &&     metSalesLine.ReasonId  != METConstants::NewReasonCode)
+            join InventTransId, RecId from inventTransOrigin
+                where inventTransOrigin.InventTransId == salesLine.InventTransId
+            exists join RecId from inventTrans
+                where inventTrans.StatusIssue == StatusIssue::OnOrder &&
+                inventTrans.InventTransOrigin == inventTransOrigin.RecId
+            notexists join RecId from inventTransReserved
+                where inventTransReserved.StatusIssue == StatusIssue::ReservPhysical &&
+                inventTransReserved.InventTransOrigin == inventTransOrigin.RecId;
+
+            if (!salesLine.RecId)
+            {
+                continue;
+            }
+
+            subSalesLineProcess = METSubstitutionSalesLineProcess::construct(salesLine, salesLine.inventDim());
+
+            if (subSalesLineProcess.run() && !lineSubstituted)
+            {
+                lineSubstituted = true;
+            }
+            else if (isCrossDockOrCSDOrder)
+            {
+                subSalesLineProcess = METSubstitutionSalesLineProcess::construct(salesLine, salesLine.metInventDimSupplyingWarehouse());
+                if (subSalesLineProcess.run() && !lineSubstituted)
+                {
+                    lineSubstituted = true;
+                }
+            }
         }
     }
 

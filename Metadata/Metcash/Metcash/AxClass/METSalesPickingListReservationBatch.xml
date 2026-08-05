@@ -1,0 +1,1389 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesPickingListReservationBatch</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
+{
+    container                   salesOrderList;
+    container                   csdSalesOrderList;
+    str                         csdGuid;
+    boolean                     continueFromStagingLane;
+    InventLocationId            extractionInventLocationId;
+    METSalesOrderExtractionId   extractionId;
+    container                   processedSalesContainer;
+    container                   conShipmentIds;
+    utcdatetime                 csdOrderExtractDateTime;
+    container                   allBucketsCon;
+    boolean                     useLineLevelThreading;
+
+    DialogField                 dlgOrderCount;
+    DialogField                 dlgExtractionId;
+
+    #define.CurrentVersion(1)
+    #localmacro.CurrentList
+        salesOrderList,
+        csdSalesOrderList,
+        csdGuid,
+        continueFromStagingLane,
+        extractionInventLocationId,
+        extractionId,
+        processedSalesContainer,
+        conShipmentIds,
+        csdOrderExtractDateTime,
+        allBucketsCon,
+        useLineLevelThreading
+    #endmacro
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>construct</Name>
+				<Source><![CDATA[
+    public static METSalesPickingListReservationBatch construct(
+        container            _salesOrderList,
+        container            _csdSalesOrderList,
+        str                  _csdGuid,
+        boolean              _continueFromStagingLane,
+        InventLocationId     _extractionInventLocationId,
+        boolean              _useLineLevelThreading)
+    {
+        METSalesPickingListReservationBatch batch = new METSalesPickingListReservationBatch();
+
+        batch.salesOrderList             = _salesOrderList;
+        batch.csdSalesOrderList          = _csdSalesOrderList;
+        batch.csdGuid                    = _csdGuid;
+        batch.continueFromStagingLane    = _continueFromStagingLane;
+        batch.extractionInventLocationId = _extractionInventLocationId;
+        batch.useLineLevelThreading      = _useLineLevelThreading;
+
+        return batch;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dialog</Name>
+				<Source><![CDATA[
+    public Object dialog()
+    {
+        DialogRunbase dialog = super();
+
+        if (!extractionId)
+        {
+            METSalesOrderExtractionTable extractionHeaderPreview;
+            extractionHeaderPreview.initValue();
+            extractionId = extractionHeaderPreview.ExtractionId;
+        }
+
+        dlgOrderCount   = dialog.addFieldValue(extendedtypestr(Integer), conLen(salesOrderList), "@MET:METSelectedOrderCount");
+        dlgExtractionId = dialog.addFieldValue(extendedtypestr(METSalesOrderExtractionId), extractionId, "@MET:METExtractionIdLabel");
+
+        dlgOrderCount.allowEdit(false);
+        dlgExtractionId.allowEdit(false);
+
+        return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>pack</Name>
+				<Source><![CDATA[
+    public container pack()
+    {
+        return [#CurrentVersion, #CurrentList, super()];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>unpack</Name>
+				<Source><![CDATA[
+    public boolean unpack(container _packedClass)
+    {
+        Version   version = RunBase::getVersion(_packedClass);
+        container baseCon;
+
+        switch (version)
+        {
+            case #CurrentVersion:
+                [version, #CurrentList, baseCon] = _packedClass;
+                super(baseCon);
+                break;
+            default:
+                return false;
+        }
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>mustGoBatch</Name>
+				<Source><![CDATA[
+    public boolean mustGoBatch()
+    {
+        return !useLineLevelThreading;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>canRunInNewSession</Name>
+				<Source><![CDATA[
+    public boolean canRunInNewSession()
+    {
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>description</Name>
+				<Source><![CDATA[
+    public static ClassDescription description()
+    {
+        return "@MET:MetPickingListGeneration";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runStartTask</Name>
+				<Source><![CDATA[
+    protected void runStartTask()
+    {
+        int i;
+
+        ttsbegin;
+
+        for (i = 1; i <= conLen(salesOrderList); i++)
+        {
+            SalesId    currentSalesId = conPeek(salesOrderList, i);
+            SalesTable salesTableToUpdate;
+            salesTableToUpdate.skipBusinessEvents(true);
+            select firstonly forupdate salesTableToUpdate where salesTableToUpdate.SalesId == currentSalesId;
+            if (salesTableToUpdate.RecId && (salesTableToUpdate.METOrderExtractStatus == METOrderExtractStatus::Open || salesTableToUpdate.METOrderExtractStatus == METOrderExtractStatus::ReadyForExtract))
+            {
+                salesTableToUpdate.METProcessing = NoYes::Yes;
+                salesTableToUpdate.doUpdate();
+            }
+        }
+
+        ttscommit;
+
+        if (!useLineLevelThreading)
+        {
+            METSalesPickingListGenerationContract v1Contract = new METSalesPickingListGenerationContract();
+            v1Contract.parmSalesOrderList(salesOrderList);
+            v1Contract.parmCSDSalesOrderList(csdSalesOrderList);
+            v1Contract.parmCsdGuid(csdGuid);
+            v1Contract.parmContinueFromStagingLane(continueFromStagingLane);
+
+            new METSalesPickingListGenerationService().process(v1Contract);
+            return;
+        }
+
+        SalesId                       salesIdLocal;
+        MetShipmentId                 metShipmentId;
+        METCustParameters             metCustParameters = METCustParameters::Find();
+        utcdatetime                   curDateTime = DateTimeUtil::getSystemDateTime();
+        METSalesOrderExtractionTable  extractionHeader;
+        METSalesOrderExtractionLine   extractionLine;
+        int                           taskCount;
+
+        ttsbegin;
+
+        if (extractionId)
+        {
+            extractionHeader.ExtractionId = extractionId;
+        }
+        extractionHeader.initValue();
+        extractionHeader.InventLocationId = extractionInventLocationId;
+        extractionHeader.ExtractionStatus = METSalesOrderExtractionStatus::Pending;
+        extractionHeader.Exported         = NoYes::No;
+        extractionHeader.insert();
+
+        extractionId = extractionHeader.ExtractionId;
+
+        for (i = 1; i <= conLen(salesOrderList); i++)
+        {
+            extractionLine.clear();
+            extractionLine.ExtractionId     = extractionId;
+            extractionLine.SalesId          = conPeek(salesOrderList, i);
+            extractionLine.ExtractionStatus = METSalesOrderExtractionStatus::Pending;
+            extractionLine.insert();
+        }
+
+        ttscommit;
+
+        ttsbegin;
+
+        for (i = 1; i <= conLen(salesOrderList); i++)
+        {
+            str actionToPerform;
+
+            salesIdLocal = conPeek(salesOrderList, i);
+
+            if (SalesTable::find(salesIdLocal).CredManInCreditControl)
+            {
+                warning(strFmt("@MET:SOCredMgmtValidation", salesIdLocal));
+                continue;
+            }
+
+            METOrderShipmentLoadCreation shipmentLoadCreation = METOrderShipmentLoadCreation::construct(METOrderTransactionType::SalesOrder, salesIdLocal);
+            metShipmentId = shipmentLoadCreation.createShippmentLoad(true, true);
+
+            if (conFind(conShipmentIds, metShipmentId) == 0)
+            {
+                conShipmentIds += [metShipmentId];
+            }
+
+            this.stampCsdExtractDateTime(csdSalesOrderList, salesIdLocal, curDateTime);
+
+            actionToPerform = this.decideActionToPerform(salesIdLocal);
+            this.stampActionToPerformOnExtractionLine(extractionId, salesIdLocal, actionToPerform);
+
+            processedSalesContainer += salesIdLocal;
+        }
+
+        if (conLen(processedSalesContainer) == 0)
+        {
+            ttsabort;
+            return;
+        }
+
+        ttscommit;
+
+        csdOrderExtractDateTime = curDateTime;
+
+        taskCount     = metCustParameters.SalesExtractionBatchLineTaskCount > 0 ? metCustParameters.SalesExtractionBatchLineTaskCount : 1;
+        allBucketsCon = this.buildLineTaskBuckets(processedSalesContainer, taskCount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBatchIdentifiersRangeCon</Name>
+				<Source><![CDATA[
+    protected container getBatchIdentifiersRangeCon()
+    {
+        container res;
+        int       i;
+
+        for (i = 1; i <= conLen(allBucketsCon); i++)
+        {
+            if (conLen(conPeek(allBucketsCon, i)) > 0)
+            {
+                res += int2str(i);
+            }
+        }
+
+        return res;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>decideActionToPerform</Name>
+				<Source><![CDATA[
+    private str decideActionToPerform(SalesId _salesId)
+    {
+        str                actionToPerfrom;
+        SalesTable         salesTable      = SalesTable::find(_salesId);
+        METSalesTable      metSalesTable   = METSalesTable::findByRefRecId(salesTable.RecId);
+        InventParameters   inventParameter = InventParameters::find();
+        InventLocation     inventLocation  = InventLocation::find(salesTable.InventLocationId);
+
+        if (inventParameter.METSupplyFromTransfer == NoYes::Yes) //Food entity
+        {
+            if (metSalesTable.InternalCrossDockOrder == NoYes::Yes  &&
+                inventLocation.METCSDWarehouse == NoYes::No         &&
+                inventLocation.METPickDirector == NoYes::No         &&
+                inventLocation.METWaveRequired == NoYes::No)
+            {
+                actionToPerfrom = METConstants::SOExtractCreateOnlyTO;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    salesTable.METAllowBackOrders == NoYes::No          &&
+                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                    inventLocation.METPickDirector == NoYes::No         &&
+                    inventLocation.METWaveRequired == NoYes::Yes)
+            {
+                actionToPerfrom = METConstants::SOExtractOrderedSOPickOnly;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    salesTable.METAllowBackOrders == NoYes::No          &&
+                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                    inventLocation.METPickDirector == NoYes::Yes        &&
+                    inventLocation.METWaveRequired == NoYes::Yes)
+            {
+                actionToPerfrom = METConstants::SOExtractUpdateStatusOnly;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    salesTable.METAllowBackOrders == NoYes::No          &&
+                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                    inventLocation.METPickDirector == NoYes::No         &&
+                    inventLocation.METWaveRequired == NoYes::No)
+            {
+                actionToPerfrom = METConstants::SOExtractUpdateStatusOnly;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    salesTable.METAllowBackOrders == NoYes::No          &&
+                    inventLocation.METCSDWarehouse == NoYes::No         &&
+                    inventLocation.METPickDirector == NoYes::No         &&
+                    inventLocation.METWaveRequired == NoYes::No)
+            {
+                actionToPerfrom = METConstants::SOExtractReservedSOPickOnly;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    salesTable.METAllowBackOrders == NoYes::Yes         &&
+                    inventLocation.METCSDWarehouse == NoYes::No         &&
+                    inventLocation.METPickDirector == NoYes::No         &&
+                    inventLocation.METWaveRequired == NoYes::No)
+            {
+                actionToPerfrom = METConstants::SOExtractReservedSOPickOnly;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    salesTable.METAllowBackOrders == NoYes::Yes         &&
+                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                    inventLocation.METPickDirector == NoYes::Yes        &&
+                    inventLocation.METWaveRequired == NoYes::Yes)
+            {
+                actionToPerfrom = METConstants::SOExtractUpdateStatusOnly;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    salesTable.METAllowBackOrders == NoYes::Yes         &&
+                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                    inventLocation.METPickDirector == NoYes::No         &&
+                    inventLocation.METWaveRequired == NoYes::Yes)
+            {
+                actionToPerfrom = METConstants::SOExtractOrderedSOPickOnly;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    salesTable.METAllowBackOrders == NoYes::Yes         &&
+                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                    inventLocation.METPickDirector == NoYes::No         &&
+                    inventLocation.METWaveRequired == NoYes::No)
+            {
+                actionToPerfrom = METConstants::SOExtractUpdateStatusOnly;
+            }
+            else
+            {
+                actionToPerfrom = METConstants::SOExtractSkip;
+            }
+        }
+        else // Liquor entity
+        {
+            if (metSalesTable.InternalCrossDockOrder == NoYes::Yes  &&
+                salesTable.METAllowBackOrders == NoYes::Yes         &&
+                inventLocation.METCSDWarehouse == NoYes::No         &&
+                inventLocation.METPickDirector == NoYes::No         &&
+                inventLocation.METWaveRequired == NoYes::No)
+            {
+                actionToPerfrom = METConstants::SOExtractReservedSOPickAndTO;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::Yes     &&
+                salesTable.METAllowBackOrders == NoYes::No                  &&
+                inventLocation.METCSDWarehouse == NoYes::No                 &&
+                inventLocation.METPickDirector == NoYes::No                 &&
+                inventLocation.METWaveRequired == NoYes::No)
+            {
+                actionToPerfrom = METConstants::SOExtractReservedSOPickAndTO;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    salesTable.METAllowBackOrders == NoYes::No          &&
+                    inventLocation.METCSDWarehouse == NoYes::No         &&
+                    inventLocation.METPickDirector == NoYes::No         &&
+                    inventLocation.METWaveRequired == NoYes::No)
+            {
+                actionToPerfrom = METConstants::SOExtractReservedSOPickOnly;
+            }
+            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                    salesTable.METAllowBackOrders == NoYes::Yes         &&
+                    inventLocation.METCSDWarehouse == NoYes::No         &&
+                    inventLocation.METPickDirector == NoYes::No         &&
+                    inventLocation.METWaveRequired == NoYes::No)
+            {
+                actionToPerfrom = METConstants::SOExtractReservedSOPickOnly;
+            }
+            else
+            {
+                actionToPerfrom = METConstants::SOExtractSkip;
+            }
+        }
+
+        return actionToPerfrom;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stampActionToPerformOnExtractionLine</Name>
+				<Source><![CDATA[
+    private void stampActionToPerformOnExtractionLine(METSalesOrderExtractionId _extractionId, SalesId _salesId, str _actionToPerform)
+    {
+        METSalesOrderExtractionLine extractionLine = METSalesOrderExtractionLine::find(_extractionId, _salesId, true);
+
+        if (extractionLine.RecId)
+        {
+            extractionLine.ActionToPerform = _actionToPerform;
+            extractionLine.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildLineTaskBuckets</Name>
+				<Source><![CDATA[
+    private container buildLineTaskBuckets(container _salesIdContainer, int _taskCount)
+    {
+        SalesLine  salesLine;
+        Map        itemLineMap  = new Map(Types::String, Types::Container);
+        List       itemIdList   = new List(Types::String);
+        Map        bucketSizeMap = new Map(Types::Integer, Types::Integer);
+        container  bucketLines;
+        container  itemIdArr;
+        int        i, b, k;
+
+        for (i = 1; i <= _taskCount; i++)
+        {
+            bucketLines += [conNull()];
+            bucketSizeMap.insert(i, 0);
+        }
+
+        for (i = 1; i <= conLen(_salesIdContainer); i++)
+        {
+            SalesId salesIdLocal = conPeek(_salesIdContainer, i);
+
+            while select salesLine
+                where salesLine.SalesId     == salesIdLocal
+                   && salesLine.SalesStatus != SalesStatus::Canceled
+            {
+                container existingLines = itemLineMap.exists(salesLine.ItemId) ? itemLineMap.lookup(salesLine.ItemId) : conNull();
+
+                if (!itemLineMap.exists(salesLine.ItemId))
+                {
+                    itemIdList.addEnd(salesLine.ItemId);
+                }
+
+                itemLineMap.insert(salesLine.ItemId, existingLines + salesLine.RecId);
+            }
+        }
+
+        ListEnumerator itemEnum = itemIdList.getEnumerator();
+        while (itemEnum.moveNext())
+        {
+            itemIdArr += itemEnum.current();
+        }
+
+        for (i = 1; i < conLen(itemIdArr); i++)
+        {
+            int maxIdx = i;
+
+            for (k = i + 1; k <= conLen(itemIdArr); k++)
+            {
+                if (conLen(itemLineMap.lookup(conPeek(itemIdArr, k))) > conLen(itemLineMap.lookup(conPeek(itemIdArr, maxIdx))))
+                {
+                    maxIdx = k;
+                }
+            }
+
+            if (maxIdx != i)
+            {
+                str tmp   = conPeek(itemIdArr, i);
+                itemIdArr = conPoke(itemIdArr, i, conPeek(itemIdArr, maxIdx));
+                itemIdArr = conPoke(itemIdArr, maxIdx, tmp);
+            }
+        }
+
+        for (i = 1; i <= conLen(itemIdArr); i++)
+        {
+            str        itemId         = conPeek(itemIdArr, i);
+            container  linesForItem   = itemLineMap.lookup(itemId);
+            int        smallestBucket = 1;
+            int        smallestSize   = bucketSizeMap.lookup(1);
+
+            for (b = 2; b <= _taskCount; b++)
+            {
+                int bSize = bucketSizeMap.lookup(b);
+
+                if (bSize < smallestSize)
+                {
+                    smallestSize   = bSize;
+                    smallestBucket = b;
+                }
+            }
+
+            bucketLines = conPoke(bucketLines, smallestBucket, conPeek(bucketLines, smallestBucket) + linesForItem);
+            bucketSizeMap.insert(smallestBucket, smallestSize + conLen(linesForItem));
+        }
+
+        return bucketLines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>stampCsdExtractDateTime</Name>
+				<Source><![CDATA[
+    private void stampCsdExtractDateTime(container _csdSalesOrderList, SalesId _salesId, utcdatetime _extractedDateTime)
+    {
+        #OCCRetryCount
+
+        try
+        {
+            if (conFind(_csdSalesOrderList, _salesId) > 0)
+            {
+                SalesTable salesTable = SalesTable::find(_salesId, true);
+
+                if (salesTable)
+                {
+                    salesTable.skipDataMethods(true);
+                    salesTable.skipBusinessEvents(true);
+                    salesTable.METOrderExtractDateTime = _extractedDateTime;
+                    salesTable.update();
+                }
+            }
+        }
+        catch (Exception::Deadlock)
+        {
+            retry;
+        }
+        catch (Exception::UpdateConflict)
+        {
+            if (appl.ttsLevel() == 0)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    throw Exception::UpdateConflictNotRecovered;
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            else
+            {
+                throw Exception::UpdateConflict;
+            }
+        }
+        catch (Exception::Error)
+        {
+            throw error("@SYS93835");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runThreadTask</Name>
+				<Source><![CDATA[
+    protected void runThreadTask()
+    {
+        #OCCRetryCount
+        container  lineRecIdContainer = conPeek(allBucketsCon, str2int(batchIdentifier));
+        int        i;
+
+        for (i = 1; i <= conLen(lineRecIdContainer); i++)
+        {
+            RefRecId lineRecId = conPeek(lineRecIdContainer, i);
+
+            try
+            {
+                SalesLine salesLineLocal = SalesLine::findRecId(lineRecId, true);
+
+                if (salesLineLocal.RecId)
+                {
+                    str lineActionToPerform = this.readStoredActionToPerform(extractionId, salesLineLocal.SalesId);
+
+                    this.performGuideCheckForLine(salesLineLocal);
+
+                    if (lineActionToPerform == METConstants::SOExtractReservedSOPickAndTO
+                     || lineActionToPerform == METConstants::SOExtractReservedSOPickOnly)
+                    {
+                        SalesTable reservationSalesTable = salesLineLocal.salesTable();
+                        METStockReservation::construct(reservationSalesTable).processV2ForLines([lineRecId], extractionId);
+                    }
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                retry;
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>readStoredActionToPerform</Name>
+				<Source><![CDATA[
+    private str readStoredActionToPerform(METSalesOrderExtractionId _extractionId, SalesId _salesId)
+    {
+        METSalesOrderExtractionLine extractionLine = METSalesOrderExtractionLine::find(_extractionId, _salesId);
+
+        return extractionLine.ActionToPerform;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildSalesUpdateRemain</Name>
+				<Source><![CDATA[
+    private SalesUpdateRemain buildSalesUpdateRemain()
+    {
+        SalesUpdateRemain salesUpdateRemainLocal = SalesUpdateRemain::construct();
+        salesUpdateRemainLocal.metParmIsExtraction(true);
+        salesUpdateRemainLocal.parmSkipBusinessEvents(true);
+
+        return salesUpdateRemainLocal;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>performGuideCheckForLine</Name>
+				<Source><![CDATA[
+    public void performGuideCheckForLine(SalesLine _salesLine)
+    {
+        SalesLine               salesLine;
+        METSalesLine            metSalesLine;
+        METInventItemOrderSetup metInventItemOrderSetup;
+        InventDim               inventDim;
+        CustTable               custTable;
+        LogisticsPostalAddress  deliveryAddress;
+        METSalesOrderGuideItem  salesOrderGuideItemCustomerOnlySellTo, salesOrderGuideItemCustomerOperationsGroupOnlySellTo, salesOrderGuideItemSiteOnlySellTo, salesOrderGuideItemStateOnlySellTo, salesOrderGuideItemCustomerDoNotSellTo, salesOrderGuideItemCustomerOperationsGroupDoNotSellTo, salesOrderGuideItemSiteDoNotSellTo, salesOrderGuideItemStateDoNotSellTo;
+
+        SalesTable salesTableLocal;
+
+        salesTableLocal = SalesTable::find(_salesLine.SalesId, true);
+
+        if (salesTableLocal.METOrderExtractStatus != METOrderExtractStatus::Open && salesTableLocal.METOrderExtractStatus != METOrderExtractStatus::ReadyForExtract)
+        {
+            return;
+        }
+
+        select firstonly METCustOperGroupId
+            from custTable
+            where custTable.AccountNum == salesTableLocal.CustAccount;
+
+        while select salesLine
+                where salesLine.RecId == _salesLine.RecId
+                &&  salesLine.SalesStatus == SalesStatus::Backorder
+                &&  salesLine.SalesId == salesTableLocal.SalesId
+            join InventSiteId from inventDim
+                where inventDim.InventDimId == salesLine.InventDimId
+            join metSalesLine
+                where metSalesLine.SalesLine == salesLine.RecId
+            outer join ItemStatus, RecId from metInventItemOrderSetup
+                where metInventItemOrderSetup.ItemId == salesLine.ItemId
+                && METInventItemOrderSetup.SiteId == inventDim.InventSiteId
+            outer join State from deliveryAddress
+                where deliveryAddress.Location == salesLine.DeliveryPostalAddress
+            outer join RecId from salesOrderGuideItemCustomerOnlySellTo
+                where salesOrderGuideItemCustomerOnlySellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemCustomerOnlySellTo.ReferenceType == METSalesOrderGuideReferenceType::Customer
+                && salesOrderGuideItemCustomerOnlySellTo.Type == METSalesOrderGuideType::OnlySellTo
+                && salesOrderGuideItemCustomerOnlySellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemCustomerOnlySellTo.Reference != ''
+            outer join RecId from salesOrderGuideItemCustomerOperationsGroupOnlySellTo
+                where salesOrderGuideItemCustomerOperationsGroupOnlySellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemCustomerOperationsGroupOnlySellTo.ReferenceType == METSalesOrderGuideReferenceType::CustomerOperationsGroup
+                && salesOrderGuideItemCustomerOperationsGroupOnlySellTo.Type == METSalesOrderGuideType::OnlySellTo
+                && salesOrderGuideItemCustomerOperationsGroupOnlySellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemCustomerOperationsGroupOnlySellTo.Reference != ''
+            outer join RecId from salesOrderGuideItemSiteOnlySellTo
+                where salesOrderGuideItemSiteOnlySellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemSiteOnlySellTo.ReferenceType == METSalesOrderGuideReferenceType::Site
+                && salesOrderGuideItemSiteOnlySellTo.Type == METSalesOrderGuideType::OnlySellTo
+                && salesOrderGuideItemSiteOnlySellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemSiteOnlySellTo.Reference != ''
+            outer join RecId from salesOrderGuideItemStateOnlySellTo
+                where salesOrderGuideItemStateOnlySellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemStateOnlySellTo.ReferenceType == METSalesOrderGuideReferenceType::State
+                && salesOrderGuideItemStateOnlySellTo.Type == METSalesOrderGuideType::OnlySellTo
+                && salesOrderGuideItemStateOnlySellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemStateOnlySellTo.Reference != ''
+            outer join RecId from salesOrderGuideItemCustomerDoNotSellTo
+                where salesOrderGuideItemCustomerDoNotSellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemCustomerDoNotSellTo.ReferenceType == METSalesOrderGuideReferenceType::Customer
+                && salesOrderGuideItemCustomerDoNotSellTo.Reference == salesLine.CustAccount
+                && salesOrderGuideItemCustomerDoNotSellTo.Type == METSalesOrderGuideType::DoNotSellTo
+                && salesOrderGuideItemCustomerDoNotSellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemCustomerDoNotSellTo.Reference != ''
+            outer join RecId from salesOrderGuideItemCustomerOperationsGroupDoNotSellTo
+                where salesOrderGuideItemCustomerOperationsGroupDoNotSellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemCustomerOperationsGroupDoNotSellTo.ReferenceType == METSalesOrderGuideReferenceType::CustomerOperationsGroup
+                && salesOrderGuideItemCustomerOperationsGroupDoNotSellTo.Reference == custTable.METCustOperGroupId
+                && salesOrderGuideItemCustomerOperationsGroupDoNotSellTo.Type == METSalesOrderGuideType::DoNotSellTo
+                && salesOrderGuideItemCustomerOperationsGroupDoNotSellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemCustomerOperationsGroupDoNotSellTo.Reference != ''
+            outer join RecId from salesOrderGuideItemSiteDoNotSellTo
+                where salesOrderGuideItemSiteDoNotSellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemSiteDoNotSellTo.ReferenceType == METSalesOrderGuideReferenceType::Site
+                && salesOrderGuideItemSiteDoNotSellTo.Reference == inventDim.InventSiteId
+                && salesOrderGuideItemSiteDoNotSellTo.Type == METSalesOrderGuideType::DoNotSellTo
+                && salesOrderGuideItemSiteDoNotSellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemSiteDoNotSellTo.Reference != ''
+            outer join RecId from salesOrderGuideItemStateDoNotSellTo
+                where salesOrderGuideItemStateDoNotSellTo.ItemId == salesLine.ItemId
+                && salesOrderGuideItemStateDoNotSellTo.ReferenceType == METSalesOrderGuideReferenceType::State
+                && salesOrderGuideItemStateDoNotSellTo.Reference == deliveryAddress.State
+                && salesOrderGuideItemStateDoNotSellTo.Type == METSalesOrderGuideType::DoNotSellTo
+                && salesOrderGuideItemStateDoNotSellTo.Status == METEnabledDisabled::Enable
+                && salesOrderGuideItemStateDoNotSellTo.Reference != ''
+        {
+            if (metInventItemOrderSetup.RecId
+                && metInventItemOrderSetup.ItemStatus != METConstants::Active
+                && metSalesLine.ReasonId != METConstants::NewReasonCode
+                && metSalesLine.ReasonId != METConstants::DEL)
+            {
+                ttsbegin;
+                metSalesLine.selectForUpdate(true);
+                metSalesLine.ReasonId = METConstants::NewReasonCode;
+                metSalesLine.skipBusinessEvents(true);
+                metSalesLine.update();
+                ttscommit;
+
+                continue;
+            }
+
+            if (salesOrderGuideItemCustomerOnlySellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
+                {
+                    ttsbegin;
+                    metSalesLine.selectForUpdate(true);
+
+                    if (salesOrderGuideItemCustomerOnlySellTo.RecId && salesOrderGuideItemCustomerOnlySellTo.Reference == salesLine.CustAccount)
+                    {
+                        metSalesLine.ReasonId = '';
+                    }
+                    else
+                    {
+                        metSalesLine.ReasonId = METConstants::NIRReasonCode;
+                        metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                    }
+                    metSalesLine.skipBusinessEvents(true);
+                    metSalesLine.update();
+
+                    if (salesOrderGuideItemCustomerOnlySellTo.RecId && salesOrderGuideItemCustomerOnlySellTo.Reference != salesLine.CustAccount)
+                    {
+                        salesLine.selectForUpdate(true);
+                        if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+                        {
+                            this.buildSalesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+                        }
+                        else
+                        {
+                            this.buildSalesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
+                        }
+                    }
+
+                    ttscommit;
+                }
+
+                continue;
+            }
+
+            if (salesOrderGuideItemCustomerDoNotSellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != METConstants::NIRReasonCode)
+                {
+                    ttsbegin;
+                    salesLine.selectForUpdate(true);
+                    metSalesLine.selectForUpdate(true);
+                    metSalesLine.ReasonId = METConstants::NIRReasonCode;
+                    metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                    metSalesLine.skipBusinessEvents(true);
+                    metSalesLine.update();
+
+                    if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+                    {
+                        this.buildSalesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+                    }
+                    else
+                    {
+                        this.buildSalesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
+                    }
+
+                    ttscommit;
+                }
+
+                continue;
+            }
+
+            if (salesOrderGuideItemCustomerOperationsGroupOnlySellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
+                {
+                    ttsbegin;
+                    metSalesLine.selectForUpdate(true);
+                    if (salesOrderGuideItemCustomerOperationsGroupOnlySellTo.RecId && salesOrderGuideItemCustomerOperationsGroupOnlySellTo.Reference == custTable.METCustOperGroupId)
+                    {
+                        metSalesLine.ReasonId = '';
+                    }
+                    else
+                    {
+                        metSalesLine.ReasonId = METConstants::NIRReasonCode;
+                        metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                    }
+                    metSalesLine.skipBusinessEvents(true);
+                    metSalesLine.update();
+
+                    if (salesOrderGuideItemCustomerOperationsGroupOnlySellTo.RecId && salesOrderGuideItemCustomerOperationsGroupOnlySellTo.Reference != custTable.METCustOperGroupId)
+                    {
+                        salesLine.selectForUpdate(true);
+                        if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+                        {
+                            this.buildSalesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+                        }
+                        else
+                        {
+                            this.buildSalesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
+                        }
+                    }
+
+                    ttscommit;
+                }
+
+                continue;
+            }
+
+            if (salesOrderGuideItemCustomerOperationsGroupDoNotSellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != METConstants::NIRReasonCode)
+                {
+                    ttsbegin;
+                    salesLine.selectForUpdate(true);
+                    metSalesLine.selectForUpdate(true);
+                    metSalesLine.ReasonId = METConstants::NIRReasonCode;
+                    metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                    metSalesLine.skipBusinessEvents(true);
+                    metSalesLine.update();
+
+                    if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+                    {
+                        this.buildSalesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+                    }
+                    else
+                    {
+                        this.buildSalesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
+                    }
+
+                    ttscommit;
+                }
+
+                continue;
+            }
+
+            if (salesOrderGuideItemSiteOnlySellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
+                {
+                    ttsbegin;
+                    metSalesLine.selectForUpdate(true);
+
+                    if (salesOrderGuideItemSiteOnlySellTo.RecId && salesOrderGuideItemSiteOnlySellTo.Reference == inventDim.InventSiteId)
+                    {
+                        metSalesLine.ReasonId = '';
+                    }
+                    else
+                    {
+                        metSalesLine.ReasonId = METConstants::NIRReasonCode;
+                        metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                    }
+
+                    metSalesLine.skipBusinessEvents(true);
+                    metSalesLine.update();
+
+                    if (salesOrderGuideItemSiteOnlySellTo.RecId && salesOrderGuideItemSiteOnlySellTo.Reference != inventDim.InventSiteId)
+                    {
+                        salesLine.selectForUpdate(true);
+                        if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+                        {
+                            this.buildSalesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+                        }
+                        else
+                        {
+                            this.buildSalesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
+                        }
+                    }
+
+                    ttscommit;
+                }
+
+                continue;
+            }
+
+            if (salesOrderGuideItemSiteDoNotSellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != METConstants::NIRReasonCode)
+                {
+                    ttsbegin;
+                    salesLine.selectForUpdate(true);
+
+                    metSalesLine.selectForUpdate(true);
+                    metSalesLine.ReasonId = METConstants::NIRReasonCode;
+                    metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                    metSalesLine.skipBusinessEvents(true);
+                    metSalesLine.update();
+
+                    if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+                    {
+                        this.buildSalesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+                    }
+                    else
+                    {
+                        this.buildSalesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
+                    }
+
+                    ttscommit;
+                }
+
+                continue;
+            }
+
+            if (salesOrderGuideItemStateOnlySellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
+                {
+                    ttsbegin;
+                    metSalesLine.selectForUpdate(true);
+
+                    if (salesOrderGuideItemStateOnlySellTo.RecId && salesOrderGuideItemStateOnlySellTo.Reference == deliveryAddress.State)
+                    {
+                        metSalesLine.ReasonId = '';
+                    }
+                    else
+                    {
+                        metSalesLine.ReasonId = METConstants::NIRReasonCode;
+                        metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                    }
+
+                    metSalesLine.skipBusinessEvents(true);
+                    metSalesLine.update();
+
+                    if (salesOrderGuideItemStateOnlySellTo.RecId && salesOrderGuideItemStateOnlySellTo.Reference != deliveryAddress.State)
+                    {
+                        salesLine.selectForUpdate(true);
+                        if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+                        {
+                            this.buildSalesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+                        }
+                        else
+                        {
+                            this.buildSalesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
+                        }
+                    }
+
+                    ttscommit;
+                }
+
+                continue;
+            }
+
+            if (salesOrderGuideItemStateDoNotSellTo.RecId)
+            {
+                if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != METConstants::NIRReasonCode)
+                {
+                    ttsbegin;
+                    salesLine.selectForUpdate(true);
+                    metSalesLine.selectForUpdate(true);
+                    metSalesLine.ReasonId = METConstants::NIRReasonCode;
+                    metSalesLine.OrderExtractStatus = METOrderExtractStatus::Extracted;
+                    metSalesLine.skipBusinessEvents(true);
+                    metSalesLine.update();
+
+                    if (PdsGlobal::pdsIsCWItem(salesLine.ItemId))
+                    {
+                        this.buildSalesUpdateRemain().updateCatchWeightExtractionDeliverRemainder(salesLine, 0);
+                    }
+                    else
+                    {
+                        this.buildSalesUpdateRemain().updateExtractionDeliverRemainder(salesLine, 0, 0, 0);
+                    }
+
+                    ttscommit;
+                }
+
+                continue;
+            }
+
+            if (metSalesLine.ReasonId != METConstants::DEL && metSalesLine.ReasonId != '')
+            {
+                ttsbegin;
+                metSalesLine.selectForUpdate(true);
+                metSalesLine.ReasonId = '';
+                metSalesLine.skipBusinessEvents(true);
+                metSalesLine.update();
+                ttscommit;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runFinalTask</Name>
+				<Source><![CDATA[
+    protected void runFinalTask()
+    {
+        int                                    i;
+        boolean                                isBatchMode = this.isInBatch();
+        Batch                                  currentBatchTask;
+        BatchHeader                             fulfillmentBatchHeader;
+        RefRecId                                anchorRecId;
+        List                                    fulfillmentTaskList = new List(Types::Class);
+        METSalesPickingListFulfillmentBatch     endTask;
+        ListEnumerator                          soEnumerator;
+
+        if (isBatchMode)
+        {
+            currentBatchTask       = this.parmCurrentBatch();
+            fulfillmentBatchHeader = BatchHeader::construct(currentBatchTask.BatchJobId);
+            anchorRecId            = currentBatchTask.RecId;
+        }
+
+        for (i = 1; i <= conLen(processedSalesContainer); i++)
+        {
+            SalesId                               salesIdLocal = conPeek(processedSalesContainer, i);
+            METSalesPickingListFulfillmentBatch   soTask = new METSalesPickingListFulfillmentBatch();
+            int                                    csdPosition = conFind(csdSalesOrderList, salesIdLocal);
+
+            soTask.parmSalesId(salesIdLocal);
+            soTask.parmSalesOrderExtractionId(extractionId);
+            soTask.parmContinueFromStagingLane(continueFromStagingLane);
+            soTask.parmCSDSalesOrderCount(conLen(csdSalesOrderList));
+            soTask.parmCSDSalesOrderExtractDateTime(csdOrderExtractDateTime);
+
+            if (csdPosition > 0)
+            {
+                soTask.parmCSDSalesId(salesIdLocal);
+            }
+
+            if (csdGuid && conLen(csdSalesOrderList) > 0)
+            {
+                soTask.parmCsdGuid(csdGuid);
+            }
+
+            soTask.parmBatchIdentifier(salesIdLocal);
+
+            if (isBatchMode)
+            {
+                soTask.batchInfo().resetBatchHeader();
+                soTask.batchInfo().parmGroupId(currentBatchTask.GroupId);
+                soTask.batchInfo().parmConstraintType(BatchConstraintType::And);
+                soTask.batchInfo().parmDataareaId(currentBatchTask.Company);
+                fulfillmentBatchHeader.addRuntimeTask(soTask, anchorRecId);
+            }
+            else
+            {
+                soTask.run();
+            }
+
+            fulfillmentTaskList.addEnd(soTask);
+        }
+
+        if (fulfillmentTaskList.elements() == 0)
+        {
+            return;
+        }
+
+        endTask = new METSalesPickingListFulfillmentBatch();
+        endTask.parmSalesOrderExtractionId(extractionId);
+        endTask.parmShipmentIdList(conShipmentIds);
+        endTask.parmCsdGuid(csdGuid);
+        endTask.parmCSDSalesOrderList(csdSalesOrderList);
+        endTask.parmCSDSalesOrderExtractDateTime(csdOrderExtractDateTime);
+
+        if (conLen(csdSalesOrderList) > 0)
+        {
+            endTask.parmCSDSalesId(conPeek(csdSalesOrderList, 1));
+        }
+
+        endTask.parmBatchIdentifier(endTask.finalTaskIdentifier());
+
+        if (isBatchMode)
+        {
+            endTask.batchInfo().resetBatchHeader();
+            endTask.batchInfo().parmGroupId(currentBatchTask.GroupId);
+            endTask.batchInfo().parmConstraintType(BatchConstraintType::And);
+            endTask.batchInfo().parmDataareaId(currentBatchTask.Company);
+            fulfillmentBatchHeader.addRuntimeTask(endTask, anchorRecId);
+
+            soEnumerator = fulfillmentTaskList.getEnumerator();
+            while (soEnumerator.moveNext())
+            {
+                fulfillmentBatchHeader.addDependency(endTask, soEnumerator.current());
+            }
+        }
+        else
+        {
+            endTask.run();
+        }
+
+        // CB395 CSD inter-branch transfer task - depends on every per-SO task AND the
+        // End/export task, matching METSalesPickingListGenerationService.addCreateCSDTransferOrderTask.
+        if (conLen(csdSalesOrderList) > 0)
+        {
+            SysOperationServiceController      csdController = METCreateCSDTransferOrderController::construct(csdSalesOrderList);
+            METCreateCSDTransferOrderContract  csdContract    = csdController.getDataContractObject() as METCreateCSDTransferOrderContract;
+            csdContract.parmContinueFromStagingLane(continueFromStagingLane);
+
+            if (isBatchMode)
+            {
+                ListEnumerator csdSoEnumerator;
+
+                fulfillmentBatchHeader.addRuntimeTask(csdController, anchorRecId);
+
+                csdSoEnumerator = fulfillmentTaskList.getEnumerator();
+                while (csdSoEnumerator.moveNext())
+                {
+                    fulfillmentBatchHeader.addDependency(csdController, csdSoEnumerator.current(), BatchDependencyStatus::Finished);
+                }
+                fulfillmentBatchHeader.addDependency(csdController, endTask, BatchDependencyStatus::Finished);
+            }
+            else
+            {
+                csdController.parmShowDialog(false);
+                csdController.startOperation();
+            }
+        }
+
+        if (isBatchMode)
+        {
+            fulfillmentBatchHeader.save();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>main</Name>
+				<Source><![CDATA[
+    [SuppressBPWarning('BPErrorSelectUsingFirstOnly', 'This is required as a complete set of buffer needs to be passed')]
+    public static void main(Args _args)
+    {
+        METSalesPickingListReservationBatch  reservationBatch;
+        FormRun                              formRun;
+        container                            salesOrderOSCCon, csdSalesOrderCon, csdsalesOrderCustAccountCon;
+        SalesTable                           salesTableLoc;
+        boolean                              isCSDWarehouse;
+        METNumberOfCustomers                 numberOfCSDCustomers;
+        InventLocationId                     csdWareHouse;
+        InventLocationId                     extractionInventLocationId;
+        InventLocation                       inventLocation;
+        boolean                              boxCalled = false;
+        boolean                              isCSDWareHouseChecked;
+        boolean                              continueFromStagingLane;
+        boolean                              useLineLevelThreading;
+
+        formRun = _args.caller();
+
+        FormDataSource              tmpFormDataSource = formRun.dataSource(formDataSourceStr(METOrderExtractScreen, METOrderExtractScreenTmpDS));
+        METOrderExtractScreenTmp    metOrderExtractScreenTmp;
+
+        metOrderExtractScreenTmp = tmpFormDataSource.getFirst(false);
+
+        while select metOrderExtractScreenTmp
+            where metOrderExtractScreenTmp.Selection == NoYes::Yes
+            join salesTableLoc
+                where salesTableLoc.SalesId == metOrderExtractScreenTmp.SalesId
+        {
+            if (!boxCalled && salesTableLoc.METOrderExtractStatus == METOrderExtractStatus::Open)
+            {
+                if (Box::yesNo("@MET:SOUpdateExtraction", DialogButton::No) == DialogButton::No)
+                {
+                    break;
+                }
+                boxCalled = true;
+            }
+
+            if (salesTableLoc.METOrderExtractStatus != METOrderExtractStatus::Extracted)
+            {
+                if (!salesTableLoc.METRoute || !salesTableLoc.METRouteStopNum)
+                {
+                    warning(strFmt("@MET:OrderExtractMissingRouteWarning", salesTableLoc.SalesId));
+                    continue;
+                }
+            }
+
+            if (!isCSDWareHouseChecked && !isCSDWarehouse && salesTableLoc.RecId != 0)
+            {
+                select firstonly METNumberOfCustomers, RecId from inventLocation
+                    where inventLocation.InventLocationId == salesTableLoc.InventLocationId
+                    &&  inventLocation.METCSDWarehouse == NoYes::Yes;
+
+                isCSDWareHouseChecked = true;
+
+                if (inventLocation.RecId != 0)
+                {
+                    numberOfCSDCustomers = inventLocation.METNumberOfCustomers;
+                    csdWareHouse = salesTableLoc.InventLocationId;
+                    isCSDWarehouse = true;
+                }
+            }
+
+            if (isCSDWarehouse && salesTableLoc.RecId != 0)
+            {
+                if (!conFind(csdSalesOrderCon, salesTableLoc.SalesId))
+                {
+                    csdSalesOrderCon += salesTableLoc.SalesId;
+                }
+
+                if (!conFind(csdsalesOrderCustAccountCon, salesTableLoc.CustAccount))
+                {
+                    csdsalesOrderCustAccountCon += salesTableLoc.CustAccount;
+                }
+            }
+
+            if (!conFind(salesOrderOSCCon, salesTableLoc.SalesId))
+            {
+                salesOrderOSCCon += salesTableLoc.SalesId;
+            }
+
+            if (!extractionInventLocationId && salesTableLoc.RecId)
+            {
+                extractionInventLocationId = salesTableLoc.InventLocationId;
+            }
+        }
+
+        //CB123 SalesOrderExtractScreenforCSD -start
+        if (conLen(csdsalesOrderCustAccountCon) > numberOfCSDCustomers)
+        {
+            throw error("@MET:CSDMaximumCustomersExceeded");
+        }
+        //CB123 SalesOrderExtractScreenforCSD -end
+
+        if (conLen(salesOrderOSCCon))
+        {
+            METCustParameters metCustParameters = METCustParameters::find();
+            useLineLevelThreading = metCustParameters.SalesExtractionDisableLineLevelThreading == NoYes::No;
+
+            //CB123 SalesOrderExtractScreenforCSD -start
+            if (conLen(csdSalesOrderCon))
+            {
+                // Introduce the Code to check for 'Continue  from staging lane - XXX ?'
+                METNextCustStartingPosition custStartingPosition = InventLocation::find(salesTableLoc.InventLocationId).METCustStartingPosition;
+
+                if (isCSDWarehouse && custStartingPosition > 0)
+                {
+                    //Check for next staging lane position stored for the warehouse in METStagingLanePositionCounter table.
+                    METStagingLanePositionCounter metStagingLanePositionCounter = METStagingLanePositionCounter::find(salesTableLoc.InventLocationId, true);
+                    METNextCustStartingPosition nextStagingLane = metStagingLanePositionCounter.NextStagingLane;
+
+                    if (!nextStagingLane)
+                    {
+                        nextStagingLane = custStartingPosition;
+                    }
+
+                    if (Box::yesNo(strFmt("@MET:ContinueFromStagingLane", nextStagingLane), DialogButton::No) == DialogButton::No)
+                    {
+                        continueFromStagingLane = false;
+
+                        if (metStagingLanePositionCounter.RecId)
+                        {
+                            ttsbegin;
+                            metStagingLanePositionCounter.delete();
+                            ttscommit;
+                        }
+                    }
+                    else
+                    {
+                        continueFromStagingLane = true;
+                    }
+                }
+            }
+
+            reservationBatch = METSalesPickingListReservationBatch::construct(
+                salesOrderOSCCon,
+                csdSalesOrderCon,
+                guid2Str(newGuid()),
+                continueFromStagingLane,
+                extractionInventLocationId,
+                useLineLevelThreading);
+
+            if (metCustParameters.SalesExtractionBatchGroupId)
+            {
+                reservationBatch.batchInfo().parmGroupId(metCustParameters.SalesExtractionBatchGroupId);
+            }
+
+            if (!useLineLevelThreading)
+            {
+                reservationBatch.batchInfo().parmBatchExecute(NoYes::Yes);
+            }
+
+            if (reservationBatch.prompt())
+            {
+                reservationBatch.runOperation();
+            }
+        }
+        else
+        {
+            warning("@MET:NoSalesOrderToProcess");
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>run</Name>
+				<Source><![CDATA[
+    public void run()
+    {
+        if (!useLineLevelThreading)
+        {
+            this.runStartTask();
+            return;
+        }
+
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>showDialog</Name>
+				<Source><![CDATA[
+    public boolean showDialog()
+    {
+        return useLineLevelThreading;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>allowSaveLast</Name>
+				<Source><![CDATA[
+    public boolean allowSaveLast()
+    {
+        return false;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
