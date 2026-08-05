@@ -253,21 +253,20 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
     /// <summary>
     /// Resolves the entity type and delegates to the matching decision matrix.
     /// </summary>
-    /// <param name = "_salesId">Sales order to decide the action for</param>
+    /// <param name = "_salesTable">Already-read sales order (avoids a repeat SalesTable::find)</param>
+    /// <param name = "_inventParameter">Already-read InventParameters singleton (avoids a repeat find per SO)</param>
     /// <returns>The decided action code</returns>
-    private str decideActionToPerform(SalesId _salesId)
+    private str decideActionToPerform(SalesTable _salesTable, InventParameters _inventParameter)
     {
-        SalesTable        salesTable      = SalesTable::find(_salesId);
-        METSalesTable     metSalesTable   = METSalesTable::findByRefRecId(salesTable.RecId);
-        InventParameters  inventParameter = InventParameters::find();
-        InventLocation    inventLocation  = InventLocation::find(salesTable.InventLocationId);
+        METSalesTable     metSalesTable   = METSalesTable::findByRefRecId(_salesTable.RecId);
+        InventLocation    inventLocation  = InventLocation::find(_salesTable.InventLocationId);
 
-        if (inventParameter.METSupplyFromTransfer == NoYes::Yes)
+        if (_inventParameter.METSupplyFromTransfer == NoYes::Yes)
         {
-            return this.decideActionToPerformFood(salesTable, metSalesTable, inventLocation);
+            return this.decideActionToPerformFood(_salesTable, metSalesTable, inventLocation);
         }
 
-        return this.decideActionToPerformLiquor(salesTable, metSalesTable, inventLocation);
+        return this.decideActionToPerformLiquor(_salesTable, metSalesTable, inventLocation);
     }
 
 ]]></Source>
@@ -361,8 +360,9 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
     protected void runThreadTask()
     {
         #OCCRetryCount
-        container  lineRecIdContainer = conPeek(lineTaskBundles, str2int(batchIdentifier));
+        container  lineRecIdContainer      = conPeek(lineTaskBundles, str2int(batchIdentifier));
         int        i;
+        Map        actionToPerformCache    = new Map(Types::String, Types::String);
 
         for (i = 1; i <= conLen(lineRecIdContainer); i++)
         {
@@ -374,7 +374,7 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 
                 if (salesLineLocal.RecId)
                 {
-                    str lineActionToPerform = this.readStoredActionToPerform(extractionId, salesLineLocal.SalesId);
+                    str lineActionToPerform = this.readCachedActionToPerform(actionToPerformCache, extractionId, salesLineLocal.SalesId);
 
                     this.performGuideCheckForLine(salesLineLocal);
 
@@ -469,7 +469,9 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 
         SalesTable salesTableLocal;
 
-        salesTableLocal = SalesTable::find(_salesLine.SalesId, true);
+        select firstonly METOrderExtractStatus 
+            from salesTableLocal 
+            where salesTableLocal.SalesId == _salesLine.SalesId;
 
         if (salesTableLocal.METOrderExtractStatus != METOrderExtractStatus::Open && salesTableLocal.METOrderExtractStatus != METOrderExtractStatus::ReadyForExtract)
         {
@@ -1223,20 +1225,23 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
     /// </summary>
     private void filterEligibleAndStampActions()
     {
-        int            i;
-        SalesId        salesIdLocal;
-        MetShipmentId  metShipmentId;
-        utcdatetime    curDateTime = DateTimeUtil::getSystemDateTime();
+        int               i;
+        SalesId           salesIdLocal;
+        MetShipmentId     metShipmentId;
+        utcdatetime       curDateTime     = DateTimeUtil::getSystemDateTime();
+        InventParameters  inventParameter = InventParameters::find();
 
         ttsbegin;
 
         for (i = 1; i <= conLen(salesOrderList); i++)
         {
-            str actionToPerform;
+            str        actionToPerform;
+            SalesTable salesTableLocal;
 
-            salesIdLocal = conPeek(salesOrderList, i);
+            salesIdLocal    = conPeek(salesOrderList, i);
+            salesTableLocal = SalesTable::find(salesIdLocal);
 
-            if (SalesTable::find(salesIdLocal).CredManInCreditControl)
+            if (salesTableLocal.CredManInCreditControl)
             {
                 warning(strFmt("@MET:SOCredMgmtValidation", salesIdLocal));
                 continue;
@@ -1252,7 +1257,7 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 
             this.stampCsdExtractDateTime(csdSalesOrderList, salesIdLocal, curDateTime);
 
-            actionToPerform = this.decideActionToPerform(salesIdLocal);
+            actionToPerform = this.decideActionToPerform(salesTableLocal, inventParameter);
             this.stampActionToPerformOnExtractionLine(extractionId, salesIdLocal, actionToPerform);
 
             processedSalesContainer += salesIdLocal;
@@ -1442,7 +1447,7 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
         {
             SalesId salesIdLocal = conPeek(_salesIdContainer, i);
 
-            while select salesLine
+            while select ItemId from salesLine
                 where salesLine.SalesId     == salesIdLocal
                    && salesLine.SalesStatus != SalesStatus::Canceled
             {
@@ -1738,6 +1743,29 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
         }
 
         return _bundleLines;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>readCachedActionToPerform</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cached wrapper around readStoredActionToPerform - avoids a repeat DB read when a
+    /// bundle has multiple lines from the same SO.
+    /// </summary>
+    /// <param name = "_cache">Per-task Map(SalesId -> action code), populated lazily</param>
+    /// <param name = "_extractionId">Owning ExtractionId</param>
+    /// <param name = "_salesId">Sales order to look up</param>
+    /// <returns>The stored action code</returns>
+    private str readCachedActionToPerform(Map _cache, METSalesOrderExtractionId _extractionId, SalesId _salesId)
+    {
+        if (!_cache.exists(_salesId))
+        {
+            _cache.insert(_salesId, this.readStoredActionToPerform(_extractionId, _salesId));
+        }
+
+        return _cache.lookup(_salesId);
     }
 
 ]]></Source>
