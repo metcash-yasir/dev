@@ -3,6 +3,10 @@
 	<Name>METSalesPickingListReservationBatch</Name>
 	<SourceCode>
 		<Declaration><![CDATA[
+/// <summary>
+/// Phase 1 of the SO extraction pipeline: dialog, credit check, ItemId-bundled guide check
+/// and reservation, then hands off to METSalesPickingListFulfillmentBatch (Phase 2).
+/// </summary>
 class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 {
     container                   salesOrderList;
@@ -12,9 +16,9 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
     InventLocationId            extractionInventLocationId;
     METSalesOrderExtractionId   extractionId;
     container                   processedSalesContainer;
-    container                   conShipmentIds;
+    container                   shipmentIdList;
     utcdatetime                 csdOrderExtractDateTime;
-    container                   allBucketsCon;
+    container                   lineTaskBundles;
     boolean                     useLineLevelThreading;
 
     DialogField                 dlgOrderCount;
@@ -29,17 +33,28 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
         extractionInventLocationId,
         extractionId,
         processedSalesContainer,
-        conShipmentIds,
+        shipmentIdList,
         csdOrderExtractDateTime,
-        allBucketsCon,
+        lineTaskBundles,
         useLineLevelThreading
     #endmacro
+
 }
 ]]></Declaration>
 		<Methods>
 			<Method>
 				<Name>construct</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Builds a new instance from the selected SOs and the CSD/staging-lane context gathered in main().
+    /// </summary>
+    /// <param name = "_salesOrderList">Selected SalesIds</param>
+    /// <param name = "_csdSalesOrderList">CSD SalesIds among the selection</param>
+    /// <param name = "_csdGuid">CSD wave GUID</param>
+    /// <param name = "_continueFromStagingLane">Staging-lane continuation flag</param>
+    /// <param name = "_extractionInventLocationId">Inventory location for the extraction header</param>
+    /// <param name = "_useLineLevelThreading">True for the new V2 flow, false for legacy V1</param>
+    /// <returns>The constructed instance</returns>
     public static METSalesPickingListReservationBatch construct(
         container            _salesOrderList,
         container            _csdSalesOrderList,
@@ -65,6 +80,11 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>dialog</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Shows order count and the pre-allocated ExtractionId (non-editable); never shown for
+    /// V1 - see showDialog().
+    /// </summary>
+    /// <returns>The dialog instance</returns>
     public Object dialog()
     {
         DialogRunbase dialog = super();
@@ -90,6 +110,10 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>pack</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Packs batchIdentifier (base class) plus this class's own fields for batch/runtime-task serialization.
+    /// </summary>
+    /// <returns>Packed state</returns>
     public container pack()
     {
         return [#CurrentVersion, #CurrentList, super()];
@@ -100,6 +124,11 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>unpack</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Reverses pack().
+    /// </summary>
+    /// <param name = "_packedClass">Packed state produced by pack()</param>
+    /// <returns>True if the packed version was recognized</returns>
     public boolean unpack(container _packedClass)
     {
         Version   version = RunBase::getVersion(_packedClass);
@@ -122,6 +151,10 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>mustGoBatch</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// V1 always runs in batch; V2 lets the dialog's own batch checkbox decide.
+    /// </summary>
+    /// <returns>True to force batch execution</returns>
     public boolean mustGoBatch()
     {
         return !useLineLevelThreading;
@@ -132,6 +165,10 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>canRunInNewSession</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Lets runOperation() execute in a new session (needed for the non-batch/synchronous path).
+    /// </summary>
+    /// <returns>Always true</returns>
     public boolean canRunInNewSession()
     {
         return true;
@@ -142,6 +179,10 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>description</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Static fallback caption; actual per-task captions come from caption() instead.
+    /// </summary>
+    /// <returns>The fallback caption</returns>
     public static ClassDescription description()
     {
         return "@MET:MetPickingListGeneration";
@@ -152,114 +193,31 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>runStartTask</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Orchestrates the parent-task setup: flag orders, delegate to V1, or run V2's setup steps.
+    /// </summary>
     protected void runStartTask()
     {
-        int i;
-
-        ttsbegin;
-
-        for (i = 1; i <= conLen(salesOrderList); i++)
-        {
-            SalesId    currentSalesId = conPeek(salesOrderList, i);
-            SalesTable salesTableToUpdate;
-            salesTableToUpdate.skipBusinessEvents(true);
-            select firstonly forupdate salesTableToUpdate where salesTableToUpdate.SalesId == currentSalesId;
-            if (salesTableToUpdate.RecId && (salesTableToUpdate.METOrderExtractStatus == METOrderExtractStatus::Open || salesTableToUpdate.METOrderExtractStatus == METOrderExtractStatus::ReadyForExtract))
-            {
-                salesTableToUpdate.METProcessing = NoYes::Yes;
-                salesTableToUpdate.doUpdate();
-            }
-        }
-
-        ttscommit;
+        this.flagOrdersAsProcessing();
 
         if (!useLineLevelThreading)
         {
-            METSalesPickingListGenerationContract v1Contract = new METSalesPickingListGenerationContract();
-            v1Contract.parmSalesOrderList(salesOrderList);
-            v1Contract.parmCSDSalesOrderList(csdSalesOrderList);
-            v1Contract.parmCsdGuid(csdGuid);
-            v1Contract.parmContinueFromStagingLane(continueFromStagingLane);
-
-            new METSalesPickingListGenerationService().process(v1Contract);
+            this.runLegacyFlow();
             return;
         }
 
-        SalesId                       salesIdLocal;
-        MetShipmentId                 metShipmentId;
-        METCustParameters             metCustParameters = METCustParameters::Find();
-        utcdatetime                   curDateTime = DateTimeUtil::getSystemDateTime();
-        METSalesOrderExtractionTable  extractionHeader;
-        METSalesOrderExtractionLine   extractionLine;
-        int                           taskCount;
-
-        ttsbegin;
-
-        if (extractionId)
-        {
-            extractionHeader.ExtractionId = extractionId;
-        }
-        extractionHeader.initValue();
-        extractionHeader.InventLocationId = extractionInventLocationId;
-        extractionHeader.ExtractionStatus = METSalesOrderExtractionStatus::Pending;
-        extractionHeader.Exported         = NoYes::No;
-        extractionHeader.insert();
-
-        extractionId = extractionHeader.ExtractionId;
-
-        for (i = 1; i <= conLen(salesOrderList); i++)
-        {
-            extractionLine.clear();
-            extractionLine.ExtractionId     = extractionId;
-            extractionLine.SalesId          = conPeek(salesOrderList, i);
-            extractionLine.ExtractionStatus = METSalesOrderExtractionStatus::Pending;
-            extractionLine.insert();
-        }
-
-        ttscommit;
-
-        ttsbegin;
-
-        for (i = 1; i <= conLen(salesOrderList); i++)
-        {
-            str actionToPerform;
-
-            salesIdLocal = conPeek(salesOrderList, i);
-
-            if (SalesTable::find(salesIdLocal).CredManInCreditControl)
-            {
-                warning(strFmt("@MET:SOCredMgmtValidation", salesIdLocal));
-                continue;
-            }
-
-            METOrderShipmentLoadCreation shipmentLoadCreation = METOrderShipmentLoadCreation::construct(METOrderTransactionType::SalesOrder, salesIdLocal);
-            metShipmentId = shipmentLoadCreation.createShippmentLoad(true, true);
-
-            if (conFind(conShipmentIds, metShipmentId) == 0)
-            {
-                conShipmentIds += [metShipmentId];
-            }
-
-            this.stampCsdExtractDateTime(csdSalesOrderList, salesIdLocal, curDateTime);
-
-            actionToPerform = this.decideActionToPerform(salesIdLocal);
-            this.stampActionToPerformOnExtractionLine(extractionId, salesIdLocal, actionToPerform);
-
-            processedSalesContainer += salesIdLocal;
-        }
+        this.insertExtractionHeaderAndLines();
+        this.filterEligibleAndStampActions();
 
         if (conLen(processedSalesContainer) == 0)
         {
-            ttsabort;
             return;
         }
 
-        ttscommit;
+        METCustParameters metCustParameters = METCustParameters::Find();
+        int               taskCount = metCustParameters.SalesExtractionBatchLineTaskCount > 0 ? metCustParameters.SalesExtractionBatchLineTaskCount : 1;
 
-        csdOrderExtractDateTime = curDateTime;
-
-        taskCount     = metCustParameters.SalesExtractionBatchLineTaskCount > 0 ? metCustParameters.SalesExtractionBatchLineTaskCount : 1;
-        allBucketsCon = this.buildLineTaskBuckets(processedSalesContainer, taskCount);
+        lineTaskBundles = this.buildLineTaskBundles(processedSalesContainer, taskCount);
     }
 
 ]]></Source>
@@ -267,14 +225,18 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>getBatchIdentifiersRangeCon</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Returns one identifier per non-empty reservation bundle.
+    /// </summary>
+    /// <returns>Container of bundle-index identifiers</returns>
     protected container getBatchIdentifiersRangeCon()
     {
         container res;
         int       i;
 
-        for (i = 1; i <= conLen(allBucketsCon); i++)
+        for (i = 1; i <= conLen(lineTaskBundles); i++)
         {
-            if (conLen(conPeek(allBucketsCon, i)) > 0)
+            if (conLen(conPeek(lineTaskBundles, i)) > 0)
             {
                 res += int2str(i);
             }
@@ -288,133 +250,24 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>decideActionToPerform</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Resolves the entity type and delegates to the matching decision matrix.
+    /// </summary>
+    /// <param name = "_salesId">Sales order to decide the action for</param>
+    /// <returns>The decided action code</returns>
     private str decideActionToPerform(SalesId _salesId)
     {
-        str                actionToPerfrom;
-        SalesTable         salesTable      = SalesTable::find(_salesId);
-        METSalesTable      metSalesTable   = METSalesTable::findByRefRecId(salesTable.RecId);
-        InventParameters   inventParameter = InventParameters::find();
-        InventLocation     inventLocation  = InventLocation::find(salesTable.InventLocationId);
+        SalesTable        salesTable      = SalesTable::find(_salesId);
+        METSalesTable     metSalesTable   = METSalesTable::findByRefRecId(salesTable.RecId);
+        InventParameters  inventParameter = InventParameters::find();
+        InventLocation    inventLocation  = InventLocation::find(salesTable.InventLocationId);
 
-        if (inventParameter.METSupplyFromTransfer == NoYes::Yes) //Food entity
+        if (inventParameter.METSupplyFromTransfer == NoYes::Yes)
         {
-            if (metSalesTable.InternalCrossDockOrder == NoYes::Yes  &&
-                inventLocation.METCSDWarehouse == NoYes::No         &&
-                inventLocation.METPickDirector == NoYes::No         &&
-                inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractCreateOnlyTO;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    salesTable.METAllowBackOrders == NoYes::No          &&
-                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
-                    inventLocation.METPickDirector == NoYes::No         &&
-                    inventLocation.METWaveRequired == NoYes::Yes)
-            {
-                actionToPerfrom = METConstants::SOExtractOrderedSOPickOnly;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    salesTable.METAllowBackOrders == NoYes::No          &&
-                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
-                    inventLocation.METPickDirector == NoYes::Yes        &&
-                    inventLocation.METWaveRequired == NoYes::Yes)
-            {
-                actionToPerfrom = METConstants::SOExtractUpdateStatusOnly;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    salesTable.METAllowBackOrders == NoYes::No          &&
-                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
-                    inventLocation.METPickDirector == NoYes::No         &&
-                    inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractUpdateStatusOnly;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    salesTable.METAllowBackOrders == NoYes::No          &&
-                    inventLocation.METCSDWarehouse == NoYes::No         &&
-                    inventLocation.METPickDirector == NoYes::No         &&
-                    inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractReservedSOPickOnly;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    salesTable.METAllowBackOrders == NoYes::Yes         &&
-                    inventLocation.METCSDWarehouse == NoYes::No         &&
-                    inventLocation.METPickDirector == NoYes::No         &&
-                    inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractReservedSOPickOnly;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    salesTable.METAllowBackOrders == NoYes::Yes         &&
-                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
-                    inventLocation.METPickDirector == NoYes::Yes        &&
-                    inventLocation.METWaveRequired == NoYes::Yes)
-            {
-                actionToPerfrom = METConstants::SOExtractUpdateStatusOnly;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    salesTable.METAllowBackOrders == NoYes::Yes         &&
-                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
-                    inventLocation.METPickDirector == NoYes::No         &&
-                    inventLocation.METWaveRequired == NoYes::Yes)
-            {
-                actionToPerfrom = METConstants::SOExtractOrderedSOPickOnly;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    salesTable.METAllowBackOrders == NoYes::Yes         &&
-                    inventLocation.METCSDWarehouse == NoYes::Yes        &&
-                    inventLocation.METPickDirector == NoYes::No         &&
-                    inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractUpdateStatusOnly;
-            }
-            else
-            {
-                actionToPerfrom = METConstants::SOExtractSkip;
-            }
-        }
-        else // Liquor entity
-        {
-            if (metSalesTable.InternalCrossDockOrder == NoYes::Yes  &&
-                salesTable.METAllowBackOrders == NoYes::Yes         &&
-                inventLocation.METCSDWarehouse == NoYes::No         &&
-                inventLocation.METPickDirector == NoYes::No         &&
-                inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractReservedSOPickAndTO;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::Yes     &&
-                salesTable.METAllowBackOrders == NoYes::No                  &&
-                inventLocation.METCSDWarehouse == NoYes::No                 &&
-                inventLocation.METPickDirector == NoYes::No                 &&
-                inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractReservedSOPickAndTO;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    salesTable.METAllowBackOrders == NoYes::No          &&
-                    inventLocation.METCSDWarehouse == NoYes::No         &&
-                    inventLocation.METPickDirector == NoYes::No         &&
-                    inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractReservedSOPickOnly;
-            }
-            else if (metSalesTable.InternalCrossDockOrder == NoYes::No  &&
-                    salesTable.METAllowBackOrders == NoYes::Yes         &&
-                    inventLocation.METCSDWarehouse == NoYes::No         &&
-                    inventLocation.METPickDirector == NoYes::No         &&
-                    inventLocation.METWaveRequired == NoYes::No)
-            {
-                actionToPerfrom = METConstants::SOExtractReservedSOPickOnly;
-            }
-            else
-            {
-                actionToPerfrom = METConstants::SOExtractSkip;
-            }
+            return this.decideActionToPerformFood(salesTable, metSalesTable, inventLocation);
         }
 
-        return actionToPerfrom;
+        return this.decideActionToPerformLiquor(salesTable, metSalesTable, inventLocation);
     }
 
 ]]></Source>
@@ -422,6 +275,12 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>stampActionToPerformOnExtractionLine</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Persists the decided action onto the extraction line.
+    /// </summary>
+    /// <param name = "_extractionId">Owning ExtractionId</param>
+    /// <param name = "_salesId">Sales order the line belongs to</param>
+    /// <param name = "_actionToPerform">Decided action code</param>
     private void stampActionToPerformOnExtractionLine(METSalesOrderExtractionId _extractionId, SalesId _salesId, str _actionToPerform)
     {
         METSalesOrderExtractionLine extractionLine = METSalesOrderExtractionLine::find(_extractionId, _salesId, true);
@@ -436,99 +295,14 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>buildLineTaskBuckets</Name>
-				<Source><![CDATA[
-    private container buildLineTaskBuckets(container _salesIdContainer, int _taskCount)
-    {
-        SalesLine  salesLine;
-        Map        itemLineMap  = new Map(Types::String, Types::Container);
-        List       itemIdList   = new List(Types::String);
-        Map        bucketSizeMap = new Map(Types::Integer, Types::Integer);
-        container  bucketLines;
-        container  itemIdArr;
-        int        i, b, k;
-
-        for (i = 1; i <= _taskCount; i++)
-        {
-            bucketLines += [conNull()];
-            bucketSizeMap.insert(i, 0);
-        }
-
-        for (i = 1; i <= conLen(_salesIdContainer); i++)
-        {
-            SalesId salesIdLocal = conPeek(_salesIdContainer, i);
-
-            while select salesLine
-                where salesLine.SalesId     == salesIdLocal
-                   && salesLine.SalesStatus != SalesStatus::Canceled
-            {
-                container existingLines = itemLineMap.exists(salesLine.ItemId) ? itemLineMap.lookup(salesLine.ItemId) : conNull();
-
-                if (!itemLineMap.exists(salesLine.ItemId))
-                {
-                    itemIdList.addEnd(salesLine.ItemId);
-                }
-
-                itemLineMap.insert(salesLine.ItemId, existingLines + salesLine.RecId);
-            }
-        }
-
-        ListEnumerator itemEnum = itemIdList.getEnumerator();
-        while (itemEnum.moveNext())
-        {
-            itemIdArr += itemEnum.current();
-        }
-
-        for (i = 1; i < conLen(itemIdArr); i++)
-        {
-            int maxIdx = i;
-
-            for (k = i + 1; k <= conLen(itemIdArr); k++)
-            {
-                if (conLen(itemLineMap.lookup(conPeek(itemIdArr, k))) > conLen(itemLineMap.lookup(conPeek(itemIdArr, maxIdx))))
-                {
-                    maxIdx = k;
-                }
-            }
-
-            if (maxIdx != i)
-            {
-                str tmp   = conPeek(itemIdArr, i);
-                itemIdArr = conPoke(itemIdArr, i, conPeek(itemIdArr, maxIdx));
-                itemIdArr = conPoke(itemIdArr, maxIdx, tmp);
-            }
-        }
-
-        for (i = 1; i <= conLen(itemIdArr); i++)
-        {
-            str        itemId         = conPeek(itemIdArr, i);
-            container  linesForItem   = itemLineMap.lookup(itemId);
-            int        smallestBucket = 1;
-            int        smallestSize   = bucketSizeMap.lookup(1);
-
-            for (b = 2; b <= _taskCount; b++)
-            {
-                int bSize = bucketSizeMap.lookup(b);
-
-                if (bSize < smallestSize)
-                {
-                    smallestSize   = bSize;
-                    smallestBucket = b;
-                }
-            }
-
-            bucketLines = conPoke(bucketLines, smallestBucket, conPeek(bucketLines, smallestBucket) + linesForItem);
-            bucketSizeMap.insert(smallestBucket, smallestSize + conLen(linesForItem));
-        }
-
-        return bucketLines;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
 				<Name>stampCsdExtractDateTime</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Stamps the CSD extract datetime on the SO, retrying on deadlock/update conflict.
+    /// </summary>
+    /// <param name = "_csdSalesOrderList">CSD SalesIds for this extraction</param>
+    /// <param name = "_salesId">Sales order to stamp, if it is a CSD order</param>
+    /// <param name = "_extractedDateTime">Datetime to stamp</param>
     private void stampCsdExtractDateTime(container _csdSalesOrderList, SalesId _salesId, utcdatetime _extractedDateTime)
     {
         #OCCRetryCount
@@ -581,10 +355,13 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>runThreadTask</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Per-bundle guide check + reservation for this task's assigned lines.
+    /// </summary>
     protected void runThreadTask()
     {
         #OCCRetryCount
-        container  lineRecIdContainer = conPeek(allBucketsCon, str2int(batchIdentifier));
+        container  lineRecIdContainer = conPeek(lineTaskBundles, str2int(batchIdentifier));
         int        i;
 
         for (i = 1; i <= conLen(lineRecIdContainer); i++)
@@ -639,6 +416,12 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>readStoredActionToPerform</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Reads back the ActionToPerform stamped during runStartTask().
+    /// </summary>
+    /// <param name = "_extractionId">Owning ExtractionId</param>
+    /// <param name = "_salesId">Sales order to look up</param>
+    /// <returns>The stored action code</returns>
     private str readStoredActionToPerform(METSalesOrderExtractionId _extractionId, SalesId _salesId)
     {
         METSalesOrderExtractionLine extractionLine = METSalesOrderExtractionLine::find(_extractionId, _salesId);
@@ -651,6 +434,10 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>buildSalesUpdateRemain</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Builds a SalesUpdateRemain configured for extraction, with business events skipped.
+    /// </summary>
+    /// <returns>The configured SalesUpdateRemain instance</returns>
     private SalesUpdateRemain buildSalesUpdateRemain()
     {
         SalesUpdateRemain salesUpdateRemainLocal = SalesUpdateRemain::construct();
@@ -665,6 +452,11 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>performGuideCheckForLine</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Sell-to / do-not-sell-to guide check for one line: 8-tier priority (Customer, then
+    /// CustOpsGroup, then Site, then State - OnlySellTo checked before DoNotSellTo at each tier).
+    /// </summary>
+    /// <param name = "_salesLine">The line to check</param>
     public void performGuideCheckForLine(SalesLine _salesLine)
     {
         SalesLine               salesLine;
@@ -1048,16 +840,17 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>runFinalTask</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Orchestrates the End task: spawn per-SO tasks, the End/export task, then the CSD task.
+    /// </summary>
     protected void runFinalTask()
     {
-        int                                    i;
-        boolean                                isBatchMode = this.isInBatch();
-        Batch                                  currentBatchTask;
-        BatchHeader                             fulfillmentBatchHeader;
-        RefRecId                                anchorRecId;
-        List                                    fulfillmentTaskList = new List(Types::Class);
-        METSalesPickingListFulfillmentBatch     endTask;
-        ListEnumerator                          soEnumerator;
+        boolean                              isBatchMode = this.isInBatch();
+        Batch                                currentBatchTask;
+        BatchHeader                          fulfillmentBatchHeader;
+        RefRecId                             anchorRecId;
+        List                                 fulfillmentTaskList;
+        METSalesPickingListFulfillmentBatch  endTask;
 
         if (isBatchMode)
         {
@@ -1066,111 +859,16 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
             anchorRecId            = currentBatchTask.RecId;
         }
 
-        for (i = 1; i <= conLen(processedSalesContainer); i++)
-        {
-            SalesId                               salesIdLocal = conPeek(processedSalesContainer, i);
-            METSalesPickingListFulfillmentBatch   soTask = new METSalesPickingListFulfillmentBatch();
-            int                                    csdPosition = conFind(csdSalesOrderList, salesIdLocal);
-
-            soTask.parmSalesId(salesIdLocal);
-            soTask.parmSalesOrderExtractionId(extractionId);
-            soTask.parmContinueFromStagingLane(continueFromStagingLane);
-            soTask.parmCSDSalesOrderCount(conLen(csdSalesOrderList));
-            soTask.parmCSDSalesOrderExtractDateTime(csdOrderExtractDateTime);
-
-            if (csdPosition > 0)
-            {
-                soTask.parmCSDSalesId(salesIdLocal);
-            }
-
-            if (csdGuid && conLen(csdSalesOrderList) > 0)
-            {
-                soTask.parmCsdGuid(csdGuid);
-            }
-
-            soTask.parmBatchIdentifier(salesIdLocal);
-
-            if (isBatchMode)
-            {
-                soTask.batchInfo().resetBatchHeader();
-                soTask.batchInfo().parmGroupId(currentBatchTask.GroupId);
-                soTask.batchInfo().parmConstraintType(BatchConstraintType::And);
-                soTask.batchInfo().parmDataareaId(currentBatchTask.Company);
-                fulfillmentBatchHeader.addRuntimeTask(soTask, anchorRecId);
-            }
-            else
-            {
-                soTask.run();
-            }
-
-            fulfillmentTaskList.addEnd(soTask);
-        }
+        fulfillmentTaskList = this.spawnPerSOTasks(isBatchMode, currentBatchTask, fulfillmentBatchHeader, anchorRecId);
 
         if (fulfillmentTaskList.elements() == 0)
         {
             return;
         }
 
-        endTask = new METSalesPickingListFulfillmentBatch();
-        endTask.parmSalesOrderExtractionId(extractionId);
-        endTask.parmShipmentIdList(conShipmentIds);
-        endTask.parmCsdGuid(csdGuid);
-        endTask.parmCSDSalesOrderList(csdSalesOrderList);
-        endTask.parmCSDSalesOrderExtractDateTime(csdOrderExtractDateTime);
+        endTask = this.spawnEndTask(isBatchMode, currentBatchTask, fulfillmentBatchHeader, anchorRecId, fulfillmentTaskList);
 
-        if (conLen(csdSalesOrderList) > 0)
-        {
-            endTask.parmCSDSalesId(conPeek(csdSalesOrderList, 1));
-        }
-
-        endTask.parmBatchIdentifier(endTask.finalTaskIdentifier());
-
-        if (isBatchMode)
-        {
-            endTask.batchInfo().resetBatchHeader();
-            endTask.batchInfo().parmGroupId(currentBatchTask.GroupId);
-            endTask.batchInfo().parmConstraintType(BatchConstraintType::And);
-            endTask.batchInfo().parmDataareaId(currentBatchTask.Company);
-            fulfillmentBatchHeader.addRuntimeTask(endTask, anchorRecId);
-
-            soEnumerator = fulfillmentTaskList.getEnumerator();
-            while (soEnumerator.moveNext())
-            {
-                fulfillmentBatchHeader.addDependency(endTask, soEnumerator.current());
-            }
-        }
-        else
-        {
-            endTask.run();
-        }
-
-        // CB395 CSD inter-branch transfer task - depends on every per-SO task AND the
-        // End/export task, matching METSalesPickingListGenerationService.addCreateCSDTransferOrderTask.
-        if (conLen(csdSalesOrderList) > 0)
-        {
-            SysOperationServiceController      csdController = METCreateCSDTransferOrderController::construct(csdSalesOrderList);
-            METCreateCSDTransferOrderContract  csdContract    = csdController.getDataContractObject() as METCreateCSDTransferOrderContract;
-            csdContract.parmContinueFromStagingLane(continueFromStagingLane);
-
-            if (isBatchMode)
-            {
-                ListEnumerator csdSoEnumerator;
-
-                fulfillmentBatchHeader.addRuntimeTask(csdController, anchorRecId);
-
-                csdSoEnumerator = fulfillmentTaskList.getEnumerator();
-                while (csdSoEnumerator.moveNext())
-                {
-                    fulfillmentBatchHeader.addDependency(csdController, csdSoEnumerator.current(), BatchDependencyStatus::Finished);
-                }
-                fulfillmentBatchHeader.addDependency(csdController, endTask, BatchDependencyStatus::Finished);
-            }
-            else
-            {
-                csdController.parmShowDialog(false);
-                csdController.startOperation();
-            }
-        }
+        this.spawnCsdTransferOrderTask(isBatchMode, fulfillmentBatchHeader, anchorRecId, fulfillmentTaskList, endTask);
 
         if (isBatchMode)
         {
@@ -1183,6 +881,11 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>main</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Extract-button entry point: scans the selected orders, resolves CSD/staging-lane
+    /// context, then prompts (V2) or silently schedules (V1) this batch.
+    /// </summary>
+    /// <param name = "_args">Caller args - the extraction screen's form is expected</param>
     [SuppressBPWarning('BPErrorSelectUsingFirstOnly', 'This is required as a complete set of buffer needs to be passed')]
     public static void main(Args _args)
     {
@@ -1351,6 +1054,9 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>run</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// V1 skips the base class's parent/thread/final dispatch entirely and just runs runStartTask() once.
+    /// </summary>
     public void run()
     {
         if (!useLineLevelThreading)
@@ -1367,6 +1073,10 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>showDialog</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// No dialog at all for V1 - main() silently forces batch instead.
+    /// </summary>
+    /// <returns>True to show the dialog (V2 only)</returns>
     public boolean showDialog()
     {
         return useLineLevelThreading;
@@ -1377,9 +1087,657 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 			<Method>
 				<Name>allowSaveLast</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Parameters are always set via code, never loaded from SysLastValue.
+    /// </summary>
+    /// <returns>Always false</returns>
     public boolean allowSaveLast()
     {
         return false;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>caption</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Per-role task caption: setup (named like the original job, by user, for ExtractionId),
+    /// bundle N, or dispatch-to-fulfillment.
+    /// </summary>
+    /// <returns>The caption for this task instance</returns>
+    public ClassDescription caption()
+    {
+        if (batchIdentifier == this.finalTaskIdentifier())
+        {
+            return "@MET:METCaptionReservationDispatch";
+        }
+        else if (batchIdentifier)
+        {
+            return strFmt("@MET:METCaptionGuideCheckReservation", batchIdentifier);
+        }
+        else if (extractionId)
+        {
+            return strFmt("@MET:METCaptionReservationSetupForExtraction", "@MET:MetPickingListGeneration", curUserId(), extractionId);
+        }
+
+        return "@MET:MetPickingListGeneration";
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>flagOrdersAsProcessing</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets METProcessing=Yes on each selected order that is still Open/ReadyForExtract.
+    /// </summary>
+    private void flagOrdersAsProcessing()
+    {
+        int i;
+
+        ttsbegin;
+
+        for (i = 1; i <= conLen(salesOrderList); i++)
+        {
+            SalesId    currentSalesId = conPeek(salesOrderList, i);
+            SalesTable salesTableToUpdate;
+            salesTableToUpdate.skipBusinessEvents(true);
+            select firstonly forupdate salesTableToUpdate where salesTableToUpdate.SalesId == currentSalesId;
+            if (salesTableToUpdate.RecId && (salesTableToUpdate.METOrderExtractStatus == METOrderExtractStatus::Open || salesTableToUpdate.METOrderExtractStatus == METOrderExtractStatus::ReadyForExtract))
+            {
+                salesTableToUpdate.METProcessing = NoYes::Yes;
+                salesTableToUpdate.doUpdate();
+            }
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runLegacyFlow</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// V1: builds the original contract and hands off to METSalesPickingListGenerationService.
+    /// </summary>
+    private void runLegacyFlow()
+    {
+        METSalesPickingListGenerationContract v1Contract = new METSalesPickingListGenerationContract();
+        v1Contract.parmSalesOrderList(salesOrderList);
+        v1Contract.parmCSDSalesOrderList(csdSalesOrderList);
+        v1Contract.parmCsdGuid(csdGuid);
+        v1Contract.parmContinueFromStagingLane(continueFromStagingLane);
+
+        new METSalesPickingListGenerationService().process(v1Contract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>insertExtractionHeaderAndLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Inserts the extraction header (reusing the dialog's pre-allocated ExtractionId) and one line per SO.
+    /// </summary>
+    private void insertExtractionHeaderAndLines()
+    {
+        int                           i;
+        METSalesOrderExtractionTable  extractionHeader;
+        METSalesOrderExtractionLine   extractionLine;
+
+        ttsbegin;
+
+        if (extractionId)
+        {
+            extractionHeader.ExtractionId = extractionId;
+        }
+        extractionHeader.initValue();
+        extractionHeader.InventLocationId = extractionInventLocationId;
+        extractionHeader.ExtractionStatus = METSalesOrderExtractionStatus::Pending;
+        extractionHeader.Exported         = NoYes::No;
+        extractionHeader.insert();
+
+        extractionId = extractionHeader.ExtractionId;
+
+        for (i = 1; i <= conLen(salesOrderList); i++)
+        {
+            extractionLine.clear();
+            extractionLine.ExtractionId     = extractionId;
+            extractionLine.SalesId          = conPeek(salesOrderList, i);
+            extractionLine.ExtractionStatus = METSalesOrderExtractionStatus::Pending;
+            extractionLine.insert();
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>filterEligibleAndStampActions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Credit-check filters the SO list, stamps shipment/CSD/action data, and builds processedSalesContainer.
+    /// </summary>
+    private void filterEligibleAndStampActions()
+    {
+        int            i;
+        SalesId        salesIdLocal;
+        MetShipmentId  metShipmentId;
+        utcdatetime    curDateTime = DateTimeUtil::getSystemDateTime();
+
+        ttsbegin;
+
+        for (i = 1; i <= conLen(salesOrderList); i++)
+        {
+            str actionToPerform;
+
+            salesIdLocal = conPeek(salesOrderList, i);
+
+            if (SalesTable::find(salesIdLocal).CredManInCreditControl)
+            {
+                warning(strFmt("@MET:SOCredMgmtValidation", salesIdLocal));
+                continue;
+            }
+
+            METOrderShipmentLoadCreation shipmentLoadCreation = METOrderShipmentLoadCreation::construct(METOrderTransactionType::SalesOrder, salesIdLocal);
+            metShipmentId = shipmentLoadCreation.createShippmentLoad(true, true);
+
+            if (conFind(shipmentIdList, metShipmentId) == 0)
+            {
+                shipmentIdList += [metShipmentId];
+            }
+
+            this.stampCsdExtractDateTime(csdSalesOrderList, salesIdLocal, curDateTime);
+
+            actionToPerform = this.decideActionToPerform(salesIdLocal);
+            this.stampActionToPerformOnExtractionLine(extractionId, salesIdLocal, actionToPerform);
+
+            processedSalesContainer += salesIdLocal;
+        }
+
+        if (conLen(processedSalesContainer) == 0)
+        {
+            ttsabort;
+            return;
+        }
+
+        ttscommit;
+
+        csdOrderExtractDateTime = curDateTime;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>decideActionToPerformFood</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Food-entity decision matrix - unchanged from the original Orchestrator.
+    /// </summary>
+    /// <param name = "_salesTable">The sales order</param>
+    /// <param name = "_metSalesTable">Metcash sales order extension</param>
+    /// <param name = "_inventLocation">The order's warehouse</param>
+    /// <returns>The decided action code</returns>
+    private str decideActionToPerformFood(SalesTable _salesTable, METSalesTable _metSalesTable, InventLocation _inventLocation)
+    {
+        str actionToPerform;
+
+        if (_metSalesTable.InternalCrossDockOrder == NoYes::Yes  &&
+            _inventLocation.METCSDWarehouse == NoYes::No         &&
+            _inventLocation.METPickDirector == NoYes::No         &&
+            _inventLocation.METWaveRequired == NoYes::No)
+        {
+            actionToPerform = METConstants::SOExtractCreateOnlyTO;
+        }
+        else if (_metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                _salesTable.METAllowBackOrders == NoYes::No          &&
+                _inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                _inventLocation.METPickDirector == NoYes::No         &&
+                _inventLocation.METWaveRequired == NoYes::Yes)
+        {
+            actionToPerform = METConstants::SOExtractOrderedSOPickOnly;
+        }
+        else if (_metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                _salesTable.METAllowBackOrders == NoYes::No          &&
+                _inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                _inventLocation.METPickDirector == NoYes::Yes        &&
+                _inventLocation.METWaveRequired == NoYes::Yes)
+        {
+            actionToPerform = METConstants::SOExtractUpdateStatusOnly;
+        }
+        else if (_metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                _salesTable.METAllowBackOrders == NoYes::No          &&
+                _inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                _inventLocation.METPickDirector == NoYes::No         &&
+                _inventLocation.METWaveRequired == NoYes::No)
+        {
+            actionToPerform = METConstants::SOExtractUpdateStatusOnly;
+        }
+        else if (_metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                _salesTable.METAllowBackOrders == NoYes::No          &&
+                _inventLocation.METCSDWarehouse == NoYes::No         &&
+                _inventLocation.METPickDirector == NoYes::No         &&
+                _inventLocation.METWaveRequired == NoYes::No)
+        {
+            actionToPerform = METConstants::SOExtractReservedSOPickOnly;
+        }
+        else if (_metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                _salesTable.METAllowBackOrders == NoYes::Yes         &&
+                _inventLocation.METCSDWarehouse == NoYes::No         &&
+                _inventLocation.METPickDirector == NoYes::No         &&
+                _inventLocation.METWaveRequired == NoYes::No)
+        {
+            actionToPerform = METConstants::SOExtractReservedSOPickOnly;
+        }
+        else if (_metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                _salesTable.METAllowBackOrders == NoYes::Yes         &&
+                _inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                _inventLocation.METPickDirector == NoYes::Yes        &&
+                _inventLocation.METWaveRequired == NoYes::Yes)
+        {
+            actionToPerform = METConstants::SOExtractUpdateStatusOnly;
+        }
+        else if (_metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                _salesTable.METAllowBackOrders == NoYes::Yes         &&
+                _inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                _inventLocation.METPickDirector == NoYes::No         &&
+                _inventLocation.METWaveRequired == NoYes::Yes)
+        {
+            actionToPerform = METConstants::SOExtractOrderedSOPickOnly;
+        }
+        else if (_metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                _salesTable.METAllowBackOrders == NoYes::Yes         &&
+                _inventLocation.METCSDWarehouse == NoYes::Yes        &&
+                _inventLocation.METPickDirector == NoYes::No         &&
+                _inventLocation.METWaveRequired == NoYes::No)
+        {
+            actionToPerform = METConstants::SOExtractUpdateStatusOnly;
+        }
+        else
+        {
+            actionToPerform = METConstants::SOExtractSkip;
+        }
+
+        return actionToPerform;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>decideActionToPerformLiquor</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Liquor-entity decision matrix - unchanged from the original Orchestrator.
+    /// </summary>
+    /// <param name = "_salesTable">The sales order</param>
+    /// <param name = "_metSalesTable">Metcash sales order extension</param>
+    /// <param name = "_inventLocation">The order's warehouse</param>
+    /// <returns>The decided action code</returns>
+    private str decideActionToPerformLiquor(SalesTable _salesTable, METSalesTable _metSalesTable, InventLocation _inventLocation)
+    {
+        str actionToPerform;
+
+        if (_metSalesTable.InternalCrossDockOrder == NoYes::Yes  &&
+            _salesTable.METAllowBackOrders == NoYes::Yes         &&
+            _inventLocation.METCSDWarehouse == NoYes::No         &&
+            _inventLocation.METPickDirector == NoYes::No         &&
+            _inventLocation.METWaveRequired == NoYes::No)
+        {
+            actionToPerform = METConstants::SOExtractReservedSOPickAndTO;
+        }
+        else if (_metSalesTable.InternalCrossDockOrder == NoYes::Yes     &&
+            _salesTable.METAllowBackOrders == NoYes::No                  &&
+            _inventLocation.METCSDWarehouse == NoYes::No                 &&
+            _inventLocation.METPickDirector == NoYes::No                 &&
+            _inventLocation.METWaveRequired == NoYes::No)
+        {
+            actionToPerform = METConstants::SOExtractReservedSOPickAndTO;
+        }
+        else if (_metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                _salesTable.METAllowBackOrders == NoYes::No          &&
+                _inventLocation.METCSDWarehouse == NoYes::No         &&
+                _inventLocation.METPickDirector == NoYes::No         &&
+                _inventLocation.METWaveRequired == NoYes::No)
+        {
+            actionToPerform = METConstants::SOExtractReservedSOPickOnly;
+        }
+        else if (_metSalesTable.InternalCrossDockOrder == NoYes::No  &&
+                _salesTable.METAllowBackOrders == NoYes::Yes         &&
+                _inventLocation.METCSDWarehouse == NoYes::No         &&
+                _inventLocation.METPickDirector == NoYes::No         &&
+                _inventLocation.METWaveRequired == NoYes::No)
+        {
+            actionToPerform = METConstants::SOExtractReservedSOPickOnly;
+        }
+        else
+        {
+            actionToPerform = METConstants::SOExtractSkip;
+        }
+
+        return actionToPerform;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>collectLinesByItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Groups every backorder-eligible line across all SOs by ItemId.
+    /// </summary>
+    /// <param name = "_salesIdContainer">SalesIds to scan</param>
+    /// <param name = "_itemLineMap">Map(ItemId -> container of line RecIds), filled in place</param>
+    /// <returns>Container of distinct ItemIds found</returns>
+    private container collectLinesByItem(container _salesIdContainer, Map _itemLineMap)
+    {
+        SalesLine  salesLine;
+        List       itemIdList = new List(Types::String);
+        container  itemIdArr;
+        int        i;
+
+        for (i = 1; i <= conLen(_salesIdContainer); i++)
+        {
+            SalesId salesIdLocal = conPeek(_salesIdContainer, i);
+
+            while select salesLine
+                where salesLine.SalesId     == salesIdLocal
+                   && salesLine.SalesStatus != SalesStatus::Canceled
+            {
+                container existingLines = _itemLineMap.exists(salesLine.ItemId) ? _itemLineMap.lookup(salesLine.ItemId) : conNull();
+
+                if (!_itemLineMap.exists(salesLine.ItemId))
+                {
+                    itemIdList.addEnd(salesLine.ItemId);
+                }
+
+                _itemLineMap.insert(salesLine.ItemId, existingLines + salesLine.RecId);
+            }
+        }
+
+        ListEnumerator itemEnum = itemIdList.getEnumerator();
+        while (itemEnum.moveNext())
+        {
+            itemIdArr += itemEnum.current();
+        }
+
+        return itemIdArr;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>sortItemsByLineCountDescending</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Selection sort so the heaviest items (most lines) get bundled first.
+    /// </summary>
+    /// <param name = "_itemIdArr">ItemIds to sort</param>
+    /// <param name = "_itemLineMap">Map(ItemId -> lines), used for the comparison</param>
+    /// <returns>ItemIds sorted by line count, descending</returns>
+    private container sortItemsByLineCountDescending(container _itemIdArr, Map _itemLineMap)
+    {
+        int i, compareIdx;
+
+        for (i = 1; i < conLen(_itemIdArr); i++)
+        {
+            int maxIdx = i;
+
+            for (compareIdx = i + 1; compareIdx <= conLen(_itemIdArr); compareIdx++)
+            {
+                if (conLen(_itemLineMap.lookup(conPeek(_itemIdArr, compareIdx))) > conLen(_itemLineMap.lookup(conPeek(_itemIdArr, maxIdx))))
+                {
+                    maxIdx = compareIdx;
+                }
+            }
+
+            if (maxIdx != i)
+            {
+                str tmp    = conPeek(_itemIdArr, i);
+                _itemIdArr = conPoke(_itemIdArr, i, conPeek(_itemIdArr, maxIdx));
+                _itemIdArr = conPoke(_itemIdArr, maxIdx, tmp);
+            }
+        }
+
+        return _itemIdArr;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>spawnPerSOTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates one Class 2 pick-list task per eligible SO, either as a real batch task or run inline.
+    /// </summary>
+    /// <param name = "_isBatchMode">True if running as a real batch job</param>
+    /// <param name = "_currentBatchTask">The currently-executing batch task (batch mode only)</param>
+    /// <param name = "_fulfillmentBatchHeader">Batch header to add tasks to (batch mode only)</param>
+    /// <param name = "_anchorRecId">RecId to anchor runtime tasks to (batch mode only)</param>
+    /// <returns>The list of spawned/run Class 2 instances</returns>
+    private List spawnPerSOTasks(boolean _isBatchMode, Batch _currentBatchTask, BatchHeader _fulfillmentBatchHeader, RefRecId _anchorRecId)
+    {
+        int  i;
+        List fulfillmentTaskList = new List(Types::Class);
+
+        for (i = 1; i <= conLen(processedSalesContainer); i++)
+        {
+            SalesId                               salesIdLocal = conPeek(processedSalesContainer, i);
+            METSalesPickingListFulfillmentBatch   soTask = new METSalesPickingListFulfillmentBatch();
+            int                                    csdPosition = conFind(csdSalesOrderList, salesIdLocal);
+
+            soTask.parmSalesId(salesIdLocal);
+            soTask.parmSalesOrderExtractionId(extractionId);
+            soTask.parmContinueFromStagingLane(continueFromStagingLane);
+            soTask.parmCSDSalesOrderCount(conLen(csdSalesOrderList));
+            soTask.parmCSDSalesOrderExtractDateTime(csdOrderExtractDateTime);
+
+            if (csdPosition > 0)
+            {
+                soTask.parmCSDSalesId(salesIdLocal);
+            }
+
+            if (csdGuid && conLen(csdSalesOrderList) > 0)
+            {
+                soTask.parmCsdGuid(csdGuid);
+            }
+
+            soTask.parmBatchIdentifier(salesIdLocal);
+
+            if (_isBatchMode)
+            {
+                soTask.batchInfo().resetBatchHeader();
+                soTask.batchInfo().parmGroupId(_currentBatchTask.GroupId);
+                soTask.batchInfo().parmConstraintType(BatchConstraintType::And);
+                soTask.batchInfo().parmDataareaId(_currentBatchTask.Company);
+                _fulfillmentBatchHeader.addRuntimeTask(soTask, _anchorRecId);
+            }
+            else
+            {
+                soTask.run();
+            }
+
+            fulfillmentTaskList.addEnd(soTask);
+        }
+
+        return fulfillmentTaskList;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>spawnEndTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates the Class 2 End/export task, dependent on every per-SO task in batch mode.
+    /// </summary>
+    /// <param name = "_isBatchMode">True if running as a real batch job</param>
+    /// <param name = "_currentBatchTask">The currently-executing batch task (batch mode only)</param>
+    /// <param name = "_fulfillmentBatchHeader">Batch header to add the task to (batch mode only)</param>
+    /// <param name = "_anchorRecId">RecId to anchor the runtime task to (batch mode only)</param>
+    /// <param name = "_fulfillmentTaskList">Per-SO tasks the End task depends on</param>
+    /// <returns>The spawned/run End task instance</returns>
+    private METSalesPickingListFulfillmentBatch spawnEndTask(boolean _isBatchMode, Batch _currentBatchTask, BatchHeader _fulfillmentBatchHeader, RefRecId _anchorRecId, List _fulfillmentTaskList)
+    {
+        METSalesPickingListFulfillmentBatch endTask = new METSalesPickingListFulfillmentBatch();
+
+        endTask.parmSalesOrderExtractionId(extractionId);
+        endTask.parmShipmentIdList(shipmentIdList);
+        endTask.parmCsdGuid(csdGuid);
+        endTask.parmCSDSalesOrderList(csdSalesOrderList);
+        endTask.parmCSDSalesOrderExtractDateTime(csdOrderExtractDateTime);
+
+        if (conLen(csdSalesOrderList) > 0)
+        {
+            endTask.parmCSDSalesId(conPeek(csdSalesOrderList, 1));
+        }
+
+        endTask.parmBatchIdentifier(endTask.finalTaskIdentifier());
+
+        if (_isBatchMode)
+        {
+            ListEnumerator soEnumerator;
+
+            endTask.batchInfo().resetBatchHeader();
+            endTask.batchInfo().parmGroupId(_currentBatchTask.GroupId);
+            endTask.batchInfo().parmConstraintType(BatchConstraintType::And);
+            endTask.batchInfo().parmDataareaId(_currentBatchTask.Company);
+            _fulfillmentBatchHeader.addRuntimeTask(endTask, _anchorRecId);
+
+            soEnumerator = _fulfillmentTaskList.getEnumerator();
+            while (soEnumerator.moveNext())
+            {
+                _fulfillmentBatchHeader.addDependency(endTask, soEnumerator.current());
+            }
+        }
+        else
+        {
+            endTask.run();
+        }
+
+        return endTask;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>spawnCsdTransferOrderTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// CB395 CSD inter-branch transfer task - depends on every per-SO task AND the End/export
+    /// task, matching METSalesPickingListGenerationService.addCreateCSDTransferOrderTask.
+    /// </summary>
+    /// <param name = "_isBatchMode">True if running as a real batch job</param>
+    /// <param name = "_fulfillmentBatchHeader">Batch header to add the task to (batch mode only)</param>
+    /// <param name = "_anchorRecId">RecId to anchor the runtime task to (batch mode only)</param>
+    /// <param name = "_fulfillmentTaskList">Per-SO tasks the CSD task depends on</param>
+    /// <param name = "_endTask">End/export task the CSD task also depends on</param>
+    private void spawnCsdTransferOrderTask(boolean _isBatchMode, BatchHeader _fulfillmentBatchHeader, RefRecId _anchorRecId, List _fulfillmentTaskList, METSalesPickingListFulfillmentBatch _endTask)
+    {
+        if (conLen(csdSalesOrderList) == 0)
+        {
+            return;
+        }
+
+        SysOperationServiceController      csdController = METCreateCSDTransferOrderController::construct(csdSalesOrderList);
+        METCreateCSDTransferOrderContract  csdContract    = csdController.getDataContractObject() as METCreateCSDTransferOrderContract;
+        csdContract.parmContinueFromStagingLane(continueFromStagingLane);
+
+        if (_isBatchMode)
+        {
+            ListEnumerator csdSoEnumerator;
+
+            _fulfillmentBatchHeader.addRuntimeTask(csdController, _anchorRecId);
+
+            csdSoEnumerator = _fulfillmentTaskList.getEnumerator();
+            while (csdSoEnumerator.moveNext())
+            {
+                _fulfillmentBatchHeader.addDependency(csdController, csdSoEnumerator.current(), BatchDependencyStatus::Finished);
+            }
+            _fulfillmentBatchHeader.addDependency(csdController, _endTask, BatchDependencyStatus::Finished);
+        }
+        else
+        {
+            csdController.parmShowDialog(false);
+            csdController.startOperation();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildLineTaskBundles</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// LPT bin-packing: collect lines by item, sort items by line count descending, then
+    /// greedily assign items to the smallest bundle.
+    /// </summary>
+    /// <param name = "_salesIdContainer">Eligible SalesIds to bundle</param>
+    /// <param name = "_taskCount">Number of bundles to produce</param>
+    /// <returns>Container of bundles, each a container of SalesLine RecIds</returns>
+    private container buildLineTaskBundles(container _salesIdContainer, int _taskCount)
+    {
+        Map        itemLineMap   = new Map(Types::String, Types::Container);
+        Map        bundleSizeMap = new Map(Types::Integer, Types::Integer);
+        container  bundleLines;
+        container  itemIdArr;
+        int        i;
+
+        for (i = 1; i <= _taskCount; i++)
+        {
+            bundleLines += [conNull()];
+            bundleSizeMap.insert(i, 0);
+        }
+
+        itemIdArr = this.collectLinesByItem(_salesIdContainer, itemLineMap);
+        itemIdArr = this.sortItemsByLineCountDescending(itemIdArr, itemLineMap);
+
+        return this.assignItemsToBundles(itemIdArr, itemLineMap, bundleLines, bundleSizeMap, _taskCount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>assignItemsToBundles</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Greedily assigns each item's lines to whichever bundle currently has the fewest lines.
+    /// </summary>
+    /// <param name = "_itemIdArr">Items in the order to assign</param>
+    /// <param name = "_itemLineMap">Map(ItemId -> lines)</param>
+    /// <param name = "_bundleLines">Bundles to fill</param>
+    /// <param name = "_bundleSizeMap">Running line count per bundle</param>
+    /// <param name = "_taskCount">Number of bundles</param>
+    /// <returns>The filled bundles</returns>
+    private container assignItemsToBundles(container _itemIdArr, Map _itemLineMap, container _bundleLines, Map _bundleSizeMap, int _taskCount)
+    {
+        int i, bundleIdx;
+
+        for (i = 1; i <= conLen(_itemIdArr); i++)
+        {
+            str        itemId         = conPeek(_itemIdArr, i);
+            container  linesForItem   = _itemLineMap.lookup(itemId);
+            int        smallestBundle = 1;
+            int        smallestSize   = _bundleSizeMap.lookup(1);
+
+            for (bundleIdx = 2; bundleIdx <= _taskCount; bundleIdx++)
+            {
+                int bundleSize = _bundleSizeMap.lookup(bundleIdx);
+
+                if (bundleSize < smallestSize)
+                {
+                    smallestSize   = bundleSize;
+                    smallestBundle = bundleIdx;
+                }
+            }
+
+            _bundleLines = conPoke(_bundleLines, smallestBundle, conPeek(_bundleLines, smallestBundle) + linesForItem);
+            _bundleSizeMap.insert(smallestBundle, smallestSize + conLen(linesForItem));
+        }
+
+        return _bundleLines;
     }
 
 ]]></Source>
