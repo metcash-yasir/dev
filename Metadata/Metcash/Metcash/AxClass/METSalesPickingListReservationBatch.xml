@@ -20,6 +20,7 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
     utcdatetime                 csdOrderExtractDateTime;
     container                   lineTaskBundles;
     boolean                     useLineLevelThreading;
+    METProcMetrics              procMetrics;
 
     DialogField                 dlgOrderCount;
     DialogField                 dlgExtractionId;
@@ -207,12 +208,15 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
         }
 
         this.insertExtractionHeaderAndLines();
+        this.markHeaderProcessing();
         this.filterEligibleAndStampActions();
 
         if (conLen(processedSalesContainer) == 0)
         {
             return;
         }
+
+        this.persistRetryContext();
 
         METCustParameters metCustParameters = METCustParameters::Find();
         int               taskCount = metCustParameters.SalesExtractionBatchLineTaskCount > 0 ? metCustParameters.SalesExtractionBatchLineTaskCount : 1;
@@ -355,7 +359,14 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 				<Name>runThreadTask</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Per-bundle guide check + reservation for this task's assigned lines.
+    /// Per-bundle guide check + reservation for this task's assigned lines, traced via
+    /// METProcMetrics: one METBatchMonitoringLog row per bundle, Details = ExtractionId,
+    /// progress tracked via DocumentCount/LineCount vs LinesToProcess. Slot 2 = guide check,
+    /// slot 3 = reservation (also updated by METStockReservation itself, via the ambient
+    /// METProcMetricsScope). Every line is isolated in its own try/catch and logged with its
+    /// stage/LineNum/ItemId on failure, but if any line failed the bundle task itself ends in
+    /// error so runFinalTask() - and therefore Phase 2 - never runs for this extraction; the
+    /// batch dependency chain does the blocking, not application logic.
     /// </summary>
     protected void runThreadTask()
     {
@@ -363,51 +374,93 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
         container  lineRecIdContainer      = conPeek(lineTaskBundles, str2int(batchIdentifier));
         int        i;
         Map        actionToPerformCache    = new Map(Types::String, Types::String);
+        boolean    anyLineFailed;
 
-        for (i = 1; i <= conLen(lineRecIdContainer); i++)
+        procMetrics = METProcMetrics::construct(METBatchLogOperation::SalesOrderExtractJob);
+
+        using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
         {
-            RefRecId lineRecId = conPeek(lineRecIdContainer, i);
+            procMetrics.startTrace(conLen(lineRecIdContainer), extractionId);
 
-            try
+            for (i = 1; i <= conLen(lineRecIdContainer); i++)
             {
-                SalesLine salesLineLocal = SalesLine::findRecId(lineRecId, true);
+                RefRecId  lineRecId    = conPeek(lineRecIdContainer, i);
+                SalesLine salesLineLocal;
+                str       currentStage = "GuideCheck";
 
-                if (salesLineLocal.RecId)
+                try
                 {
-                    str lineActionToPerform = this.readCachedActionToPerform(actionToPerformCache, extractionId, salesLineLocal.SalesId);
-
-                    this.performGuideCheckForLine(salesLineLocal);
-
-                    if (lineActionToPerform == METConstants::SOExtractReservedSOPickAndTO
-                     || lineActionToPerform == METConstants::SOExtractReservedSOPickOnly)
+                    try
                     {
-                        SalesTable reservationSalesTable = salesLineLocal.salesTable();
-                        METStockReservation::construct(reservationSalesTable).processV2ForLines([lineRecId], extractionId);
+                        salesLineLocal = SalesLine::findRecId(lineRecId, true);
+
+                        if (salesLineLocal.RecId)
+                        {
+                            procMetrics.incProcessedCount(1, 1);
+
+                            str lineActionToPerform = this.readCachedActionToPerform(actionToPerformCache, extractionId, salesLineLocal.SalesId);
+
+                            currentStage = "GuideCheck";
+                            procMetrics.startDescriptionTime(2, "@MET:METSOExtractSOGuideCheck");
+                            this.performGuideCheckForLine(salesLineLocal);
+                            procMetrics.incDescriptionCount(2, 1);
+                            procMetrics.endDescriptionTime(2);
+
+                            if (lineActionToPerform == METConstants::SOExtractReservedSOPickAndTO
+                             || lineActionToPerform == METConstants::SOExtractReservedSOPickOnly)
+                            {
+                                SalesTable reservationSalesTable = salesLineLocal.salesTable();
+                                currentStage = "Reservation";
+                                procMetrics.startDescriptionTime(3, "@MET:METSOExtractStockReservation");
+                                METStockReservation::construct(reservationSalesTable).processV2ForLines([lineRecId], extractionId);
+                                procMetrics.endDescriptionTime(3);
+                            }
+                        }
                     }
-                }
-            }
-            catch (Exception::Deadlock)
-            {
-                retry;
-            }
-            catch (Exception::UpdateConflict)
-            {
-                if (appl.ttsLevel() == 0)
-                {
-                    if (xSession::currentRetryCount() >= #RetryNum)
-                    {
-                        throw Exception::UpdateConflictNotRecovered;
-                    }
-                    else
+                    catch (Exception::Deadlock)
                     {
                         retry;
                     }
+                    catch (Exception::UpdateConflict)
+                    {
+                        if (appl.ttsLevel() == 0)
+                        {
+                            if (xSession::currentRetryCount() >= #RetryNum)
+                            {
+                                throw Exception::UpdateConflictNotRecovered;
+                            }
+                            else
+                            {
+                                retry;
+                            }
+                        }
+                        else
+                        {
+                            throw Exception::UpdateConflict;
+                        }
+                    }
                 }
-                else
+                catch
                 {
-                    throw Exception::UpdateConflict;
+                    anyLineFailed = true;
+
+                    try
+                    {
+                        this.logLineFailure(currentStage, lineRecId, salesLineLocal.SalesId);
+                    }
+                    catch
+                    {
+                        // Logging itself failed - the bundle is still marked failed below regardless.
+                    }
                 }
             }
+
+            if (anyLineFailed)
+            {
+                throw error(strFmt("@MET:METBundleHadLineFailures", batchIdentifier));
+            }
+
+            procMetrics.endTrace(METBatchMonitoringStatus::Completed);
         }
     }
 
@@ -844,6 +897,9 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 				<Source><![CDATA[
     /// <summary>
     /// Orchestrates the End task: spawn per-SO tasks, the End/export task, then the CSD task.
+    /// Traced separately from the per-bundle runThreadTask() traces - own
+    /// METBatchMonitoringLog row, Details = ExtractionId, progress tracked via DocumentCount
+    /// vs LinesToProcess.
     /// </summary>
     protected void runFinalTask()
     {
@@ -854,27 +910,37 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
         List                                 fulfillmentTaskList;
         METSalesPickingListFulfillmentBatch  endTask;
 
-        if (isBatchMode)
+        procMetrics = METProcMetrics::construct(METBatchLogOperation::SalesOrderExtractJob);
+
+        using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
         {
-            currentBatchTask       = this.parmCurrentBatch();
-            fulfillmentBatchHeader = BatchHeader::construct(currentBatchTask.BatchJobId);
-            anchorRecId            = currentBatchTask.RecId;
-        }
+            procMetrics.startTrace(conLen(processedSalesContainer), extractionId);
 
-        fulfillmentTaskList = this.spawnPerSOTasks(isBatchMode, currentBatchTask, fulfillmentBatchHeader, anchorRecId);
+            if (isBatchMode)
+            {
+                currentBatchTask       = this.parmCurrentBatch();
+                fulfillmentBatchHeader = BatchHeader::construct(currentBatchTask.BatchJobId);
+                anchorRecId            = currentBatchTask.RecId;
+            }
 
-        if (fulfillmentTaskList.elements() == 0)
-        {
-            return;
-        }
+            fulfillmentTaskList = this.spawnPerSOTasks(isBatchMode, currentBatchTask, fulfillmentBatchHeader, anchorRecId);
 
-        endTask = this.spawnEndTask(isBatchMode, currentBatchTask, fulfillmentBatchHeader, anchorRecId, fulfillmentTaskList);
+            if (fulfillmentTaskList.elements() == 0)
+            {
+                procMetrics.endTrace(METBatchMonitoringStatus::Completed);
+                return;
+            }
 
-        this.spawnCsdTransferOrderTask(isBatchMode, fulfillmentBatchHeader, anchorRecId, fulfillmentTaskList, endTask);
+            endTask = this.spawnEndTask(isBatchMode, currentBatchTask, fulfillmentBatchHeader, anchorRecId, fulfillmentTaskList);
 
-        if (isBatchMode)
-        {
-            fulfillmentBatchHeader.save();
+            this.spawnCsdTransferOrderTask(isBatchMode, fulfillmentBatchHeader, anchorRecId, fulfillmentTaskList, endTask);
+
+            if (isBatchMode)
+            {
+                fulfillmentBatchHeader.save();
+            }
+
+            procMetrics.endTrace(METBatchMonitoringStatus::Completed);
         }
     }
 
@@ -1515,7 +1581,8 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 				<Name>spawnPerSOTasks</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Creates one Class 2 pick-list task per eligible SO, either as a real batch task or run inline.
+    /// Creates one Class 2 pick-list task per eligible SO, either as a real batch task or run
+    /// inline. Increments the dispatch trace's progress counter (Details stays ExtractionId).
     /// </summary>
     /// <param name = "_isBatchMode">True if running as a real batch job</param>
     /// <param name = "_currentBatchTask">The currently-executing batch task (batch mode only)</param>
@@ -1532,6 +1599,11 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
             SalesId                               salesIdLocal = conPeek(processedSalesContainer, i);
             METSalesPickingListFulfillmentBatch   soTask = new METSalesPickingListFulfillmentBatch();
             int                                    csdPosition = conFind(csdSalesOrderList, salesIdLocal);
+
+            if (procMetrics)
+            {
+                procMetrics.incProcessedCount(1, 0);
+            }
 
             soTask.parmSalesId(salesIdLocal);
             soTask.parmSalesOrderExtractionId(extractionId);
@@ -1766,6 +1838,186 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
         }
 
         return _cache.lookup(_salesId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>logLineFailure</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Captures a short failure reason, tags it with the stage and LineNum/ItemId, appends it
+    /// to the owning SO's extraction line, and logs a warning. Never lets a logging failure
+    /// escape - the caller marks the bundle failed regardless.
+    /// </summary>
+    /// <param name = "_stage">Processing stage the failure occurred in (GuideCheck/Reservation)</param>
+    /// <param name = "_lineRecId">SalesLine RecId that failed</param>
+    /// <param name = "_salesId">Owning SalesId if resolved before the failure, else blank</param>
+    private void logLineFailure(str _stage, RefRecId _lineRecId, SalesId _salesId)
+    {
+        SalesLine lineForLog    = this.resolveLineForErrorLogging(_lineRecId);
+        SalesId   salesIdForLog = _salesId ? _salesId : lineForLog.SalesId;
+        str       reason        = this.captureShortFailureReason();
+
+        warning(strFmt("@MET:METLineProcessingFailed", _stage, lineForLog.LineNum, lineForLog.ItemId, reason));
+
+        if (salesIdForLog)
+        {
+            this.appendExtractionLineError(extractionId, salesIdForLog, _stage, lineForLog.LineNum, lineForLog.ItemId, reason);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>appendExtractionLineError</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Appends a stage/LineNum/ItemId-tagged failure entry onto the extraction line's
+    /// ErrorMessage (own transaction), truncated to fit so repeated failures on the same SO
+    /// don't overwrite each other's trail.
+    /// </summary>
+    /// <param name = "_extractionId">Owning ExtractionId</param>
+    /// <param name = "_salesId">Sales order the failed line belongs to</param>
+    /// <param name = "_stage">Processing stage the failure occurred in</param>
+    /// <param name = "_lineNum">Failed line's LineNum</param>
+    /// <param name = "_itemId">Failed line's ItemId</param>
+    /// <param name = "_reason">Short failure reason</param>
+    private void appendExtractionLineError(METSalesOrderExtractionId _extractionId, SalesId _salesId, str _stage, LineNum _lineNum, ItemId _itemId, str _reason)
+    {
+        #define.MaxErrorMessageLen(1000)
+
+        METSalesOrderExtractionLine extractionLine;
+        str                         entry = strFmt("[%1] L%2/%3: %4", _stage, _lineNum, _itemId, _reason);
+        str                         combined;
+
+        ttsbegin;
+
+        extractionLine = METSalesOrderExtractionLine::find(_extractionId, _salesId, true);
+
+        if (extractionLine.RecId)
+        {
+            combined = extractionLine.ErrorMessage
+                ? extractionLine.ErrorMessage + "; " + entry
+                : entry;
+
+            extractionLine.ErrorMessage = subStr(combined, 1, #MaxErrorMessageLen);
+            extractionLine.update();
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>persistRetryContext</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Persists CSD/shipment context onto the extraction header so a later retry (triggered
+    /// independently from the form, with no access to this in-memory instance) can rebuild
+    /// the End task's context without re-deriving it.
+    /// </summary>
+    private void persistRetryContext()
+    {
+        METSalesOrderExtractionTable extractionHeader = METSalesOrderExtractionTable::find(extractionId, true);
+
+        if (extractionHeader.RecId)
+        {
+            ttsbegin;
+            extractionHeader.CSDGuid        = csdGuid;
+            extractionHeader.CSDSalesOrder  = csdSalesOrderList;
+            extractionHeader.ShipmentIdList = shipmentIdList;
+            extractionHeader.update();
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resolveLineForErrorLogging</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Best-effort LineNum/ItemId/SalesId lookup for a failed line, safe even if the line's
+    /// own buffer was never populated before the failure.
+    /// </summary>
+    /// <param name = "_lineRecId">SalesLine RecId</param>
+    /// <returns>A SalesLine buffer with at least LineNum/ItemId/SalesId populated, if found</returns>
+    private SalesLine resolveLineForErrorLogging(RefRecId _lineRecId)
+    {
+        SalesLine lineForLog;
+
+        try
+        {
+            select firstonly LineNum, ItemId, SalesId from lineForLog
+                where lineForLog.RecId == _lineRecId;
+        }
+        catch
+        {
+        }
+
+        return lineForLog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>captureShortFailureReason</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Captures the last infolog message raised during the current attempt, capped short
+    /// since an SO can have 1000+ lines sharing the same 1000-char ErrorMessage field.
+    /// </summary>
+    /// <returns>The last infolog message, truncated</returns>
+    private str captureShortFailureReason()
+    {
+        #define.MaxReasonLen(120)
+
+        str                     reason;
+        SysInfologEnumerator    enumerator;
+        SysInfologMessageStruct msgStruct;
+
+        enumerator = SysInfologEnumerator::newData(infolog.copy(1, infologLine()));
+
+        while (enumerator.moveNext())
+        {
+            msgStruct = new SysInfologMessageStruct(enumerator.currentMessage());
+            reason = msgStruct.message();
+        }
+
+        return subStr(reason, 1, #MaxReasonLen);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markHeaderProcessing</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Claims the extraction header for processing, mirroring
+    /// METSalesOrderExtractionPendingProcess.processRecord()'s claim pattern: only flips
+    /// Pending/Failed to Processing, so the header reflects that the batch job has actually
+    /// started working on it rather than just being queued.
+    /// </summary>
+    private void markHeaderProcessing()
+    {
+        METSalesOrderExtractionTable extractionHeaderUpd;
+
+        ttsbegin;
+
+        select forupdate extractionHeaderUpd
+            where extractionHeaderUpd.ExtractionId == extractionId;
+
+        if (extractionHeaderUpd.RecId
+         && (extractionHeaderUpd.ExtractionStatus == METSalesOrderExtractionStatus::Pending
+          || extractionHeaderUpd.ExtractionStatus == METSalesOrderExtractionStatus::Failed))
+        {
+            extractionHeaderUpd.ExtractionStatus = METSalesOrderExtractionStatus::Processing;
+            extractionHeaderUpd.update();
+        }
+
+        ttscommit;
     }
 
 ]]></Source>
