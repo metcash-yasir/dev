@@ -41,11 +41,13 @@ class METDallasPicklistRegSalesConfirmService extends SysOperationServiceBase
         SysOperationServiceController controller;
         BatchHeader batchHeader;
         container salesOrderCon;
-        Set wmsOrderTransRouteSet;
+        Set salesOrderSet;
         int bundlesize;
         int totalTasks;
         int counter;
         int taskNumber = 1;
+        
+        METProcMetrics procMetrics = METProcMetrics::construct(METBatchLogOperation::DallasPicklistRegistration);
 
         batchHeader = this.getCurrentBatchHeader();
 
@@ -54,39 +56,63 @@ class METDallasPicklistRegSalesConfirmService extends SysOperationServiceBase
             batchHeader = batchHeader::construct();
         }
         
-        totalTasks  = contract.parmParallelTasksNumber();
-        
-        wmsOrderTransRouteSet = Set::create(contract.parmWMSOrderTransRouteSet());
-        
-        bundleSize = real2int(roundUp((wmsOrderTransRouteSet.elements() / totalTasks), 1.0));
+        totalTasks = contract.parmParallelTasksNumber();
 
-        SetEnumerator setEnum = wmsOrderTransRouteSet.getEnumerator();
-        
-        while (setEnum.moveNext())
+        if (totalTasks <= 0)
         {
-            WMSPickingRouteID routeId = setEnum.current();
+            totalTasks = 1;
+        }
+        
+        salesOrderSet = this.getSalesOrderSet(contract.parmWMSOrderTransRouteSet());
 
-            WMSPickingRoute route = WMSPickingRoute::find(routeId);
+        if (salesOrderSet.elements() == 0)
+        {
+            return;
+        }
 
-            boolean canAddRecord = (   route.transType == InventTransType::Sales
-                                    && route.expeditionStatus == WMSExpeditionStatus::Complete
-                                    && METSalesTable::findBySalesId(route.transRefId).OrderProcessingStatus == METSalesOrderProcessingStatus::OptimisationCompleted);
+        procMetrics.setTotalCount(salesOrderSet.elements());
+        procMetrics.beginTrace('Process started');
+        procMetrics.startDescriptionTime(2, "@MET:DallasConfirmSalesOrdersScheduled");
+        
+        bundleSize = real2int(roundUp((salesOrderSet.elements() / totalTasks), 1.0));
 
-            if (!canAddRecord)
+        SetEnumerator setEnum = salesOrderSet.getEnumerator();
+
+        using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
+        {
+            while (setEnum.moveNext())
             {
-                continue;
-            }
+                SalesId salesId = setEnum.current();
 
-            counter += 1;
+                counter += 1;
 
-            if (counter == 1)
-            {
-                salesOrderCon = conNull();
-            }
+                if (counter == 1)
+                {
+                    salesOrderCon = conNull();
+                }
 
-            salesOrderCon += route.transRefId;
+                salesOrderCon += salesId;
                 
-            if (counter == bundlesize)
+                if (counter == bundlesize)
+                {
+                    controller = new SysOperationServiceController(
+                                                classStr(METPickingListRegistrationPostingJob),
+                                                methodStr(METPickingListRegistrationPostingJob, salesOrdersConfirmInBundle));
+
+                    controller.parmDialogCaption(strFmt("@MET:DallasConfirmSalesOrdersSubTask", taskNumber));
+
+                    metDataContract = controller.getDataContractObject() as METDallasPicklistRegSalesConfirmContract;
+                    metDataContract.parmSalesOrderCon(salesOrderCon);
+
+                    batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
+                    
+                    counter = 0;
+
+                    taskNumber++;
+                }
+            }
+  
+            if (counter > 0)
             {
                 controller = new SysOperationServiceController(
                                                 classStr(METPickingListRegistrationPostingJob),
@@ -98,28 +124,50 @@ class METDallasPicklistRegSalesConfirmService extends SysOperationServiceBase
                 metDataContract.parmSalesOrderCon(salesOrderCon);
 
                 batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
-                    
-                counter = 0;
+            }
 
-                taskNumber++;
+            batchHeader.save();
+            procMetrics.endTrace();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSalesOrderSet</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the sales order set from the WMS order transaction route set.
+    /// </summary>
+    /// <param name = "_wmsOrderTransRouteSet">WMS order trans route.</param>
+    /// <returns></returns>
+    private Set getSalesOrderSet(container _wmsOrderTransRouteSet)
+    {
+        Set wmsOrderTransRouteSet;
+        Set salesOrderSet;
+        
+        wmsOrderTransRouteSet = Set::create(_wmsOrderTransRouteSet);
+        salesOrderSet = new Set(Types::String);
+
+        SetEnumerator setEnum = wmsOrderTransRouteSet.getEnumerator();
+
+        while (setEnum.moveNext())
+        {
+            WMSPickingRouteID routeId = setEnum.current();
+
+            WMSPickingRoute route = WMSPickingRoute::find(routeId);
+
+            boolean canAddRecord = (   route.transType == InventTransType::Sales
+                                    && route.expeditionStatus == WMSExpeditionStatus::Complete
+                                    && METSalesTable::findBySalesId(route.transRefId).OrderProcessingStatus == METSalesOrderProcessingStatus::OptimisationCompleted);
+
+            if (canAddRecord)
+            {
+                salesOrderSet.add(route.transRefId);
             }
         }
-  
-        if (counter > 0)
-        {
-            controller = new SysOperationServiceController(
-                                                classStr(METPickingListRegistrationPostingJob),
-                                                methodStr(METPickingListRegistrationPostingJob, salesOrdersConfirmInBundle));
 
-            controller.parmDialogCaption(strFmt("@MET:DallasConfirmSalesOrdersSubTask", taskNumber));
-
-            metDataContract = controller.getDataContractObject() as METDallasPicklistRegSalesConfirmContract;
-            metDataContract.parmSalesOrderCon(salesOrderCon);
-
-            batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
-        }
-
-        batchHeader.save();
+        return salesOrderSet;
     }
 
 ]]></Source>
