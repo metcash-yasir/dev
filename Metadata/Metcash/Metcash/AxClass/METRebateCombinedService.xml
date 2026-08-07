@@ -16,20 +16,21 @@ public final class METRebateCombinedService
         // Extension point: allow recurring schedules to roll the date range forward on each run.
         this.adjustingDateRange(_contract);
 
-        container allDeals = METRebateCombinedFlow::enumerateDealRecIds(_contract.parmQuery());
-
-        // maxBatchTaskNum: 0 = auto (all available batch sessions), 1 = single-thread, >1 = that many (capped).
-        int requestedTasks = _contract.parmMaxBatchTaskNum();
+        // Enumerate the selection once. reconByDeal maps dealRecId -> reconciliation (used only by
+        // the parallel split); allDealRecIds is the deal RecIds alone (map keys) for the gate and
+        // the single-thread path - it carries NO reconciliation, so process logic is unaffected.
+        Map reconByDeal = METRebateCombinedFlow::enumerateDeals(_contract.parmQuery());
+        container allDealRecIds = METRebateCombinedFlow::dealRecIds(reconByDeal);
 
         boolean multiThread = BatchHeader::isExecutingInBatch()
-                           && requestedTasks != 1
-                           && conLen(allDeals) > 1;
+                           && _contract.parmRunInParallel()
+                           && conLen(allDealRecIds) > 1;
 
         if (!multiThread)
         {
-            // Requirement 1 - single sequential job over the whole selection.
+            // Requirement 1 - single sequential job over the whole selection (deal RecIds only).
             METRebateCombinedFlow::runForDeals(
-                allDeals,
+                allDealRecIds,
                 _contract.parmFromDate(),
                 _contract.parmToDate(),
                 _contract.parmTransDate(),
@@ -38,14 +39,14 @@ public final class METRebateCombinedService
             return;
         }
 
-        // Requirement 2 - parallel create-trans per deal bucket with single-threaded posting,
-        // wired as a batch task DAG (create -> post barrier per transaction type).
+        // Requirement 2 - parallel create-trans (one task per work unit, respecting reconcile-by)
+        // with single-threaded posting, wired as a batch task DAG (create -> post barrier per type).
         METRebateCombinedSplitTask splitTask =
-            METRebateCombinedSplitTask::construct(requestedTasks);
+            METRebateCombinedSplitTask::construct();
 
         splitTask.parmDates(_contract.parmFromDate(), _contract.parmToDate(), _contract.parmTransDate());
         splitTask.parmScope(_contract.parmProcessRebate(), _contract.parmProcessWriteOff());
-        splitTask.addDeals(allDeals);
+        splitTask.addDeals(reconByDeal);
         splitTask.spawnCombinedBatchTasks();
     }
 
