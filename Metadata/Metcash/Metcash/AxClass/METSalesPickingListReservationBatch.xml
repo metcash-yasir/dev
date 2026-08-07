@@ -25,6 +25,7 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
     DialogField                 dlgOrderCount;
     DialogField                 dlgExtractionId;
 
+
     #define.CurrentVersion(1)
     #localmacro.CurrentList
         salesOrderList,
@@ -72,6 +73,58 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
         batch.continueFromStagingLane    = _continueFromStagingLane;
         batch.extractionInventLocationId = _extractionInventLocationId;
         batch.useLineLevelThreading      = _useLineLevelThreading;
+
+        return batch;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>constructForRetry</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds a single-SO guide check + reservation task for retry - re-runs Phase 1 for one
+    /// already-extracted SO, bypassing runStartTask()'s dialog/credit-check/header-insert
+    /// setup (the header/line already exist; ActionToPerform was already stamped on the
+    /// original run). Dispatches straight to runThreadTask() as a bundle of one. Claims the
+    /// line here, since runStartTask()'s own claim (markLinesProcessing()) never runs for a
+    /// retry-spawned task.
+    /// </summary>
+    /// <param name = "_extractionId">Owning ExtractionId</param>
+    /// <param name = "_salesId">Sales order to re-run guide check + reservation for</param>
+    /// <returns>The constructed retry task</returns>
+    public static METSalesPickingListReservationBatch constructForRetry(METSalesOrderExtractionId _extractionId, SalesId _salesId)
+    {
+        METSalesPickingListReservationBatch batch = new METSalesPickingListReservationBatch();
+        SalesLine                           salesLineLocal;
+        container                           lineRecIds;
+        METSalesOrderExtractionLine         extractionLine;
+
+        batch.extractionId = _extractionId;
+
+        while select RecId from salesLineLocal
+            where salesLineLocal.SalesId     == _salesId
+               && salesLineLocal.SalesStatus != SalesStatus::Canceled
+        {
+            lineRecIds += salesLineLocal.RecId;
+        }
+
+        batch.lineTaskBundles = [lineRecIds];
+        batch.parmBatchIdentifier("1");
+
+        ttsbegin;
+
+        extractionLine = METSalesOrderExtractionLine::find(_extractionId, _salesId, true);
+
+        if (extractionLine.RecId
+         && (extractionLine.ExtractionStatus == METSalesOrderExtractionStatus::Pending
+          || extractionLine.ExtractionStatus == METSalesOrderExtractionStatus::Failed))
+        {
+            extractionLine.ExtractionStatus = METSalesOrderExtractionStatus::Processing;
+            extractionLine.update();
+        }
+
+        ttscommit;
 
         return batch;
     }
@@ -222,6 +275,39 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
         int               taskCount = metCustParameters.SalesExtractionBatchLineTaskCount > 0 ? metCustParameters.SalesExtractionBatchLineTaskCount : 1;
 
         lineTaskBundles = this.buildLineTaskBundles(processedSalesContainer, taskCount);
+
+        this.markLinesProcessing();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markLinesProcessing</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Claims every line about to be dispatched into a bundle task - last step of
+    /// runStartTask(), after filtering/bundling, so only the SOs that survived credit-check
+    /// filtering (processedSalesContainer) are touched; a SO filtered out earlier stays
+    /// Pending rather than being falsely marked Processing.
+    /// </summary>
+    private void markLinesProcessing()
+    {
+        int i;
+
+        ttsbegin;
+
+        for (i = 1; i <= conLen(processedSalesContainer); i++)
+        {
+            METSalesOrderExtractionLine extractionLine = METSalesOrderExtractionLine::find(extractionId, conPeek(processedSalesContainer, i), true);
+
+            if (extractionLine.RecId && extractionLine.ExtractionStatus == METSalesOrderExtractionStatus::Pending)
+            {
+                extractionLine.ExtractionStatus = METSalesOrderExtractionStatus::Processing;
+                extractionLine.update();
+            }
+        }
+
+        ttscommit;
     }
 
 ]]></Source>
@@ -401,6 +487,11 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
                             str lineActionToPerform = this.readCachedActionToPerform(actionToPerformCache, extractionId, salesLineLocal.SalesId);
 
                             currentStage = "GuideCheck";
+                            // TEMP TEST - remove after retry/failure testing (SO 700227500)
+                            if (salesLineLocal.SalesId == "700227500")
+                            {
+                                throw error(strFmt("TEST: forced %1 failure for SO %2", currentStage, salesLineLocal.SalesId));
+                            }
                             procMetrics.startDescriptionTime(2, "@MET:METSOExtractSOGuideCheck");
                             this.performGuideCheckForLine(salesLineLocal);
                             procMetrics.incDescriptionCount(2, 1);
@@ -411,6 +502,11 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
                             {
                                 SalesTable reservationSalesTable = salesLineLocal.salesTable();
                                 currentStage = "Reservation";
+                                // TEMP TEST - remove after retry/failure testing (SO 700227500)
+                                if (salesLineLocal.SalesId == "700227500")
+                                {
+                                    throw error(strFmt("TEST: forced %1 failure for SO %2", currentStage, salesLineLocal.SalesId));
+                                }
                                 procMetrics.startDescriptionTime(3, "@MET:METSOExtractStockReservation");
                                 METStockReservation::construct(reservationSalesTable).processV2ForLines([lineRecId], extractionId);
                                 procMetrics.endDescriptionTime(3);
@@ -1901,7 +1997,8 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
                 ? extractionLine.ErrorMessage + "; " + entry
                 : entry;
 
-            extractionLine.ErrorMessage = subStr(combined, 1, #MaxErrorMessageLen);
+            extractionLine.ErrorMessage    = subStr(combined, 1, #MaxErrorMessageLen);
+            extractionLine.ExtractionStatus = METSalesOrderExtractionStatus::Failed;
             extractionLine.update();
         }
 

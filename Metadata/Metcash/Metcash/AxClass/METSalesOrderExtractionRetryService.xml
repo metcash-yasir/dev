@@ -43,75 +43,87 @@ class METSalesOrderExtractionRetryService
 				<Name>retry</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Retries every Failed line: resets to Pending, then schedules a new per-SO/End/CSD task set.
+    /// Retries every retriable line: resets to Pending, then schedules a new per-SO/End/CSD
+    /// task set.
     /// </summary>
     /// <param name = "_extractionId">Extraction to retry</param>
     public static void retry(METSalesOrderExtractionId _extractionId)
     {
         METSalesOrderExtractionTable header = METSalesOrderExtractionTable::find(_extractionId);
-        container                    failedSalesIds = METSalesOrderExtractionRetryService::getFailedSalesIds(_extractionId);
+        container                    retriableSalesIds = METSalesOrderExtractionRetryService::getRetriableSalesIds(_extractionId);
 
         if (!header.RecId)
         {
             throw error(strFmt("@MET:METExtractionNotFound", _extractionId));
         }
 
-        if (conLen(failedSalesIds) == 0)
+        if (conLen(retriableSalesIds) == 0)
         {
             warning("@MET:METNoFailedLinesToRetry");
             return;
         }
 
-        METSalesOrderExtractionRetryService::resetFailedLines(_extractionId, failedSalesIds);
-        METSalesOrderExtractionRetryService::spawnRetryBatch(header, failedSalesIds);
+        METSalesOrderExtractionRetryService::resetRetriableLines(_extractionId, retriableSalesIds);
+        METSalesOrderExtractionRetryService::spawnRetryBatch(header, retriableSalesIds);
 
-        info(strFmt("@MET:METRetryScheduled", conLen(failedSalesIds), _extractionId));
+        info(strFmt("@MET:METRetryScheduled", conLen(retriableSalesIds), _extractionId));
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>getFailedSalesIds</Name>
+				<Name>getRetriableSalesIds</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Reads every SalesId currently Failed for this extraction.
+    /// Reads every SalesId that needs retrying: Failed lines, plus - once at least one line
+    /// has Failed - every still-Processing line too. A single bundle failure blocks the
+    /// extraction's one shared final task (see runFinalTask()), so any sibling SO that reached
+    /// Processing but never got to Phase 2 is just as stuck as the one that actually errored;
+    /// it just never got tagged Failed itself.
     /// </summary>
     /// <param name = "_extractionId">Extraction to scan</param>
-    /// <returns>Container of failed SalesIds</returns>
-    private static container getFailedSalesIds(METSalesOrderExtractionId _extractionId)
+    /// <returns>Container of retriable SalesIds</returns>
+    private static container getRetriableSalesIds(METSalesOrderExtractionId _extractionId)
     {
         METSalesOrderExtractionLine extractionLine;
-        container                   failedSalesIds;
+        container                   retriableSalesIds;
+        boolean                     hasFailedLine;
 
-        while select SalesId from extractionLine
+        while select SalesId, ExtractionStatus from extractionLine
             where extractionLine.ExtractionId     == _extractionId
-               && extractionLine.ExtractionStatus  == METSalesOrderExtractionStatus::Failed
+               && (extractionLine.ExtractionStatus == METSalesOrderExtractionStatus::Failed
+                || extractionLine.ExtractionStatus == METSalesOrderExtractionStatus::Processing)
         {
-            failedSalesIds += extractionLine.SalesId;
+            if (extractionLine.ExtractionStatus == METSalesOrderExtractionStatus::Failed)
+            {
+                hasFailedLine = true;
+            }
+
+            retriableSalesIds += extractionLine.SalesId;
         }
 
-        return failedSalesIds;
+        return hasFailedLine ? retriableSalesIds : conNull();
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>resetFailedLines</Name>
+				<Name>resetRetriableLines</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Resets every failed line back to Pending; ErrorMessage is left as-is.
+    /// Resets every retried line back to Pending; ErrorMessage is left as-is.
     /// </summary>
     /// <param name = "_extractionId">Owning ExtractionId</param>
-    /// <param name = "_failedSalesIds">SalesIds to reset</param>
-    private static void resetFailedLines(METSalesOrderExtractionId _extractionId, container _failedSalesIds)
+    /// <param name = "_retriableSalesIds">SalesIds to reset</param>
+    private static void resetRetriableLines(METSalesOrderExtractionId _extractionId, container _retriableSalesIds)
     {
         int i;
 
         ttsbegin;
 
-        for (i = 1; i <= conLen(_failedSalesIds); i++)
+        for (i = 1; i <= conLen(_retriableSalesIds); i++)
         {
-            METSalesOrderExtractionLine extractionLine = METSalesOrderExtractionLine::find(_extractionId, conPeek(_failedSalesIds, i), true);
+            METSalesOrderExtractionLine extractionLine = METSalesOrderExtractionLine::find(_extractionId, conPeek(_retriableSalesIds, i), true);
 
             if (extractionLine.RecId)
             {
@@ -129,8 +141,10 @@ class METSalesOrderExtractionRetryService
 				<Name>spawnRetryBatch</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Schedules a new standalone batch job for the retried SalesIds - per-SO tasks, a new
-    /// End task, and (if applicable) a new CSD task - mirroring runFinalTask()'s spawn shape.
+    /// Schedules a new standalone batch job for the retried SalesIds - a Phase1 guide
+    /// check/reservation task per SO, a Phase2 pick-list task depending on it (so a SO that
+    /// failed before ever being reserved gets re-reserved, not just re-posted), a new End
+    /// task, and (if applicable) a new CSD task - mirroring runFinalTask()'s spawn shape.
     /// </summary>
     /// <param name = "_header">The extraction header, carrying the persisted CSD/shipment context</param>
     /// <param name = "_failedSalesIds">SalesIds to retry</param>
@@ -153,7 +167,15 @@ class METSalesOrderExtractionRetryService
         for (i = 1; i <= conLen(_failedSalesIds); i++)
         {
             SalesId                              salesIdLocal = conPeek(_failedSalesIds, i);
+            METSalesPickingListReservationBatch  reservationTask = METSalesPickingListReservationBatch::constructForRetry(_header.ExtractionId, salesIdLocal);
             METSalesPickingListFulfillmentBatch  soTask = new METSalesPickingListFulfillmentBatch();
+
+            reservationTask.batchInfo().resetBatchHeader();
+            reservationTask.batchInfo().parmGroupId(metCustParameters.SalesExtractionBatchGroupId);
+            reservationTask.batchInfo().parmConstraintType(BatchConstraintType::And);
+            reservationTask.batchInfo().parmDataareaId(curExt());
+
+            retryBatchHeader.addTask(reservationTask);
 
             soTask.parmSalesId(salesIdLocal);
             soTask.parmSalesOrderExtractionId(_header.ExtractionId);
@@ -174,6 +196,8 @@ class METSalesOrderExtractionRetryService
             soTask.batchInfo().parmDataareaId(curExt());
 
             retryBatchHeader.addTask(soTask);
+            retryBatchHeader.addDependency(soTask, reservationTask);
+
             retryTaskList.addEnd(soTask);
         }
 
