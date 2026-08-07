@@ -16,6 +16,14 @@ public class METSalesInvoiceDataGenerator
     Map                             componentSums;
 
     Map                             markupTransByInventTransId;
+    Map                             licenceCustTobaccoMap;
+    Map                             licenceCustLiqMap;
+    Map                             licenceMetcashMap;
+    Map                             markupCalcAmountOnly;
+    Map                             Fees;
+    Map                             headerTaxTrans;
+
+    LogisticsElectronicAddressLocator invoiceToPhone, shipToPhone;
 
     CustFormLetterParameters        custFormLetterParameters;
     CompanyInfo                     companyInfo;
@@ -47,11 +55,214 @@ public class METSalesInvoiceDataGenerator
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>generateHeaderKPMGFields</Name>
+				<Source><![CDATA[
+    public void generateHeaderKPMGFields(METBundleSalesInvoiceHeaderFooterTmp bundlingHeaderFooterTmp, CustInvoiceJour  _custInvoiceJour)
+    {
+        CustInvoiceJour custInvoiceJour;
+        MarkupTrans markupTrans;
+        
+        #define.Admin('Admin')
+
+        while select MarkupCode, CalculatedAmount, MarkupCategory, Value from markupTrans
+            where markupTrans.TransTableId == _custInvoiceJour.TableId &&
+                 markupTrans.TransRecId == _custInvoiceJour.RecId &&
+                 markupTrans.CalculatedAmount != 0
+        {
+            // Lasernet change request - show all markups including
+            if (markupTrans.MarkupCategory == MarkupCategory::Fixed)
+            {
+                bundlingHeaderFooterTmp.KPMGHeaderCharges += markupTrans.MarkupCode  + ' ' + METConstants::Dollar  +  num2Str(markupTrans.Value, 1,2, 1,0) + '\n';
+               
+            }
+            else if (markupTrans.MarkupCategory == MarkupCategory::Percent)
+            {
+                bundlingHeaderFooterTmp.KPMGHeaderCharges  += markupTrans.MarkupCode  +  ' ' +  num2Str(markupTrans.Value, 1,2, 1,0) +  METConstants::Percent + '\n';
+            }
+            else
+            {
+                bundlingHeaderFooterTmp.KPMGHeaderCharges  += markupTrans.MarkupCode +  ' ' +  num2Str(markupTrans.Value, 1,2, 1,0) + '\n';
+            }
+
+            if (markupTrans.MarkupCode == #Admin)
+            {
+                bundlingHeaderFooterTmp.METAdminFeeSymbol = (markupTrans.MarkupCategory == MarkupCategory::Fixed) ? METConstants::Dollar : METConstants::Percent;
+            }
+
+            TaxTrans taxTransBuf;
+
+            select sum(SourceTaxAmountCur) from taxTransBuf
+                where markupTrans.RecId == taxTransBuf.SourceRecId && markupTrans.TableId == taxTransBuf.SourceTableId
+                 && taxTransBuf.SourceTaxAmountCur != 0;
+
+            if (taxTransBuf.SourceTaxAmountCur)
+            {
+                Amount  gstExclValue        = markupTrans.CalculatedAmount + abs(taxTransBuf.SourceTaxAmountCur);
+                
+                bundlingHeaderFooterTmp.KPMGHeaderChargesValue          += strFmt('%1', gstExclValue) + '\n';
+                bundlingHeaderFooterTmp.METHeaderLineGSTValue           += strFmt('%1',abs(taxTransBuf.SourceTaxAmountCur)) + '\n';//GST
+                bundlingHeaderFooterTmp.METHeaderLineTotExclGSTValue    += strFmt('%1',markupTrans.CalculatedAmount) + '\n';
+            }
+            else
+            {
+                bundlingHeaderFooterTmp.METHeaderLineGSTValue += strFmt('%1', 0) + '\n';
+                bundlingHeaderFooterTmp.METHeaderLineTotExclGSTValue  += strFmt('%1',0) + '\n';
+
+                // For return sales type, the value should be shown as negative in invoice.
+                bundlingHeaderFooterTmp.KPMGHeaderChargesValue          += strFmt('%1',markupTrans.CalculatedAmount) + '\n';
+
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateHeaderChangesFee</Name>
+				<Source><![CDATA[
+    public void generateHeaderChangesFee()
+    {
+        CustInvoiceJour custInvoiceJour;
+        MarkupTrans     markupTrans;
+        SalesTable      salesTable;
+
+        TaxTrans        taxTrans;
+
+        Fees = new Map(Types::String,Types::Real);
+        headerTaxTrans = new Map(Types::String,Types::Real);
+        str key;
+
+        while select sum(CalculatedAmount), TransTableId, TransRecId from markupTrans
+            group by markupTrans.TransTableId, markupTrans.TransRecId
+           exists join custInvoiceJour
+                where custInvoiceJour.METShipmentId == shipmentId &&
+                      custInvoiceJour.TableId == markupTrans.TransTableId &&
+                      custInvoiceJour.RecId == markupTrans.TransRecId
+                exists join salesTable
+                    where salesTable.SalesId == custInvoiceJour.SalesId &&
+                          !(salesTable.METInvoiceType == METInvoiceTypeSO::ChargeThroughClaim ||
+                           salesTable.METInvoiceType == METInvoiceTypeSO::CrossDockClaim)
+        {
+            key = strFmt("%1|%2", markupTrans.TransTableId, markupTrans.TransRecId);
+
+            if (!Fees.exists(markupTrans))
+            {
+                Fees.insert(key, markupTrans.CalculatedAmount);
+            }
+        }
+
+
+        while select sum(SourceRegulateAmountCur), Voucher from taxTrans
+             group by taxTrans.Voucher
+            where taxTrans.InventTransId == ''
+            exists join custInvoiceJour
+                where custInvoiceJour.METShipmentId == shipmentId &&
+                      custInvoiceJour.LedgerVoucher == taxTrans.Voucher &&
+                      custInvoiceJour.InvoiceDate == taxTrans.TransDate
+        {
+            if (!headerTaxTrans.exists(taxTrans.Voucher))
+            {
+                headerTaxTrans.insert(taxTrans.Voucher, taxTrans.SourceRegulateAmountCur);
+            }
+        }
+                
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>setShipInvoicePhone</Name>
+				<Source><![CDATA[
+    public void setShipInvoicePhone()
+    {
+        DirPartyLocation                    dirPartyLocation;
+        LogisticsElectronicAddress          logisticsElectronicAddress;
+        LogisticsElectronicAddressRole      logisticsElectronicAddressRole;
+        LogisticsLocationRole               logisticsLocationRole;
+
+        CustTable                           custTable = CustTable::find(METSalesOrderShipmentLoadHeader::findByShipmentId(shipmentId).CustAccount);
+   
+        select firstonly Locator from logisticsElectronicAddress
+            where logisticsElectronicAddress.Type == LogisticsElectronicAddressMethodType::Phone
+            exists join dirPartyLocation
+                where dirPartyLocation.Location == logisticsElectronicAddress.Location &&
+                    dirPartyLocation.Party == custTable.Party
+            exists join logisticsElectronicAddressRole
+                where logisticsElectronicAddressRole.ElectronicAddress == logisticsElectronicAddress.RecId
+            exists join logisticsLocationRole
+                where logisticsLocationRole.RecId == logisticsElectronicAddressRole.LocationRole
+                && logisticsLocationRole.Name == strFmt("%1",logisticsLocationRoleType::Invoice);
+
+        invoiceToPhone = logisticsElectronicAddress.Locator;
+
+        select firstonly Locator from logisticsElectronicAddress
+            where logisticsElectronicAddress.Type == LogisticsElectronicAddressMethodType::Phone
+            exists join dirPartyLocation
+                where dirPartyLocation.Location == logisticsElectronicAddress.Location&&
+                    dirPartyLocation.Party == custTable.Party
+            exists join logisticsElectronicAddressRole
+                where logisticsElectronicAddressRole.ElectronicAddress == logisticsElectronicAddress.RecId
+            exists join logisticsLocationRole
+                where logisticsLocationRole.RecId == logisticsElectronicAddressRole.LocationRole
+                && logisticsLocationRole.Name == strFmt("%1",logisticsLocationRoleType::Delivery);
+
+        shipToPhone = logisticsElectronicAddress.Locator;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>construct</Name>
 				<Source><![CDATA[
     public static METSalesInvoiceDataGenerator construct(MetShipmentId  _shipmentId, Str1260  _bundlingHeaderGUID)
     {
         return new METSalesInvoiceDataGenerator(_shipmentId, _bundlingHeaderGUID);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>generateLicenceCache</Name>
+				<Source><![CDATA[
+    public void generateLicenceCache()
+    {
+        METCustomerLicence  metCustomerLicenceTobacco, metCustomerLicenceLiquor;
+        METMetcashLicence   metMetcashLicenceTobacco;
+        METSalesOrderShipmentLoadHeader shipmentLoadHeader;
+        METSalesOrderShipmentLoadLines  orderLines;
+        METInventItemOrderSetup inventItemOrderSetup;
+
+        licenceCustLiqMap = new Map(Types::String, Types::String);
+        licenceCustTobaccoMap = new Map(Types::String, Types::String);
+        licenceMetcashMap = new Map(Types::String, Types::String);
+
+        while select OrderNum from orderLines 
+            group by OrderNum
+            where orderLines.ShipmentId == shipmentId
+            join CustAccount, SiteId from shipmentLoadHeader
+                where shipmentLoadHeader.ShipmentId == orderLines.ShipmentId
+            outer join LicenceNumber from metCustomerLicenceTobacco
+                where metCustomerLicenceTobacco.CustAccount == shipmentLoadHeader.CustAccount &&
+                      metCustomerLicenceTobacco.Type == METLicenceType::Tobacco
+            outer join LicenceNumber from metCustomerLicenceLiquor
+                where metCustomerLicenceLiquor.CustAccount == shipmentLoadHeader.CustAccount &&
+                      metCustomerLicenceLiquor.Type == METLicenceType::Liquor
+            outer join LicenceNumber from metMetcashLicenceTobacco
+                where metMetcashLicenceTobacco.InventSiteId == shipmentLoadHeader.SiteId &&
+                      metMetcashLicenceTobacco.Type == METLicenceType::Tobacco
+            exists join inventItemOrderSetup
+                where inventItemOrderSetup.SiteId == shipmentLoadHeader.SiteId &&
+                      inventItemOrderSetup.ItemId == orderLines.ItemId 
+        {
+            if (inventItemOrderSetup.ItemType == METConstants::T)
+            {
+            licenceCustTobaccoMap.insert(orderLines.OrderNum, metCustomerLicenceTobacco.LicenceNumber);
+            
+            licenceMetcashMap.insert(orderLines.OrderNum, metMetcashLicenceTobacco.LicenceNumber);
+            }
+            licenceCustLiqMap.insert(orderLines.OrderNum, metCustomerLicenceLiquor.LicenceNumber);
+        }
     }
 
 ]]></Source>
@@ -85,6 +296,9 @@ public class METSalesInvoiceDataGenerator
         this.generateCachedTaxTransComponents();
         this.generateCachedLinePricingComponents();
         this.generateCachedMarkupTrans();
+        this.generateLicenceCache();
+        this.setShipInvoicePhone();
+        this.generateHeaderChangesFee();
 
         InvoiceId lastInvoiceId;
 
@@ -100,17 +314,13 @@ public class METSalesInvoiceDataGenerator
 
         bundleSalesCTInvoiceList = new RecordInsertList(tableNum(METBundleSalesCTInvoiceTmp), true, true, true, true, true, metSalesCTInvoiceTmp);
 
-        while select SalesId, InvoiceId, LineNum, InventTransId, ItemId, InvoiceDate, numberSequenceGroup,
-              Name, SalesUnit, Qty, LineAmount, SalesPrice, METPickedBrokenCases, METPickedCases,
-              METLitres, TableId, RecId, TaxAmount, PdsCWQty, METCase, METItemType
-            from custInvoiceTrans
+        while select custInvoiceTrans
             order by custInvoiceTrans.InvoiceId, custInvoiceTrans.SalesId, custInvoiceTrans.LineNum
-            join InventTransId, ItemId, SalesUnit, SalesType, SalesQty, METCWActualWeight, BarCode from salesLine
+            join salesLine
                 where salesLine.InventTransId == custInvoiceTrans.InventTransId
             join AlcoholContent, CountryCode, ItemSize from metInventTable
                 where metInventTable.ItemId == custInvoiceTrans.ItemId
-            join SalesId, InvoiceId, InvoiceDate, numberSequenceGroup, METShipmentId, LanguageId,
-                 DueDate, InvoiceAccount, RecId, TableId, LedgerVoucher from custInvoiceJour
+            join custInvoiceJour
                 where custInvoiceJour.SalesId == custInvoiceTrans.SalesId &&
                       custInvoiceJour.InvoiceId == custInvoiceTrans.InvoiceId &&
                       custInvoiceJour.InvoiceDate == custInvoiceTrans.InvoiceDate &&
@@ -121,7 +331,7 @@ public class METSalesInvoiceDataGenerator
                 where salesTable.SalesId == custInvoiceJour.SalesId
             join SalesId, DeliveryInstructions, OriginalInvoice, SalesTable from metSalesTable
                 where metSalesTable.SalesTable == salesTable.RecId
-            join RecId from inventLocation
+            join RecId, Name from inventLocation
                 where inventLocation.InventLocationId == salesTable.InventLocationId
             join AccountNum, Party, CustGroup, METCustOperGroupId from custTable
                 where custTable.AccountNum == custInvoiceJour.InvoiceAccount
@@ -137,15 +347,6 @@ public class METSalesInvoiceDataGenerator
                 where whsPhysDimUOMSite.ItemId == salesLine.ItemId
                    && whsPhysDimUOMSite.UOM == salesLine.SalesUnit
                    && whsPhysDimUOMSite.SiteId == inventLocation.InventSiteId
-            outer join LicenceNumber from metCustomerLicenceTobacco
-                where metCustomerLicenceTobacco.CustAccount == custTable.AccountNum &&
-                      metCustomerLicenceTobacco.Type == METLicenceType::Tobacco
-            outer join LicenceNumber from metCustomerLicenceLiquor
-                where metCustomerLicenceLiquor.CustAccount == custTable.AccountNum &&
-                      metCustomerLicenceLiquor.Type == METLicenceType::Liquor
-            outer join LicenceNumber from metMetcashLicenceTobacco
-                where metMetcashLicenceTobacco.InventSiteId == salesTable.InventSiteId &&
-                      metMetcashLicenceTobacco.Type == METLicenceType::Tobacco
             outer join ItemType from metInventItemOrderSetup                       
                 where metInventItemOrderSetup.SiteId == salesTable.InventSiteId &&
                       metInventItemOrderSetup.ItemId == custInvoiceTrans.ItemId
@@ -154,7 +355,7 @@ public class METSalesInvoiceDataGenerator
             {
                 lastInvoiceId = custInvoiceTrans.InvoiceId;
                 headerGuid = guid2Str(newGuid());                
-                this.generateBundlingHeaderFooterTmp(custInvoiceJour, custTable, metCustTable, salesTable, metSalesTable,metIndustryKeyTable, dirPartyTable, metCustomerLicenceTobacco, metCustomerLicenceLiquor, metMetcashLicenceTobacco, metInventItemOrderSetup, metSalesOrderTypes, headerGuid, bundlingHeaderFooterTmp, metSalesCTInvoiceTmp);
+                this.generateBundlingHeaderFooterTmp(custInvoiceJour, custTable, metCustTable, salesTable, metSalesTable,metIndustryKeyTable, dirPartyTable, metInventItemOrderSetup, metSalesOrderTypes, headerGuid, bundlingHeaderFooterTmp, metSalesCTInvoiceTmp);
             }
 
             this.generateSalesInvoiceTmp(custInvoiceJour, custInvoiceTrans, salesLine, metSalesOrderTypes, metIndustryKeyTable, whsPhysDimUOMSite, metInventItemOrderSetup, metInventTable, salesTable, metSalesTable,headerGuid, bundleSalesInvoiceTmp);
@@ -366,6 +567,8 @@ public class METSalesInvoiceDataGenerator
                       custInvoiceJour.numberSequenceGroup == custInvoiceTrans.numberSequenceGroup &&
                       custInvoiceJour.METShipmentId == shipmentId
         {
+            taxValuePct = 0;
+
             if (!taxValuePct && taxTrans.TaxValue)
             {
                 taxValuePct = taxTrans.TaxValue;
@@ -547,9 +750,9 @@ public class METSalesInvoiceDataGenerator
 
         bundleSalesInvoiceTmp.METINDS                 =   salesLine.getSalesLineInvoiceIndicator(true);
 
-        MarkupTrans metMarkupTransStd   = MarkupTrans::findValue(_custInvoiceTrans.TableId, _custInvoiceTrans.RecId);
-        bundleSalesInvoiceTmp.MarkupCode      = metMarkupTransStd.MarkupCode;
-        bundleSalesInvoiceTmp.MarkupAmount    = metMarkupTransStd.CalculatedAmount;
+        //bundleSalesInvoiceTmp.MarkupCode      = metMarkupTransStd.MarkupCode;
+        str calcAmtCacheKey = strFmt("%1|%2", _custInvoiceTrans.TableId, _custInvoiceTrans.RecId);
+        bundleSalesInvoiceTmp.MarkupAmount    = markupCalcAmountOnly.exists(calcAmtCacheKey) ? markupCalcAmountOnly.lookup(calcAmtCacheKey) : 0;
         bundleSalesInvoiceTmp.METRetailAmount = bundleSalesInvoiceTmp.LineAmount;
 
         container taxComponents = taxByInventTransId.exists(_custInvoiceTrans.InventTransId) ? taxByInventTransId.lookup(_custInvoiceTrans.InventTransId) : conNull();
@@ -695,7 +898,7 @@ public class METSalesInvoiceDataGenerator
             bundleSalesInvoiceTmp.METGSTExempt = bundleSalesInvoiceTmp.LineAmountInclTax;
         }
 
-        if(!bundleSalesInvoiceTmp.TaxAmount && !metMarkupTransStd.TaxAmount)
+        if(!bundleSalesInvoiceTmp.TaxAmount)// && !metMarkupTransStd.TaxAmount)
         {
             bundleSalesInvoiceTmp.METAmountTaxExempt = _custInvoiceTrans.LineAmount;//also used in CT invoice reort
         }
@@ -865,6 +1068,7 @@ public class METSalesInvoiceDataGenerator
         MarkupTrans         markupTrans;
 
         markupTransByInventTransId = new Map(Types::String, Types::String);
+        markupCalcAmountOnly = new Map(Types::String, Types::Real);
 
         select sum(CalculatedAmount), TransTableId, TransRecId, MarkupCode from markupTrans
             group by markupTrans.TransTableId, markupTrans.TransRecId, markupTrans.MarkupCode
@@ -888,6 +1092,11 @@ public class METSalesInvoiceDataGenerator
             if (!markupTransByInventTransId.exists(key))
             {
                 markupTransByInventTransId.insert(key, value);
+            }
+
+            if (!markupCalcAmountOnly.exists(key))
+            {
+                markupCalcAmountOnly.insert(key, markupTrans.CalculatedAmount);
             }
         }
 
@@ -1138,17 +1347,12 @@ public class METSalesInvoiceDataGenerator
                                                 METSalesTable           _metSalesTable,
                                                 METIndustryKeyTable     _metIndustryKeyTable,
                                                 DirPartyTable           _dirPartyTable,
-                                                METCustomerLicence      _metCustomerLicenceTobacco,
-                                                METCustomerLicence      _metCustomerLicenceLiquor,
-                                                METMetcashLicence       _metMetcashLicenceTobacco,
                                                 METInventItemOrderSetup _metInventItemOrderSetup,
                                                 METSalesOrderTypes      _metSalesOrderTypes,
                                                 str1260                 headerGuid,
                                                 METBundleSalesInvoiceHeaderFooterTmp bundlingHeaderFooterTmp,
                                                 METBundleSalesCTInvoiceTmp metSalesCTInvoiceTmp)
     {
-        
-
         Map metChargesComponentMap = new Map(Types::String, Types::Real);
         METSalesLinePriceComponent  metSalesLinePriceComponent, metSalesLinePriceComponentloc;
 
@@ -1156,6 +1360,21 @@ public class METSalesInvoiceDataGenerator
         bundlingHeaderFooterTmp.CompanyEmail = companyInfo.email();
         bundlingHeaderFooterTmp.BundleReportHeaderGuidStr = bundlingHeaderGUID;
         bundlingHeaderFooterTmp.SalesInvoiceHeaderGuidStr = headerGuid;
+
+        this.generateHeaderKPMGFields(bundlingHeaderFooterTmp, _custInvoiceJour);
+
+        bundlingHeaderFooterTmp.METBranchName = _salesTable.InventLocationId;
+        bundlingHeaderFooterTmp.METBranchNumber = inventLocation.Name;
+
+        bundlingHeaderFooterTmp.METShipToPhone = shipToPhone;
+        bundlingHeaderFooterTmp.METInvoiceToPhone = invoiceToPhone;
+
+        str feeKey = strFmt("%1|%2", _custInvoiceJour.TableId, _custInvoiceJour.RecId);
+        bundlingHeaderFooterTmp.METFees = Fees.exists(feeKey) ? Fees.lookup(feeKey) : 0;
+
+        bundlingHeaderFooterTmp.METGSTActual = headerTaxTrans.exists(feeKey) ? headerTaxTrans.lookup(feeKey) : 0; 
+
+        bundlingHeaderFooterTmp.METFeesTotal = bundlingHeaderFooterTmp.METFees + bundlingHeaderFooterTmp.METGSTActual;
 
         bundlingHeaderFooterTmp.METInvoiceReportInternetBankingNotes = custFormLetterParameters.METInvoiceReportInternetBankingNotes;
        
@@ -1185,19 +1404,16 @@ public class METSalesInvoiceDataGenerator
         bundlingHeaderFooterTmp.METCustAccount          = _salesTable.CustAccount;
         bundlingHeaderFooterTmp.METCustName             = _custTable.name();
         bundlingHeaderFooterTmp.METReturnItemNum        = _salesTable.ReturnItemNum;
-
+        bundlingHeaderFooterTmp.SalesId                 = _salesTable.SalesId;
+        bundlingHeaderFooterTmp.CustomerRef             = _custInvoiceJour.CustomerRef;
+        bundlingHeaderFooterTmp.PurchaseOrder           = _custInvoiceJour.PurchaseOrder;
+        bundlingHeaderFooterTmp.InvoiceAccount          = _custInvoiceJour.InvoiceAccount;
          
-        if (_metCustomerLicenceTobacco.LicenceNumber && _metInventItemOrderSetup.ItemType == METConstants::T)
-        {
-            bundlingHeaderFooterTmp.METCustTobaccoLicense = _metCustomerLicenceTobacco.LicenceNumber;
-        }
+        bundlingHeaderFooterTmp.METCustTobaccoLicense = licenceCustTobaccoMap.exists(_salesTable.CustAccount) ? licenceCustTobaccoMap.lookup(_salesTable.CustAccount) : "";
    
-        bundlingHeaderFooterTmp.METCustLiquorLicense    = _metCustomerLicenceLiquor.LicenceNumber;
+        bundlingHeaderFooterTmp.METCustLiquorLicense    = licenceCustLiqMap.exists(_salesTable.CustAccount) ? licenceCustLiqMap.lookup(_salesTable.CustAccount) : "";;
         
-        if (_metMetcashLicenceTobacco.LicenceNumber && _metInventItemOrderSetup.ItemType == METConstants::T)
-        {
-            bundlingHeaderFooterTmp.METTobaccoLicense = _metMetcashLicenceTobacco.LicenceNumber;
-        }
+        bundlingHeaderFooterTmp.METTobaccoLicense = licenceMetcashMap.exists(_salesTable.InventSiteId) ? licenceMetcashMap.lookup(_salesTable.InventSiteId) : "";
         
         bundlingHeaderFooterTmp.metIndustryKey          = _metIndustryKeyTable.ParentIndustryKey;
         bundlingHeaderFooterTmp.InvoicingName           = _dirpartyTable.KnownAs;
