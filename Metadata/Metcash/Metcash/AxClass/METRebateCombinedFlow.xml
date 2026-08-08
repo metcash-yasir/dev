@@ -24,18 +24,20 @@ public final class METRebateCombinedFlow
     {
         if (_processRebate)
         {
-            METRebateCombinedFlow::createTrans(TAMRebateTransactionType::Rebate, _dealRecIds, _from, _to);
-            METRebateCombinedFlow::post(TAMRebateTransactionType::Rebate, _dealRecIds, _from, _to, _transDate);
+            // Single-thread whole-selection path: scope by deal (the deal variant handles a deal's
+            // reconcile-by-line tables internally).
+            METRebateCombinedFlow::createTrans(TAMRebateTransactionType::Rebate, tableNum(TAMRebateDeal), _dealRecIds, _from, _to);
+            METRebateCombinedFlow::post(TAMRebateTransactionType::Rebate, METRebateCombinedSplitTask::getDealsToPost(_dealRecIds), _from, _to, _transDate);
         }
-
+        
         if (_processWriteOff)
         {
             // Standard excludes RebateOutputType::Item for non-Rebate types (see controller.updateQueryRebateOutputType).
             container writeOffDeals = METRebateCombinedFlow::filterNonItemOutput(_dealRecIds);
             if (conLen(writeOffDeals) > 0)
             {
-                METRebateCombinedFlow::createTrans(TAMRebateTransactionType::WriteOff, writeOffDeals, _from, _to);
-                METRebateCombinedFlow::post(TAMRebateTransactionType::WriteOff, writeOffDeals, _from, _to, _transDate);
+                METRebateCombinedFlow::createTrans(TAMRebateTransactionType::WriteOff, tableNum(TAMRebateDeal), writeOffDeals, _from, _to);
+                METRebateCombinedFlow::post(TAMRebateTransactionType::WriteOff, METRebateCombinedSplitTask::getDealsToPost(writeOffDeals), _from, _to, _transDate);
             }
         }
     }
@@ -45,9 +47,16 @@ public final class METRebateCombinedFlow
 			<Method>
 				<Name>createTrans</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Runs create-trans inline for the given records. <c>_tableId</c> selects the engine variant:
+    /// tableNum(TAMRebateDeal) processes whole deals (used for reconcile-by-deal, and for the
+    /// single-thread whole-selection path); tableNum(TAMRebateTable) processes individual rebate
+    /// tables/lines (used to parallelize reconcile-by-line deals at line granularity).
+    /// </summary>
     public static void createTrans(
         TAMRebateTransactionType _type,
-        container _dealRecIds,
+        TableId _tableId,
+        container _recIds,
         TAMRebateFromDate _from,
         TAMRebateToDate _to)
     {
@@ -55,11 +64,11 @@ public final class METRebateCombinedFlow
         c.parmRebateTransactionType(_type);
         c.parmFromDate(_from);
         c.parmToDate(_to);
-        c.parmPackedRecords(_dealRecIds);
-        c.parmTableId(tableNum(TAMRebateDeal));
-        c.metParmAutoSetDate(false);
-        // Force INLINE execution for this bucket: the contract getter coerces any value <= 0 to 8,
-        // so we must explicitly set 1 to keep processRebateTrans's '> 1' guard false and avoid a nested split.
+        c.parmPackedRecords(_recIds);
+        c.parmTableId(_tableId);
+
+        // Force INLINE execution: the contract getter coerces any value <= 0 to 8, so we must
+        // explicitly set 1 to keep processRebateTrans's '> 1' guard false and avoid a nested split.
         c.parmMaxBatchTaskNum(1);
 
         TAMRebateCreateTrans::processRebateTrans(c);
@@ -77,7 +86,9 @@ public final class METRebateCombinedFlow
         TAMRebateToDate _to,
         TransDate _transDate)
     {
-        _to = endMth(_to);
+        int days = abs(_to - _from);
+        
+        _to = days <= 7 ? dateEndWk(_to) : dateEndMth(_to);
 
         TAMRebatePostContract p = TAMRebatePostContract::newFromParameters(
             _type,
@@ -93,7 +104,6 @@ public final class METRebateCombinedFlow
             tableNum(TAMRebateDeal),
             false,                          // useOriginalTransactionType
             false);                         // isCancelling
-        p.metParmAutoSetDate(false);
 
         TAMRebatePost::postRebate(p);
     }
@@ -101,23 +111,46 @@ public final class METRebateCombinedFlow
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>enumerateDealRecIds</Name>
+				<Name>enumerateDeals</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Enumerate deal RecIds from the dialog selection query (empty query =&gt; all deals).
+    /// Enumerate the selected deals from the dialog query (empty query =&gt; all deals) in a single
+    /// pass, capturing each deal's <c>RebateReconciliation</c> so the split does not re-query it
+    /// per deal. Returns a Map of deal RecId -&gt; reconciliation (as int).
     /// </summary>
-    public static container enumerateDealRecIds(str _packedQuery)
+    public static Map enumerateDeals(str _packedQuery)
     {
         Query q;
         container qc = SysOperationHelper::base64Decode(_packedQuery);
         q = qc ? new Query(qc) : new Query(queryStr(METRebateCombinedDeals));
 
-        container recIds;
+        Map deals = new Map(Types::Int64, Types::Integer);
         QueryRun qr = new QueryRun(q);
         while (qr.next())
         {
             TAMRebateDeal deal = qr.get(tableNum(TAMRebateDeal));
-            recIds += deal.RecId;
+            deals.insert(deal.RecId, enum2int(deal.RebateReconciliation));
+        }
+
+        return deals;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>dealRecIds</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// The deal RecIds of an <c>enumerateDeals</c> map, as a container (for the post/single-thread
+    /// paths that only need the RecId list).
+    /// </summary>
+    public static container dealRecIds(Map _deals)
+    {
+        container recIds;
+        MapEnumerator me = _deals.getEnumerator();
+        while (me.moveNext())
+        {
+            recIds += me.currentKey();
         }
 
         return recIds;
