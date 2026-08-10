@@ -6,16 +6,13 @@
 public class METRebateCombinedSplitTask extends RunBaseBatch implements BatchRetryable
 {
     private BatchHeader batchHeader;
-    private int maxBatchTaskNum;
     private container dealRecIds;
+    private Map reconByDeal;
     private TAMRebateFromDate fromDate;
     private TAMRebateToDate toDate;
     private TransDate transDate;
     private boolean processRebate;
     private boolean processWriteOff;
-
-    #DEFINE.MaxNumberOfBatchSessions(64)
-    #DEFINE.DefaultNumberOfBatchSessions(8)
 
 }
 ]]></Declaration>
@@ -23,10 +20,9 @@ public class METRebateCombinedSplitTask extends RunBaseBatch implements BatchRet
 			<Method>
 				<Name>construct</Name>
 				<Source><![CDATA[
-    internal static METRebateCombinedSplitTask construct(int _tasks)
+    internal static METRebateCombinedSplitTask construct()
     {
         METRebateCombinedSplitTask t = new METRebateCombinedSplitTask();
-        t.maxBatchTaskNum = _tasks;
         t.batchHeader = BatchHeader::getCurrentBatchHeader();
 
         return t;
@@ -60,9 +56,10 @@ public class METRebateCombinedSplitTask extends RunBaseBatch implements BatchRet
 			<Method>
 				<Name>addDeals</Name>
 				<Source><![CDATA[
-    public void addDeals(container _dealRecIds)
+    public void addDeals(Map _reconByDeal)
     {
-        dealRecIds = _dealRecIds;
+        reconByDeal = _reconByDeal;
+        dealRecIds = METRebateCombinedFlow::dealRecIds(_reconByDeal);
     }
 
 ]]></Source>
@@ -84,14 +81,14 @@ public class METRebateCombinedSplitTask extends RunBaseBatch implements BatchRet
 
         if (processRebate)
         {
-            // Phase 1: parallel Rebate create-trans over all deals (bucketed, LPT-balanced).
+            // Phase 1: parallel Rebate create-trans, one task per work unit (respecting reconcile-by).
             List rebateCreateTasks = this.queueCreateTasks(TAMRebateTransactionType::Rebate, dealRecIds);
 
             // Phase 2: single-threaded Rebate post over all deals, gated on ALL Phase-1 tasks.
             // Posting is single-threaded by design: it writes shared ledger / subledger / voucher
             // number sequences that are not partitioned by deal and cannot run concurrently.
             rebatePostTask = METRebatePostTask::construct(
-                TAMRebateTransactionType::Rebate, dealRecIds, fromDate, toDate, transDate);
+                TAMRebateTransactionType::Rebate, METRebateCombinedSplitTask::getDealsToPost(dealRecIds), fromDate, toDate, transDate);
             this.queueRuntimeTask(rebatePostTask);
             this.addDependencies(rebatePostTask, rebateCreateTasks);
         }
@@ -117,7 +114,7 @@ public class METRebateCombinedSplitTask extends RunBaseBatch implements BatchRet
 
                 // Phase 4: single-threaded Write-off post, gated on ALL Phase-3 tasks.
                 Batchable writeOffPostTask = METRebatePostTask::construct(
-                    TAMRebateTransactionType::WriteOff, writeOffDeals, fromDate, toDate, transDate);
+                    TAMRebateTransactionType::WriteOff, METRebateCombinedSplitTask::getDealsToPost(writeOffDeals), fromDate, toDate, transDate);
                 this.queueRuntimeTask(writeOffPostTask);
                 this.addDependencies(writeOffPostTask, writeOffCreateTasks);
             }
@@ -129,34 +126,92 @@ public class METRebateCombinedSplitTask extends RunBaseBatch implements BatchRet
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>getDealsToPost</Name>
+				<Source><![CDATA[
+    public static container getDealsToPost(container _dealsRecIds, boolean _writeoff = false)
+    {
+        container dealsPost;
+        
+        for (int i = 1; i <= conLen(_dealsRecIds); i++)
+        {
+            RefRecId dealRecId = conPeek(_dealsRecIds, i);
+            TAMRebateDeal deal; 
+
+            select firstonly deal
+                where deal.RecId == dealRecId;
+
+            if (deal.RebateReconciliation == enum2int(TAMRebateReconciliation::Deal))
+            {
+                // Whole deal = one unit (deal-scoped create).
+                dealsPost += dealRecId;
+            }
+            else
+            {
+                // Reconcile-by-line: one unit per rebate table/line (table-scoped create).
+                TAMRebateTable rebateTable;
+                while select RecId from rebateTable
+                    where rebateTable.RebateDeal == dealRecId
+                    && rebateTable.METSkipPosting == NoYes::No
+                {
+                    dealsPost += dealRecId;
+                }
+            }
+        }
+        return dealsPost;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>queueCreateTasks</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Bucket the given deals (LPT-balanced) and queue one parallel create-trans task per bucket.
+    /// Expand the given deals into one create-trans task per work unit, respecting reconciliation:
+    /// a reconcile-by-deal deal becomes a single deal-scoped task (its lines must aggregate together);
+    /// a reconcile-by-line deal becomes one table-scoped task per rebate line (lines are independent
+    /// and can run in different tasks). One task per unit lets the batch scheduler load-balance at
+    /// runtime — heavy units run alongside light ones without predicting transaction volume.
     /// Returns the queued tasks so the caller can wire the post barrier onto them.
     /// </summary>
     private List queueCreateTasks(TAMRebateTransactionType _type, container _deals)
     {
         List createTasks = new List(Types::Class);
+        List postTasks = new List(Types::Class);
 
-        Map weightByDeal = this.buildWeightMap(_deals);
-        List buckets = METRebateCombinedSplitTask::computeLPTBuckets(weightByDeal, min(this.effectiveMaxTasks(), conLen(_deals)));
-
-        ListEnumerator le = buckets.getEnumerator();
-        while (le.moveNext())
+        for (int i = 1; i <= conLen(_deals); i++)
         {
-            container bucketDeals = le.current();
-            if (conLen(bucketDeals) == 0)
-            {
-                continue;
-            }
+            RefRecId dealRecId = conPeek(_deals, i);
 
-            METRebateCreateTask task = METRebateCreateTask::construct(_type, bucketDeals, fromDate, toDate);
-            this.queueRuntimeTask(task);
-            createTasks.addEnd(task);
+            if (reconByDeal.lookup(dealRecId) == enum2int(TAMRebateReconciliation::Deal))
+            {
+                // Whole deal = one unit (deal-scoped create).
+                this.queueCreateTask(createTasks, _type, tableNum(TAMRebateDeal), [dealRecId]);
+            }
+            else
+            {
+                // Reconcile-by-line: one unit per rebate table/line (table-scoped create).
+                TAMRebateTable rebateTable;
+                while select RecId from rebateTable
+                    where rebateTable.RebateDeal == dealRecId
+                {
+                    this.queueCreateTask(createTasks, _type, tableNum(TAMRebateTable), [rebateTable.RecId]);
+                }
+            }
         }
 
         return createTasks;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>queueCreateTask</Name>
+				<Source><![CDATA[
+    private void queueCreateTask(List _createTasks, TAMRebateTransactionType _type, TableId _tableId, container _recIds)
+    {
+        METRebateCreateTask task = METRebateCreateTask::construct(_type, _tableId, _recIds, fromDate, toDate);
+        this.queueRuntimeTask(task);
+        _createTasks.addEnd(task);
     }
 
 ]]></Source>
@@ -168,57 +223,6 @@ public class METRebateCombinedSplitTask extends RunBaseBatch implements BatchRet
     {
         _task.batchInfo().parmGroupId(this.parmCurrentBatch().GroupId);
         batchHeader.addRuntimeTask(_task, this.parmCurrentBatch().BatchJobId);
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>effectiveMaxTasks</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Resolves the parallel-task count: 0 (auto) uses all available batch sessions;
-    /// an explicit value is capped at the available sessions so we never oversubscribe the cluster.
-    /// </summary>
-    private int effectiveMaxTasks()
-    {
-        int sessions = this.numberOfBatchSessions();
-
-        return maxBatchTaskNum <= 0 ? sessions : min(maxBatchTaskNum, sessions);
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>numberOfBatchSessions</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Total batch sessions available across batch-enabled AOS servers (capped), mirroring the
-    /// standard pattern used by GUPDiscountClaimProcessBatchHandler / BOMCalcJobItemTaskBatchManager.
-    /// </summary>
-    private int numberOfBatchSessions()
-    {
-        SysServerConfig serverConfig;
-        BatchServerConfig batchServerConfig;
-
-        int sessions = 0;
-
-        select sum(MaxBatchSessions) from batchServerConfig
-            exists join serverConfig
-                where serverConfig.ServerId == batchServerConfig.ServerId
-                   && serverConfig.EnableBatch == NoYes::Yes;
-
-        if (batchServerConfig.MaxBatchSessions)
-        {
-            // Cap total sessions - very high counts cause BatchConstraints blocking overhead.
-            sessions = min(batchServerConfig.MaxBatchSessions, #MaxNumberOfBatchSessions);
-        }
-
-        if (sessions == 0)
-        {
-            sessions = #DefaultNumberOfBatchSessions;
-        }
-
-        return sessions;
     }
 
 ]]></Source>
@@ -243,94 +247,11 @@ public class METRebateCombinedSplitTask extends RunBaseBatch implements BatchRet
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>buildWeightMap</Name>
-				<Source><![CDATA[
-    private Map buildWeightMap(container _deals)
-    {
-        Map m = new Map(Types::Int64, Types::Integer);
-        for (int i = 1; i <= conLen(_deals); i++)
-        {
-            RefRecId dealRecId = conPeek(_deals, i);
-            TAMRebateTable rt;
-            select count(RecId) from rt where rt.RebateDeal == dealRecId;
-            m.insert(dealRecId, max(1, any2Int(rt.RecId)));
-        }
-
-        return m;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>computeLPTBuckets</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Longest-Processing-Time greedy bin-packing (self-contained; standard computeLPTBuckets is
-    /// 'internal' to RebatesAndDeductions and keyed differently).
-    /// </summary>
-    internal static List computeLPTBuckets(Map _weightByDeal, int _numBuckets)
-    {
-        List buckets = new List(Types::Container);
-        int n = _weightByDeal.elements();
-        if (n == 0 || _numBuckets <= 0)
-        {
-            return buckets;
-        }
-
-        System.Int32[] sortKeys = new System.Int32[n]();   // negated weights =&gt; descending sort
-        System.Int64[] recIds   = new System.Int64[n]();
-        int idx = 0;
-        MapEnumerator me = _weightByDeal.getEnumerator();
-        while (me.moveNext())
-        {
-            sortKeys.SetValue(-(any2Int(me.currentValue())), idx);
-            recIds.SetValue(me.currentKey(), idx);
-            idx++;
-        }
-        System.Array::Sort(sortKeys, recIds);
-
-        container bucketLoads;
-        container bucketCons;
-        for (int b = 1; b <= _numBuckets; b++)
-        {
-            bucketLoads += 0;
-            bucketCons  += [conNull()];
-        }
-
-        for (int r = 0; r < n; r++)
-        {
-            int weight = -(any2Int(CLRInterop::getAnyTypeForObject(sortKeys.GetValue(r))));
-            RefRecId dealRecId = CLRInterop::getAnyTypeForObject(recIds.GetValue(r));
-
-            int target = 1, minLoad = conPeek(bucketLoads, 1);
-            for (int b = 2; b <= _numBuckets; b++)
-            {
-                if (conPeek(bucketLoads, b) < minLoad)
-                {
-                    minLoad = conPeek(bucketLoads, b);
-                    target = b;
-                }
-            }
-            bucketCons  = conPoke(bucketCons, target, conPeek(bucketCons, target) + [dealRecId]);
-            bucketLoads = conPoke(bucketLoads, target, minLoad + weight);
-        }
-
-        for (int b = 1; b <= _numBuckets; b++)
-        {
-            buckets.addEnd(conPeek(bucketCons, b));
-        }
-
-        return buckets;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
 				<Name>description</Name>
 				<Source><![CDATA[
     internal static ClassDescription description()
     {
-        return "@MET:RebateCombinedSplitTaskTitle";
+        return "Rebate + write-off combined split task";
     }
 
 ]]></Source>
