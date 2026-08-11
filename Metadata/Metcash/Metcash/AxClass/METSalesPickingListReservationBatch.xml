@@ -20,6 +20,8 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
     utcdatetime                 csdOrderExtractDateTime;
     container                   lineTaskBundles;
     boolean                     useLineLevelThreading;
+    boolean                     isRetryRun;
+    boolean                     finalTaskOnlyRetry;
     METProcMetrics              procMetrics;
 
     DialogField                 dlgOrderCount;
@@ -38,7 +40,9 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
         shipmentIdList,
         csdOrderExtractDateTime,
         lineTaskBundles,
-        useLineLevelThreading
+        useLineLevelThreading,
+        isRetryRun,
+        finalTaskOnlyRetry
     #endmacro
 
 }
@@ -83,48 +87,65 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 				<Name>constructForRetry</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Builds a single-SO guide check + reservation task for retry - re-runs Phase 1 for one
-    /// already-extracted SO, bypassing runStartTask()'s dialog/credit-check/header-insert
-    /// setup (the header/line already exist; ActionToPerform was already stamped on the
-    /// original run). Dispatches straight to runThreadTask() as a bundle of one. Claims the
-    /// line here, since runStartTask()'s own claim (markLinesProcessing()) never runs for a
-    /// retry-spawned task.
+    /// Builds a retry parent task (isRetryRun=true) seeded from the persisted header, so
+    /// runStartTask()/runFinalTask() rejoin the exact same bundling/dispatch path as a fresh run.
     /// </summary>
     /// <param name = "_extractionId">Owning ExtractionId</param>
-    /// <param name = "_salesId">Sales order to re-run guide check + reservation for</param>
-    /// <returns>The constructed retry task</returns>
-    public static METSalesPickingListReservationBatch constructForRetry(METSalesOrderExtractionId _extractionId, SalesId _salesId)
+    /// <param name = "_retriedSalesIds">SalesIds to retry</param>
+    /// <param name = "_header">The extraction header, carrying the persisted CSD/shipment context</param>
+    /// <returns>The constructed retry parent task</returns>
+    public static METSalesPickingListReservationBatch constructForRetry(METSalesOrderExtractionId _extractionId, container _retriedSalesIds, METSalesOrderExtractionTable _header)
     {
         METSalesPickingListReservationBatch batch = new METSalesPickingListReservationBatch();
-        SalesLine                           salesLineLocal;
-        container                           lineRecIds;
-        METSalesOrderExtractionLine         extractionLine;
 
-        batch.extractionId = _extractionId;
+        batch.extractionId              = _extractionId;
+        batch.salesOrderList            = _retriedSalesIds;
+        batch.processedSalesContainer   = _retriedSalesIds;
+        batch.useLineLevelThreading     = true;
+        batch.isRetryRun                = true;
+        batch.csdGuid                   = _header.CSDGuid;
+        batch.csdSalesOrderList         = _header.CSDSalesOrder;
+        batch.shipmentIdList            = _header.ShipmentIdList;
+        batch.continueFromStagingLane   = _header.ContinueFromStagingLane == NoYes::Yes;
 
-        while select RecId from salesLineLocal
-            where salesLineLocal.SalesId     == _salesId
-               && salesLineLocal.SalesStatus != SalesStatus::Canceled
+        if (conLen(batch.csdSalesOrderList) > 0)
         {
-            lineRecIds += salesLineLocal.RecId;
+            batch.csdOrderExtractDateTime = SalesTable::find(conPeek(batch.csdSalesOrderList, 1)).METOrderExtractDateTime;
         }
 
-        batch.lineTaskBundles = [lineRecIds];
-        batch.parmBatchIdentifier("1");
+        return batch;
+    }
 
-        ttsbegin;
+]]></Source>
+			</Method>
+			<Method>
+				<Name>constructForFinalTaskRetry</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds a retry parent task that resumes only the End/CSD tasks - every per-SO task
+    /// already Completed, only the final task itself failed. salesOrderList/
+    /// processedSalesContainer are deliberately left empty so no bundles/per-SO tasks spawn.
+    /// </summary>
+    /// <param name = "_extractionId">Owning ExtractionId</param>
+    /// <param name = "_header">The extraction header, carrying the persisted CSD/shipment context</param>
+    /// <returns>The constructed retry parent task</returns>
+    public static METSalesPickingListReservationBatch constructForFinalTaskRetry(METSalesOrderExtractionId _extractionId, METSalesOrderExtractionTable _header)
+    {
+        METSalesPickingListReservationBatch batch = new METSalesPickingListReservationBatch();
 
-        extractionLine = METSalesOrderExtractionLine::find(_extractionId, _salesId, true);
+        batch.extractionId              = _extractionId;
+        batch.useLineLevelThreading     = true;
+        batch.isRetryRun                = true;
+        batch.finalTaskOnlyRetry        = true;
+        batch.csdGuid                   = _header.CSDGuid;
+        batch.csdSalesOrderList         = _header.CSDSalesOrder;
+        batch.shipmentIdList            = _header.ShipmentIdList;
+        batch.continueFromStagingLane   = _header.ContinueFromStagingLane == NoYes::Yes;
 
-        if (extractionLine.RecId
-         && (extractionLine.ExtractionStatus == METSalesOrderExtractionStatus::Pending
-          || extractionLine.ExtractionStatus == METSalesOrderExtractionStatus::Failed))
+        if (conLen(batch.csdSalesOrderList) > 0)
         {
-            extractionLine.ExtractionStatus = METSalesOrderExtractionStatus::Processing;
-            extractionLine.update();
+            batch.csdOrderExtractDateTime = SalesTable::find(conPeek(batch.csdSalesOrderList, 1)).METOrderExtractDateTime;
         }
-
-        ttscommit;
 
         return batch;
     }
@@ -149,9 +170,9 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
             extractionHeaderPreview.initValue();
             extractionId = extractionHeaderPreview.ExtractionId;
         }
-
-        dlgOrderCount   = dialog.addFieldValue(extendedtypestr(Integer), conLen(salesOrderList), "@MET:METSelectedOrderCount");
+        
         dlgExtractionId = dialog.addFieldValue(extendedtypestr(METSalesOrderExtractionId), extractionId, "@MET:METExtractionIdLabel");
+        dlgOrderCount   = dialog.addFieldValue(extendedtypestr(Integer), conLen(salesOrderList), "@MET:METSelectedOrderCount");
 
         dlgOrderCount.allowEdit(false);
         dlgExtractionId.allowEdit(false);
@@ -248,7 +269,8 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 				<Name>runStartTask</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Orchestrates the parent-task setup: flag orders, delegate to V1, or run V2's setup steps.
+    /// Parent-task setup: flag orders, delegate to V1, or run V2's setup steps. Retry skips
+    /// header-insert/credit-check (already seeded); markHeaderProcessing() always runs.
     /// </summary>
     protected void runStartTask()
     {
@@ -260,16 +282,24 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
             return;
         }
 
-        this.insertExtractionHeaderAndLines();
-        this.markHeaderProcessing();
-        this.filterEligibleAndStampActions();
-
-        if (conLen(processedSalesContainer) == 0)
+        if (!isRetryRun)
         {
-            return;
+            this.insertExtractionHeaderAndLines();
         }
 
-        this.persistRetryContext();
+        this.markHeaderProcessing();
+
+        if (!isRetryRun)
+        {
+            this.filterEligibleAndStampActions();
+
+            if (conLen(processedSalesContainer) == 0)
+            {
+                return;
+            }
+
+            this.persistRetryContext();
+        }
 
         METCustParameters metCustParameters = METCustParameters::Find();
         int               taskCount = metCustParameters.SalesExtractionBatchLineTaskCount > 0 ? metCustParameters.SalesExtractionBatchLineTaskCount : 1;
@@ -285,10 +315,8 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 				<Name>markLinesProcessing</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Claims every line about to be dispatched into a bundle task - last step of
-    /// runStartTask(), after filtering/bundling, so only the SOs that survived credit-check
-    /// filtering (processedSalesContainer) are touched; a SO filtered out earlier stays
-    /// Pending rather than being falsely marked Processing.
+    /// Claims every line about to be dispatched - last step of runStartTask(), so a SO
+    /// filtered out earlier stays Pending instead of being falsely marked Processing.
     /// </summary>
     private void markLinesProcessing()
     {
@@ -445,14 +473,8 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 				<Name>runThreadTask</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Per-bundle guide check + reservation for this task's assigned lines, traced via
-    /// METProcMetrics: one METBatchMonitoringLog row per bundle, Details = ExtractionId,
-    /// progress tracked via DocumentCount/LineCount vs LinesToProcess. Slot 2 = guide check,
-    /// slot 3 = reservation (also updated by METStockReservation itself, via the ambient
-    /// METProcMetricsScope). Every line is isolated in its own try/catch and logged with its
-    /// stage/LineNum/ItemId on failure, but if any line failed the bundle task itself ends in
-    /// error so runFinalTask() - and therefore Phase 2 - never runs for this extraction; the
-    /// batch dependency chain does the blocking, not application logic.
+    /// Per-bundle guide check + reservation, traced via METProcMetrics. Any line failure ends
+    /// the bundle task in error, blocking runFinalTask()/Phase 2 via the dependency chain.
     /// </summary>
     protected void runThreadTask()
     {
@@ -476,78 +498,51 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 
                 try
                 {
-                    try
+                    salesLineLocal = SalesLine::findRecId(lineRecId, true);
+
+                    if (salesLineLocal.RecId)
                     {
-                        salesLineLocal = SalesLine::findRecId(lineRecId, true);
+                        procMetrics.incProcessedCount(1, 1);
 
-                        if (salesLineLocal.RecId)
+                        str lineActionToPerform = this.readCachedActionToPerform(actionToPerformCache, extractionId, salesLineLocal.SalesId);
+
+                        currentStage = "GuideCheck";
+                        procMetrics.startDescriptionTime(2, "@MET:METSOExtractSOGuideCheck");
+                        this.performGuideCheckForLine(salesLineLocal);
+                        procMetrics.incDescriptionCount(2, 1);
+                        procMetrics.endDescriptionTime(2);
+
+                        if (lineActionToPerform == METConstants::SOExtractReservedSOPickAndTO
+                         || lineActionToPerform == METConstants::SOExtractReservedSOPickOnly)
                         {
-                            procMetrics.incProcessedCount(1, 1);
-
-                            str lineActionToPerform = this.readCachedActionToPerform(actionToPerformCache, extractionId, salesLineLocal.SalesId);
-
-                            currentStage = "GuideCheck";
-                            // TEMP TEST - remove after retry/failure testing (SO 700227500)
-                            if (salesLineLocal.SalesId == "700227500")
-                            {
-                                throw error(strFmt("TEST: forced %1 failure for SO %2", currentStage, salesLineLocal.SalesId));
-                            }
-                            procMetrics.startDescriptionTime(2, "@MET:METSOExtractSOGuideCheck");
-                            this.performGuideCheckForLine(salesLineLocal);
-                            procMetrics.incDescriptionCount(2, 1);
-                            procMetrics.endDescriptionTime(2);
-
-                            if (lineActionToPerform == METConstants::SOExtractReservedSOPickAndTO
-                             || lineActionToPerform == METConstants::SOExtractReservedSOPickOnly)
-                            {
-                                SalesTable reservationSalesTable = salesLineLocal.salesTable();
-                                currentStage = "Reservation";
-                                // TEMP TEST - remove after retry/failure testing (SO 700227500)
-                                if (salesLineLocal.SalesId == "700227500")
-                                {
-                                    throw error(strFmt("TEST: forced %1 failure for SO %2", currentStage, salesLineLocal.SalesId));
-                                }
-                                procMetrics.startDescriptionTime(3, "@MET:METSOExtractStockReservation");
-                                METStockReservation::construct(reservationSalesTable).processV2ForLines([lineRecId], extractionId);
-                                procMetrics.endDescriptionTime(3);
-                            }
+                            SalesTable reservationSalesTable = salesLineLocal.salesTable();
+                            currentStage = "Reservation";
+                            procMetrics.startDescriptionTime(3, "@MET:METSOExtractStockReservation");
+                            METStockReservation::construct(reservationSalesTable).processV2ForLines([lineRecId], extractionId);
+                            procMetrics.endDescriptionTime(3);
                         }
                     }
-                    catch (Exception::Deadlock)
+                }
+                catch (Exception::Deadlock)
+                {
+                    retry;
+                }
+                catch (Exception::UpdateConflict)
+                {
+                    if (appl.ttsLevel() == 0 && xSession::currentRetryCount() < #RetryNum)
                     {
                         retry;
                     }
-                    catch (Exception::UpdateConflict)
+                    else
                     {
-                        if (appl.ttsLevel() == 0)
-                        {
-                            if (xSession::currentRetryCount() >= #RetryNum)
-                            {
-                                throw Exception::UpdateConflictNotRecovered;
-                            }
-                            else
-                            {
-                                retry;
-                            }
-                        }
-                        else
-                        {
-                            throw Exception::UpdateConflict;
-                        }
+                        anyLineFailed = true;
+                        this.logLineFailure(currentStage, lineRecId, salesLineLocal.SalesId);
                     }
                 }
                 catch
                 {
                     anyLineFailed = true;
-
-                    try
-                    {
-                        this.logLineFailure(currentStage, lineRecId, salesLineLocal.SalesId);
-                    }
-                    catch
-                    {
-                        // Logging itself failed - the bundle is still marked failed below regardless.
-                    }
+                    this.logLineFailure(currentStage, lineRecId, salesLineLocal.SalesId);
                 }
             }
 
@@ -992,10 +987,8 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 				<Name>runFinalTask</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Orchestrates the End task: spawn per-SO tasks, the End/export task, then the CSD task.
-    /// Traced separately from the per-bundle runThreadTask() traces - own
-    /// METBatchMonitoringLog row, Details = ExtractionId, progress tracked via DocumentCount
-    /// vs LinesToProcess.
+    /// Orchestrates the End task: spawns per-SO tasks, the End/export task, then the CSD task.
+    /// finalTaskOnlyRetry always proceeds to the End/CSD tasks even with zero per-SO tasks.
     /// </summary>
     protected void runFinalTask()
     {
@@ -1021,7 +1014,7 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 
             fulfillmentTaskList = this.spawnPerSOTasks(isBatchMode, currentBatchTask, fulfillmentBatchHeader, anchorRecId);
 
-            if (fulfillmentTaskList.elements() == 0)
+            if (fulfillmentTaskList.elements() == 0 && !finalTaskOnlyRetry)
             {
                 procMetrics.endTrace(METBatchMonitoringStatus::Completed);
                 return;
@@ -1942,24 +1935,30 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 				<Name>logLineFailure</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Captures a short failure reason, tags it with the stage and LineNum/ItemId, appends it
-    /// to the owning SO's extraction line, and logs a warning. Never lets a logging failure
-    /// escape - the caller marks the bundle failed regardless.
+    /// Tags a short failure reason with stage/LineNum/ItemId, logs it, and appends it to the
+    /// extraction line. Never lets a logging failure itself escape.
     /// </summary>
     /// <param name = "_stage">Processing stage the failure occurred in (GuideCheck/Reservation)</param>
     /// <param name = "_lineRecId">SalesLine RecId that failed</param>
     /// <param name = "_salesId">Owning SalesId if resolved before the failure, else blank</param>
     private void logLineFailure(str _stage, RefRecId _lineRecId, SalesId _salesId)
     {
-        SalesLine lineForLog    = this.resolveLineForErrorLogging(_lineRecId);
-        SalesId   salesIdForLog = _salesId ? _salesId : lineForLog.SalesId;
-        str       reason        = this.captureShortFailureReason();
-
-        warning(strFmt("@MET:METLineProcessingFailed", _stage, lineForLog.LineNum, lineForLog.ItemId, reason));
-
-        if (salesIdForLog)
+        try
         {
-            this.appendExtractionLineError(extractionId, salesIdForLog, _stage, lineForLog.LineNum, lineForLog.ItemId, reason);
+            SalesLine lineForLog    = this.resolveLineForErrorLogging(_lineRecId);
+            SalesId   salesIdForLog = _salesId ? _salesId : lineForLog.SalesId;
+            str       reason        = this.captureShortFailureReason();
+
+            warning(strFmt("@MET:METLineProcessingFailed", _stage, lineForLog.LineNum, lineForLog.ItemId, reason));
+
+            if (salesIdForLog)
+            {
+                this.appendExtractionLineError(extractionId, salesIdForLog, _stage, lineForLog.LineNum, lineForLog.ItemId, reason);
+            }
+        }
+        catch
+        {
+            // Logging itself failed - the caller marks the bundle failed regardless.
         }
     }
 
@@ -1969,9 +1968,7 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 				<Name>appendExtractionLineError</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Appends a stage/LineNum/ItemId-tagged failure entry onto the extraction line's
-    /// ErrorMessage (own transaction), truncated to fit so repeated failures on the same SO
-    /// don't overwrite each other's trail.
+    /// Appends a tagged failure entry onto the extraction line's ErrorMessage, truncated to fit.
     /// </summary>
     /// <param name = "_extractionId">Owning ExtractionId</param>
     /// <param name = "_salesId">Sales order the failed line belongs to</param>
@@ -2011,9 +2008,7 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 				<Name>persistRetryContext</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Persists CSD/shipment context onto the extraction header so a later retry (triggered
-    /// independently from the form, with no access to this in-memory instance) can rebuild
-    /// the End task's context without re-deriving it.
+    /// Persists CSD/shipment context onto the header so a later retry can rebuild it.
     /// </summary>
     private void persistRetryContext()
     {
@@ -2022,9 +2017,10 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
         if (extractionHeader.RecId)
         {
             ttsbegin;
-            extractionHeader.CSDGuid        = csdGuid;
-            extractionHeader.CSDSalesOrder  = csdSalesOrderList;
-            extractionHeader.ShipmentIdList = shipmentIdList;
+            extractionHeader.CSDGuid                 = csdGuid;
+            extractionHeader.CSDSalesOrder           = csdSalesOrderList;
+            extractionHeader.ShipmentIdList          = shipmentIdList;
+            extractionHeader.ContinueFromStagingLane = continueFromStagingLane ? NoYes::Yes : NoYes::No;
             extractionHeader.update();
             ttscommit;
         }
@@ -2092,10 +2088,8 @@ class METSalesPickingListReservationBatch extends METRunBaseBatchMultiThreadBase
 				<Name>markHeaderProcessing</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Claims the extraction header for processing, mirroring
-    /// METSalesOrderExtractionPendingProcess.processRecord()'s claim pattern: only flips
-    /// Pending/Failed to Processing, so the header reflects that the batch job has actually
-    /// started working on it rather than just being queued.
+    /// Claims the header for processing, mirroring
+    /// METSalesOrderExtractionPendingProcess.processRecord()'s claim pattern.
     /// </summary>
     private void markHeaderProcessing()
     {

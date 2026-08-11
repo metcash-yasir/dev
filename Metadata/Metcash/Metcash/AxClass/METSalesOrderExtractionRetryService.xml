@@ -4,8 +4,8 @@
 	<SourceCode>
 		<Declaration><![CDATA[
 /// <summary>
-/// Retries the failed per-SO tasks of a prior extraction run, without touching lines
-/// already Completed.
+/// Retries the retriable SOs of a prior extraction run via a single Class1 retry-parent
+/// task, without touching lines already Completed.
 /// </summary>
 class METSalesOrderExtractionRetryService
 {
@@ -16,14 +16,16 @@ class METSalesOrderExtractionRetryService
 				<Name>canRetry</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// True if the extraction has at least one Failed line.
+    /// True if the extraction has a Failed line, or (with no Failed line - every SO already
+    /// Completed) the header itself is Failed, meaning only the End task needs retrying.
     /// </summary>
     /// <param name = "_extractionId">Extraction to check</param>
     /// <returns>True if a retry is possible</returns>
     public static boolean canRetry(METSalesOrderExtractionId _extractionId)
     {
-        METSalesOrderExtractionLine extractionLine;
-        boolean                    hasFailedLines;
+        METSalesOrderExtractionLine   extractionLine;
+        METSalesOrderExtractionTable  header;
+        boolean                       hasFailedLines;
 
         if (_extractionId)
         {
@@ -32,6 +34,14 @@ class METSalesOrderExtractionRetryService
                   && extractionLine.ExtractionStatus  == METSalesOrderExtractionStatus::Failed;
 
             hasFailedLines = extractionLine.RecId != 0;
+
+            if (!hasFailedLines)
+            {
+                select firstonly ExtractionStatus from header
+                    where header.ExtractionId == _extractionId;
+
+                return header.ExtractionStatus == METSalesOrderExtractionStatus::Failed;
+            }
         }
 
         return hasFailedLines;
@@ -43,30 +53,38 @@ class METSalesOrderExtractionRetryService
 				<Name>retry</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Retries every retriable line: resets to Pending, then schedules a new per-SO/End/CSD
-    /// task set.
+    /// Retries retriable lines if any exist (full Phase1+Phase2 retry); otherwise, if the
+    /// header itself is Failed, resumes only the End/CSD tasks.
     /// </summary>
     /// <param name = "_extractionId">Extraction to retry</param>
     public static void retry(METSalesOrderExtractionId _extractionId)
     {
         METSalesOrderExtractionTable header = METSalesOrderExtractionTable::find(_extractionId);
-        container                    retriableSalesIds = METSalesOrderExtractionRetryService::getRetriableSalesIds(_extractionId);
+        container                    retriableSalesIds;
 
         if (!header.RecId)
         {
             throw error(strFmt("@MET:METExtractionNotFound", _extractionId));
         }
 
-        if (conLen(retriableSalesIds) == 0)
+        retriableSalesIds = METSalesOrderExtractionRetryService::getRetriableSalesIds(_extractionId);
+
+        if (conLen(retriableSalesIds) > 0)
+        {
+            METSalesOrderExtractionRetryService::resetRetriableLines(_extractionId, retriableSalesIds);
+            METSalesOrderExtractionRetryService::spawnRetryBatch(header, retriableSalesIds);
+            info(strFmt("@MET:METRetryScheduled", conLen(retriableSalesIds), _extractionId));
+        }
+        else if (header.ExtractionStatus == METSalesOrderExtractionStatus::Failed)
+        {
+            METSalesOrderExtractionRetryService::resetHeaderForFinalTaskRetry(_extractionId);
+            METSalesOrderExtractionRetryService::spawnFinalTaskRetryBatch(header);
+            info(strFmt("@MET:METFinalTaskRetryScheduled", _extractionId));
+        }
+        else
         {
             warning("@MET:METNoFailedLinesToRetry");
-            return;
         }
-
-        METSalesOrderExtractionRetryService::resetRetriableLines(_extractionId, retriableSalesIds);
-        METSalesOrderExtractionRetryService::spawnRetryBatch(header, retriableSalesIds);
-
-        info(strFmt("@MET:METRetryScheduled", conLen(retriableSalesIds), _extractionId));
     }
 
 ]]></Source>
@@ -75,11 +93,8 @@ class METSalesOrderExtractionRetryService
 				<Name>getRetriableSalesIds</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Reads every SalesId that needs retrying: Failed lines, plus - once at least one line
-    /// has Failed - every still-Processing line too. A single bundle failure blocks the
-    /// extraction's one shared final task (see runFinalTask()), so any sibling SO that reached
-    /// Processing but never got to Phase 2 is just as stuck as the one that actually errored;
-    /// it just never got tagged Failed itself.
+    /// Failed lines, plus - once at least one line has Failed - every still-Processing
+    /// sibling too (a Processing line is just as stuck, it just never errored itself).
     /// </summary>
     /// <param name = "_extractionId">Extraction to scan</param>
     /// <returns>Container of retriable SalesIds</returns>
@@ -111,7 +126,7 @@ class METSalesOrderExtractionRetryService
 				<Name>resetRetriableLines</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Resets every retried line back to Pending; ErrorMessage is left as-is.
+    /// Resets every retried line back to Pending, bumps RetryCount, and clears ErrorMessage.
     /// </summary>
     /// <param name = "_extractionId">Owning ExtractionId</param>
     /// <param name = "_retriableSalesIds">SalesIds to reset</param>
@@ -128,8 +143,38 @@ class METSalesOrderExtractionRetryService
             if (extractionLine.RecId)
             {
                 extractionLine.ExtractionStatus = METSalesOrderExtractionStatus::Pending;
+                extractionLine.RetryCount       += 1;
+                extractionLine.ErrorMessage      = '';
                 extractionLine.update();
             }
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>resetHeaderForFinalTaskRetry</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Resets the header back to Processing and clears ErrorMessage before resuming only
+    /// the End/CSD tasks.
+    /// </summary>
+    /// <param name = "_extractionId">Extraction to reset</param>
+    private static void resetHeaderForFinalTaskRetry(METSalesOrderExtractionId _extractionId)
+    {
+        METSalesOrderExtractionTable header;
+
+        ttsbegin;
+
+        header = METSalesOrderExtractionTable::find(_extractionId, true);
+
+        if (header.RecId)
+        {
+            header.ExtractionStatus = METSalesOrderExtractionStatus::Processing;
+            header.ErrorMessage     = '';
+            header.update();
         }
 
         ttscommit;
@@ -141,110 +186,62 @@ class METSalesOrderExtractionRetryService
 				<Name>spawnRetryBatch</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Schedules a new standalone batch job for the retried SalesIds - a Phase1 guide
-    /// check/reservation task per SO, a Phase2 pick-list task depending on it (so a SO that
-    /// failed before ever being reserved gets re-reserved, not just re-posted), a new End
-    /// task, and (if applicable) a new CSD task - mirroring runFinalTask()'s spawn shape.
+    /// Schedules a Class1 retry-parent task that reruns Phase1+Phase2 for the given SalesIds.
     /// </summary>
     /// <param name = "_header">The extraction header, carrying the persisted CSD/shipment context</param>
-    /// <param name = "_failedSalesIds">SalesIds to retry</param>
-    private static void spawnRetryBatch(METSalesOrderExtractionTable _header, container _failedSalesIds)
+    /// <param name = "_retriedSalesIds">SalesIds to retry</param>
+    private static void spawnRetryBatch(METSalesOrderExtractionTable _header, container _retriedSalesIds)
     {
-        METCustParameters                    metCustParameters  = METCustParameters::find();
-        BatchHeader                          retryBatchHeader   = BatchHeader::construct();
-        List                                 retryTaskList      = new List(Types::Class);
-        container                            csdSalesOrderList  = _header.CSDSalesOrder;
-        utcdatetime                          csdOrderExtractDateTime;
-        METSalesPickingListFulfillmentBatch  endTask;
-        ListEnumerator                       soEnumerator;
-        int                                  i;
+        METSalesPickingListReservationBatch retryParentTask = METSalesPickingListReservationBatch::constructForRetry(_header.ExtractionId, _retriedSalesIds, _header);
 
-        if (conLen(csdSalesOrderList) > 0)
+        METSalesOrderExtractionRetryService::scheduleRetryParentTask(retryParentTask, _header.ExtractionId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>spawnFinalTaskRetryBatch</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Schedules a Class1 retry-parent task that resumes only the End/CSD tasks - every
+    /// per-SO task already Completed.
+    /// </summary>
+    /// <param name = "_header">The extraction header, carrying the persisted CSD/shipment context</param>
+    private static void spawnFinalTaskRetryBatch(METSalesOrderExtractionTable _header)
+    {
+        METSalesPickingListReservationBatch retryParentTask = METSalesPickingListReservationBatch::constructForFinalTaskRetry(_header.ExtractionId, _header);
+
+        METSalesOrderExtractionRetryService::scheduleRetryParentTask(retryParentTask, _header.ExtractionId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>scheduleRetryParentTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Shared scheduling for both retry shapes: new job, same caption/group as a fresh run.
+    /// </summary>
+    /// <param name = "_retryParentTask">The configured retry-parent task to schedule</param>
+    /// <param name = "_extractionId">Owning ExtractionId, for the job caption</param>
+    private static void scheduleRetryParentTask(METSalesPickingListReservationBatch _retryParentTask, METSalesOrderExtractionId _extractionId)
+    {
+        METCustParameters  metCustParameters = METCustParameters::find();
+        BatchHeader        retryBatchHeader  = BatchHeader::construct();
+
+        retryBatchHeader.parmCaption(strFmt("@MET:METCaptionReservationSetupForExtraction", "@MET:MetPickingListGeneration", curUserId(), _extractionId));
+
+        _retryParentTask.batchInfo().resetBatchHeader();
+
+        if (metCustParameters.SalesExtractionBatchGroupId)
         {
-            csdOrderExtractDateTime = SalesTable::find(conPeek(csdSalesOrderList, 1)).METOrderExtractDateTime;
+            _retryParentTask.batchInfo().parmGroupId(metCustParameters.SalesExtractionBatchGroupId);
         }
 
-        for (i = 1; i <= conLen(_failedSalesIds); i++)
-        {
-            SalesId                              salesIdLocal = conPeek(_failedSalesIds, i);
-            METSalesPickingListReservationBatch  reservationTask = METSalesPickingListReservationBatch::constructForRetry(_header.ExtractionId, salesIdLocal);
-            METSalesPickingListFulfillmentBatch  soTask = new METSalesPickingListFulfillmentBatch();
+        _retryParentTask.batchInfo().parmConstraintType(BatchConstraintType::And);
+        _retryParentTask.batchInfo().parmDataareaId(curExt());
 
-            reservationTask.batchInfo().resetBatchHeader();
-            reservationTask.batchInfo().parmGroupId(metCustParameters.SalesExtractionBatchGroupId);
-            reservationTask.batchInfo().parmConstraintType(BatchConstraintType::And);
-            reservationTask.batchInfo().parmDataareaId(curExt());
-
-            retryBatchHeader.addTask(reservationTask);
-
-            soTask.parmSalesId(salesIdLocal);
-            soTask.parmSalesOrderExtractionId(_header.ExtractionId);
-            soTask.parmCSDSalesOrderCount(conLen(csdSalesOrderList));
-            soTask.parmCSDSalesOrderExtractDateTime(csdOrderExtractDateTime);
-            soTask.parmCsdGuid(_header.CSDGuid);
-
-            if (conFind(csdSalesOrderList, salesIdLocal) > 0)
-            {
-                soTask.parmCSDSalesId(salesIdLocal);
-            }
-
-            soTask.parmBatchIdentifier(salesIdLocal);
-
-            soTask.batchInfo().resetBatchHeader();
-            soTask.batchInfo().parmGroupId(metCustParameters.SalesExtractionBatchGroupId);
-            soTask.batchInfo().parmConstraintType(BatchConstraintType::And);
-            soTask.batchInfo().parmDataareaId(curExt());
-
-            retryBatchHeader.addTask(soTask);
-            retryBatchHeader.addDependency(soTask, reservationTask);
-
-            retryTaskList.addEnd(soTask);
-        }
-
-        endTask = new METSalesPickingListFulfillmentBatch();
-        endTask.parmSalesOrderExtractionId(_header.ExtractionId);
-        endTask.parmShipmentIdList(_header.ShipmentIdList);
-        endTask.parmCsdGuid(_header.CSDGuid);
-        endTask.parmCSDSalesOrderList(csdSalesOrderList);
-        endTask.parmCSDSalesOrderExtractDateTime(csdOrderExtractDateTime);
-
-        if (conLen(csdSalesOrderList) > 0)
-        {
-            endTask.parmCSDSalesId(conPeek(csdSalesOrderList, 1));
-        }
-
-        endTask.parmBatchIdentifier(endTask.finalTaskIdentifier());
-
-        endTask.batchInfo().resetBatchHeader();
-        endTask.batchInfo().parmGroupId(metCustParameters.SalesExtractionBatchGroupId);
-        endTask.batchInfo().parmConstraintType(BatchConstraintType::And);
-        endTask.batchInfo().parmDataareaId(curExt());
-
-        retryBatchHeader.addTask(endTask);
-
-        soEnumerator = retryTaskList.getEnumerator();
-        while (soEnumerator.moveNext())
-        {
-            retryBatchHeader.addDependency(endTask, soEnumerator.current());
-        }
-
-        if (conLen(csdSalesOrderList) > 0)
-        {
-            SysOperationServiceController      csdController = METCreateCSDTransferOrderController::construct(csdSalesOrderList);
-            METCreateCSDTransferOrderContract  csdContract    = csdController.getDataContractObject() as METCreateCSDTransferOrderContract;
-
-            csdContract.parmContinueFromStagingLane(false);
-
-            retryBatchHeader.addTask(csdController);
-
-            soEnumerator = retryTaskList.getEnumerator();
-            while (soEnumerator.moveNext())
-            {
-                retryBatchHeader.addDependency(csdController, soEnumerator.current(), BatchDependencyStatus::Finished);
-            }
-            retryBatchHeader.addDependency(csdController, endTask, BatchDependencyStatus::Finished);
-        }
-
+        retryBatchHeader.addTask(_retryParentTask);
         retryBatchHeader.save();
     }
 

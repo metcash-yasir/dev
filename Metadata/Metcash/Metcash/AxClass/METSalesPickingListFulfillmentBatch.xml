@@ -4,9 +4,8 @@
 	<SourceCode>
 		<Declaration><![CDATA[
 /// <summary>
-/// Phase 2 of the SO extraction pipeline: per-SO pick list posting, then (on the End task)
-/// CSD wave business event, shipment cleanup, and ExtractionStatus finalize/export.
-/// Never shown interactively - always spawned directly by METSalesPickingListReservationBatch.
+/// Phase 2: per-SO pick list posting, then (on the End task) CSD wave/cleanup/export.
+/// Always spawned by METSalesPickingListReservationBatch, never shown interactively.
 /// </summary>
 class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
 {
@@ -33,6 +32,7 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
     LineNum                     currentLineNum;
     ItemId                      currentItemId;
     METProcMetrics              procMetrics;
+    str                         capturedErrorReason;
 
     #define.CurrentVersion(1)
     #localmacro.CurrentList
@@ -253,11 +253,8 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
 				<Name>runThreadTask</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Per-SO pick list posting, wrapped with the standard retry/error handling, traced via
-    /// METProcMetrics (one METBatchMonitoringLog row per SO, Details = ExtractionId-SalesId).
-    /// Any failure marks this SO's extraction line Failed with a stage-tagged reason and
-    /// fails the task itself, so the End/CSD tasks (which depend on every per-SO task
-    /// Finishing) never run - the batch dependency chain blocks export, not application logic.
+    /// Per-SO pick list posting. Any failure marks the extraction line Failed and fails the
+    /// task, so the dependency chain blocks the End/CSD tasks (and export) from running.
     /// </summary>
     protected void runThreadTask()
     {
@@ -298,6 +295,8 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
                 }
                 else
                 {
+                    phase2HasError = true;
+                    this.markLineFailed("PickListCreation");
                     throw Exception::UpdateConflict;
                 }
             }
@@ -318,6 +317,8 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
                 }
                 else
                 {
+                    phase2HasError = true;
+                    this.markLineFailed("PickListCreation");
                     throw Exception::DuplicateKeyException;
                 }
             }
@@ -331,7 +332,7 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
             {
                 phase2HasError = true;
                 this.markLineFailed("PickListCreation");
-                exceptionTextFallThrough();
+                throw error(strFmt("@MET:METPickListTaskFailed", salesId));
             }
             finally
             {
@@ -353,9 +354,8 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
 				<Name>processPickingListPhase2</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Header-level TMS trigger for substituted lines (slot 8), wave creation (slot 2), then
-    /// branches by ActionToPerform: TO-only queues to pending process (slot 12), pick actions
-    /// post the list (slot 7, inside postPickingListV2), status-only updates status (slot 11).
+    /// TMS trigger for substituted lines, wave creation, then branches by ActionToPerform to
+    /// queue TO/post pick list/update status only.
     /// </summary>
     private void processPickingListPhase2()
     {
@@ -512,9 +512,7 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
 				<Name>updateExtractionLineStatus</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Records this SO's pick-list outcome on its extraction line. A non-empty error message
-    /// is appended (not overwritten) so a Phase1 line failure already logged here survives a
-    /// later Phase2 success; on success with no message, ErrorMessage is left untouched.
+    /// Records this SO's outcome. Errors append to ErrorMessage; reaching Completed clears it.
     /// </summary>
     /// <param name = "_status">Outcome status to record</param>
     /// <param name = "_errorMessage">Error message, if any</param>
@@ -530,7 +528,11 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
             extractionLine.ExtractionStatus   = _status;
             extractionLine.ProcessEndDateTime = DateTimeUtil::getSystemDateTime();
 
-            if (_errorMessage)
+            if (_status == METSalesOrderExtractionStatus::Completed)
+            {
+                extractionLine.ErrorMessage = '';
+            }
+            else if (_errorMessage)
             {
                 str combined = extractionLine.ErrorMessage
                     ? extractionLine.ErrorMessage + " | " + _errorMessage
@@ -681,10 +683,8 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
 				<Name>postPickingListV2</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Reserves qualifying lines, posts the pick list (slot 7), and falls back to a
-    /// status-only update when nothing qualifies. Skips posting entirely if this SO's
-    /// extraction line already has a PickingRouteId (a prior attempt already committed a full
-    /// pick list for it) - makes a retry safe without double-posting WMS orders.
+    /// Reserves qualifying lines and posts the pick list; skips if already stamped with a
+    /// PickingRouteId. Every catch throws explicitly so runThreadTask() marks the line Failed.
     /// </summary>
     /// <param name = "_salesTable">The sales order to post</param>
     /// <param name = "_pickListOrderedQty">True to pick ordered qty instead of reserved qty</param>
@@ -762,8 +762,9 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
             {
                 if (xSession::currentRetryCount() >= #RetryNum)
                 {
-                    error ("@WAX:UpdateCancelled");
                     isError = true;
+                    capturedErrorReason = this.captureShortFailureReason();
+                    throw error(strFmt("@MET:METPickListTaskFailed", _salesTable.SalesId));
                 }
                 else
                 {
@@ -772,8 +773,9 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
             }
             else
             {
-                error ("@WAX:UpdateCancelled");
                 isError = true;
+                capturedErrorReason = this.captureShortFailureReason();
+                throw error(strFmt("@MET:METPickListTaskFailed", _salesTable.SalesId));
             }
         }
         catch(Exception::DuplicateKeyException)
@@ -782,8 +784,9 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
             {
                 if (xSession::currentRetryCount() >= #RetryNum)
                 {
-                    error ("@WAX:UpdateCancelled");
                     isError = true;
+                    capturedErrorReason = this.captureShortFailureReason();
+                    throw error(strFmt("@MET:METPickListTaskFailed", _salesTable.SalesId));
                 }
                 else
                 {
@@ -792,19 +795,23 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
             }
             else
             {
-                error ("@WAX:UpdateCancelled");
                 isError = true;
+                capturedErrorReason = this.captureShortFailureReason();
+                throw error(strFmt("@MET:METPickListTaskFailed", _salesTable.SalesId));
             }
         }
         catch
         {
-            error ("@WAX:UpdateCancelled");
             isError = true;
+            capturedErrorReason = this.captureShortFailureReason();
+            throw error(strFmt("@MET:METPickListTaskFailed", _salesTable.SalesId));
         }
-
-        _salesTable.reread();
-        _salesTable.selectForUpdate(true);
-        _salesTable.metUpdateExtractStatus();
+        finally
+        {
+            _salesTable.reread();
+            _salesTable.selectForUpdate(true);
+            _salesTable.metUpdateExtractStatus();
+        }
     }
 
 ]]></Source>
@@ -972,12 +979,6 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
         boolean      isCSDPrint = csdSalesId != '' && csdSalesId == salesId;
         WMSShipment  wmsShipment;
         Map          pickedQtyMap;
-
-        // TEMP TEST - remove after retry/failure testing (SO 700227500)
-        if (_salesTable.SalesId == "700227500")
-        {
-            throw error(strFmt("TEST: forced PickListCreation failure for SO %1", _salesTable.SalesId));
-        }
 
         if (procMetrics)
         {
@@ -1444,17 +1445,15 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
 				<Name>runFinalTask</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Orchestrates the End task: CSD wave event (slot 2), shipment cleanup (slot 3),
-    /// completion check (slot 4), header finalize/file export (slot 5). Own
-    /// METBatchMonitoringLog row, Details = ExtractionId. LinesToProcess is not meaningful
-    /// for this trace (this is one atomic finalize operation, not a per-line one) - the real
-    /// exported record count is DEVIntegExportDocumentLog.NumberOfRecords, tracked
-    /// separately by the export framework, not folded in here.
+    /// End task: CSD wave event, shipment cleanup, completion check, header finalize/export.
+    /// Any failure marks the header Failed (not line-derived - all lines are Completed by now).
     /// </summary>
     protected void runFinalTask()
     {
+        #OCCRetryCount
         str      failedSalesIds;
         boolean  allCompleted;
+        str      currentStage = "CsdWaveEvent";
 
         procMetrics = METProcMetrics::construct(METBatchLogOperation::SalesOrderExtractJob);
 
@@ -1462,32 +1461,60 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
         {
             procMetrics.startTrace(1, extractionId);
 
-            procMetrics.startDescriptionTime(2, "@MET:METSOExtractCsdWaveEvent");
-            this.triggerCsdWaveEvent();
-            procMetrics.incDescriptionCount(2, 1);
-            procMetrics.endDescriptionTime(2);
+            try
+            {
+                currentStage = "CsdWaveEvent";
+                procMetrics.startDescriptionTime(2, "@MET:METSOExtractCsdWaveEvent");
+                this.triggerCsdWaveEvent();
+                procMetrics.incDescriptionCount(2, 1);
+                procMetrics.endDescriptionTime(2);
 
-            procMetrics.startDescriptionTime(3, "@MET:METSOExtractShipmentCleanup");
-            METSalesOrderShipmentLoadHeader::cleanShipmentIfNoLines(shipmentIdList);
-            procMetrics.incDescriptionCount(3, 1);
-            procMetrics.endDescriptionTime(3);
+                currentStage = "ShipmentCleanup";
+                procMetrics.startDescriptionTime(3, "@MET:METSOExtractShipmentCleanup");
+                METSalesOrderShipmentLoadHeader::cleanShipmentIfNoLines(shipmentIdList);
+                procMetrics.incDescriptionCount(3, 1);
+                procMetrics.endDescriptionTime(3);
 
-            procMetrics.startDescriptionTime(4, "@MET:METSOExtractValidateLinesCompleted");
-            [allCompleted, failedSalesIds] = this.validateAllLinesCompleted();
-            procMetrics.incDescriptionCount(4, 1);
-            procMetrics.endDescriptionTime(4);
+                currentStage = "ValidateLinesCompleted";
+                procMetrics.startDescriptionTime(4, "@MET:METSOExtractValidateLinesCompleted");
+                [allCompleted, failedSalesIds] = this.validateAllLinesCompleted();
+                procMetrics.incDescriptionCount(4, 1);
+                procMetrics.endDescriptionTime(4);
 
-            procMetrics.startDescriptionTime(5, "@MET:METSOExtractFileExport");
-            this.finalizeExtractionHeader(allCompleted);
-            procMetrics.incDescriptionCount(5, 1);
-            procMetrics.endDescriptionTime(5);
+                if (!allCompleted)
+                {
+                    warning(strFmt("@MET:METExtractionPartiallyCompleted", extractionId, failedSalesIds));
+                }
+
+                currentStage = "FinalizeExport";
+                procMetrics.startDescriptionTime(5, "@MET:METSOExtractFileExport");
+                this.finalizeExtractionHeader();
+                procMetrics.incDescriptionCount(5, 1);
+                procMetrics.endDescriptionTime(5);
+            }
+            catch (Exception::Deadlock)
+            {
+                retry;
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0 && xSession::currentRetryCount() < #RetryNum)
+                {
+                    retry;
+                }
+                else
+                {
+                    this.markHeaderFailed(currentStage);
+                    throw error(strFmt("@MET:METFinalTaskFailed", extractionId));
+                }
+            }
+            catch
+            {
+                this.markHeaderFailed(currentStage);
+                throw error(strFmt("@MET:METFinalTaskFailed", extractionId));
+            }
 
             procMetrics.endTrace(allCompleted ? METBatchMonitoringStatus::Completed : METBatchMonitoringStatus::Failed);
-
-            if (!allCompleted)
-            {
-                warning(strFmt("@MET:METExtractionPartiallyCompleted", extractionId, failedSalesIds));
-            }
         }
     }
 
@@ -1762,10 +1789,10 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
 				<Name>finalizeExtractionHeader</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Flips ExtractionStatus to Completed/PartiallyCompleted; Completed triggers the export DataEventHandler.
+    /// Flips ExtractionStatus to Completed and triggers the export DataEventHandler. Only
+    /// reached once every per-SO task Finished, so every line is already Completed by now.
     /// </summary>
-    /// <param name = "_allCompleted">True if every extraction line completed successfully</param>
-    private void finalizeExtractionHeader(boolean _allCompleted)
+    private void finalizeExtractionHeader()
     {
         METSalesOrderExtractionTable header;
 
@@ -1774,16 +1801,10 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
 
         if (header.RecId)
         {
-            header.ExtractionStatus = _allCompleted
-                ? METSalesOrderExtractionStatus::Completed
-                : METSalesOrderExtractionStatus::PartiallyCompleted;
+            header.ExtractionStatus = METSalesOrderExtractionStatus::Completed;
             header.update();
 
-            // Send the file.
-            if (header.ExtractionStatus == METSalesOrderExtractionStatus::Completed)
-            {
-                DEVIntegExportDocumentsLog::exportRecordList(DEVIntegExportRecordList::constructFromRecord(header, classStr(METSalesOrderExtractionExportIntegration)));
-            }
+            DEVIntegExportDocumentsLog::exportRecordList(DEVIntegExportRecordList::constructFromRecord(header, classStr(METSalesOrderExtractionExportIntegration)));
         }
         ttscommit;
     }
@@ -1794,17 +1815,18 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
 				<Name>markLineFailed</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Marks this SO's extraction line Failed with a stage-tagged short reason (LineNum/ItemId
-    /// included when the failure happened inside the per-line posting loop), and reports it to
-    /// telemetry.
+    /// Marks the line Failed with a stage-tagged reason, logs it, and reports to telemetry.
+    /// Prefers capturedErrorReason over re-scanning the infolog, which cleanup can pollute.
     /// </summary>
     /// <param name = "_stage">Processing stage the failure occurred in</param>
     private void markLineFailed(str _stage)
     {
-        str reason = this.captureShortFailureReason();
+        str reason = capturedErrorReason ? capturedErrorReason : this.captureShortFailureReason();
         str tagged = currentLineNum
             ? strFmt("[%1] L%2/%3: %4", _stage, currentLineNum, currentItemId, reason)
             : strFmt("[%1] %2", _stage, reason);
+
+        warning(tagged);
 
         if (salesId != '')
         {
@@ -1846,14 +1868,39 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>markHeaderFailed</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Marks the header Failed with a stage-tagged reason - written directly, not derived
+    /// from line status, since every line is already Completed by the time runFinalTask() runs.
+    /// </summary>
+    /// <param name = "_stage">End-task stage the failure occurred in</param>
+    private void markHeaderFailed(str _stage)
+    {
+        #define.MaxErrorMessageLen(1000)
+
+        METSalesOrderExtractionTable header = METSalesOrderExtractionTable::find(extractionId, true);
+
+        if (header.RecId)
+        {
+            str tagged = strFmt("[%1] %2", _stage, this.captureShortFailureReason());
+
+            ttsbegin;
+            header.ExtractionStatus = METSalesOrderExtractionStatus::Failed;
+            header.ErrorMessage     = subStr(tagged, 1, #MaxErrorMessageLen);
+            header.update();
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>isAlreadyPicked</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Checks whether this SO's pick list was already created and committed in a prior
-    /// attempt (its extraction line already has a PickingRouteId) - the checkpoint that makes
-    /// retry safe without double-posting. Only covers the SO's own extraction line; the
-    /// intercompany leg posted via postIntercompanyPickingList() has no extraction line of
-    /// its own and is not covered by this guard.
+    /// True if a prior attempt already committed a pick list (PickingRouteId stamped) - the
+    /// retry-safety checkpoint. Doesn't cover the intercompany leg, which has no line of its own.
     /// </summary>
     /// <param name = "_salesId">Sales order to check</param>
     /// <returns>True if a picking route was already created and committed for this SO</returns>
@@ -1870,10 +1917,8 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
 				<Name>stampPickingRouteIdCheckpoint</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Stamps the created picking route id as the last statement inside the same transaction
-    /// as the WMS order posting, so the checkpoint only lands if every line committed
-    /// successfully - a partial failure rolls the route, the postings, and this stamp back
-    /// together.
+    /// Stamps the picking route id as the last statement in the WMS posting transaction, so a
+    /// partial failure rolls this back along with everything else.
     /// </summary>
     /// <param name = "_salesId">Sales order the picking route belongs to</param>
     private void stampPickingRouteIdCheckpoint(SalesId _salesId)
@@ -1893,10 +1938,8 @@ class METSalesPickingListFulfillmentBatch extends METRunBaseBatchMultiThreadBase
 				<Name>markLineProcessing</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Claims this SO's extraction line for processing, mirroring
-    /// METSalesOrderExtractionPendingProcess.processRecord()'s claim pattern: only flips
-    /// Pending/Failed to Processing and stamps ProcessStartDateTime, so the line reflects
-    /// that this task has actually started working on it rather than just being queued.
+    /// Claims the line for processing, mirroring
+    /// METSalesOrderExtractionPendingProcess.processRecord()'s claim pattern.
     /// </summary>
     private void markLineProcessing()
     {
