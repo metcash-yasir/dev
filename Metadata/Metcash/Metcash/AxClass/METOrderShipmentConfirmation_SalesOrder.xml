@@ -26,6 +26,9 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
         AccountOrder    accountOrder;
         METFinalizationDocument  finalizationDocument;
         WHSParameters whsParameters = WHSParameters::find();
+        // Bug 413645: Refactor METOrderShipmentConfirmation_SalesOrder
+        // Finding 3 - Medium: Redundant find() calls with identical keys within the same method
+        METCustTable metCustTable = MetCustTable::find(metSalesOrderShipmentLoadHeader.CustAccount);
 
         #OCCRetryCount
         try
@@ -58,7 +61,7 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
 
             if (whsParameters.METDecoupleSalesShipmentInvoice)
             {
-                finalizationDocument = MetCustTable::find(metSalesOrderShipmentLoadHeader.CustAccount).FinalizationDocument;
+                finalizationDocument = metCustTable.FinalizationDocument;
 
                 METSalesOrderShipmentLoadLines metSalesOrderShipmentLoadLinesLoc;
                 SalesTable salesTableLoc;
@@ -67,7 +70,9 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
 
                 if (finalizationDocument == METFinalizationDocument::None)
                 {
-                    info("@MET:FinDocNone");
+                    // Bug 413645: Refactor METOrderShipmentConfirmation_SalesOrder
+                    // Finding 2 - High: Per-record forupdate + doUpdate loop writes only constant values - convert to update_recordset
+                    /*info("@MET:FinDocNone");
 
                     while select forupdate salesTableLoc
                         exists join metSalesOrderShipmentLoadLinesLoc
@@ -84,6 +89,14 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
                     }
                     
                     metSalesOrderShipmentLoadHeader.reread();
+                    */
+                    update_recordset salesTableLoc
+                        setting SkipUpdate = true,
+                            METFinalisationDeliveryNotePostingRequired = NoYes::Yes,
+                            METFinalisationInvoicePostingRequired = NoYes::Yes
+                        exists join metSalesOrderShipmentLoadLinesLoc
+                            where salesTableLoc.SalesId == metSalesOrderShipmentLoadLinesLoc.OrderNum
+                            && metSalesOrderShipmentLoadLinesLoc.ShipmentId == metSalesOrderShipmentLoadHeader.ShipmentId;
 
                     if (!metSalesOrderShipmentLoadHeader.PendingDocument)
                     {
@@ -91,12 +104,15 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
                         metSalesOrderShipmentLoadHeader.PendingDocument = NoYes::Yes;
                         metSalesOrderShipmentLoadHeader.doUpdate();
 
-                        Info(strFmt("@MET:ShipmentPending", metSalesOrderShipmentLoadHeader.ShipmentId));
+                        //Info(strFmt("@MET:ShipmentPending", metSalesOrderShipmentLoadHeader.ShipmentId));
                     }
 
                 }
                 else if (finalizationDocument == METFinalizationDocument::DeliveryNote)
                 {
+                    // Bug 413645: Refactor METOrderShipmentConfirmation_SalesOrder
+                    // Finding 2 - High: Per-record forupdate + doUpdate loop writes only constant values - convert to update_recordset
+                    /*
                     info("@MET:FinDocDeliveryNote");
 
                     while select forupdate salesTableLoc
@@ -111,7 +127,14 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
                     }
 
                     metSalesOrderShipmentLoadHeader.reread();
-                    
+                    */
+                    update_recordset salesTableLoc
+                        setting SkipUpdate = true,
+                            METFinalisationInvoicePostingRequired = NoYes::Yes
+                        exists join metSalesOrderShipmentLoadLinesLoc
+                            where salesTableLoc.SalesId == metSalesOrderShipmentLoadLinesLoc.OrderNum
+                            && metSalesOrderShipmentLoadLinesLoc.ShipmentId == metSalesOrderShipmentLoadHeader.ShipmentId;
+
                     if (!metSalesOrderShipmentLoadHeader.PendingDocument)
                     {
                         metSalesOrderShipmentLoadHeader.selectForUpdate(true);
@@ -121,6 +144,26 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
                         Info(strFmt("@MET:ShipmentPending", metSalesOrderShipmentLoadHeader.ShipmentId));
                     }
                 }
+            }
+
+            // Bug 413645: Refactor METOrderShipmentConfirmation_SalesOrder
+            // Finding 1 - Critical: Wide transaction scope holds pessimistic locks on SalesTable/METSalesOrderShipmentLoadHeader through the entire packing-slip + invoice-posting duration
+            if (procMetrics)
+            {
+                procMetrics.ttsCommitTrace();
+            }
+            else
+            {
+                ttscommit;
+            }
+
+            if (procMetrics)
+            {
+                procMetrics.ttsBeginTrace();
+            }
+            else
+            {
+                ttsbegin;
             }
 
             metSalesOrderShipmentLoadHeader.reread();
@@ -171,7 +214,7 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
             {
                 procMetrics.ttsCommitTrace();
 
-                METCustTable metCustTable = METCustTable::find(metSalesOrderShipmentLoadHeader.CustAccount);
+                //METCustTable metCustTable = METCustTable::find(metSalesOrderShipmentLoadHeader.CustAccount);
                 NotesLine descriptionLine = orderNum ? strFmt("%1 - %2 - %3", metSalesOrderShipmentLoadHeader.ShipmentId, orderNum, metCustTable.FinalizationDocument) : strFmt("%1 - %2", metSalesOrderShipmentLoadHeader.ShipmentId, metCustTable.FinalizationDocument);
 
                 procMetrics.incProcessedCountWithDocument(descriptionLine);
@@ -303,6 +346,7 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
         METSalesOrderShipmentLoadLines      shipmentLoadLines;
         SalesFormLetter_Invoice             salesFormLetterInvoice;
         boolean                             isPosted = false;
+        SalesTable                          salesTable;    
 
         if (procMetrics)
         {
@@ -314,8 +358,12 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
             while select shipmentLoadLines
                     group by orderNum
                         where shipmentLoadLines.ShipmentId == _shipmentLoadHeader.ShipmentId
+                    // Bug 413645: Refactor METOrderShipmentConfirmation_SalesOrder
+                    // Finding 3 - Medium: Redundant find() calls with identical keys within the same method
+                    join salesTable
+                        where salesTable.SalesId == shipmentLoadLines.OrderNum
             {
-                salesFormLetterInvoice = this.postInvoice(shipmentLoadLines.OrderNum);                
+                salesFormLetterInvoice = this.postInvoice(salesTable);
             }
         }
         else
@@ -366,7 +414,13 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
             procMetrics.endDescriptionTime(6);
         }
 
-        select firstOnly invoiceJourSelect
+        // Bug 413645: Refactor METOrderShipmentConfirmation_SalesOrder
+        // Finding 4 - Medium: Unconditional verification SELECT after update_recordset even when RowCount() already proves success
+        isPosted = invoiceJour.RowCount() > 0;
+
+        if (!isPosted)
+        {
+            select firstOnly invoiceJourSelect
         exists join invoiceTrans
             where invoiceTrans.InvoiceId == invoiceJourSelect.InvoiceId
                && invoiceTrans.InvoiceDate == invoiceJourSelect.InvoiceDate
@@ -381,15 +435,16 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
             && invoiceJourSelect.METLoadId == _shipmentLoadHeader.LoadId
             && invoiceJourSelect.METShipmentId == _shipmentLoadHeader.ShipmentId;
 
-        if (invoiceJour.RowCount() == 0 && (!invoiceJourSelect.METLoadId || !invoiceJourSelect.METShipmentId))
-        {
-            isPosted = false;
-            warning(strFmt("@MET:SalesInvoicePostingFailed", _shipmentLoadHeader.ShipmentId));
-        }
-        else
-        {
-            isPosted = true;
-            info(strFmt("@MET:InvoicePosted", _shipmentLoadHeader.ShipmentId));
+            if (invoiceJour.RowCount() == 0 && (!invoiceJourSelect.METLoadId || !invoiceJourSelect.METShipmentId))
+            {
+                isPosted = false;
+                warning(strFmt("@MET:SalesInvoicePostingFailed", _shipmentLoadHeader.ShipmentId));
+            }
+            else
+            {
+                isPosted = true;
+                info(strFmt("@MET:InvoicePosted", _shipmentLoadHeader.ShipmentId));
+            }
         }
 
         return isPosted;
@@ -469,16 +524,16 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
     /// <summary>
     /// Post the sales order invoice
     /// </summary>
-    /// <param name = "_salesId">SalesId reference</param>
+    /// <param name = "_salesTable"><c>SalesTable</c> record</param>
     /// <returns>SalesFormLetter</returns>
-    public SalesFormLetter_Invoice postInvoice(SalesId  _salesId)
+    public SalesFormLetter_Invoice postInvoice(SalesTable  _salesTable)
     {
         SalesFormLetter_Invoice     salesFormLetter;
         CustPackingSlipJour         custPackingSlipJour;
         TmpFrmVirtual               tmpFrmVirtual;
         List                        packingSlipList = new List(Types::Record);
 
-        while select custPackingSlipJour where custPackingSlipJour.SalesId == _salesId
+        while select custPackingSlipJour where custPackingSlipJour.SalesId == _salesTable.SalesId
         {
             tmpFrmVirtual.clear();
             
@@ -493,12 +548,12 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
 
         if (packingSlipList.empty())
         {
-            throw Error(strFmt("@MET:SOPackingError", _salesId));
+            throw Error(strFmt("@MET:SOPackingError", _salesTable.SalesId));
         }
 
         salesFormLetter = SalesFormLetter::construct(DocumentStatus::Invoice);
        
-        salesFormLetter.salesTable(SalesTable::find(_salesId));
+        salesFormLetter.salesTable(_salesTable);
         salesFormLetter.transDate(systemDateGet());
         salesFormLetter.specQty(SalesUpdate::PackingSlip);
         salesFormLetter.proforma(NoYes::No);
@@ -508,14 +563,14 @@ class METOrderShipmentConfirmation_SalesOrder extends METOrderShipmentConfirmati
         salesFormLetter.run();
 
         //NS - CB274
-        if (SalesTable::find(_salesId).InterCompanyOrigin == InterCompanyOrigin::Derived)
+        if (_salesTable.InterCompanyOrigin == InterCompanyOrigin::Derived)
         {
             if (procMetrics)
             {
                 procMetrics.startDescriptionTime(5, "@MET:InterCompSOFinalization");
             }
 
-            METSalesOrderProcessHelper::processPostIntercompanySOFinalization(_salesId, CustInvoiceJour::findFromSalesId(_salesId).InvoiceId);
+            METSalesOrderProcessHelper::processPostIntercompanySOFinalization(_salesTable.SalesId, CustInvoiceJour::findFromSalesId(_salesTable.SalesId).InvoiceId);
 
             if (procMetrics)
             {
