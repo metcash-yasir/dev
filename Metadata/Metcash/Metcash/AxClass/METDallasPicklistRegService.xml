@@ -24,25 +24,28 @@ final class METDallasPicklistRegService extends SysOperationServiceBase
         #OCCRetryCount
 
         WMSOrderTrans                   wmsOrderTrans;
+        WMSRouteId                      lastRouteId;
         METDallasPicklistRegContract    metDataContract;
         SysOperationServiceController   controller;
-        Int                             bundlesize; 
+        Int                             bundlesize;
         container                       conOrdTrans, conOrdTransRoute;
         BatchHeader                     batchHeader;
         int                             counter     = 0;
-        int                             totalTasks  = _dataContract.parmParallelTasksNumber();
-        Int                             numOfOrders;
+        int                             maxNumberOfLinesInBundle  = _dataContract.parmParallelLineTasksNumber();
         boolean                         processExtInvSO = _dataContract.parmProcessExtInvSo();
         Query                           query = _dataContract.getQuery();
         Set                             taskSet = new Set(Types::Class);
-        Set                             routeIdSet = new Set(Types::String);             
+        Set                             routeIdSet = new Set(Types::String);    
+        int                             totalParallelSOTasks = _dataContract.parmParallelTasksNumber(); 
+        QueryBuildDataSource            qbdsWmsOrderTrans, qbdsWmsPickingRoute;
+
+        qbdsWmsOrderTrans = query.dataSourceTable(tableNum(WmsOrderTrans));
+        qbdsWmsOrderTrans.sortClear();
+        qbdsWmsOrderTrans.addSortField(fieldNum(WMSOrderTrans, routeId), SortOrder::Ascending);
 
         // --- Apply filter based on ExternalInvoiceOrder flag -- -
         if (!processExtInvSO)
         {
-            QueryBuildDataSource qbdsWmsOrderTrans, qbdsWmsPickingRoute;
-            qbdsWmsOrderTrans = query.dataSourceTable(tableNum(WmsOrderTrans));
-
             qbdsWmsPickingRoute = qbdsWmsOrderTrans.addDataSource(tableNum(WMSPickingRoute));
             qbdsWmsPickingRoute.relations(false);
             qbdsWmsPickingRoute.joinMode(JoinMode::OuterJoin);
@@ -53,11 +56,6 @@ final class METDallasPicklistRegService extends SysOperationServiceBase
         }
 
         METProcMetrics procMetrics   = METProcMetrics::construct(METBatchLogOperation::DallasPicklistRegistration);
-
-        if (totalTasks  <= 0)
-        {
-            totalTasks  = 1;
-        }
 
         batchHeader     = this.getCurrentBatchHeader();
 
@@ -71,30 +69,31 @@ final class METDallasPicklistRegService extends SysOperationServiceBase
             // Populate the map to group WMSOrderTrans by routeId
             QueryRun queryRun = new QueryRun(query);
 
-            numOfOrders = QueryRun::getQueryRowCount(query, intMax());
-            bundleSize = real2int(roundUp((numOfOrders / totalTasks), 1.0));
-            
-            procMetrics.setTotalCountFromQuery(queryRun);
+            int totalCount = QueryRun::getQueryRowCount(queryRun.query(), intMax());
+
+            if (totalCount == 0)
+            {
+                return;
+            }
+
+            if (maxNumberOfLinesInBundle  <= 0)
+            {
+                maxNumberOfLinesInBundle  = totalCount;
+            }
+
+            bundlesize = maxNumberOfLinesInBundle;
+
+            procMetrics.setTotalCount(totalCount);
             procMetrics.beginTrace('Process started');
-            
+
             using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
             {
                 while (queryRun.next())
                 {
                     wmsOrderTrans = queryRun.get(tableNum(WMSOrderTrans));
 
-                    routeIdSet.add(wmsOrderTrans.routeId);
-
-                    counter += 1;
-
-                    if (counter == 1)
-                    {
-                        conOrdTrans = conNull();
-                    }
-
-                    conOrdTrans += wmsOrderTrans;
-
-                    if (counter == bundlesize)
+                    // Close the bundle only at a route boundary once it has reached its target size.
+                    if (counter >= bundlesize && wmsOrderTrans.routeId != lastRouteId)
                     {
                         controller      = new SysOperationServiceController(
                                                 classStr(METPickingListRegistrationPostingJob),
@@ -106,11 +105,24 @@ final class METDallasPicklistRegService extends SysOperationServiceBase
                         metDataContract.parmConOrderTrans(conOrdTrans);
 
                         batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
-                    
-                        counter = 0;
 
                         taskSet.add(controller);
+
+                        counter = 0;
+                        conOrdTrans = conNull();
                     }
+
+                    routeIdSet.add(wmsOrderTrans.routeId);
+
+                    counter += 1;
+
+                    if (counter == 1)
+                    {
+                        conOrdTrans = conNull();
+                    }
+
+                    conOrdTrans += wmsOrderTrans.RecId;
+                    lastRouteId = wmsOrderTrans.routeId;
                 }
   
                 if (counter > 0)
@@ -129,7 +141,7 @@ final class METDallasPicklistRegService extends SysOperationServiceBase
                     taskSet.add(controller);
                 }
 
-                this.addSalesOrderConfirmTask(routeIdSet, taskSet, totalTasks, batchHeader);
+                this.addSalesOrderConfirmTask(routeIdSet, taskSet, totalParallelSOTasks, batchHeader);
 
                 batchHeader.save();
 
