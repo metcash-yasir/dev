@@ -9,7 +9,8 @@
 class METVendorChangeRequestService
 {
     Set vendorChangerequestsProcessed;
-    
+    Map basePricePendingItems;          
+
     //Task110346_CB409-D365ToPIM-Supplier change request- start
     private List        vendAccountNumberList;              //C - Task 259910: CB409 - PE-128: D365 to PIM
     private List        coverageWareHouseIdList;
@@ -48,6 +49,7 @@ class METVendorChangeRequestService
             METSalesItemSubstitutionParentChild salesItemSubstitutionParentChild;
             inventSiteId = _data.parmInventSiteId();
             vendorChangerequestsProcessed = new Set(Types::Int64);
+            basePricePendingItems = new Map(Types::String, Types::Class);
             currentDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), DateTimeUtil::getUserPreferredTimeZone()));
             //Task110346_CB409-D365ToPIM-Supplier change request- start
             boolean validateVendorChangeRequests = true;
@@ -108,8 +110,8 @@ class METVendorChangeRequestService
 
                         if (metVendorChangeRequestProcessed.RecId)
                         {
-                            this.runBasePriceVersionJob(metVendorChangeRequestProcessed.ItemId, metVendorChangeRequestProcessed.SiteId);
-                        }                    
+                            this.addBasePricePendingItem(metVendorChangeRequestProcessed.SiteId, metVendorChangeRequestProcessed.ItemId);
+                        }
 
                         vendorProcessedItr.next();
                     }
@@ -118,13 +120,25 @@ class METVendorChangeRequestService
                     while select salesItemSubstitutionParentChild
                             where salesItemSubstitutionParentChild.ParentItemID == metVendorChangeRequest.ItemId
                     {
-                        this.runBasePriceVersionJob(salesItemSubstitutionParentChild.ChildItemID, salesItemSubstitutionParentChild.InventSiteId);
+                        this.addBasePricePendingItem(salesItemSubstitutionParentChild.InventSiteId, salesItemSubstitutionParentChild.ChildItemID);
                     }
 
                     coverageWareHouseIdList = new List(Types::String);
                 }
                 //Task110346_CB409-D365ToPIM-Supplier change request- end
             }
+
+            // Run a single base price recalculation/update job per site for all changed items to avoid conflicts when multiple items share the same base price version.
+            MapEnumerator basePriceSiteEnumerator = basePricePendingItems.getEnumerator();
+            InventSiteId  basePriceSiteId;
+            Set           basePriceItemSet;
+            while (basePriceSiteEnumerator.moveNext())
+            {
+                basePriceSiteId  = basePriceSiteEnumerator.currentKey();
+                basePriceItemSet = basePriceSiteEnumerator.currentValue();
+                this.runBasePriceVersionJob(basePriceSiteId, basePriceItemSet);
+            }
+
             ttscommit;
         }
         catch (Exception::CLRError)
@@ -1224,13 +1238,38 @@ class METVendorChangeRequestService
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>addBasePricePendingItem</Name>
+				<Source><![CDATA[
+    private void addBasePricePendingItem(InventSiteId _siteId, ItemId _itemId)
+    {
+        Set itemSet;
+
+        if (basePricePendingItems.exists(_siteId))
+        {
+            itemSet = basePricePendingItems.lookup(_siteId);
+        }
+        else
+        {
+            itemSet = new Set(Types::String);
+            basePricePendingItems.insert(_siteId, itemSet);
+        }
+
+        itemSet.add(_itemId);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>runBasePriceVersionJob</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Runs the base price version job for the given vendor change request.
+    /// Runs the base price version job for the given site, covering every item queued for that
+    /// site in this run. GUPItemBasePriceUpdateValidJob's delta consumption is scoped only by
+    /// site (GUPBasePriceVersion), so this must run once per site - never once per item
     /// </summary>
-    /// <param name = "_vendorChangeRequest"></param>
-    private void runBasePriceVersionJob(ItemId _itemId, InventSiteId _siteId)
+    /// <param name = "_siteId">Site to recalculate base prices for.</param>
+    /// <param name = "_itemIdSet">Set of ItemId to recalculate for this site.</param>
+    private void runBasePriceVersionJob(InventSiteId _siteId, Set _itemIdSet)
     {
         BatchHeader         header;
         SysRecurrenceData   sysRecurrenceData;
@@ -1240,8 +1279,15 @@ class METVendorChangeRequestService
         BatchRetries        noOfRetriesOnFailure = 4;
         GUPItemBasePriceCalcJob_All gupItemBasePriceCalcJob_All;
         GUPBasePriceVersion gupBasePriceVersion;
+        str                 itemRangeValue;
+        SetEnumerator       itemRangeEnumerator;
         #define.timeInSecondsDelay(2)
-            
+
+        if (!_itemIdSet || !_itemIdSet.elements())
+        {
+            return;
+        }
+
         // Setup the RunBaseBatch Job
 
         select firstonly AllowPurch, AllowSales, AllowInventoryCost, BlockActivation, VersionId
@@ -1257,11 +1303,17 @@ class METVendorChangeRequestService
         inventdim.InventSiteId = _siteId;
         inventdim = InventDim::findOrCreate(inventdim);
 
+        itemRangeEnumerator = _itemIdSet.getEnumerator();
+        while (itemRangeEnumerator.moveNext())
+        {
+            itemRangeValue += (itemRangeValue ? ',' : '') + itemRangeEnumerator.current();
+        }
+
         Query               query = new Query(queryStr(GUPItemBasePriceCalc));
-        query.dataSourceTable(tableNum(InventTable)).findRange(fieldNum(InventTable, ItemId)).value(queryValue(_itemId));
+        query.dataSourceTable(tableNum(InventTable)).findRange(fieldNum(InventTable, ItemId)).value(itemRangeValue);
         header = BatchHeader::construct();
         gupItemBasePriceCalcJob_All = GUPItemBasePriceCalcJob_All::construct();
-        gupItemBasePriceCalcJob_All.parmItemId(_itemId);
+        //gupItemBasePriceCalcJob_All.parmItemId(_itemId);
         gupItemBasePriceCalcJob_All.parmSiteId(_siteId);
         gupItemBasePriceCalcJob_All.parmCalcDate(DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()));
         gupItemBasePriceCalcJob_All.parmPurchPriceTransfer(gupBasePriceVersion.AllowPurch);
@@ -1278,7 +1330,7 @@ class METVendorChangeRequestService
         processBatchInfo = gupItemBasePriceCalcJob_All.batchInfo();
         
         processBatchInfo.parmRetriesOnFailure(noOfRetriesOnFailure);
-        processBatchInfo.parmCaption("@MET:VendChgReqBase" + strFmt(" - %1, %2", _siteId, _itemId));
+        processBatchInfo.parmCaption("@MET:VendChgReqBase" + strFmt(" - %1, %2 items", _siteId, _itemIdSet.elements()));
 
         if (InventParameters::find().METBasePriceJobRunAsUser)
         {
