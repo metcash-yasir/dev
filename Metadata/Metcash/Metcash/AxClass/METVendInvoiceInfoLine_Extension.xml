@@ -51,6 +51,19 @@ final class METVendInvoiceInfoLine_Extension
 
         switch(_fieldId)
         {
+            case fieldNum(VendInvoiceInfoLine, ItemId):
+                if (this.ItemId)
+                {
+                    ReasonTable noDelReason = this.metGetNoDeliveryReasonCode();
+                    if (noDelReason.RecId)
+                    {
+                        this.ReasonTableRef = ReasonTableRef::createReasonTableRef(noDelReason.Reason, noDelReason.Description);
+                        this.MetPriceVarianceReasonCode = 0;
+                        this.MetClaimLine = noDelReason.METClaim;
+                        this.MetExtCommentQty = noDelReason.MetExtComment;
+                    }
+                }
+                break;
             case fieldNum(VendInvoiceInfoLine, ReceiveNow):
             case fieldNum(VendInvoiceInfoLine, PdsCWReceiveNow):
             case fieldNum(VendInvoiceInfoLine, PurchPrice):
@@ -259,6 +272,11 @@ final class METVendInvoiceInfoLine_Extension
     /// </summary>
     public void metFetchInitializeReasonCode()
     {
+        if (this.ItemId && this.metGetNoDeliveryReasonCode().RecId)
+        {
+            return;
+        }
+
         this.MetExtComment = '';
         this.MetExtCommentQty = '';
         this.MetClaimLine =  NoYes::No;
@@ -571,6 +589,199 @@ final class METVendInvoiceInfoLine_Extension
                && markupTable.METIsOffRemittance;
 
         return markupTrans.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metGetNoDeliveryReasonCode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if this line is associated with a No Delivery variance reason.
+    /// </summary>
+    /// <returns>The ReasonTable record if associated, otherwise an empty record.</returns>
+    public ReasonTable metGetNoDeliveryReasonCode()
+    {
+        ReasonTable reasonCode;
+        if (this.ItemId)
+        {
+            select firstonly reasonCode
+            where reasonCode.METItem == this.ItemId
+               && reasonCode.METVarianceType == METVarianceType::QuantityVarianceNoDelivery;
+        }
+        return reasonCode;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metValidateReasonCode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the reason code.
+    /// </summary>
+    public boolean metValidateReasonCode()
+    {
+        ReasonTable reasonCode;
+        ReasonTableRef reasonRef;
+        boolean ret = true;
+
+        if (this.ItemId)
+        {
+            select firstonly reasonCode
+                join reasonRef
+            where reasonRef.Reason == reasonCode.Reason
+                && (reasonRef.RecId == this.ReasonTableRef || reasonRef.RecId == this.MetPriceVarianceReasonCode)
+                && reasonCode.METItem != this.ItemId
+                && reasonCode.METVarianceType == METVarianceType::QuantityVarianceNoDelivery;
+
+            if (reasonCode.RecId)
+            {
+                ret = checkFailed("@MET:InvalidReasonCodeVal");
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metIsEligibleForNoDelivery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the pending vendor invoice line is eligible for No Delivery processing.
+    /// </summary>
+    /// <returns>True if eligible, otherwise false.</returns>
+    public boolean metIsEligibleForNoDelivery()
+    {
+        VendInvoiceInfoTable header = this.vendInvoiceInfoTable();
+
+        if (!header)
+        {
+            select firstonly header
+            where header.TableRefId == this.TableRefId
+               && header.ParmId == this.ParmId;
+        }
+
+        if (!header 
+            || !header.PurchId 
+            || header.METChargeThrough == NoYes::Yes
+            || header.METCrossDock == NoYes::Yes
+            || header.METRDA == NoYes::Yes
+            || header.isLandedCostEnabled())
+        {
+            return false;
+        }
+
+        PurchTable purchTable = this.purchLine().purchTable();
+        if (purchTable 
+            && (purchTable.InterCompanyOrder 
+            || purchTable.InterCompanyDirectDelivery 
+            || purchTable.METIntercompanyTransferReplenishment
+            || purchTable.InterCompanyCustPurchOrderFormNum))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metValidatePositiveOnly</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates if the quantity and price are positive when the reason code has METPositiveOnly checked.
+    /// </summary>
+    /// <param name = "_showError">Boolean to show standard checkFailed</param>
+    /// <returns>True if valid, otherwise false</returns>
+    public boolean metValidatePositiveOnly(boolean _showError = true)
+    {
+        boolean ret = true;
+        ReasonTable reasonCode;
+        ReasonTableRef reasonRef;
+
+        if (this.ReasonTableRef)
+        {
+            select firstonly METVarianceType from reasonCode
+            join reasonRef
+            where reasonRef.Reason == reasonCode.Reason
+               && reasonRef.RecId == this.ReasonTableRef;
+        
+            if (reasonCode.METVarianceType == METVarianceType::QuantityVarianceNoDelivery && (this.ReceiveNow < 0 || this.PurchPrice < 0 || this.LineAmount < 0))
+            {
+                ret = _showError ? checkFailed("@MET:NegativeValuesNotAllowed") : false;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateWrite</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the record before writing.
+    /// </summary>
+    /// <returns>Boolean indicating validation success</returns>
+    public boolean validateWrite()
+    {
+        boolean ret = next validateWrite();
+
+        if (ret)
+        {
+            ret = this.metValidatePositiveOnly(true);
+        }
+
+        if (ret)
+        {
+            ret = this.metValidateReasonCode();
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateField</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates field values.
+    /// </summary>
+    /// <param name = "_fieldId">Field ID to validate</param>
+    /// <param name = "_purchLine">Associated purchase line record; optional</param>
+    /// <returns>True if validation is successful; otherwise, false</returns>
+    public boolean validateField(FieldId _fieldId, PurchLine _purchLine)
+    {
+        boolean ret = next validateField(_fieldId, _purchLine);
+
+        if (ret)
+        {
+            if (_fieldId == fieldNum(VendInvoiceInfoLine, ItemId))
+            {
+                ReasonTable reasonCode = this.metGetNoDeliveryReasonCode();
+                if (reasonCode.RecId)
+                {
+                    if (!this.metIsEligibleForNoDelivery())
+                    {
+                        ret = checkFailed("@MET:NoDeliveryServiceItemNotAllowed");
+                    }
+                }
+            }
+            else if (_fieldId == fieldNum(VendInvoiceInfoLine, ReceiveNow)
+             || _fieldId == fieldNum(VendInvoiceInfoLine, PurchPrice)
+             || _fieldId == fieldNum(VendInvoiceInfoLine, LineAmount))
+            {
+                ret = this.metValidatePositiveOnly(true);
+            }
+        }
+
+        return ret;
     }
 
 ]]></Source>
