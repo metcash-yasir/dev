@@ -23,16 +23,17 @@ class METItemPackChangeHelper
     //Task 170637:CB409 - PE-128: D365 to PIM -start
     List siteList = new List(Types::String);
     List warehouseList = new List(Types::String);
+    //Task 170637:CB409 - PE-128: D365 to PIM -end
+    List journalNumList = new List(Types::String);
+    
+   
+
 }
 ]]></Declaration>
 		<Methods>
 			<Method>
 				<Name>captureStatusChange</Name>
 				<Source><![CDATA[
-    //Task 170637:CB409 - PE-128: D365 to PIM -end
-    
-   
-
     /// Capture a status change for a GUPVendPriceAdmTable record.
     /// - Inserts a row into METVendPriceAdmStatusLog with JournalNum, Detail, ModifiedBy, NoYesId.
     /// - Assumes METVendPriceAdmStatusLog has fields: JournalNum (str), Detail (str), ModifiedBy (userid), NoYesId (NoYes).
@@ -91,10 +92,10 @@ class METItemPackChangeHelper
             {
                 vendRec.Status = GUPDisabledEnabled::Enabled;
                 vendRec.update();
+                lastLog.Details = strFmt("@MET:METSupplierEnableLogPass", _journalNum);
             }
 
             lastLog.Processed = NoYes::Yes;
-            lastLog.Details = strFmt("@MET:METSupplierEnableLogPass", _journalNum);
             lastLog.update();
 
             ttsCommit;
@@ -335,6 +336,7 @@ class METItemPackChangeHelper
             this.runPricingRoutine();
             this.createBarcode(metInventItemOrderSetupOrigItem, metInventItemOrderSetupTempItem);
 
+            
             this.replaceOriginalItemSiteInfo(
                     inventItemPurchSetupOrigItem, inventItemPurchSetupTempItem, 
                     inventItemSalesSetupOrigItem, inventItemSalesSetupTempItem, 
@@ -354,6 +356,8 @@ class METItemPackChangeHelper
             this.processCampbellsSubOrdinateSites();
             this.runVendorChangeRequest();        
 
+            // Enable all the disabled vendor price records that were created in this pack change operation
+            this.finalizeEnableForJournalList();
             ttscommit;  
         
             //Task110346_CB409-D365ToPIM- start
@@ -992,6 +996,79 @@ class METItemPackChangeHelper
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>finalizeEnableForJournalList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Enable GUPVendPriceAdmTable.Status = GUPDisabledEnabled::Enabled for every journal in
+    /// the instance field `journalNumList` (if currently disabled) and ensure a status
+    /// entry is captured in `METVendPriceAdmStatusLog`.
+    /// This method re-uses the existing per-journal static helper `finalizeEnableForJournal`.
+    /// </summary>
+    public void finalizeEnableForJournalList()
+    {
+        ListEnumerator           enumerator = this.journalNumList.getEnumerator();
+        str                      journalNum;
+        GUPVendPriceAdmTable     vendRec;
+        METVendPriceAdmStatusLog logRec;
+
+        while (enumerator.moveNext())
+        {
+            journalNum = enumerator.current();
+            if (!journalNum)
+            {
+                continue;
+            }
+
+            // Find the journal header that is currently disabled.
+            select forUpdate vendRec
+            where vendRec.JournalNum == journalNum
+               && vendRec.Status     == GUPDisabledEnabled::Disabled;
+
+            if (!vendRec.RecId)
+            {
+                // Nothing to enable for this journal
+                continue;
+            }
+
+            try
+            {
+                ttsBegin;
+
+                vendRec.selectForUpdate(true);
+                vendRec.Status = GUPDisabledEnabled::Enabled;
+                vendRec.update();
+
+                // Capture action in METVendPriceAdmStatusLog
+                logRec.clear();
+                logRec.JournalNum = vendRec.JournalNum;
+                logRec.Status     = vendRec.Status;
+                logRec.Details    = strFmt("@MET:METSupplierEnableLogPass", vendRec.JournalNum);
+                logRec.Processed  = NoYes::Yes;
+                logRec.insert();
+
+                ttsCommit;
+            }
+            catch
+            {
+                ttsAbort;
+
+                // Record failure in the status log
+                logRec.clear();
+                logRec.JournalNum = journalNum;
+                logRec.Status     = GUPDisabledEnabled::Disabled;
+                logRec.Details    = strFmt("@MET:METSupplierEnableLogFail", journalNum);
+                logRec.Processed  = NoYes::Yes;
+                logRec.insert();
+            }
+        }
+
+        // Clear the journal list so journals are not processed again in this instance.
+        this.journalNumList = new List(Types::String);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>createVendorListPrice</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -1025,6 +1102,7 @@ class METItemPackChangeHelper
             {
                 gupVendPriceAdmTable.Status = GUPDisabledEnabled::Disabled;
                 gupVendPriceAdmTable.update();
+                journalNumList.addEnd(gupVendPriceAdmTable.JournalNum);
                 // Capture the change into METVendPriceAdmStatusLog
                 METItemPackChangeHelper::captureStatusChange(gupVendPriceAdmTable);
 
@@ -1091,6 +1169,7 @@ class METItemPackChangeHelper
             {
                 gupVendPriceAdmTable.Status = GUPDisabledEnabled::Disabled;
                 gupVendPriceAdmTable.update();
+                journalNumList.addEnd(gupVendPriceAdmTable.JournalNum);
                 // Capture the change into METVendPriceAdmStatusLog
                 METItemPackChangeHelper::captureStatusChange(gupVendPriceAdmTable);
 
@@ -1148,6 +1227,8 @@ class METItemPackChangeHelper
             {
                 gupVendPriceAdmTable.Status = GUPDisabledEnabled::Disabled;
                 gupVendPriceAdmTable.update();
+
+                journalNumList.addEnd(gupVendPriceAdmTable.JournalNum);
                 // Capture the change into METVendPriceAdmStatusLog
                 METItemPackChangeHelper::captureStatusChange(gupVendPriceAdmTable);
 
@@ -1484,7 +1565,7 @@ class METItemPackChangeHelper
 
         gupPriceTermJournalTable.Status = GUPDisabledEnabled::Disabled;
         gupPriceTermJournalTable.update();
-
+        
         if(metInventItemOrderSetupOrigItem.ItemId == _itemid)
         {
             select firstonly RecId from gupPriceTermJournalTransEntityMainItem
