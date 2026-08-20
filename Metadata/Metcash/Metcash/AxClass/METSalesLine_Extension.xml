@@ -350,6 +350,9 @@ final class METSalesLine_Extension
         NoYes           skipPriceCompDeletion = this.METSkipPriceCompDeletion;
         METInvoicePostingContext    invoicePostingContext = METInvoicePostingContext::current();
 
+        // Bug 411374: Require a trace of the invoice batch job from a dev box
+        SalesLineSkipBusinessLogicContext salesLineSkipBusinessLogicContext = SalesLineSkipBusinessLogicContext::construct();
+
         if (this.SalesUnit != salesLineOrig.SalesUnit ||  this.InventDimId != salesLineOrig.InventDimId)
         {
             updateSalesUnitFields = true;
@@ -371,83 +374,94 @@ final class METSalesLine_Extension
             this.skipBusinessEvents(true);
         }
         else
-        {
+        {              
+            // Bug 411374: Require a trace of the invoice batch job from a dev box
+            if (salesLineSkipBusinessLogicContext.parmSkipUpdate())
+            {
+                this.skipBusinessEvents(true);
+            }            
+
             // Skip business events processing for this update operation
             METCheckSkipBusinessEventsHelper::shouldSkipBusinessEvents(this);        
         }     
 
         next update(_dropInvent, _childBuffer, _updateOrderLineOfDeliverySchedule, _mcrAutoallocate, _cameFromCreate, _promptSuppItem);
 
-        //CB274
-        if (this.SalesQty != salesLineOrig.SalesQty)
+        // Bug 411374: Require a trace of the invoice batch job from a dev box
+        // skip below logic when called from SalesInvoiceJournalPost\updateSourceLine
+        if (!salesLineSkipBusinessLogicContext.parmSkipUpdate())
         {
-            InventDim salesInvetnDim = InventDim::find(this.InventDimId);
-            this.updarePOReplenishmentLineDetails(salesInvetnDim);
-        }
-        //CB274
-
-        metSalesLineUpdate = METSalesLine::find(this.RecId, true);
-
-        // Avoid updating METSalesLine during data import - 317907 it will be directly updated through data entity
-        RetailSalesOrderCreationContext context = RetailSalesOrderCreationContext::current();
-        if (context == null || !context.parmDataImporting())
-        {
-            if (metSalesLineUpdate.RecId)
+            //CB274
+            if (this.SalesQty != salesLineOrig.SalesQty)
             {
-                ttsbegin;
-                // CB173 Sales Order Extract Screen V2 - refactor
-                this.metSetActualUnitFields(metSalesLineUpdate);
-                // CB871_CB872 Sales returns . Get unit in shipcase during return order line export
-                this.metSetWMSFactor(metSalesLineUpdate);
+                InventDim salesInvetnDim = InventDim::find(this.InventDimId);
+                this.updarePOReplenishmentLineDetails(salesInvetnDim);
+            }
+            //CB274
 
-                if (updateSalesUnitFields)
+            metSalesLineUpdate = METSalesLine::find(this.RecId, true);
+
+            // Avoid updating METSalesLine during data import - 317907 it will be directly updated through data entity
+            RetailSalesOrderCreationContext context = RetailSalesOrderCreationContext::current();
+            
+            if (context == null || !context.parmDataImporting())
+            {
+                if (metSalesLineUpdate.RecId)
                 {
-                    metSalesLineUpdate = this.metSalesLine();
-                    metSalesLineUpdate.selectForUpdate(true);
-    
+                    ttsbegin;
                     // CB173 Sales Order Extract Screen V2 - refactor
-                    this.metSetSalesUnitFields(metSalesLineUpdate);
+                    this.metSetActualUnitFields(metSalesLineUpdate);
                     // CB871_CB872 Sales returns . Get unit in shipcase during return order line export
                     this.metSetWMSFactor(metSalesLineUpdate);
 
-                    // Sales order Return / Claims
-                    if (metSalesLineUpdate.salesLine().salesTable().SalesType == SalesType::ReturnItem)
+                    if (updateSalesUnitFields)
                     {
-                        this.metSetExciseDutyFields(metSalesLineUpdate);
+                        metSalesLineUpdate = this.metSalesLine();
+                        metSalesLineUpdate.selectForUpdate(true);
+    
+                        // CB173 Sales Order Extract Screen V2 - refactor
+                        this.metSetSalesUnitFields(metSalesLineUpdate);
+                        // CB871_CB872 Sales returns . Get unit in shipcase during return order line export
+                        this.metSetWMSFactor(metSalesLineUpdate);
+
+                        // Sales order Return / Claims
+                        if (metSalesLineUpdate.salesLine().salesTable().SalesType == SalesType::ReturnItem)
+                        {
+                            this.metSetExciseDutyFields(metSalesLineUpdate);
+                        }
+                        // Sales order Return / Claims
                     }
-                    // Sales order Return / Claims
+                    ttscommit;
+
+                    this.metPackMETSalesLine(metSalesLineUpdate);
                 }
-                ttscommit;
-
-                this.metPackMETSalesLine(metSalesLineUpdate);
+                this.SysExtensionSerializerMap::postUpdate();
             }
-            this.SysExtensionSerializerMap::postUpdate();
-        }
 
-        if (this.RemainSalesPhysical == 0 && this.RemainInventPhysical == 0)
-        {
-            metSalesLineUpdate = this.metSalesLine();
-            metSalesLineUpdate.selectForUpdate(true);
-
-            if (metSalesLineUpdate.OrderExtractStatus != METOrderExtractStatus::Extracted)
+            if (this.RemainSalesPhysical == 0 && this.RemainInventPhysical == 0)
             {
-                metSalesLineUpdate.updateExtractionStatus(METOrderExtractStatus::Extracted);
+                metSalesLineUpdate = this.metSalesLine();
+                metSalesLineUpdate.selectForUpdate(true);
+
+                if (metSalesLineUpdate.OrderExtractStatus != METOrderExtractStatus::Extracted)
+                {
+                    metSalesLineUpdate.updateExtractionStatus(METOrderExtractStatus::Extracted);
+                }
+            }
+            // CB796 Send PE pricing purge value for custom tables
+            if (!this.SalesPrice
+                && salesLineOrig.SalesPrice
+                && metSalesTable.OrderProcessingStatus != METSalesOrderProcessingStatus::PricingCompleted
+                && skipPriceCompDeletion != NoYes::Yes)
+            {
+                // Purge the data in custom tables
+                delete_from METSalesLinePriceComponent
+                    where METSalesLinePriceComponent.InventTransId == this.InventTransId;
+
+                delete_from METSalesLinePriceComponentDetail
+                    where METSalesLinePriceComponentDetail.InventTransId == this.InventTransId;
             }
         }
-        // CB796 Send PE pricing purge value for custom tables
-        if (!this.SalesPrice
-            && salesLineOrig.SalesPrice
-            && metSalesTable.OrderProcessingStatus != METSalesOrderProcessingStatus::PricingCompleted
-            && skipPriceCompDeletion != NoYes::Yes)
-        {
-            // Purge the data in custom tables
-            delete_from METSalesLinePriceComponent
-                where METSalesLinePriceComponent.InventTransId == this.InventTransId;
-
-            delete_from METSalesLinePriceComponentDetail
-                where METSalesLinePriceComponentDetail.InventTransId == this.InventTransId;
-        }
-
     }
 
 ]]></Source>
@@ -2138,7 +2152,7 @@ final class METSalesLine_Extension
     {
         boolean ret = next validateWrite(_skipCreditLimitCheck);
         
-        if (ret && this.SalesType == SalesType::ReturnItem && !Global::isSystemAdministrator())
+        if (ret && METSecurityPolicyHelper::isRoleActiveForCurrentUser(roleStr(METInventLocationPolicyRole)))
         {
             InventDim           inventDim = this.inventDim();
             InventLocationId    warehouseId = inventDim.InventLocationId;

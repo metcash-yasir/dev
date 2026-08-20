@@ -23,16 +23,100 @@ class METItemPackChangeHelper
     //Task 170637:CB409 - PE-128: D365 to PIM -start
     List siteList = new List(Types::String);
     List warehouseList = new List(Types::String);
+    //Task 170637:CB409 - PE-128: D365 to PIM -end
+    List journalNumList = new List(Types::String);
+    List aggrementIdList = new List(Types::String);
+   
+
 }
 ]]></Declaration>
 		<Methods>
 			<Method>
+				<Name>captureStatusChange</Name>
+				<Source><![CDATA[
+    /// Capture a status change for a GUPVendPriceAdmTable record.
+    /// - Inserts a row into METVendPriceAdmStatusLog with JournalNum, Detail, ModifiedBy, NoYesId.
+    /// - Assumes METVendPriceAdmStatusLog has fields: JournalNum (str), Detail (str), ModifiedBy (userid), NoYesId (NoYes).
+    public static void captureStatusChange(GUPVendPriceAdmTable _rec)
+    {
+        METVendPriceAdmStatusLog logRec;
+        NoYes noYesValue;
+
+        logRec.JournalNum  = _rec.JournalNum;
+        logRec.Status      = _rec.Status;
+        logRec.insert();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>finalizeEnableForJournal</Name>
+				<Source><![CDATA[
+    /// For a given journal number: find GUPVendPriceAdmTable rows and if their latest
+    /// status log shows "Disabled" (NoYes::No), attempt to enable them all.
+    /// On success, write an "Auto-enabled" log entry. On error, write the error text into Detail.
+    ///
+    /// Notes:
+    /// - This routine runs updates inside a transaction per-record to avoid partial updates.
+    /// - If your table field types differ (e.g., Status is an enum), adjust the mapping accordingly.
+    /// <param name = "_journalNum">GUPVendPriceJournalNum</param>
+    public static void finalizeEnableForJournal(GUPVendPriceJournalNum _journalNum)
+    {
+        GUPVendPriceAdmTable     vendRec;
+        METVendPriceAdmStatusLog lastLog, logRec;
+
+        vendRec.reread();
+
+        select forupdate vendRec
+            where vendRec.JournalNum == _journalNum
+               && vendRec.Status     == GUPDisabledEnabled::Disabled;
+
+        select firstOnly forUpdate lastLog
+                order by lastLog.RecId desc
+                join forUpdate vendRec
+                        where vendRec.JournalNum == lastLog.JournalNum
+                           && lastLog.JournalNum == _journalNum
+                           && lastLog.Status     == GUPDisabledEnabled::Disabled
+                           && lastLog.Processed  == NoYes::No;
+
+        if (!lastLog.RecId || !vendRec.RecId)
+        {
+            return;
+        }
+
+        try
+        {
+            ttsBegin;
+
+            if (vendRec.RecId)
+            {
+                vendRec.Status = GUPDisabledEnabled::Enabled;
+                vendRec.update();
+                lastLog.Details = strFmt("@MET:METSupplierEnableLogPass", _journalNum);
+            }
+
+            lastLog.Processed = NoYes::Yes;
+            lastLog.update();
+
+            ttsCommit;
+        }
+        catch (Exception::Error)
+        {
+            ttsAbort;
+
+            logRec.clear();
+            logRec.JournalNum = _journalNum;
+            logRec.Processed  = NoYes::Yes;
+            logRec.Details     = strFmt("@MET:METSupplierEnableLogFail", _journalNum);
+            logRec.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>parmMETInventItemOrderSetup</Name>
 				<Source><![CDATA[
-    //Task 170637:CB409 - PE-128: D365 to PIM -end
-    
-   
-
     /// <summary>
     /// Parm method for METInventItemOrderSetup
     /// </summary>
@@ -252,6 +336,7 @@ class METItemPackChangeHelper
             this.runPricingRoutine();
             this.createBarcode(metInventItemOrderSetupOrigItem, metInventItemOrderSetupTempItem);
 
+            
             this.replaceOriginalItemSiteInfo(
                     inventItemPurchSetupOrigItem, inventItemPurchSetupTempItem, 
                     inventItemSalesSetupOrigItem, inventItemSalesSetupTempItem, 
@@ -271,6 +356,8 @@ class METItemPackChangeHelper
             this.processCampbellsSubOrdinateSites();
             this.runVendorChangeRequest();        
 
+            // Enable all the disabled vendor price records that were created in this pack change operation
+            this.finalizeEnableForJournalList();
             ttscommit;  
         
             //Task110346_CB409-D365ToPIM- start
@@ -724,6 +811,7 @@ class METItemPackChangeHelper
         _metItemSiteSettingsSetupOriginal.selectForUpdate(true);
         _metItemSiteSettingsSetupOriginal.CartonPerLayer = _metInventItemOrderSetupTempItem.CartonPerLayer;        
         _metItemSiteSettingsSetupOriginal.Layers = _metInventItemOrderSetupTempItem.Layers;
+        _metItemSiteSettingsSetupOriginal.RetailPackSize = _metInventItemOrderSetupTempItem.RetailPackSize;
         _metItemSiteSettingsSetupOriginal.RetailUnitLUCPack = _metInventItemOrderSetupTempItem.RetailUnitLUCPack;
         _metItemSiteSettingsSetupOriginal.modifiedField(fieldNum(METInventItemOrderSetup,CartonPerLayer));
         _metItemSiteSettingsSetupOriginal.update();
@@ -818,11 +906,12 @@ class METItemPackChangeHelper
     /// <param name = "_metItemSiteSettingsSetupTemp">The item site settings buffer</param>
     private void createBarcode(METInventItemOrderSetup  _metItemSiteSettingsSetupOriginal, METInventItemOrderSetup  _metItemSiteSettingsSetupTemp)
     {
-        InventItemBarcode inventItemBarcodeMainItem, inventItemBarcodeTempItem, inventItemBarcode;
+        InventItemBarcode inventItemBarcodeMainItem, inventItemBarcodeTempItem, inventItemBarcode, inventItemBarcodeMainItemMultiple;
         ReqItemTable reqItemTableBarcode;
         METReqItemTable metReqItemTableBarcode;
         InventDim inventDimBarcode;
         VendAccount vendAccount;
+        UnitOfMeasureSymbol mainItemUnit = InventTable::find(_metItemSiteSettingsSetupOriginal.ItemId).inventTableModuleInvent().UnitId;
 
         select firstonly VendId, RecId from reqItemTableBarcode
             join metReqItemTableBarcode
@@ -848,10 +937,19 @@ class METItemPackChangeHelper
             select firstonly inventItemBarcodeMainItem
             where inventItemBarcodeMainItem.itemId == _metItemSiteSettingsSetupOriginal.ItemId
             && inventItemBarcodeMainItem.UnitID == purchUnitTmpItem
-            && InventTable::find(_metItemSiteSettingsSetupOriginal.ItemId).inventTableModuleInvent().UnitId != inventItemBarcodeMainItem.UnitID
+            && mainItemUnit != inventItemBarcodeMainItem.UnitID
             && inventItemBarcodeMainItem.METVendAccount == vendAccount;
 
-            if (inventItemBarcodeMainItem && inventItemBarcodeMainItem.METDefault == NoYes::No)
+            select firstonly inventItemBarcodeMainItemMultiple
+                where inventItemBarcodeMainItemMultiple.itemId == _metItemSiteSettingsSetupOriginal.ItemId
+                    && inventItemBarcodeMainItemMultiple.UnitID == purchUnitTmpItem
+                    && mainItemUnit != inventItemBarcodeMainItemMultiple.UnitID
+                    && inventItemBarcodeMainItemMultiple.METVendAccount == vendAccount
+                    && inventItemBarcodeMainItemMultiple.METDefault == NoYes::Yes;
+
+            if (inventItemBarcodeMainItem 
+                    && inventItemBarcodeMainItem.METDefault == NoYes::No
+                    && !inventItemBarcodeMainItemMultiple.RecId)
             {
                 inventItemBarcodeMainItem.selectForUpdate(true);
                 inventItemBarcodeMainItem.METDefault = NoYes::Yes;
@@ -869,10 +967,19 @@ class METItemPackChangeHelper
         select firstonly inventItemBarcodeMainItem where
             inventItemBarcodeMainItem.itemId == _metItemSiteSettingsSetupOriginal.ItemId
             && inventItemBarcodeMainItem.UnitID == metSalesUnitTmpItem
-            && InventTable::find(_metItemSiteSettingsSetupOriginal.ItemId).inventTableModuleInvent().UnitId != inventItemBarcodeMainItem.UnitID
+            && mainItemUnit != inventItemBarcodeMainItem.UnitID
             && inventItemBarcodeMainItem.METVendAccount == vendAccount;
 
-        if (inventItemBarcodeMainItem && inventItemBarcodeMainItem.METDefault == NoYes::No)
+        select firstonly inventItemBarcodeMainItem 
+            where inventItemBarcodeMainItem.itemId == _metItemSiteSettingsSetupOriginal.ItemId
+                && inventItemBarcodeMainItem.UnitID == metSalesUnitTmpItem
+                && mainItemUnit != inventItemBarcodeMainItem.UnitID
+                && inventItemBarcodeMainItem.METVendAccount == vendAccount
+                && inventItemBarcodeMainItemMultiple.METDefault == NoYes::Yes;
+
+        if (inventItemBarcodeMainItem 
+                && inventItemBarcodeMainItem.METDefault == NoYes::No
+                && !inventItemBarcodeMainItemMultiple.RecId)
         {
             inventItemBarcodeMainItem.selectForUpdate(true);
             inventItemBarcodeMainItem.METDefault = NoYes::Yes;
@@ -886,10 +993,11 @@ class METItemPackChangeHelper
             select firstonly inventItemBarcodeMainItem
                 where inventItemBarcodeMainItem.itemId == _metItemSiteSettingsSetupOriginal.ItemId
                     && inventItemBarcodeMainItem.UnitID == inventItemBarcodeTempItem.UnitID
-                    && inventItemBarcodeMainItem.METVendAccount == vendAccount;
+                    && inventItemBarcodeMainItem.METVendAccount == vendAccount
+                    && inventItemBarcodeMainItem.itemBarCode == inventItemBarcodeTempItem.itemBarCode;
 
             if(!inventItemBarcodeMainItem.RecId)
-            {                         
+            {  
                 inventItemBarcode.clear();
                 buf2Buf(inventItemBarcodeTempItem, inventItemBarcode);
                 inventItemBarcode.ItemId = _metItemSiteSettingsSetupOriginal.ItemId;
@@ -909,6 +1017,136 @@ class METItemPackChangeHelper
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>finalizeEnableForJournalList</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Enable GUPVendPriceAdmTable.Status = GUPDisabledEnabled::Enabled for every journal in
+    /// the instance field `journalNumList` (if currently disabled) and ensure a status
+    /// entry is captured in `METVendPriceAdmStatusLog`.
+    /// This method re-uses the existing per-journal static helper `finalizeEnableForJournal`.
+    /// </summary>
+    public void finalizeEnableForJournalList()
+    {
+        ListEnumerator           enumerator = this.journalNumList.getEnumerator();
+        ListEnumerator           aggrementenumerator = this.aggrementIdList.getEnumerator();
+        str                      journalNum,aggrementId;
+        GUPVendPriceAdmTable     vendRec;
+        GUPPriceTermJournalTable priceTermAgreeementRec;
+        METVendPriceAdmStatusLog logRec;
+
+        while (enumerator.moveNext())
+        {
+            journalNum = enumerator.current();
+            if (!journalNum)
+            {
+                continue;
+            }
+
+            // Find the journal header that is currently disabled.
+            select forUpdate vendRec
+            where vendRec.JournalNum == journalNum
+               && vendRec.Status     == GUPDisabledEnabled::Disabled;
+
+            if (!vendRec.RecId)
+            {
+                // Nothing to enable for this journal
+                continue;
+            }
+
+            try
+            {
+                ttsBegin;
+
+                vendRec.selectForUpdate(true);
+                vendRec.Status = GUPDisabledEnabled::Enabled;
+                vendRec.update();
+
+                // Capture action in METVendPriceAdmStatusLog
+                logRec.clear();
+                logRec.JournalNum = vendRec.JournalNum;
+                logRec.Status     = vendRec.Status;
+                logRec.Details    = strFmt("@MET:METSupplierEnableLogPass", vendRec.JournalNum);
+                logRec.Processed  = NoYes::Yes;
+                logRec.insert();
+
+                ttsCommit;
+            }
+            catch
+            {
+                ttsAbort;
+
+                // Record failure in the status log
+                logRec.clear();
+                logRec.JournalNum = journalNum;
+                logRec.Status     = GUPDisabledEnabled::Disabled;
+                logRec.Details    = strFmt("@MET:METSupplierEnableLogFail", journalNum);
+                logRec.Processed  = NoYes::Yes;
+                logRec.insert();
+            }
+        }
+
+        // Clear the journal list so journals are not processed again in this instance.
+        this.journalNumList = new List(Types::String);
+
+        while (aggrementenumerator.moveNext())
+        {
+            aggrementId = aggrementenumerator.current();
+            if (!aggrementId)
+            {
+                continue;
+            }
+
+            // Find the journal header that is currently disabled.
+            select forUpdate priceTermAgreeementRec
+            where priceTermAgreeementRec.AgreementId == aggrementId
+               && priceTermAgreeementRec.Status     == GUPDisabledEnabled::Disabled;
+
+            if (!priceTermAgreeementRec.RecId)
+            {
+                // Nothing to enable for this journal
+                continue;
+            }
+
+            try
+            {
+                ttsBegin;
+
+                priceTermAgreeementRec.selectForUpdate(true);
+                priceTermAgreeementRec.Status = GUPDisabledEnabled::Enabled;
+                priceTermAgreeementRec.update();
+
+                // Capture action in METVendPriceAdmStatusLog
+                logRec.clear();
+                logRec.JournalNum = priceTermAgreeementRec.AgreementId;
+                logRec.Status     = priceTermAgreeementRec.Status;
+                logRec.Details    = strFmt("@MET:METSupplierEnableLogPass", priceTermAgreeementRec.AgreementId);
+                logRec.Processed  = NoYes::Yes;
+                logRec.insert();
+
+                ttsCommit;
+            }
+            catch
+            {
+                ttsAbort;
+
+                // Record failure in the status log
+                logRec.clear();
+                logRec.JournalNum = aggrementId;
+                logRec.Status     = GUPDisabledEnabled::Disabled;
+                logRec.Details    = strFmt("@MET:METSupplierEnableLogFail", aggrementId);
+                logRec.Processed  = NoYes::Yes;
+                logRec.insert();
+            }
+        }
+
+        // Clear the journal list so journals are not processed again in this instance.
+        this.aggrementIdList = new List(Types::String);
+    
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>createVendorListPrice</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -918,9 +1156,13 @@ class METItemPackChangeHelper
     {
         TransDate   currentDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
         GUPVendPriceAdmTable    gupVendPriceAdmTable;
-        GUPVendPriceAdmTrans    gupVendPriceAdmTransMainItem;
+        GUPVendPriceAdmTrans    gupVendPriceAdmTransMainItem, gupVendPriceAdmTransFind;
         METReqItemTable         metReqItemTable;
+        UnitOfMeasureSymbol     unitId;
         METReqItemTableInventDimView metReqItemTableInventDimView;
+        // Track keys for records we plan to insert to avoid adding duplicates to the RecordInsertList
+        Set gupVendPriceAdmTransKeySet = new Set(Types::String);
+        str recordKey;
 
         select firstonly RecId from metReqItemTableInventDimView
             exists join metReqItemTable
@@ -941,14 +1183,34 @@ class METItemPackChangeHelper
             {
                 gupVendPriceAdmTable.Status = GUPDisabledEnabled::Disabled;
                 gupVendPriceAdmTable.update();
+                journalNumList.addEnd(gupVendPriceAdmTable.JournalNum);
+                // Capture the change into METVendPriceAdmStatusLog
+                METItemPackChangeHelper::captureStatusChange(gupVendPriceAdmTable);
 
                 METPurchUnit metpurchUnit       = inventItemPurchSetupOrigItem.METPurchUnit;
+
+                select firstonly  RecId from gupVendPriceAdmTransFind
+                order by gupVendPriceAdmTransFind.LineNum desc
+                    where gupVendPriceAdmTransFind.JournalNum == gupVendPriceAdmTable.JournalNum
+                        && gupVendPriceAdmTransFind.ItemNum == metInventItemOrderSetupOrigItem.ItemId
+                        && gupVendPriceAdmTransFind.UnitId == metpurchUnit
+                        && (!gupVendPriceAdmTransFind.ToDate
+                        || gupVendPriceAdmTransFind.ToDate > currentDate);
+
+                if (gupVendPriceAdmTransFind.RecId)
+                {
+                    unitId = metpurchUnit;
+                }
+                else
+                {
+                    unitId = inventItemSalesSetupOrigItem.METSalesUnit;
+                }
 
                 while select forupdate gupVendPriceAdmTransMainItem
                 order by gupVendPriceAdmTransMainItem.LineNum desc
                 where gupVendPriceAdmTransMainItem.JournalNum == gupVendPriceAdmTable.JournalNum
                 && gupVendPriceAdmTransMainItem.ItemNum == metInventItemOrderSetupOrigItem.ItemId
-                && gupVendPriceAdmTransMainItem.UnitId == metpurchUnit
+                && gupVendPriceAdmTransMainItem.UnitId == unitId
                 && (!gupVendPriceAdmTransMainItem.ToDate
                 || gupVendPriceAdmTransMainItem.ToDate > currentDate)
                 {
@@ -969,8 +1231,14 @@ class METItemPackChangeHelper
                 {
                     gupVendPriceAdmTable.Status = GUPDisabledEnabled::Enabled;
                     gupVendPriceAdmTable.update();
+                    // Capture the change into METVendPriceAdmStatusLog
+                    METItemPackChangeHelper::captureStatusChange(gupVendPriceAdmTable);
+
                 }
 
+
+                // At last enable the disable supplier records
+                METItemPackChangeHelper::finalizeEnableForJournal(gupVendPriceAdmTable.JournalNum);
             }
 
             //Copy the supplier list price from temp item to main item.
@@ -982,18 +1250,45 @@ class METItemPackChangeHelper
             {
                 gupVendPriceAdmTable.Status = GUPDisabledEnabled::Disabled;
                 gupVendPriceAdmTable.update();
+                journalNumList.addEnd(gupVendPriceAdmTable.JournalNum);
+                // Capture the change into METVendPriceAdmStatusLog
+                METItemPackChangeHelper::captureStatusChange(gupVendPriceAdmTable);
 
                 METPurchUnit metpurchUnit       = inventItemPurchSetupTempItem.METPurchUnit;
+
+                select firstonly RecId from gupVendPriceAdmTransFind
+                    order by gupVendPriceAdmTransFind.LineNum desc
+                    where gupVendPriceAdmTransFind.JournalNum == gupVendPriceAdmTable.JournalNum
+                        && gupVendPriceAdmTransFind.ItemNum == metInventItemOrderSetupTempItem.ItemId
+                        && gupVendPriceAdmTransFind.UnitId == metpurchUnit
+                        && (!gupVendPriceAdmTransFind.ToDate
+                        || gupVendPriceAdmTransFind.ToDate > currentDate);
+
+                if (gupVendPriceAdmTransFind.RecId)
+                {
+                    unitId = metpurchUnit;
+                }
+                else
+                {
+                    unitId = inventItemSalesSetupTempItem.METSalesUnit;
+                }
 
                 while select forupdate gupVendPriceAdmTransMainItem
                 order by gupVendPriceAdmTransMainItem.LineNum desc
                 where gupVendPriceAdmTransMainItem.JournalNum == gupVendPriceAdmTable.JournalNum
                 && gupVendPriceAdmTransMainItem.ItemNum == metInventItemOrderSetupTempItem.ItemId
-                && gupVendPriceAdmTransMainItem.UnitId == metpurchUnit
+                && gupVendPriceAdmTransMainItem.UnitId == unitId
                 && (!gupVendPriceAdmTransMainItem.ToDate
                 || gupVendPriceAdmTransMainItem.ToDate > currentDate)
-                {                  
-                    this.copyVendorListPriceFromTempToMainItem(gupVendPriceAdmTable.JournalNum);
+                {
+                    // Build a simple composite key of the record to detect duplicates before adding to the RecordInsertList, key includes JournalNum, ItemNum and UnitId.
+                    recordKey = strFmt("%1|%2|%3", gupVendPriceAdmTransMainItem.JournalNum, gupVendPriceAdmTransMainItem.ItemNum, gupVendPriceAdmTransMainItem.UnitId);
+              
+                    if (!gupVendPriceAdmTransKeySet.in(recordKey))
+                    {
+                        this.copyVendorListPriceFromTempToMainItem(gupVendPriceAdmTable.JournalNum);
+                        gupVendPriceAdmTransKeySet.add(recordKey);
+                    }                    
                 }
 
                 // Edge Scenario when it doest not flow into the above while loop, we need to enable the journal if its disabled.
@@ -1002,8 +1297,13 @@ class METItemPackChangeHelper
                 {
                     gupVendPriceAdmTable.Status = GUPDisabledEnabled::Enabled;
                     gupVendPriceAdmTable.update();
+                    // Capture the change into METVendPriceAdmStatusLog
+                    METItemPackChangeHelper::captureStatusChange(gupVendPriceAdmTable);
                 }
-            }                   
+
+                // At last enable the disable supplier records
+                METItemPackChangeHelper::finalizeEnableForJournal(gupVendPriceAdmTable.JournalNum);
+            }
         }
         else
         {
@@ -1016,13 +1316,34 @@ class METItemPackChangeHelper
                 gupVendPriceAdmTable.Status = GUPDisabledEnabled::Disabled;
                 gupVendPriceAdmTable.update();
 
+                journalNumList.addEnd(gupVendPriceAdmTable.JournalNum);
+                // Capture the change into METVendPriceAdmStatusLog
+                METItemPackChangeHelper::captureStatusChange(gupVendPriceAdmTable);
+
                 METPurchUnit metpurchUnit       = inventItemPurchSetupOrigItem.METPurchUnit;
+
+                select Firstonly RecId from gupVendPriceAdmTransFind
+                    order by gupVendPriceAdmTransFind.LineNum desc
+                    where gupVendPriceAdmTransFind.JournalNum == gupVendPriceAdmTable.JournalNum
+                        && gupVendPriceAdmTransFind.ItemNum == metInventItemOrderSetupOrigItem.ItemId
+                        && gupVendPriceAdmTransFind.UnitId == metpurchUnit
+                        && (!gupVendPriceAdmTransFind.ToDate
+                        || gupVendPriceAdmTransFind.ToDate > currentDate);
+
+                if(gupVendPriceAdmTransFind.RecId)
+                {
+                    unitId = metpurchUnit;
+                }
+                else
+                {
+                    unitId = inventItemSalesSetupOrigItem.METSalesUnit;
+                }
 
                 while select forupdate gupVendPriceAdmTransMainItem
                 order by gupVendPriceAdmTransMainItem.LineNum desc
                 where gupVendPriceAdmTransMainItem.JournalNum == gupVendPriceAdmTable.JournalNum
                 && gupVendPriceAdmTransMainItem.ItemNum == metInventItemOrderSetupOrigItem.ItemId
-                && gupVendPriceAdmTransMainItem.UnitId == metpurchUnit
+                && gupVendPriceAdmTransMainItem.UnitId == unitId
                 && (!gupVendPriceAdmTransMainItem.ToDate
                 || gupVendPriceAdmTransMainItem.ToDate > currentDate)
                 {
@@ -1036,8 +1357,14 @@ class METItemPackChangeHelper
                         gupVendPriceAdmTransMainItem.update();
                     }
 
-                    this.copyVendorListPriceFromTempToMainItem(gupVendPriceAdmTable.JournalNum);
-
+                    // Build a simple composite key of the record to detect duplicates before adding to the RecordInsertList, key includes JournalNum, ItemNum and UnitId.
+                    recordKey = strFmt("%1|%2|%3", gupVendPriceAdmTransMainItem.JournalNum, gupVendPriceAdmTransMainItem.ItemNum, gupVendPriceAdmTransMainItem.UnitId);
+              
+                    if (!gupVendPriceAdmTransKeySet.in(recordKey))
+                    {
+                        this.copyVendorListPriceFromTempToMainItem(gupVendPriceAdmTable.JournalNum);
+                        gupVendPriceAdmTransKeySet.add(recordKey);
+                    }
                 }
 
                 // Edge Scenario when it doest not flow into the above while loop, we need to enable the journal if its disabled.
@@ -1046,7 +1373,12 @@ class METItemPackChangeHelper
                 {
                     gupVendPriceAdmTable.Status = GUPDisabledEnabled::Enabled;
                     gupVendPriceAdmTable.update();
+                    // Capture the change into METVendPriceAdmStatusLog
+                    METItemPackChangeHelper::captureStatusChange(gupVendPriceAdmTable);
                 }
+
+                // At last enable the disable supplier records
+                METItemPackChangeHelper::finalizeEnableForJournal(gupVendPriceAdmTable.JournalNum);
             }
         }
 
@@ -1065,34 +1397,80 @@ class METItemPackChangeHelper
     /// <param name = "_journalNum">Journal</param>
     private void copyVendorListPriceFromTempToMainItem(GUPVendPriceJournalNum _journalNum)
     {
-        GUPVendPriceAdmTrans    gupVendPriceAdmTransTempItem, gupVendPriceAdmTrans;
+        GUPVendPriceAdmTrans    gupVendPriceAdmTransTempItem, gupVendPriceAdmTrans, gupVendPriceAdmTransFind;
         int                     countLoop = 0;
+        UnitOfMeasureSymbol     unitId;
         TransDate   currentDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
 
         METPurchUnit metpurchUnit = inventItemPurchSetupTempItem.METPurchUnit;
 
         RecordInsertList gupVendPriceAdmTransRecordInsertList = new RecordInsertList(tableNum(GUPVendPriceAdmTrans));
 
+        select firstonly RecId from gupVendPriceAdmTransFind
+              where gupVendPriceAdmTransFind.JournalNum == _journalNum
+              && gupVendPriceAdmTransFind.ItemNum == metInventItemOrderSetupTempItem.ItemId
+              && gupVendPriceAdmTransFind.UnitId == metpurchUnit
+              && (gupVendPriceAdmTransFind.FromDate >= currentDate
+              || gupVendPriceAdmTransFind.ToDate >= currentDate
+              || gupVendPriceAdmTransFind.ToDate == Global::dateNull());
+
+        if(gupVendPriceAdmTransFind.RecId)
+        {
+            unitId = metpurchUnit;
+        }
+        else
+        {
+            unitId = inventItemSalesSetupTempItem.METSalesUnit;
+        }
+
         while select gupVendPriceAdmTransTempItem
-                where gupVendPriceAdmTransTempItem.JournalNum == _journalNum
-                && gupVendPriceAdmTransTempItem.ItemNum == metInventItemOrderSetupTempItem.ItemId
-                && gupVendPriceAdmTransTempItem.UnitId == metpurchUnit
-                && (gupVendPriceAdmTransTempItem.FromDate >= currentDate
-                || gupVendPriceAdmTransTempItem.ToDate >= currentDate
-                || gupVendPriceAdmTransTempItem.ToDate == Global::dateNull())
+              where gupVendPriceAdmTransTempItem.JournalNum == _journalNum
+              && gupVendPriceAdmTransTempItem.ItemNum == metInventItemOrderSetupTempItem.ItemId
+              && gupVendPriceAdmTransTempItem.UnitId == unitId
+              && (gupVendPriceAdmTransTempItem.FromDate >= currentDate
+              || gupVendPriceAdmTransTempItem.ToDate >= currentDate
+              || gupVendPriceAdmTransTempItem.ToDate == Global::dateNull())
         {
             countLoop++;
-                
+              
             gupVendPriceAdmTrans.initFromGUPVendPriceAdmTrans(gupVendPriceAdmTransTempItem);
-                
-            gupVendPriceAdmTrans.ItemNum        = metInventItemOrderSetupOrigItem.ItemId;            
+
+            gupVendPriceAdmTrans.ItemNum        = metInventItemOrderSetupOrigItem.ItemId;
             gupVendPriceAdmTrans.FromDate       = max(gupVendPriceAdmTransTempItem.FromDate, currentDate);
             gupVendPriceAdmTrans.JournalNum     = _journalNum;
-            gupVendPriceAdmTrans.LineNum        = GUPVendPriceAdmTrans::lastLineNum(_journalNum) + countLoop;
-                
-            gupVendPriceAdmTransRecordInsertList.add(gupVendPriceAdmTrans);
+            gupVendPriceAdmTrans.LineNum        =  METItemPackChangeHelper::lastLineNumForSupplierListPriceItem(_journalNum, metInventItemOrderSetupOrigItem.ItemId) + countLoop;
+         
+            gupVendPriceAdmTransRecordInsertList.add(gupVendPriceAdmTrans);            
         }
         gupVendPriceAdmTransRecordInsertList.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lastLineNumForSupplierListPriceItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the highest LineNum used by `GUPVendPriceAdmTrans` rows for the specified vendor price journal and item.
+    /// </summary>
+    /// <param name = "_journalNum">Journal identifier (GUPVendPriceJournalNum) to search within.</param>
+    /// <param name = "_itemId">Item identifier (ItemId) to match against `ItemNum`.</param>
+    /// <returns>
+    /// The maximum LineNum (int) for matching `GUPVendPriceAdmTrans` records; returns 0 if no matching records exist.
+    /// </returns>
+    private static TradeLineNumber lastLineNumForSupplierListPriceItem(GUPVendPriceJournalNum _journalNum, ItemId _itemId)
+    {
+        GUPVendPriceAdmTrans vendPriceAdmTrans;
+        TradeLineNumber lineNum = 0;
+        
+        select firstOnly LineNum from vendPriceAdmTrans
+            order by vendPriceAdmTrans.LineNum desc
+                where vendPriceAdmTrans.JournalNum == _journalNum
+                   && vendPriceAdmTrans.ItemNum   == _itemId;
+        
+        lineNum = vendPriceAdmTrans.LineNum;
+
+        return lineNum;
     }
 
 ]]></Source>
@@ -1273,6 +1651,18 @@ class METItemPackChangeHelper
                 {
                     this.createVendorPriceTermAgreement(gupPriceTermJournalTransEntityGroupBy.AgreementId, inventItemPurchSetupOrigItem.METPurchUnit, metInventItemOrderSetupOrigItem.ItemId, true);
                 }
+
+                // Copy price term agrements from temp item to main item.
+                while select gupPriceTermJournalTransEntityGroupBy
+                    group by gupPriceTermJournalTransEntityGroupBy.AgreementId, gupPriceTermJournalTransEntityGroupBy.METInventDimId
+                    exists join inventDim
+                    where (gupPriceTermJournalTransEntityGroupBy.Line1 == metInventItemOrderSetupTempItem.ItemId
+                        || gupPriceTermJournalTransEntityGroupBy.Line2 == metInventItemOrderSetupTempItem.ItemId)
+                        && inventDim.InventSiteId == metInventItemOrderSetupOrigItem.SiteId
+                        && gupPriceTermJournalTransEntityGroupBy.METInventDimId == inventDim.inventDimId
+                        {
+                            this.createVendorPriceTermAgreement(gupPriceTermJournalTransEntityGroupBy.AgreementId, inventItemPurchSetupTempItem.METPurchUnit, metInventItemOrderSetupTempItem.ItemId, false);
+                        }
             }
             else
             {
@@ -1305,18 +1695,64 @@ class METItemPackChangeHelper
         TransDate                       currentDate = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
         GUPPriceTermJournalTransEntity  gupPriceTermJournalTransEntityMainItem;
         GUPPriceTermJournalTable        gupPriceTermJournalTable = GUPPriceTermJournalTable::find(_agreementId, true);
+        UnitOfMeasureSymbol             unitId;
+        // Track keys for records we plan to insert to avoid adding duplicates to the RecordInsertList
+        Set gupPriceTermJournalTranKeySet = new Set(Types::String);
+        str recordKey;
 
         gupPriceTermJournalTable.Status = GUPDisabledEnabled::Disabled;
         gupPriceTermJournalTable.update();
+        aggrementIdList.addEnd(gupPriceTermJournalTable.agreementId);
+        
+        if(metInventItemOrderSetupOrigItem.ItemId == _itemid)
+        {
+            select firstonly RecId from gupPriceTermJournalTransEntityMainItem
+                  order by gupPriceTermJournalTransEntityMainItem.RecId desc
+                  where gupPriceTermJournalTransEntityMainItem.AgreementId == gupPriceTermJournalTable.agreementId
+                      && gupPriceTermJournalTransEntityMainItem.UnitId == inventItemPurchSetupOrigItem.METPurchUnit
+                      && (gupPriceTermJournalTransEntityMainItem.Line1 == _itemid
+                      || gupPriceTermJournalTransEntityMainItem.Line2 == _itemid)
+                      && (!gupPriceTermJournalTransEntityMainItem.ValidTo
+                      || gupPriceTermJournalTransEntityMainItem.ValidTo > currentDate);
+
+            if(gupPriceTermJournalTransEntityMainItem.RecId)
+            {
+                unitId = inventItemPurchSetupOrigItem.METPurchUnit;
+            }
+            else
+            {
+                unitId =  inventItemSalesSetupOrigItem.METSalesUnit;
+            }
+        }
+        else
+        {
+            select firstonly RecId from gupPriceTermJournalTransEntityMainItem
+                  order by gupPriceTermJournalTransEntityMainItem.RecId desc
+                  where gupPriceTermJournalTransEntityMainItem.AgreementId == gupPriceTermJournalTable.agreementId
+                      && gupPriceTermJournalTransEntityMainItem.UnitId == inventItemPurchSetupTempItem.METPurchUnit
+                      && (gupPriceTermJournalTransEntityMainItem.Line1 == _itemid
+                      || gupPriceTermJournalTransEntityMainItem.Line2 == _itemid)
+                      && (!gupPriceTermJournalTransEntityMainItem.ValidTo
+                      || gupPriceTermJournalTransEntityMainItem.ValidTo > currentDate);
+
+            if(gupPriceTermJournalTransEntityMainItem.RecId)
+            {
+                unitId = inventItemPurchSetupTempItem.METPurchUnit;
+            }
+            else
+            {
+                unitId =  inventItemSalesSetupTempItem.METSalesUnit;
+            }
+        }
 
         while select forupdate gupPriceTermJournalTransEntityMainItem
-                    order by gupPriceTermJournalTransEntityMainItem.RecId desc
-                    where gupPriceTermJournalTransEntityMainItem.AgreementId == gupPriceTermJournalTable.agreementId
-                    && gupPriceTermJournalTransEntityMainItem.UnitId == _metpurchUnit
-                    && (gupPriceTermJournalTransEntityMainItem.Line1 == _itemid
-                    || gupPriceTermJournalTransEntityMainItem.Line2 == _itemid)
-                    && (!gupPriceTermJournalTransEntityMainItem.ValidTo 
-                    || gupPriceTermJournalTransEntityMainItem.ValidTo > currentDate)
+                  order by gupPriceTermJournalTransEntityMainItem.RecId desc
+                  where gupPriceTermJournalTransEntityMainItem.AgreementId == gupPriceTermJournalTable.agreementId
+                  && gupPriceTermJournalTransEntityMainItem.UnitId == unitId
+                  && (gupPriceTermJournalTransEntityMainItem.Line1 == _itemid
+                  || gupPriceTermJournalTransEntityMainItem.Line2 == _itemid)
+                  && (!gupPriceTermJournalTransEntityMainItem.ValidTo
+                  || gupPriceTermJournalTransEntityMainItem.ValidTo > currentDate)
         {
             if (_isOriginalItem)
             {
@@ -1324,11 +1760,18 @@ class METItemPackChangeHelper
                 {
                     gupPriceTermJournalTransEntityMainItem.ValidFrom = currentDate-1;
                 }
-                gupPriceTermJournalTransEntityMainItem.ValidTo = currentDate-1; //Bug 341863: moving the date back by one day as requested.           
+                gupPriceTermJournalTransEntityMainItem.ValidTo = currentDate-1; //Bug 341863: moving the date back by one day as requested.
                 gupPriceTermJournalTransEntityMainItem.update();
             }
 
-            this.copyVendorPriceTermFromTempToMainItem(gupPriceTermJournalTable.agreementId);
+            // Build a simple composite key of the record to detect duplicates before adding to the RecordInsertList, key includes AgreementId, Line1, Line2 and UnitId.
+            recordKey = strFmt("%1|%2|%3|%4", gupPriceTermJournalTransEntityMainItem.AgreementId, gupPriceTermJournalTransEntityMainItem.Line1, gupPriceTermJournalTransEntityMainItem.Line2, gupPriceTermJournalTransEntityMainItem.UnitId);
+
+            if (!gupPriceTermJournalTranKeySet.in(recordKey))
+            {
+                this.copyVendorPriceTermFromTempToMainItem(gupPriceTermJournalTable.agreementId);
+                gupPriceTermJournalTranKeySet.add(recordKey);
+            }
         }
 
         // Edge Scenario when it doest not flow into the above while loop, we need to enable the journal if its disabled.
@@ -1338,7 +1781,7 @@ class METItemPackChangeHelper
             gupPriceTermJournalTable.Status = GUPDisabledEnabled::Enabled;
             gupPriceTermJournalTable.update();
         }
-    
+  
     }
 
 ]]></Source>
@@ -1356,33 +1799,53 @@ class METItemPackChangeHelper
 
         GUPPriceTermJournalTransEntity  gupPriceTermJournalTransEntityMainItem, gupPriceTermJournalTransEntityTempItem, gupPriceTermJournalTransEntity, gupPriceTermJournalTransEntityFind;
         int                             countLoop = 0;
+        UnitOfMeasureSymbol             unitId;
         METPurchUnit metpurchUnit = inventItemPurchSetupTempItem.METPurchUnit;
 
         RecordInsertList gupPriceTermJournalTransEntityRecordInsertList = new RecordInsertList(tableNum(GUPPriceTermJournalTransEntity));
 
+        select firstonly RecId from gupPriceTermJournalTransEntityFind
+             where gupPriceTermJournalTransEntityFind.AgreementId == _agreementId
+             && gupPriceTermJournalTransEntityFind.UnitId == metpurchUnit
+             && (gupPriceTermJournalTransEntityFind.Line1 == metInventItemOrderSetupTempItem.ItemId
+             || gupPriceTermJournalTransEntityFind.Line2 == metInventItemOrderSetupTempItem.ItemId)
+             && (gupPriceTermJournalTransEntityFind.ValidFrom >= currentDate
+             || gupPriceTermJournalTransEntityFind.ValidTo >= currentDate
+             || gupPriceTermJournalTransEntityFind.ValidTo == Global::dateNull());
+
+        if(gupPriceTermJournalTransEntityFind.RecId)
+        {
+            unitId = metpurchUnit;
+        }
+        else
+        {
+            unitId = inventItemSalesSetupTempItem.METSalesUnit;
+        }
+
+
         while select gupPriceTermJournalTransEntityTempItem
-                where gupPriceTermJournalTransEntityTempItem.AgreementId == _agreementId
-                && gupPriceTermJournalTransEntityTempItem.UnitId == metpurchUnit
-                && (gupPriceTermJournalTransEntityTempItem.Line1 == metInventItemOrderSetupTempItem.ItemId
-                || gupPriceTermJournalTransEntityTempItem.Line2 == metInventItemOrderSetupTempItem.ItemId)
-                && (gupPriceTermJournalTransEntityTempItem.ValidFrom >= currentDate
-                || gupPriceTermJournalTransEntityTempItem.ValidTo >= currentDate
-                || gupPriceTermJournalTransEntityTempItem.ValidTo == Global::dateNull())
+             where gupPriceTermJournalTransEntityTempItem.AgreementId == _agreementId
+             && gupPriceTermJournalTransEntityTempItem.UnitId == unitId
+             && (gupPriceTermJournalTransEntityTempItem.Line1 == metInventItemOrderSetupTempItem.ItemId
+             || gupPriceTermJournalTransEntityTempItem.Line2 == metInventItemOrderSetupTempItem.ItemId)
+             && (gupPriceTermJournalTransEntityTempItem.ValidFrom >= currentDate
+             || gupPriceTermJournalTransEntityTempItem.ValidTo >= currentDate
+             || gupPriceTermJournalTransEntityTempItem.ValidTo == Global::dateNull())
         {
             countLoop++;
 
             select firstonly gupPriceTermJournalTransEntityFind
-                where gupPriceTermJournalTransEntityFind.AgreementId == _agreementId
-                && gupPriceTermJournalTransEntityFind.UnitId == metpurchUnit
-                && (gupPriceTermJournalTransEntityFind.Line1 == metInventItemOrderSetupOrigItem.ItemId
-                || gupPriceTermJournalTransEntityFind.Line2 == metInventItemOrderSetupOrigItem.ItemId)
-                && gupPriceTermJournalTransEntityFind.METInventDimId == gupPriceTermJournalTransEntityTempItem.METInventDimId
-                && gupPriceTermJournalTransEntityFind.Code == gupPriceTermJournalTransEntityTempItem.Code;
+             where gupPriceTermJournalTransEntityFind.AgreementId == _agreementId
+             && gupPriceTermJournalTransEntityFind.UnitId == unitId
+             && (gupPriceTermJournalTransEntityFind.Line1 == metInventItemOrderSetupOrigItem.ItemId
+             || gupPriceTermJournalTransEntityFind.Line2 == metInventItemOrderSetupOrigItem.ItemId)
+             && gupPriceTermJournalTransEntityFind.METInventDimId == gupPriceTermJournalTransEntityTempItem.METInventDimId
+             && gupPriceTermJournalTransEntityFind.Code == gupPriceTermJournalTransEntityTempItem.Code;
 
             if(!gupPriceTermJournalTransEntityFind.RecId)
             {
                 buf2Buf(gupPriceTermJournalTransEntityTempItem, gupPriceTermJournalTransEntity);
-                
+
                 if (gupPriceTermJournalTransEntity.Line2 == inventItemPurchSetupTempItem.ItemId)
                 {
                     gupPriceTermJournalTransEntity.Line2 = metInventItemOrderSetupOrigItem.ItemId;
@@ -1392,12 +1855,41 @@ class METItemPackChangeHelper
                     gupPriceTermJournalTransEntity.Line1 = metInventItemOrderSetupOrigItem.ItemId;
                 }
                 gupPriceTermJournalTransEntity.ValidFrom    = max(gupPriceTermJournalTransEntityTempItem.ValidFrom, currentDate);
-                gupPriceTermJournalTransEntity.LineNum      = GUPPriceTermJournalTrans::lastLineNum(_agreementId) + countLoop;
-                
-                gupPriceTermJournalTransEntityRecordInsertList.add(gupPriceTermJournalTransEntity);
+                gupPriceTermJournalTransEntity.LineNum = METItemPackChangeHelper::lastLineNumForVendorPriceTermItem(_agreementId, metInventItemOrderSetupOrigItem.ItemId) + countLoop;;
+
+                gupPriceTermJournalTransEntityRecordInsertList.add(gupPriceTermJournalTransEntity);                                           
             }
         }
         gupPriceTermJournalTransEntityRecordInsertList.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>lastLineNumForVendorPriceTermItem</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Returns the highest LineNum currently used for vendor price term transaction entries that reference the specified agreement and item.
+    /// </summary>
+    /// <param name = "_agreementId">Agreement identifier to search within (GUPAgreementId).</param>
+    /// <param name = "_itemId">Item identifier to match in either Line1 or Line2 (ItemId).</param>
+    /// <returns>
+    /// The maximum LineNum (int) for matching GUPPriceTermJournalTransEntity records; returns 0 if no matching records are found.
+    /// </returns>
+    private static LineNum lastLineNumForVendorPriceTermItem(GUPAgreementId _agreementId, ItemId _itemId)
+    {
+        GUPPriceTermJournalTransEntity priceTermJournalTrans;
+        LineNum lineNum = 0;
+        
+        select firstOnly LineNum from priceTermJournalTrans
+            order by priceTermJournalTrans.LineNum desc
+                where priceTermJournalTrans.AgreementId == _agreementId
+                   && (priceTermJournalTrans.line1  == _itemId
+                        || priceTermJournalTrans.line2  == _itemId);
+        
+        lineNum = priceTermJournalTrans.LineNum;
+
+        return lineNum;
     }
 
 ]]></Source>
