@@ -3,74 +3,88 @@
 	<Name>METFulfilmentProfileEntity</Name>
 	<SourceCode>
 		<Declaration><![CDATA[
+using System;
+using System.Text;
+
 public class METFulfilmentProfileEntity extends common
 {
 }
 ]]></Declaration>
 		<Methods>
 			<Method>
-				<Name>getConditions</Name>
+				<Name>getRawConditions</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Generates pipe-delimited condition string from packed query
+    /// Builds raw pipe-delimited condition string using AOT Names.
     /// </summary>
-    public Notes getConditions(METFulfilmentProfileId _profileId)
+    private Notes getRawConditions(METFulfilmentProfileId _profileId)
     {
-        Notes queryString;
+        Notes queryString = '';
         container packedQuery = METFulfilmentProfile::find(_profileId).ConditionQueryPacked;
 
-        Query condition;
-        int dsN;
-        int dsI;
-
-        void addFilter(Query _query)
+        if (conLen(packedQuery) == 0)
         {
-            int nFilter = _query.queryFilterCount();
-            int iFilter;
+            return queryString;
+        }
 
-            for (iFilter = 1; iFilter <= nFilter; iFilter++)
+        Query condition = new Query(packedQuery);
+        Set processedTables = new Set(Types::Integer);
+ 
+        int nFilter = condition.queryFilterCount();
+        for (int iFilter = 1; iFilter <= nFilter; iFilter++)
+        {
+            QueryFilter qf = condition.queryFilter(iFilter);
+            if (qf && qf.value() && qf.status() != RangeStatus::Hidden)
             {
-                QueryFilter qf = _query.queryFilter(iFilter);
-
-                if (qf.value() && qf.status() != RangeStatus::Hidden)
+                QueryBuildDataSource qbds = qf.dataSource();
+                if (qbds)
                 {
-                    QueryBuildDataSource qbds = qf.dataSource();
-                    TableId tableId = qbds.table();
-                    FieldId fieldId = fieldName2Id(tableId, qf.field());
-
-                    queryString += strFmt("%1; %2; %3|", tableId, fieldId, qf.value());
+                    TableName tableName = tableId2Name(qbds.table());
+                    FieldName fieldName = qf.field();
+                    if (tableName && fieldName)
+                    {
+                        queryString += strFmt("%1; %2; %3|", tableName, fieldName, qf.value());
+                        processedTables.add(qbds.table());
+                    }
                 }
             }
         }
 
-        void addRange(QueryBuildRange _range)
+        // Export QueryBuildRanges and Standalone Joined Data Sources
+        for (int dsI = 1; dsI <= condition.dataSourceCount(); dsI++)
         {
-            if (_range.value() && _range.status() != RangeStatus::Hidden)
+            QueryBuildDataSource qbds = condition.dataSourceNo(dsI);
+            if (qbds)
             {
-                queryString += strFmt("%1; %2; %3|", _range.table(), _range.field(), _range.value());
-            }
-        }
+                boolean hasRange = false;
+                int nRange = qbds.rangeCount();
 
-        void addDatasource(QueryBuildDataSource _ds)
-        {
-            int nRange = _ds.rangeCount();
-            int iRange;
-            for (iRange = 1; iRange <= nRange; iRange++)
-            {
-                addRange(_ds.range(iRange));
-            }
-        }
+                for (int iRange = 1; iRange <= nRange; iRange++)
+                {
+                    QueryBuildRange qbr = qbds.range(iRange);
+                    if (qbr && qbr.value() && qbr.status() != RangeStatus::Hidden)
+                    {
+                        TableName tableName = tableId2Name(qbr.table());
+                        FieldName fieldName = fieldId2Name(qbr.table(), qbr.field());
+                        if (tableName && fieldName)
+                        {
+                            queryString += strFmt("%1; %2; %3|", tableName, fieldName, qbr.value());
+                            hasRange = true;
+                            processedTables.add(qbds.table());
+                        }
+                    }
+                }
 
-        if (conLen(packedQuery) > 0)
-        {
-            condition = new Query(packedQuery);
-            dsN = condition.dataSourceCount();
-            for (dsI = 1; dsI <= dsN; dsI++)
-            {
-                addDatasource(condition.dataSourceNo(dsI));
+                if (!hasRange && !processedTables.in(qbds.table()) && dsI > 1)
+                {
+                    TableName tableName = tableId2Name(qbds.table());
+                    if (tableName)
+                    {
+                        queryString += strFmt("%1|", tableName);
+                        processedTables.add(qbds.table());
+                    }
+                }
             }
-
-            addFilter(condition);
         }
 
         return queryString;
@@ -79,10 +93,179 @@ public class METFulfilmentProfileEntity extends common
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>getConditions</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Encodes plain-text AOT conditions to Base64 for clean CSV export.
+    /// </summary>
+    public Notes getConditions(METFulfilmentProfileId _profileId)
+    {
+        Notes rawConditions = this.getRawConditions(_profileId);
+
+        if (!rawConditions)
+        {
+            return '';
+        }
+
+        System.Byte[] bytes = System.Text.Encoding::UTF8.GetBytes(rawConditions);
+        str encoded = System.Convert::ToBase64String(bytes);
+        
+        // Strip line breaks to guarantee single CSV line execution
+        encoded = strReplace(encoded, num2char(13), '');
+        encoded = strReplace(encoded, num2char(10), '');
+
+        return encoded;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildConditionQuery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Builds condition query supporting Base64-encoded strings and legacy plain-text.
+    /// </summary>
+    public static Query buildConditionQuery(str _conditions, METFulfilmentProfileId _profileId)
+    {
+        Query query = METFulfilmentProfile::defaultQuery();
+        str decodedConditions = _conditions;
+
+        if (!_conditions)
+        {
+            return query;
+        }
+
+        // attempt Base64 Decoding with fallback to plain text
+        try
+        {
+            System.Byte[] bytes = System.Convert::FromBase64String(_conditions);
+            decodedConditions = System.Text.Encoding::UTF8.GetString(bytes);
+        }
+        catch
+        {
+            decodedConditions = _conditions;
+        }
+
+        //  Pre-set One2One fetch mode across all data sources
+        for (int i = 1; i <= query.dataSourceCount(); i++)
+        {
+            query.dataSourceNo(i).fetchMode(QueryFetchMode::One2One);
+        }
+
+        List conditionsList = strSplit(decodedConditions, '|');
+        ListEnumerator conditionsEnum = conditionsList.getEnumerator();
+
+        while (conditionsEnum.moveNext())
+        {
+            str condition = strLTrim(strRTrim(conditionsEnum.current()));
+            if (!condition)
+            {
+                continue;
+            }
+
+            List conditionParts = strSplit(condition, ';');
+            ListEnumerator partsEnum = conditionParts.getEnumerator();
+
+            str tablePart = '', fieldPart = '', value = '';
+            int partCounter = 1;
+
+            while (partsEnum.moveNext())
+            {
+                str val = strLTrim(strRTrim(partsEnum.current()));
+                if (partCounter == 1)
+                {
+                    tablePart = val;
+                }
+                else if (partCounter == 2)
+                {
+                    fieldPart = val;
+                }
+                else if (partCounter == 3)
+                {
+                    value = val;
+                }
+                partCounter++;
+            }
+
+            if (!tablePart)
+            {
+                continue;
+            }
+
+            TableId tableId = tableName2Id(tablePart);
+            if (!tableId)
+            {
+                tableId = str2Int(tablePart);
+            }
+            if (!tableId)
+            {
+                continue;
+            }
+
+            QueryBuildDataSource qbds = query.dataSourceTable(tableId);
+
+            if (!qbds)
+            {
+                QueryBuildDataSource rootQbds = query.dataSourceNo(1);
+                if (rootQbds)
+                {
+                    qbds = rootQbds.addDataSource(tableId);
+                    qbds.joinMode(JoinMode::OuterJoin);
+                    qbds.fetchMode(QueryFetchMode::One2One);
+                    qbds.relations(true);
+                }
+            }
+
+            if (!qbds || !fieldPart)
+            {
+                continue;
+            }
+
+            FieldId fieldId = fieldName2Id(tableId, fieldPart);
+            if (!fieldId)
+            {
+                fieldId = str2Int(fieldPart);
+            }
+            if (!fieldId)
+            {
+                continue;
+            }
+
+            FieldName conditionFieldName = fieldId2Name(tableId, fieldId);
+            if (!conditionFieldName)
+            {
+                continue;
+            }
+
+            if (qbds.joinMode() == JoinMode::OuterJoin)
+            {
+                QueryFilter queryFilter = SysQuery::findOrCreateQueryFilter(query, qbds, conditionFieldName);
+                if (queryFilter)
+                {
+                    queryFilter.value(value);
+                }
+            }
+            else
+            {
+                QueryBuildRange qbr = qbds.findRange(fieldId);
+                if (!qbr)
+                {
+                    qbr = qbds.addRange(fieldId);
+                }
+                qbr.value(value);
+            }
+        }
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>postLoad</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Post load method to convert query conditions to string on export
+    /// Populates conditions on export
     /// </summary>
     public void postLoad()
     {
@@ -97,139 +280,11 @@ public class METFulfilmentProfileEntity extends common
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>buildConditionQuery</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Builds the fulfilment condition query from a serialised condition string.
-    /// </summary>
-    /// <param name = "_conditions">Pipe delimited conditions, each line tableId; fieldId; value.</param>
-    /// <param name = "_profileId">Profile id, used for logging only.</param>
-    /// <returns>The condition query, based on METFulfilmentProfile::defaultQuery.</returns>
-    public static Query buildConditionQuery(str _conditions, METFulfilmentProfileId _profileId)
-    {
-        Query                   query;
-        List                    conditionsList;
-        ListEnumerator          conditionsEnum;
-        List                    conditionParts;
-        ListEnumerator          conditionPartsEnum;
-        QueryBuildDataSource    qbds;
-        QueryBuildRange         qbr;
-        QueryFilter             queryFilter;
-        FieldName               conditionFieldName;
-        str                     condition;
-        str                     partVal;
-        str                     value;
-        TableId                 tableId;
-        FieldId                 fieldId;
-        Counter                 partCounter;
-
-        // Always start from defaultQuery so the AOT structure of METFulfilmentConditionQuery is preserved.
-        query = METFulfilmentProfile::defaultQuery();
-
-        if (!_conditions)
-        {
-            return query;
-        }
-
-        conditionsList = strSplit(_conditions, '|');
-        conditionsEnum = conditionsList.getEnumerator();
-
-        while (conditionsEnum.moveNext())
-        {
-            condition = strLTrim(strRTrim(conditionsEnum.current()));
-
-            if (!condition)
-            {
-                continue;
-            }
-
-            conditionParts     = strSplit(condition, ';');
-            conditionPartsEnum = conditionParts.getEnumerator();
-            tableId     = 0;
-            fieldId     = 0;
-            value       = '';
-            partCounter = 1;
-
-            while (conditionPartsEnum.moveNext())
-            {
-                partVal = strLTrim(strRTrim(conditionPartsEnum.current()));
-
-                if (partCounter == 1)
-                {
-                    tableId = str2Int(partVal);
-                }
-                else if (partCounter == 2)
-                {
-                    fieldId = str2Int(partVal);
-                }
-                else if (partCounter == 3)
-                {
-                    value = partVal;
-                }
-
-                partCounter++;
-            }
-
-            if (!tableId || !fieldId)
-            {
-                warning(strFmt('@MET:TableConditionQuery',
-                    _profileId, condition));
-                continue;
-            }
-
-            qbds = query.dataSourceTable(tableId);
-
-            if (!qbds)
-            {
-                warning(strFmt('@MET:FieldconditionQuery',
-                    _profileId, tableId));
-                continue;
-            }
-
-            conditionFieldName = fieldId2Name(tableId, fieldId);
-
-            if (!conditionFieldName)
-            {
-                warning(strFmt('@MET:FieldconditionQuery',
-                    _profileId, fieldId, tableId));
-                continue;
-            }
-
-            if (qbds.joinMode() == JoinMode::OuterJoin)
-            {
-                queryFilter = SysQuery::findOrCreateQueryFilter(query, qbds, conditionFieldName);
-
-                if (queryFilter)
-                {
-                    queryFilter.value(value);
-                }
-            }
-            else
-            {
-                qbr = qbds.findRange(fieldId);
-
-                if (!qbr)
-                {
-                    qbr = qbds.addRange(fieldId);
-                }
-
-                qbr.value(value);
-            }
-        }
-
-        return query;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
 				<Name>mapEntityToDataSource</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Maps the unmapped Conditions string back to the packed query on import.
+    /// Maps conditions on row-level import
     /// </summary>
-    /// <param name = "_entityCtx">Entity runtime context.</param>
-    /// <param name = "_dataSourceCtx">Data source runtime context.</param>
     public void mapEntityToDataSource(DataEntityRuntimeContext _entityCtx, DataEntityDataSourceRuntimeContext _dataSourceCtx)
     {
         METFulfilmentProfile fulfilmentProfile;
@@ -257,37 +312,87 @@ public class METFulfilmentProfileEntity extends common
 				<Name>postTargetProcess</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// This runs even when the framework processes the entity set based and skips mapEntityToDataSource.
+    /// Post-target set-based processing across companies
     /// </summary>
-    /// <param name = "_dmfDefinitionGroupExecution">Definition group execution.</param>
     public static void postTargetProcess(DMFDefinitionGroupExecution _dmfDefinitionGroupExecution)
     {
         METFulfilmentProfileStaging staging;
-        METFulfilmentProfile        fulfilmentProfile;
+        METFulfilmentProfile        targetProfile;
+
+        ttsbegin;
 
         while select staging
             where staging.DefinitionGroup == _dmfDefinitionGroupExecution.DefinitionGroup
                && staging.ExecutionId     == _dmfDefinitionGroupExecution.ExecutionId
         {
-            if (!staging.ProfileId || !staging.Conditions)
+            if (!staging.ProfileId)
             {
                 continue;
             }
 
-            ttsbegin;
+            select firstonly crosscompany targetProfile
+                where targetProfile.ProfileId == staging.ProfileId;
 
-            select firstonly forupdate fulfilmentProfile
-                where fulfilmentProfile.ProfileId == staging.ProfileId;
-
-            if (fulfilmentProfile.RecId)
+            if (targetProfile.RecId)
             {
-                fulfilmentProfile.ConditionQueryPacked =
-                    METFulfilmentProfileEntity::buildConditionQuery(staging.Conditions, staging.ProfileId).pack();
-                fulfilmentProfile.update();
-            }
+                RecId targetRecId = targetProfile.RecId;
 
-            ttscommit;
+                changecompany(targetProfile.DataAreaId)
+                {
+                    select firstonly forupdate targetProfile
+                        where targetProfile.RecId == targetRecId;
+
+                    if (staging.Conditions)
+                    {
+                        targetProfile.ConditionQueryPacked =
+                            METFulfilmentProfileEntity::buildConditionQuery(staging.Conditions, staging.ProfileId).pack();
+                    }
+
+                    if (staging.Description)
+                    {
+                        targetProfile.Description = staging.Description;
+                    }
+
+                    if (staging.InventLocationId)
+                    {
+                        targetProfile.InventLocationId = staging.InventLocationId;
+                    }
+
+                    targetProfile.ApplicableProcess = staging.ApplicableProcess
+                        ? staging.ApplicableProcess
+                        : METFulfilmentProfileApplicableProcess::CSDSalesOrderExtract;
+
+                    targetProfile.update();
+                }
+            }
+            else
+            {
+                changecompany(staging.DataAreaId)
+                {
+                    targetProfile.clear();
+                    targetProfile.ProfileId         = staging.ProfileId;
+                    targetProfile.Description       = staging.Description;
+                    targetProfile.InventLocationId  = staging.InventLocationId;
+                    targetProfile.ApplicableProcess = staging.ApplicableProcess
+                        ? staging.ApplicableProcess
+                        : METFulfilmentProfileApplicableProcess::CSDSalesOrderExtract;
+
+                    if (staging.Conditions)
+                    {
+                        targetProfile.ConditionQueryPacked =
+                            METFulfilmentProfileEntity::buildConditionQuery(staging.Conditions, staging.ProfileId).pack();
+                    }
+                    else
+                    {
+                        targetProfile.ConditionQueryPacked = METFulfilmentProfile::defaultQuery().pack();
+                    }
+
+                    targetProfile.insert();
+                }
+            }
         }
+
+        ttscommit;
     }
 
 ]]></Source>
@@ -300,6 +405,7 @@ public class METFulfilmentProfileEntity extends common
 	</SubscriberAccessLevel>
 	<DataManagementEnabled>Yes</DataManagementEnabled>
 	<DataManagementStagingTable>METFulfilmentProfileStaging</DataManagementStagingTable>
+	<EnableSetBasedSqlOperations>No</EnableSetBasedSqlOperations>
 	<IsPublic>Yes</IsPublic>
 	<PrimaryCompanyContext>DataAreaId</PrimaryCompanyContext>
 	<PrimaryKey>EntityKey</PrimaryKey>
@@ -358,6 +464,12 @@ public class METFulfilmentProfileEntity extends common
 		<AxDataEntityViewField xmlns=""
 			i:type="AxDataEntityViewUnmappedFieldString">
 			<Name>Conditions</Name>
+			<ExtendedDataType>Notes</ExtendedDataType>
+			<IsComputedField>No</IsComputedField>
+		</AxDataEntityViewField>
+		<AxDataEntityViewField xmlns=""
+			i:type="AxDataEntityViewUnmappedFieldString">
+			<Name>ConditionQueryPackedStr</Name>
 			<ExtendedDataType>Notes</ExtendedDataType>
 			<IsComputedField>No</IsComputedField>
 		</AxDataEntityViewField>
