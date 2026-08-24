@@ -12,8 +12,16 @@ public class METRebateCombinedSplitTask extends RunBaseBatch implements BatchRet
     private TAMRebateToDate toDate;
     private TransDate transDate;
     private boolean processRebate;
+    private boolean postRebate;
+
     private boolean processWriteOff;
+    private boolean postWriteOff;
+
+    private boolean processProvision;
+    private boolean postProvision;
+
     private boolean initiatePrintInvoice;
+    private METAutoSetDate metAutoSetDate;
 
 }
 ]]></Declaration>
@@ -63,10 +71,18 @@ public class METRebateCombinedSplitTask extends RunBaseBatch implements BatchRet
 			<Method>
 				<Name>parmScope</Name>
 				<Source><![CDATA[
-    public void parmScope(boolean _r, boolean _w)
+    public void parmScope(boolean _p, boolean _pp, boolean _r, boolean _rp, boolean _w, boolean _wp, METAutoSetDate _autosetDate)
     {
         processRebate = _r;
+        postRebate = _rp;
+        
+        processProvision = _p;
+        postProvision = _pp;
+
         processWriteOff = _w;
+        postWriteOff = _wp;
+
+        metAutoSetDate = _autosetDate;
     }
 
 ]]></Source>
@@ -96,44 +112,97 @@ public class METRebateCombinedSplitTask extends RunBaseBatch implements BatchRet
         batchHeader = BatchHeader::getCurrentBatchHeader();
 
         Batchable rebatePostTask;
+        Batchable provisionPostTask;
+
+        List rebateCreateTasks;
+        List provisionCreateTask;
+        List writeOffCreateTasks;
 
         if (processRebate)
         {
             // Phase 1: parallel Rebate create-trans, one task per work unit (respecting reconcile-by).
-            List rebateCreateTasks = this.queueCreateTasks(TAMRebateTransactionType::Rebate, dealRecIds);
+            rebateCreateTasks = this.queueCreateTasks(TAMRebateTransactionType::Rebate, dealRecIds);
+        }
 
+        if(postRebate)
+        {
             // Phase 2: single-threaded Rebate post over all deals, gated on ALL Phase-1 tasks.
             // Posting is single-threaded by design: it writes shared ledger / subledger / voucher
             // number sequences that are not partitioned by deal and cannot run concurrently.
             rebatePostTask = METRebatePostTask::construct(
-                TAMRebateTransactionType::Rebate, METRebateCombinedSplitTask::getDealsToPost(dealRecIds), fromDate, toDate, transDate, this.parmInitiatePrintInvoice());
+                TAMRebateTransactionType::Rebate, METRebateCombinedSplitTask::getDealsToPost(dealRecIds), fromDate, toDate, transDate, this.parmInitiatePrintInvoice(), metAutoSetDate);
             this.queueRuntimeTask(rebatePostTask);
-            this.addDependencies(rebatePostTask, rebateCreateTasks);
+            
+            if (rebateCreateTasks.elements() > 0)
+            {
+                this.addDependencies(rebatePostTask, rebateCreateTasks);
+            }
+        }
+
+        if (processProvision)
+        {
+            // Phase 1: parallel Rebate create-trans, one task per work unit (respecting reconcile-by).
+            provisionCreateTask = this.queueCreateTasks(TAMRebateTransactionType::Provision, dealRecIds);
+        }
+
+        if(postProvision)
+        {
+            // Phase 2: single-threaded Rebate post over all deals, gated on ALL Phase-1 tasks.
+            // Posting is single-threaded by design: it writes shared ledger / subledger / voucher
+            // number sequences that are not partitioned by deal and cannot run concurrently.
+            provisionPostTask = METRebatePostTask::construct(
+                TAMRebateTransactionType::Provision, METRebateCombinedSplitTask::getDealsToPost(dealRecIds), fromDate, toDate, transDate, this.parmInitiatePrintInvoice(), metAutoSetDate);
+            this.queueRuntimeTask(provisionPostTask);
+            
+            if (provisionCreateTask.elements() > 0)
+            {
+                this.addDependencies(provisionPostTask, provisionCreateTask);
+            }
+        }
+
+        container writeOffDeals;
+        if (processWriteOff || postWriteOff)
+        {
+            // Standard excludes RebateOutputType::Item for non-Rebate types (the packed-records path
+            // bypasses the controller's query lock, so we apply the filter here).
+            writeOffDeals = METRebateCombinedFlow::filterNonItemOutput(dealRecIds);
         }
 
         if (processWriteOff)
         {
-            // Standard excludes RebateOutputType::Item for non-Rebate types (the packed-records path
-            // bypasses the controller's query lock, so we apply the filter here).
-            container writeOffDeals = METRebateCombinedFlow::filterNonItemOutput(dealRecIds);
             if (conLen(writeOffDeals) > 0)
             {
                 // Phase 3: parallel Write-off create-trans. Write-off references previously-posted
                 // rebate amounts, so it must start only AFTER Rebate post has finished.
-                List writeOffCreateTasks = this.queueCreateTasks(TAMRebateTransactionType::WriteOff, writeOffDeals);
-                if (rebatePostTask)
+                writeOffCreateTasks = this.queueCreateTasks(TAMRebateTransactionType::WriteOff, writeOffDeals);
+                if (rebatePostTask || provisionPostTask)
                 {
                     ListEnumerator le = writeOffCreateTasks.getEnumerator();
                     while (le.moveNext())
                     {
-                        batchHeader.addDependency(le.current(), rebatePostTask, BatchDependencyStatus::FinishedOrError);
+                        if (rebatePostTask)
+                        {
+                            batchHeader.addDependency(le.current(), rebatePostTask, BatchDependencyStatus::FinishedOrError);
+                        }
+
+                        if (provisionPostTask)
+                        {
+                            batchHeader.addDependency(le.current(), provisionPostTask, BatchDependencyStatus::FinishedOrError);
+                        }
                     }
                 }
+            }
+        }
 
-                // Phase 4: single-threaded Write-off post, gated on ALL Phase-3 tasks.
-                Batchable writeOffPostTask = METRebatePostTask::construct(
-                    TAMRebateTransactionType::WriteOff, METRebateCombinedSplitTask::getDealsToPost(writeOffDeals), fromDate, toDate, transDate, this.parmInitiatePrintInvoice());
-                this.queueRuntimeTask(writeOffPostTask);
+        if (postWriteOff)
+        {
+            // Phase 4: single-threaded Write-off post, gated on ALL Phase-3 tasks.
+            Batchable writeOffPostTask = METRebatePostTask::construct(
+                    TAMRebateTransactionType::WriteOff, METRebateCombinedSplitTask::getDealsToPost(writeOffDeals), fromDate, toDate, transDate, this.parmInitiatePrintInvoice(), metAutoSetDate);
+            this.queueRuntimeTask(writeOffPostTask);
+
+            if (writeOffCreateTasks.elements() > 0)
+            {
                 this.addDependencies(writeOffPostTask, writeOffCreateTasks);
             }
         }
@@ -227,7 +296,7 @@ public class METRebateCombinedSplitTask extends RunBaseBatch implements BatchRet
 				<Source><![CDATA[
     private void queueCreateTask(List _createTasks, TAMRebateTransactionType _type, TableId _tableId, container _recIds)
     {
-        METRebateCreateTask task = METRebateCreateTask::construct(_type, _tableId, _recIds, fromDate, toDate);
+        METRebateCreateTask task = METRebateCreateTask::construct(_type, _tableId, _recIds, fromDate, toDate, metAutoSetDate);
         this.queueRuntimeTask(task);
         _createTasks.addEnd(task);
     }
