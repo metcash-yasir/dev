@@ -63,9 +63,7 @@ class METCPIRepricingTaskService extends METSysOperationTaskService
         {
             try
             {
-                ttsbegin;
                 this.execute();
-                ttscommit;
             }
             catch (Exception::Error)
             {
@@ -186,42 +184,50 @@ class METCPIRepricingTaskService extends METSysOperationTaskService
     /// </summary>
     private void execute()
     {
-        #OCCRetryCount
-        METInventTransReserveService reserveService;
+        const int METRetryNum = 2;
         SalesLine                    salesLine;
         METSalesLine                 metSalesLine;
+        
+        SalesTable salesTable = SalesTable::find(salesId);
 
-        try
+        setPrefix(strFmt("@MET:CPISOPricing %1", salesTable.SalesId));
+
+        if (salesTable.METOrderExtractStatus == METOrderExtractStatus::Open)
         {
-            if (SalesTable::find(salesId).METOrderExtractStatus == METOrderExtractStatus::Open)
-            {
-                ttsbegin;
+            try
+            {            
+                // Bug 416940: Manage Legislative Charges - Error in in CPI Sales order Repricing batch job
+                // Broke down the 1 long single transactions into 4 smaller transactions to avoid deadlocks and update conflicts
+                // Removed forupdate locks, unnecessary loops and multiple db trips
 
-                // Process SalesLines linked to the current SalesId
-                while select forupdate salesLine
-                    where salesLine.SalesId == salesId
-                {
-                    // Delete the components after line is reserved for event orders
-                    salesLine.metDeletePriceComponents();
+                // Delete the components for entire order
+                salesTable.metDeletePriceComponents();
 
-                    if (salesLine.metSalesLine().BonusType == METBonusType::DiscountBonus)
-                    {
-                        SalesUpdateRemain::updateDeliveryRemainder(salesLine, 0, 0);
-                    }
-
-                    select firstonly forupdate metSalesLine
-                    where metSalesLine.salesLine == salesLine.RecId;
-
-                    if (metSalesLine.RecId && metSalesLine.OrderedQuantity < salesLine.SalesQty)
-                    {
-                        metSalesLine.OrderedQuantity = salesLine.SalesQty;
-                        metSalesLine.update();
-                    }
-
+                // Cancel bonus lines (should not be that many)
+                // Note the cancellation will trigger Dual Write
+                while select salesLine
+                    join metSalesLine
+                     where salesLine.SalesId == salesId
+                        && metSalesLine.SalesLine == salesLine.RecId
+                        && metSalesLine.BonusType == METBonusType::DiscountBonus
+                        && salesLine.SalesStatus != SalesStatus::Canceled
+                {              
+                    salesLine.metCancelSalesOrderLine();            
                 }
 
+                // Update pre-quota qty
+                // Note the OrderedQuantity will trigger Dual Write
+                ttsbegin;
+                update_recordset metSalesLine
+                setting OrderedQuantity = salesLine.SalesQty
+                join salesLine
+                    where metSalesLine.SalesLine == salesLine.RecId
+                       && salesLine.SalesId == salesId
+                       && metSalesLine.OrderedQuantity < salesLine.SalesQty;
+                ttscommit;
+
                 // Update SalesTable header
-                SalesTable salesTable = SalesTable::find(salesId);
+                ttsbegin;
                 METSalesTable metSalesTable = salesTable.metSalesTable();
 
                 metSalesTable.selectForUpdate(true);
@@ -231,36 +237,36 @@ class METCPIRepricingTaskService extends METSysOperationTaskService
 
                 ttscommit;
             }
-        }
-        catch (Exception::Deadlock)
-        {
-            // Retry logic for deadlocks
-            if (xSession::currentRetryCount() < #RetryNum)
+            catch (Exception::Deadlock)
             {
-                retry;
+                if (xSession::currentRetryCount() >= METRetryNum)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
             }
-            else
+            catch (Exception::UpdateConflict)
             {
-                throw Exception::Deadlock;
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= METRetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
             }
-        }
-        catch (Exception::UpdateConflict)
-        {
-            // Retry logic for update conflicts
-            if (appl.ttsLevel() == 0 && xSession::currentRetryCount() < #RetryNum)
-            {
-                retry;
-            }
-            else
-            {
-                throw Exception::UpdateConflictNotRecovered;
-            }
-        }
-        catch (Exception::Error)
-        {
-            // Catch-all for unexpected errors
-            Global::exceptionTextFallThrough();
-        }
+        }        
     }
 
 ]]></Source>
