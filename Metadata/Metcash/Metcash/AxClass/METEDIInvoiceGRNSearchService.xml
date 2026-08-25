@@ -1,0 +1,291 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METEDIInvoiceGRNSearchService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// Processes pending vendor invoices based on the configured query and
+/// cut-off period. Updates the invoice GRN status and performs product
+/// </summary>
+/// 
+class METEDIInvoiceGRNSearchService extends SysOperationServiceBase
+{
+    /// <summary>
+    /// Processes pending vendor invoices based on the configured query and
+    /// cut-off period. Updates the invoice GRN status and performs product
+    /// receipt matching where applicable.
+    /// </summary>
+    /// <param name="_contract">
+    /// Contract containing the invoice query and cut-off days.
+    /// </param>
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    public void process(METEDIInvoiceGRNSearchContract _contract)
+    {
+        QueryRun                queryRunWaiting;
+        VendInvoiceInfoTable    VendInvoiceInfoTable;
+        VendInvoiceInfoLine     vendInvoiceInfoLine;
+        VendInvoiceInfoSubLine  vendInvoiceInfoSubline;
+        Query                   queryWaiting;
+        int                     cutoffDays = _contract.parmCutoffDays();
+        TransDate               currentDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+        TransDate               cutOffDate = currentDate - cutoffDays;
+         
+        queryWaiting  = _contract.getQuery();
+
+        queryWaiting.dataSourceTable(tableNum(VendInvoiceInfoTable))
+        .addRange(fieldNum(VendInvoiceInfoTable, ReceivedDate))
+            .value(SysQuery::range(cutOffDate,  currentDate));
+        
+        queryRunWaiting = new QueryRun(queryWaiting);
+
+        while (queryRunWaiting.next())
+        {
+            vendInvoiceInfoTable = queryRunWaiting.get(tableNum(VendInvoiceInfoTable));
+
+            try
+            {
+                this.processWaitingInvoice(vendInvoiceInfoTable, currentDate);
+            }
+            catch (Exception::Error)
+            {
+                error(strFmt(
+                    "@MET:EDIGrnSearchFailed",
+                    VendInvoiceInfoTable.DocumentNum));
+            }
+        }
+
+        ttsBegin;
+
+        update_recordset vendInvoiceInfoTable
+            setting METEDIGrnStatusValue = METEDIGrnStatus::Queue
+            where vendInvoiceInfoTable.ReceivedDate < cutOffDate
+               && vendInvoiceInfoTable.METEDIInvoice == NoYes::Yes
+               && vendInvoiceInfoTable.METEDIGrnStatusValue == METEDIGrnStatus::Waiting
+               && vendInvoiceInfoTable.PurchId != "";
+
+        ttsCommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasProductReceipt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether product receipts exist for any line
+    /// on the specified pending vendor invoice.
+    /// </summary>
+    /// <param name="_vendInvoiceInfoTable">
+    /// Pending vendor invoice header.
+    /// </param>
+    /// <returns>
+    /// True if at least one product receipt exists; otherwise, false.
+    /// </returns>
+    private boolean hasProductReceipt(
+    VendInvoiceInfoTable _vendInvoiceInfoTable)
+    {
+        VendInvoiceInfoLine vendInvoiceInfoLine;
+        PurchLine           purchLine;
+        VendPackingSlipTrans vendPackingSlipTrans;
+
+        select firstOnly RecId
+        from vendPackingSlipTrans
+        exists join purchLine
+            where purchLine.InventTransId == vendPackingSlipTrans.InventTransId
+        exists join vendInvoiceInfoLine
+            where vendInvoiceInfoLine.PurchLineRecId == purchLine.RecId
+               && vendInvoiceInfoLine.ParmId == _vendInvoiceInfoTable.ParmId
+               && vendInvoiceInfoLine.TableRefId == _vendInvoiceInfoTable.TableRefId;
+
+        return vendPackingSlipTrans.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createPendingVendorInvoiceInfoSubLines</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create the pending vendor invoice lines of the PO.
+    /// </summary>
+    /// <param name = "VendInvoiceInfoLine">VendInvoiceInfoLine</param>
+
+    // New helper: cap subline quantities to match the invoice line’s quantity
+    private void createPendingVendorInvoiceInfoSubLines(
+        VendInvoiceInfoLine _vendInvoiceInfoLine)
+    {
+        VendPackingSlipTrans  vendPackingSlipTrans;
+        VendInvoiceInfoSubLine  vendInvoiceInfoSubLine;
+
+        while select InventTransId, PackingSlipId, Qty, RecId, TableId, PdsCWQty from vendPackingSlipTrans
+                where vendPackingSlipTrans.InventTransId == _vendInvoiceInfoLine.purchLine().InventTransId
+        {
+            vendInvoiceInfoSubLine.clear();
+            vendInvoiceInfoSubLine.initValue();
+            vendInvoiceInfoSubLine.defaultRow();
+
+            vendInvoiceInfoSubLine.ParmId               = _vendInvoiceInfoLine.ParmId;
+            vendInvoiceInfoSubLine.InventNow            = vendPackingSlipTrans.Qty;
+            vendInvoiceInfoSubLine.ReceiveNow           = vendPackingSlipTrans.Qty;
+            vendInvoiceInfoSubLine.PdsCWInventNow       = vendPackingSlipTrans.PdsCWQty;
+            vendInvoiceInfoSubLine.DocumentId           = vendPackingSlipTrans.PackingSlipId;
+            vendInvoiceInfoSubLine.LineRefRecId         = _vendInvoiceInfoLine.RecId;
+            vendInvoiceInfoSubLine.JournalRefRecId      = vendPackingSlipTrans.RecId;
+            vendInvoiceInfoSubLine.JournalRefTableId    = vendPackingSlipTrans.TableId;
+
+            vendInvoiceInfoSubLine.insert();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateReceiptedData</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Update the receipted data on the vendor invoice info line.
+    /// </summary>
+    /// <param name = "_vendInvoiceInfoLine">Pending vendor invoice line</param>
+    /// <param name = "_purchLine">PO line</param>
+    protected void updateReceiptedData(VendInvoiceInfoLine _vendInvoiceInfoLine, PurchLine _purchLine)
+    {
+        ReasonTable reason;
+
+        ttsbegin;
+        _vendInvoiceInfoLine.reread();
+        _vendInvoiceInfoLine.selectForUpdate(true);
+        _vendInvoiceInfoLine.METReceiptedUnit           = _purchLine.PurchPrice;
+        _vendInvoiceInfoLine.METReceiptedQuantity       = _vendInvoiceInfoLine.purchQtyMatched();
+        _vendInvoiceInfoLine.METReceiptedCWQuantity     = _vendInvoiceInfoLine.pdsCWQtyMatched();
+        _vendInvoiceInfoLine.METReceiptedLineNetAmount  = _vendInvoiceInfoLine.METReceiptedQuantity * _purchLine.PurchPrice; 
+               
+        _vendInvoiceInfoLine.update();
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>matchProductReceipts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Matches product receipts for the specified pending vendor invoice.
+    /// </summary>
+    /// <param name="_vendInvoiceInfoTable">
+    /// Pending vendor invoice header.
+    /// </param>
+    private void matchProductReceipts(VendInvoiceInfoTable _vendInvoiceInfoTable)
+    {
+        VendInvoiceInfoLine vendInvoiceInfoLine;
+        PurchLine           purchLine;
+
+        while select forUpdate vendInvoiceInfoLine
+        where vendInvoiceInfoLine.ParmId     == _vendInvoiceInfoTable.ParmId
+           && vendInvoiceInfoLine.TableRefId == _vendInvoiceInfoTable.TableRefId
+        {
+            purchLine = vendInvoiceInfoLine.purchLine();
+
+            this.createPendingVendorInvoiceInfoSubLines(vendInvoiceInfoLine);
+
+            this.updateReceiptedData(vendInvoiceInfoLine, purchLine);
+
+            PurchFormletterParmDataInvoice::createVendInvoiceMatchingLineForServices(
+                        vendInvoiceInfoLine,
+                        purchLine,
+                        _vendInvoiceInfoTable.VarianceApproved,
+                        true);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getReasonCodeForVarianceType</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the reason code for the variance type.
+    /// </summary>
+    /// <param name = "_varianceType">Variance type</param>
+    /// <param name = "_createClaim">True/false</param>
+    /// <returns>Reason code</returns>
+    public ReasonTable getReasonCodeForVarianceType(METVarianceType _varianceType, NoYes _claim)
+    {
+        ReasonTable reason;
+
+        select firstonly reason
+            where reason.METVarianceType == _varianceType
+            && reason.METInvoiceMatch == NoYes::Yes
+            && reason.METClaim == _claim;
+
+        return reason;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>hasMultipleProductReceipts</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if there are multiple product receipts for the purchase order.
+    /// </summary>
+    /// <param name = "_purchId">PurchId</param>
+    /// <returns>Ture/false</returns>
+    public boolean hasMultipleProductReceipts(PurchId _purchId)
+    {
+        VendPackingSlipJour vendPackingSlipJour;
+
+        // Count packing slip journal records that reference the PurchId.
+        // The "select count(RecId)" returns the count in vendPackingSlipJour.RecId.
+        select count(RecId) from vendPackingSlipJour
+            where vendPackingSlipJour.PurchId == _purchId;
+
+        return vendPackingSlipJour.RecId > 1;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processWaitingInvoice</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Updates invoice status to GRN when matching product receipts exist.
+    /// </summary>
+    /// <param name="_vendInvoiceInfoTable">
+    /// Invoice header record.
+    /// </param>
+    /// <param name="_currentDate">
+    /// Processing date.
+    /// </param>
+    private void processWaitingInvoice(
+    VendInvoiceInfoTable _vendInvoiceInfoTable,
+    TransDate            _currentDate)
+    {
+        if (this.hasProductReceipt(_vendInvoiceInfoTable))
+        {
+            ttsbegin;
+
+            this.matchProductReceipts(_vendInvoiceInfoTable);
+
+            _vendInvoiceInfoTable.selectForUpdate(true);
+            _vendInvoiceInfoTable.METEDIGrnStatusValue = METEDIGrnStatus::GRN;
+            _vendInvoiceInfoTable.DocumentDate = VendInvoiceInfoTable::metInvoiceDateForMultipleReceipt(_vendInvoiceInfoTable);
+            _vendInvoiceInfoTable.TransDate    = _currentDate;
+            _vendInvoiceInfoTable.modifiedField(fieldNum(VendInvoiceInfoTable, DocumentDate));
+
+            _vendInvoiceInfoTable.update();
+
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
