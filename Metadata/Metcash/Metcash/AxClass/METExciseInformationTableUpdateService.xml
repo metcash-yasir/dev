@@ -116,6 +116,7 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                 contract.parmCreateDutyCredit(metExciseRegisterOriginTypes.CreateDutyCredit);
 
                 batchHeader.addRuntimeTask(runTaskController, this.getCurrentBatchTask().RecId);
+                
             }
             else
             {
@@ -146,34 +147,67 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
     /// <param name = "_contract">Contract class reference</param>
     public void runExciseInformationTableUpdate(METExciseInformationTableUpdateContract     _contract)
     {
-        METInventTransExciseRegisterUpdateView          metInventTransExciseRegisterUpdateView, metInventTransExciseViewFilter;
+        //METInventTransExciseRegisterUpdateView          metInventTransExciseRegisterUpdateView, metInventTransExciseViewFilter;
+        InventTrans                                     InventTrans;
+        InventTransOrigin                               InventTransOrigin, InventTransOriginExcise;
         boolean                                         validInsert;
         boolean                                         isReturn;
         boolean                                         validPreInsert, onlyCredit;
         METExciseRegisterEntry                          metExciseRegisterEntry;
         TransDateTime                                   transDateTime = DateTimeUtil::utcNow();
         METExciseInformationTable                       mETExciseInformationTablePOReturnUpdate; 
+        METExciseInformationTable                       exciseInformationTable;
         METCustParameters                               metCustParameters = METCustParameters::Find();
+        ReferenceNumber                                 referenceNumber;
+        METInventTable                                  metInventTable;
 
+
+        setPrefix(strFmt("Processing %1", _contract.parmReferenceId()));
         // Process excise register entries together with related inventory transactions for specific category PO/TO to build the records into excise information table with business rules.
         while select validtimestate(transDateTime) metExciseRegisterEntry
-            exists join metInventTransExciseViewFilter
+           where metExciseRegisterEntry.Migrated == NoYes::No
+                && metExciseRegisterEntry.IsError == NoYes::No
+            exists join metInventTable
+                where  metInventTable.ItemId == metExciseRegisterEntry.ItemId
+                && metInventTable.METTariffItemCodeBaseRecid  != 0
+            exists join InventTransOrigin
+                where InventTransOrigin.ReferenceId == metExciseRegisterEntry.Ordernumber
+                && (InventTransOrigin.ReferenceCategory == InventTransType::Purch
+                    || InventTransOrigin.ReferenceCategory == InventTransType::TransferOrderReceive)
+                && InventTransOrigin.ReferenceCategory == _contract.parmReferenceId()
+                && InventTransOrigin.ItemId == metExciseRegisterEntry.ItemId
+            notexists join metExciseInformationTable
+                where metExciseInformationTable.ExciseRegisterReferenceId == metExciseRegisterEntry.ReferenceId
+            /*exists join metInventTransExciseViewFilter
                 where metInventTransExciseViewFilter.ItemId == metExciseRegisterEntry.ItemId
                 && metInventTransExciseViewFilter.ReferenceId == metExciseRegisterEntry.OrderNumber
                 && (metInventTransExciseViewFilter.ReferenceCategory == InventTransType::Purch
                     || metInventTransExciseViewFilter.ReferenceCategory == InventTransType::TransferOrderReceive)
                 && metInventTransExciseViewFilter.ReferenceCategory == _contract.parmReferenceId()
                 && metExciseRegisterEntry.Migrated == NoYes::No
-                && metExciseRegisterEntry.IsError == NoYes::No
-            notexists join metExciseInformationTable
-                where metExciseInformationTable.ExciseRegisterReferenceId == metExciseRegisterEntry.ReferenceId
-        {
+                && metExciseRegisterEntry.IsError == NoYes::No*/
+        {           
+
             if (_contract.parmTransactionType() == METTransactionType::Positive && metExciseRegisterEntry.ReceiptQuantity > 0)
             {
+
                 // This is to check whether the inventtrans record already exists in excise information table for the same item and order number.
                 // Scenario where PO has multiple lines for same item and same order number.
 
-                select firstonly ReferenceId, ReferenceCategory, InventTransRecId, ItemId, inventDimId, InventTransId, StatusReceipt from metInventTransExciseRegisterUpdateView
+
+                select firstonly ReferenceId, ReferenceCategory, ItemId, InventTransId  
+                    from InventTransOriginExcise
+                    where InventTransOriginExcise.ItemId == metExciseRegisterEntry.ItemId
+                        && InventTransOriginExcise.ReferenceCategory == _contract.parmReferenceId()
+                        && InventTransOriginExcise.ReferenceId == metExciseRegisterEntry.OrderNumber
+                        && ((InventTransOriginExcise.ReferenceCategory == InventTransType::Purch || InventTransOriginExcise.ReferenceCategory == InventTransType::TransferOrderReceive))
+                        join RecId, StatusReceipt, inventDimId from InventTrans
+                            where InventTrans.InventTransOrigin == InventTransOriginExcise.RecId
+                            && (InventTrans.StatusReceipt == StatusReceipt::Received || InventTrans.StatusReceipt == StatusReceipt::Purchased)
+                            notexists join exciseInformationTable
+                                where exciseInformationTable.InventTransRefRecId == InventTrans.RecId
+                                && exciseInformationTable.Lodgement == metExciseInformationTable.Lodgement;
+                /*select firstonly ReferenceId, ReferenceCategory, InventTransRecId, ItemId, inventDimId, InventTransId, StatusReceipt from metInventTransExciseRegisterUpdateView
                     where metInventTransExciseRegisterUpdateView.ItemId == metExciseRegisterEntry.ItemId &&
                         metInventTransExciseRegisterUpdateView.ReferenceId == metExciseRegisterEntry.OrderNumber &&
                     metInventTransExciseRegisterUpdateView.ReferenceCategory == _contract.parmReferenceId() &&
@@ -182,35 +216,37 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                     notexists join metExciseInformationTable
                         where metInventTransExciseRegisterUpdateView.InventTransRecId == metExciseInformationTable.InventTransRefRecId &&
                                 metExciseInformationTable.Lodgement == metExciseRegisterEntry.Lodgement;
-
+                */
                 // continue to next if no inventtrans record found for the excise register entry.
-                if (!metInventTransExciseRegisterUpdateView.RecId)
+                if (!InventTransOriginExcise.RecId)
                 {
                     this.flagErrorInRegisterEntry(metExciseRegisterEntry);
                     continue;
                 }
 
                 metExciseInformationTable.clear();
-                metExciseInformationTable.ReferenceNumber                   = metInventTransExciseRegisterUpdateView.ReferenceId;
-                metExciseInformationTable.InventTransType                   = metInventTransExciseRegisterUpdateView.ReferenceCategory;
-                metExciseInformationTable.InventTransRefRecId               = metInventTransExciseRegisterUpdateView.InventTransRecId;
-                metExciseInformationTable.ItemId                            = metInventTransExciseRegisterUpdateView.ItemId;
-                metExciseInformationTable.SiteId                            = this.getInventSiteFromInventDimId(metInventTransExciseRegisterUpdateView.inventDimId);
-                metExciseInformationTable.InventTransId                     = metInventTransExciseRegisterUpdateView.InventTransId;
+                metExciseInformationTable.ReferenceNumber                   = InventTransOriginExcise.ReferenceId;
+                metExciseInformationTable.InventTransType                   = InventTransOriginExcise.ReferenceCategory;
+                metExciseInformationTable.InventTransRefRecId               = InventTrans.RecId;
+                metExciseInformationTable.ItemId                            = InventTransOriginExcise.ItemId;
+                metExciseInformationTable.SiteId                            = InventTrans.inventDim().InventSiteId; //.this.getInventSiteFromInventDimId(InventTrans.inventDimId);
+                metExciseInformationTable.InventTransId                     = InventTransOriginExcise.InventTransId;
                 metExciseInformationTable.ExciseRegisterReferenceId         = metExciseRegisterEntry.ReferenceId;
-                metExciseInformationTable.VersionNumberRegister                     = metExciseRegisterEntry.VersionNumberRegister;
+                metExciseInformationTable.VersionNumberRegister             = metExciseRegisterEntry.VersionNumberRegister;
                 
-                switch (metInventTransExciseRegisterUpdateView.ReferenceCategory)
+                switch (InventTransOriginExcise.ReferenceCategory)
                 {
                     case InventTransType::Purch:
-                        StatusReceipt purchStatus = metInventTransExciseRegisterUpdateView.StatusReceipt;
+                        StatusReceipt purchStatus = InventTrans.StatusReceipt;
  
                         if (purchStatus == StatusReceipt::Received ||  purchStatus == StatusReceipt::Purchased)
                         {
                             //<Task 278335: CB521 - Excise Register - Undertake Build - Part 9 (SG) - Account for receiving adjustments on the register>
                             if (metExciseInformationTable.InventoryQty < 0)
                             {
-                                select firstonly forupdate mETExciseInformationTablePOReturnUpdate order by RecId desc
+                                select firstonly forupdate mETExciseInformationTablePOReturnUpdate 
+                                    index hint ItemSiteLodgmentClosedIdx
+                                    order by RecId desc
                                     where mETExciseInformationTablePOReturnUpdate.ItemId == metExciseInformationTable.ItemId
                                     && mETExciseInformationTablePOReturnUpdate.SiteId == metExciseInformationTable.SiteId
                                     && mETExciseInformationTablePOReturnUpdate.LodgementClosed == NoYes::No
@@ -230,14 +266,14 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                             }
                             //</Task 278335: CB521 - Excise Register - Undertake Build - Part 9 (SG) - Account for receiving adjustments on the register>
 
-                            validInsert = this.mapTransferOrderShipAndReceiveData(metExciseInformationTable, metExciseRegisterEntry, metInventTransExciseRegisterUpdateView);
+                            validInsert = this.mapTransferOrderShipAndReceiveData(metExciseInformationTable, metExciseRegisterEntry, InventTransOriginExcise);
                         }
                         break;
 
                     case InventTransType::TransferOrderReceive:
-                        if (metInventTransExciseRegisterUpdateView.StatusReceipt == StatusReceipt::Purchased)
+                        if (inventTrans.StatusReceipt == StatusReceipt::Purchased)
                         {
-                            validInsert = this.mapTransferOrderShipAndReceiveData(metExciseInformationTable, metExciseRegisterEntry, metInventTransExciseRegisterUpdateView);
+                            validInsert = this.mapTransferOrderShipAndReceiveData(metExciseInformationTable, metExciseRegisterEntry, InventTransOriginExcise);
                         }
                         break;
 
@@ -248,69 +284,91 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
             }
         }
 
-        while select metInventTransExciseRegisterUpdateView
-     where metInventTransExciseRegisterUpdateView.ReferenceCategory == _contract.parmReferenceId()
-         notexists join metExciseInformationTable
-             where metInventTransExciseRegisterUpdateView.InventTransRecId == metExciseInformationTable.InventTransRefRecId
+        referenceNumber = "";
+        while select InventTransOriginExcise
+            where InventTransOriginExcise.ReferenceCategory == _contract.parmReferenceId()
+            join metInventTable 
+                where metInventTable.ItemId == InventTransOriginExcise.ItemId
+                && metInventTable.METTariffItemCodeBaseRecid != 0
+            join InventTrans
+                where InventTrans.inventTransOrigin == InventTransOriginExcise.recid
+                && (((InventTrans.StatusIssue == StatusIssue::Sold
+                    || InventTrans.StatusIssue == StatusIssue::Deducted) && InventTrans.StatusReceipt == StatusReceipt::None)
+                    || ((InventTrans.StatusReceipt == StatusReceipt::Purchased 
+                    || InventTrans.StatusReceipt == StatusReceipt::Received) &&  InventTrans.StatusIssue == StatusIssue::None))
+                notexists join metExciseInformationTable
+                    where metExciseInformationTable.InventTransRefRecId == inventTrans.RecId
         {
             validInsert = false;
             onlyCredit = false;
      
-            if ((_contract.parmTransactionType() == METTransactionType::Positive && metInventTransExciseRegisterUpdateView.Qty > 0) ||
-                (_contract.parmTransactionType() == METTransactionType::Negative && metInventTransExciseRegisterUpdateView.Qty < 0))
+            
+            if ((_contract.parmTransactionType() == METTransactionType::Positive && InventTrans.Qty > 0) ||
+                (_contract.parmTransactionType() == METTransactionType::Negative && InventTrans.Qty < 0))
             {
                 metExciseInformationTable.clear();
-                metExciseInformationTable.ReferenceNumber       = metInventTransExciseRegisterUpdateView.ReferenceId;
-                metExciseInformationTable.InventTransType       = metInventTransExciseRegisterUpdateView.ReferenceCategory;
-                metExciseInformationTable.InventTransRefRecId   = metInventTransExciseRegisterUpdateView.InventTransRecId;
-                metExciseInformationTable.ItemId                = metInventTransExciseRegisterUpdateView.ItemId;
-                metExciseInformationTable.SiteId                = this.getInventSiteFromInventDimId(metInventTransExciseRegisterUpdateView.inventDimId);
-                metExciseInformationTable.InventTransId         = metInventTransExciseRegisterUpdateView.InventTransId;
+                metExciseInformationTable.ReferenceNumber       = InventTransOriginExcise.ReferenceId;
+                metExciseInformationTable.InventTransType       = InventTransOriginExcise.ReferenceCategory;
+                metExciseInformationTable.InventTransRefRecId   = InventTrans.Recid;
+                metExciseInformationTable.ItemId                = InventTransOriginExcise.ItemId;
+              
+                metExciseInformationTable.SiteId                = InventTrans.inventDim().InventSiteId;//this.getInventSiteFromInventDimId(invent.inventDimId);
+                metExciseInformationTable.InventTransId         = InventTransOriginExcise.InventTransId;
        
-                if (metInventTransExciseRegisterUpdateView.ReferenceCategory == InventTransType::Sales &&
-             (metInventTransExciseRegisterUpdateView.StatusIssue == StatusIssue::Sold || metInventTransExciseRegisterUpdateView.StatusIssue == StatusIssue::Deducted ||
-             metInventTransExciseRegisterUpdateView.StatusReceipt == StatusReceipt::Received ||  metInventTransExciseRegisterUpdateView.StatusReceipt == StatusReceipt::Purchased))
-                {
-                    metExciseInformationTable.InventoryQty  = metInventTransExciseRegisterUpdateView.Qty;
-                    metExciseInformationTable.AvailableQty  = 0.00;
+                validInsert = false;
 
-                    validInsert = true;
-                }
-                else if (metInventTransExciseRegisterUpdateView.ReferenceCategory == InventTransType::TransferOrderShip &&
-                 metInventTransExciseRegisterUpdateView.StatusIssue == StatusIssue::Sold)
+                switch(InventTransOriginExcise.ReferenceCategory)
                 {
-                    metExciseInformationTable.InventoryQty  = metInventTransExciseRegisterUpdateView.Qty;
-                    metExciseInformationTable.AvailableQty  = 0.00;
+                    case InventTransType::Sales : 
+                        if (InventTrans.StatusIssue == StatusIssue::Sold || InventTrans.StatusIssue == StatusIssue::Deducted ||
+                            InventTrans.StatusReceipt == StatusReceipt::Received ||  InventTrans.StatusReceipt == StatusReceipt::Purchased)
+                        {
+                            metExciseInformationTable.InventoryQty  = InventTrans.Qty;
+                            metExciseInformationTable.AvailableQty  = 0.00;
+                            validInsert = true;
+                        }
+                        break;
 
-                    validInsert = true;
-                }
-                else if (metInventTransExciseRegisterUpdateView.ReferenceCategory == InventTransType::Purch &&
-                 _contract.parmTransactionType() == METTransactionType::Negative && metInventTransExciseRegisterUpdateView.Qty < 0)
-                {
-                    StatusIssue purchStatus = metInventTransExciseRegisterUpdateView.StatusIssue;
+                    case InventTransType::TransferOrderShip :
+                        if(InventTrans.StatusIssue == StatusIssue::Sold)
+                        {
+                            metExciseInformationTable.InventoryQty  = InventTrans.Qty;
+                            metExciseInformationTable.AvailableQty  = 0.00;
+
+                            validInsert = true;
+                        }
+                        break;
+
+                    case InventTransType::Purch :
+                        if(_contract.parmTransactionType() == METTransactionType::Negative && InventTrans.Qty < 0)
+                        {
+                            StatusIssue purchStatus = InventTrans.StatusIssue;
  
-                    if (purchStatus == StatusIssue::Deducted ||  purchStatus == StatusIssue::Sold)
+                            if (purchStatus == StatusIssue::Deducted ||  purchStatus == StatusIssue::Sold)
+                            {
+                                metExciseInformationTable.InventoryQty  = InventTrans.Qty;
+                                metExciseInformationTable.AvailableQty  = 0.00;
+
+                                validInsert = true;
+                            }
+                        }
+                        break;
+
+                    default:
                     {
-                        metExciseInformationTable.InventoryQty  = metInventTransExciseRegisterUpdateView.Qty;
-                        metExciseInformationTable.AvailableQty  = 0.00;
+                        if (InventJournalTable::find(InventTransOriginExcise.ReferenceId).Posted == NoYes::Yes)
+                        {
+                            metExciseInformationTable.InventoryQty  = InventTrans.Qty;
 
-                        validInsert = true;
+                            validInsert = true;
+                        }
                     }
-                }
-                else if (InventJournalTable::find(metInventTransExciseRegisterUpdateView.ReferenceId).Posted == NoYes::Yes)
-                {
-                    metExciseInformationTable.InventoryQty  = metInventTransExciseRegisterUpdateView.Qty;
-
-                    validInsert = true;
-                }
-                else
-                {
-                    validInsert = false;
+                    break;
                 }
 
-                if (metInventTransExciseRegisterUpdateView.ReferenceCategory == InventTransType::Sales && 
-                    metInventTransExciseRegisterUpdateView.Qty > 0 &&
-                    SalesLine::findInventTransId(metInventTransExciseRegisterUpdateView.InventTransId).ReturnDispositionCodeId != metCustParameters.DispositionCodeRegistration)
+                if (InventTransOriginExcise.ReferenceCategory == InventTransType::Sales && 
+                    inventTrans.Qty > 0 &&
+                    SalesLine::findInventTransId(InventTransOriginExcise.InventTransId).ReturnDispositionCodeId != metCustParameters.DispositionCodeRegistration)
                 {
                     onlyCredit = true;
                     validInsert = false;
@@ -321,17 +379,17 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                 validInsert = this.addingExciseInformationRecordToRecordList(metExciseInformationTable, validInsert, metExciseRegisterEntry);
 
                 if (validPreInsert && _contract.parmCreateDutyCredit() == NoYes::Yes &&
-             _contract.parmReferenceId() == metInventTransExciseRegisterUpdateView.ReferenceCategory &&
-             ((_contract.parmTransactionType() == METTransactionType::Positive && metInventTransExciseRegisterUpdateView.Qty > 0) ||
-             (_contract.parmTransactionType() == METTransactionType::Negative && metInventTransExciseRegisterUpdateView.Qty < 0)))
+                    _contract.parmReferenceId() == InventTransOriginExcise.ReferenceCategory &&
+                    ((_contract.parmTransactionType() == METTransactionType::Positive && InventTrans.Qty > 0) ||
+                     (_contract.parmTransactionType() == METTransactionType::Negative && InventTrans.Qty < 0)))
                 {
-                    if (metInventTransExciseRegisterUpdateView.ReferenceCategory != InventTransType::InventCounting ||
-                 (metInventTransExciseRegisterUpdateView.ReferenceCategory == InventTransType::InventCounting &&
-                 !InventCountingReasonCode::find(InventJournalTrans::findInventTransId(metExciseInformationTable.InventTransId).CountingReasonCode).METExemptFromDuty))
+                    if (InventTransOriginExcise.ReferenceCategory != InventTransType::InventCounting ||
+                        (InventTransOriginExcise.ReferenceCategory == InventTransType::InventCounting &&
+                        !InventCountingReasonCode::find(InventJournalTrans::findInventTransId(metExciseInformationTable.InventTransId).CountingReasonCode).METExemptFromDuty))
                     {
-                        if (metInventTransExciseRegisterUpdateView.ReferenceCategory != InventTransType::InventCounting)
+                        if (InventTransOriginExcise.ReferenceCategory != InventTransType::InventCounting)
                         {
-                            SalesLine salesLineCheck = SalesLine::findInventTransId(metInventTransExciseRegisterUpdateView.InventTransId);
+                            SalesLine salesLineCheck = SalesLine::findInventTransId(InventTransOriginExcise.InventTransId);
 
                             if (salesLineCheck)
                             {
@@ -348,14 +406,14 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                                     CustTable custTable = CustTable::find(salesTableReasonCode.CustAccount);
                                     if ( custTable && !custTable.metGetCustomerBooleanAttribute(salesTableReasonCode.CustAccount, METConstants::dutyFree))
                                     {
-                                        this.createDutyEditRecords(metInventTransExciseRegisterUpdateView);
+                                        this.createDutyEditRecords(InventTransOriginExcise);
                                     }
                                 }
                             }
                         }
                         else
                         {
-                            this.createDutyEditRecords(metInventTransExciseRegisterUpdateView);
+                            this.createDutyEditRecords(InventTransOriginExcise);
                         }
                     }
                 }
@@ -380,7 +438,9 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
     /// <param name = "_contract">Data contract reference</param>
     public void updateExciseInformationRecords(METExciseInformationTableUpdateContract     _contract)
     {
-        METInventTransExciseRegisterUpdateView          metInventTransExciseRegisterUpdateView;
+        //METInventTransExciseRegisterUpdateView          metInventTransExciseRegisterUpdateView;
+        InventTransOrigin                               inventTransOrigin;
+        InventTrans                                     inventTrans;
         boolean                                         validInsert;
         boolean                                         isReturn;
         METExciseRegisterEntry                          metExciseRegisterEntry;
@@ -389,21 +449,27 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
         METVendorClaimAmount                            metDutyRollVarianceClaimQtyOrig;
         METVendorClaimAmount                            metDutyRollVarianceClaimQtyNow;
         METExciseDutyParameteres                        exciseDutyParameteres   = METExciseDutyParameteres::find();
+        ReferenceNumber                                 referenceNumber;
+        METInventTable                                  metInventTable;
 
         while select validtimestate(transDateTime) metExciseRegisterEntry
-            join metInventTransExciseRegisterUpdateView
-            where metInventTransExciseRegisterUpdateView.ItemId == metExciseRegisterEntry.ItemId
-            && metInventTransExciseRegisterUpdateView.ReferenceId == metExciseRegisterEntry.OrderNumber
-            && (metInventTransExciseRegisterUpdateView.ReferenceCategory == InventTransType::Purch
-            || metInventTransExciseRegisterUpdateView.ReferenceCategory == InventTransType::TransferOrderReceive
-            || metInventTransExciseRegisterUpdateView.ReferenceCategory == InventTransType::TransferOrderShip)
-            && metInventTransExciseRegisterUpdateView.ReferenceCategory == _contract.parmReferenceId()
-            && metExciseRegisterEntry.Migrated == NoYes::No
-            && metExciseRegisterEntry.IsError == NoYes::No
-            join metExciseInformationTable
-            where metExciseInformationTable.ExciseRegisterReferenceId == metExciseRegisterEntry.ReferenceId
-            && metExciseRegisterEntry.VersionNumberRegister > metExciseInformationTable.VersionNumberRegister
+            where metExciseRegisterEntry.Migrated == NoYes::No
+                && metExciseRegisterEntry.IsError == NoYes::No
+                join metInventTable
+                    where metInventTable.ItemId == metExciseRegisterEntry.ItemId
+                    && metInventTable.METTariffItemCodeBaseRecid != 0
+                join inventTransOrigin
+                    where inventTransOrigin.ItemId == metExciseRegisterEntry.ItemId
+                        && inventTransOrigin.ReferenceId == metExciseRegisterEntry.OrderNumber
+                        && (inventTransOrigin.ReferenceCategory == InventTransType::Purch
+                            || inventTransOrigin.ReferenceCategory == InventTransType::TransferOrderShip
+                            || inventTransOrigin.ReferenceCategory == InventTransType::TransferOrderReceive)
+                        && inventTransOrigin.ReferenceCategory == _contract.parmReferenceId()
+                join metExciseInformationTable
+                    where metExciseInformationTable.ExciseRegisterReferenceId == metExciseRegisterEntry.ReferenceId
+                    && metExciseRegisterEntry.VersionNumberRegister > metExciseInformationTable.VersionNumberRegister
         {
+
             METExciseInformationTable   metExciseInformationTableUpd    = METExciseInformationTable::findByRecId(metExciseInformationTable.RecId, true);
             METDutyRollVariance         metDutyRollVariance, dutyRollVarianceClaimAmt, metDutyRollVarianceAccural, newMetDutyRollVariance;
 
@@ -411,9 +477,9 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                 (_contract.parmTransactionType() == METTransactionType::Negative && metExciseRegisterEntry.ReceiptQuantity < 0))
             {
                 InventTable                 inventTable;             
-                METInventTable              metinventTable; 
+                metInventTable              _metInventTable;
 
-                [inventTable, metinventTable] = this.getItemCache(metExciseInformationTable.ItemId);
+                [inventTable, _metInventTable] = this.getItemCache(metExciseInformationTable.ItemId);
 
                 metExciseInformationTableUpd.Lodgement      = metExciseRegisterEntry.Lodgement;
                 metExciseInformationTableUpd.PackingSlipId  = metExciseRegisterEntry.OriginDocumentNumber;
@@ -424,7 +490,7 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                         && metDutyRollVariance.ItemId                    == metExciseInformationTable.ItemId
                         && metDutyRollVariance.OrderNumber               == metExciseInformationTable.ReferenceNumber
                         && metDutyRollVariance.ExciseRegisterReferenceId == metExciseInformationTable.ExciseRegisterReferenceId
-                        && metDutyRollVariance.VersionNumberRegister             == metExciseInformationTable.VersionNumberRegister;
+                        && metDutyRollVariance.VersionNumberRegister     == metExciseInformationTable.VersionNumberRegister;
 
                 if (metDutyRollVariance.DutyValue != metExciseRegisterEntry.DutyRateReceived)
                 {
@@ -444,29 +510,29 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                             && metDutyRollVarianceAccural.ExciseRegisterReferenceId == metExciseInformationTable.ExciseRegisterReferenceId;
                 
 
-                    metDutyRollVarianceClaimQtyOrig = metDutyRollVarianceAccural.ClaimAmount; //Naren
+                    metDutyRollVarianceClaimQtyOrig     = metDutyRollVarianceAccural.ClaimAmount; //Naren
                     metDutyRollVariance.DutyValue       = metExciseRegisterEntry.DutyRateReceived;
                     MetVariance dutyRollVarianceValue   = metDutyRollVariance.AverageVFD ? (metDutyRollVariance.DutyValue - metDutyRollVariance.AverageVFD) : 0;
 
                     if (metDutyRollVariance.ClaimCreated)
                     {
                         metDutyRollVariance.AdditionalClaimFlag = NoYes::Yes;
-                        MetVariance varianceAfterUpdate = metInventTable.ItemPack ? (dutyRollVarianceValue/metInventTable.ItemPack) : dutyRollVarianceValue;
+                        MetVariance varianceAfterUpdate = _metInventTable.ItemPack ? (dutyRollVarianceValue/_metInventTable.ItemPack) : dutyRollVarianceValue;
                         metDutyRollVariance.Variance = varianceAfterUpdate - metDutyRollVariance.Variance;
                     }
 
                     this.calcVarianceForItem(metDutyRollVariance, exciseDutyParameteres.DutyRollVarianceThreshold);
 
                     metDutyRollVariance.ClaimAmount     = (metDutyRollVariance.AdValoremRate / 100) * metDutyRollVariance.VarianceAmount;
-                    metDutyRollVarianceClaimQtyNow = metDutyRollVariance.ClaimAmount;
+                    metDutyRollVarianceClaimQtyNow      = metDutyRollVariance.ClaimAmount;
                 }
                 else
                 {
                     dutyRateChanged = false;
                 }
 
-                metDutyRollVariance.Lodgement = metExciseInformationTableUpd.Lodgement;
-                metDutyRollVariance.VersionNumberRegister = metExciseInformationTableUpd.VersionNumberRegister;
+                metDutyRollVariance.Lodgement               = metExciseInformationTableUpd.Lodgement;
+                metDutyRollVariance.VersionNumberRegister   = metExciseInformationTableUpd.VersionNumberRegister;
 
                 if (metExciseInformationTableUpd.RecId && metDutyRollVariance.RecId)
                 {
@@ -520,7 +586,12 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                     // Accrual journal creation & automation Posting for duty roll value difference claim variance update.
                     if (metDutyRollVarianceClaimQtyOrig != metDutyRollVarianceClaimQtyNow)
                     {
+                        METInventTransExciseRegisterUpdateView metInventTransExciseRegisterUpdateView;
                         METVendorClaimAmount accrualPostingAmt = metDutyRollVarianceClaimQtyNow - metDutyRollVarianceClaimQtyOrig;
+
+                        select firstonly metInventTransExciseRegisterUpdateView
+                            where metInventTransExciseRegisterUpdateView.RecId == inventTrans.RecId;
+
                         newMetDutyRollVariance.reread();
                         METExciseInformationTableUpdateService::createAccrualJournal(newMetDutyRollVariance ? newMetDutyRollVariance : metDutyRollVariance, metInventTransExciseRegisterUpdateView, accrualPostingAmt);
                     }
@@ -591,7 +662,9 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
     /// <param name = "_metExciseRegisterEntry"> Excise register entry record </param>
     /// <param name = "_metInventTransExciseRegisterUpdateView"> Invent trans excise register update view record </param>
     /// <returns> boolean </returns>
-    public boolean mapTransferOrderShipAndReceiveData(METExciseInformationTable _metExciseInformationTable, METExciseRegisterEntry _metExciseRegisterEntry, METInventTransExciseRegisterUpdateView _metInventTransExciseRegisterUpdateView)
+    public boolean mapTransferOrderShipAndReceiveData(METExciseInformationTable _metExciseInformationTable, 
+                                                      METExciseRegisterEntry _metExciseRegisterEntry, 
+                                                      InventTransOrigin _inventTransOrigin)
     {
         InventTable inventTable = InventTable::find(_metExciseRegisterEntry.ItemId);
 
@@ -605,8 +678,8 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
         {
             this.initialiseAdditionalDetailsForExciseInformation(_metExciseInformationTable,
                                     _metExciseRegisterEntry,
-                                    _metInventTransExciseRegisterUpdateView,
-                                    _metInventTransExciseRegisterUpdateView.ReferenceCategory);
+                                    _inventTransOrigin,
+                                    _inventTransOrigin.ReferenceCategory);
 
             return true;
         }
@@ -631,10 +704,14 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
         InventTransOrigin inventTransOrigin;
         boolean validInsert;
         RecordInsertList    recordInsertList = new RecordInsertList(tableNum(METExciseInformationTable), false, false, false, false, false);
+        METInventTable      metInventTable;
 
         while select salesLine
                 where salesLine.SalesId == _refId
                 && salesLine.SalesStatus == SalesStatus::Invoiced
+            exists join metinventtable
+                where metInventTable.ItemId == salesLine.ItemId
+                && metInventTable.METTariffItemCodeBaseRecid != 0
             join inventTransOrigin
                 where inventTransOrigin.InventTransId == salesLine.InventTransId
                 && inventTransOrigin.ReferenceCategory == _contract.parmReferenceId()
@@ -803,9 +880,15 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
 				<Source><![CDATA[
     private void initialiseAdditionalDetailsForExciseInformation(METExciseInformationTable _metExciseInformationTable,
                                                              METExciseRegisterEntry metExciseRegisterEntry,
-                                                             METInventTransExciseRegisterUpdateView metInventTransExciseRegisterUpdateView,
+                                                             InventTransOrigin _inventTransOrigin,
                                                              InventTransType _inventTransType)
     {
+        METInventTransExciseRegisterUpdateView metInventTransExciseRegisterUpdateView;
+        InventTrans inventTrans = InventTrans::findByInventTransOrigin(_inventTransOrigin.recid);
+
+        select firstonly metInventTransExciseRegisterUpdateView
+            where metInventTransExciseRegisterUpdateView.RecId == inventTrans.RecId;
+
         if (metExciseRegisterEntry.RecId)
         {
             switch(_inventTransType)
@@ -874,7 +957,9 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                             // Accrual journal creation & automation Posting for duty roll value claim variance.
                             if (dutyRollVariance.ClaimAmount)
                             {
-                                dutyRollVariance.IsAccrualPosted = METExciseInformationTableUpdateService::createAccrualJournal(dutyRollVariance, metInventTransExciseRegisterUpdateView, dutyRollVariance.ClaimAmount);
+                                dutyRollVariance.IsAccrualPosted = METExciseInformationTableUpdateService::createAccrualJournal(dutyRollVariance, 
+                                                                                                                                metInventTransExciseRegisterUpdateView, 
+                                                                                                                                dutyRollVariance.ClaimAmount);
                             }
 
                             try
@@ -923,15 +1008,16 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
     /// - Validates and adds the record to the duty credit insert list if valid.
     /// </remarks>
 
-    private void createDutyEditRecords(METInventTransExciseRegisterUpdateView _metInventTransExciseRegisterUpdateView)
+    private void createDutyEditRecords(InventTransOrigin _inventTransOrigin)
     {
         Salestable                  salestable;
         InventDim                   inventDim;
         METDutyRate                 dutyRate;
+        InventTrans                 inventTrans = InventTrans::findByInventTransOrigin(_inventTransOrigin.RecId);
 
         dutyCreditTable.clear();
-        dutyCreditTable.SiteId = InventDim::find(_metInventTransExciseRegisterUpdateView.inventDimId).inventSiteId;
-        dutyCreditTable.ItemId = _metInventTransExciseRegisterUpdateView.ItemId;
+        dutyCreditTable.SiteId = inventTrans.inventDim().InventSiteId;
+        dutyCreditTable.ItemId = _inventTransOrigin.ItemId;
 
         METExciseSiteDutySetup  exciseSiteDutySetup;
 
@@ -954,9 +1040,9 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
                                                                                                           NoYes::No);
        
         dutyCreditTable.CreditClosed = NoYes::No;
-        dutyCreditTable.CreditRemaining = _metInventTransExciseRegisterUpdateView.Qty;
-        dutyCreditTable.ReturnQuantity = _metInventTransExciseRegisterUpdateView.Qty;
-        METInventTable metInventTable = METInventTable::find(_metInventTransExciseRegisterUpdateView.ItemId);
+        dutyCreditTable.CreditRemaining = inventTrans.Qty;
+        dutyCreditTable.ReturnQuantity = inventTrans.Qty;
+        METInventTable metInventTable = METInventTable::find(_inventTransOrigin.ItemId);
         dutyCreditTable.TariffItemCodeBaseRecid = metInventTable.METTariffItemCodeBaseRecid;
 
         METCustomExcise customExcise = metInventTable.customExcise();
@@ -970,16 +1056,15 @@ class METExciseInformationTableUpdateService extends SysOperationServiceBase
             dutyRate = exciseSiteDutySetup.ExcisePerCase / ItempackSalesunit;
         }
 
-        dutyCreditTable.DutyRate = _metInventTransExciseRegisterUpdateView.Qty * dutyRate;
+        dutyCreditTable.DutyRate = inventTrans.Qty * dutyRate;
 
-        select firstonly ReturnItemNum from salestable
-            where salestable.SalesId == _metInventTransExciseRegisterUpdateView.ReferenceId;
-
+        salestable = salestable::find(_inventTransOrigin.ReferenceId);
+        
         dutyCreditTable.RMANumber = salestable.ReturnItemNum;
 
-        if (_metInventTransExciseRegisterUpdateView.ReferenceCategory == InventTransType::InventCounting)
+        if (_inventTransOrigin.ReferenceCategory == InventTransType::InventCounting)
         {
-            dutyCreditTable.RMANumber = InventJournalTrans::findInventTransId(_metInventTransExciseRegisterUpdateView.InventTransId).JournalId;
+            dutyCreditTable.RMANumber = InventJournalTrans::findInventTransId(_inventTransOrigin.InventTransId).JournalId;
         }
 
         if (dutyCreditTable.validateWrite())
