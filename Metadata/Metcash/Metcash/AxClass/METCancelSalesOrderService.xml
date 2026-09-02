@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METCancelSalesOrderService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+class METCancelSalesOrderService extends SysOperationServiceBase
+{   
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+     /// <summary>
+     /// process the cancel sales order service. This method will populate the staging table with the sales orders to be cancelled and create batch tasks to process the cancellation.
+     /// </summary>
+     /// <param name = "_contract"></param>
+        public void process(METCancelSalesOrderContract _contract)
+    {
+        int mintask, maxtask;
+        guid executionId = newguid();
+        [mintask, maxtask] = this.populateStaging(executionId, _contract);
+        this.createBatchTasks(executionId, mintask, maxtask);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>populateStaging</Name>
+				<Source><![CDATA[
+    private container populateStaging(guid _executionId, METCancelSalesOrderContract _contract)
+    {
+        Query query;
+        QueryRun queryRun;
+        SalesTable salesTable;
+        METCancelSalesOrderStaging staging;
+        int partition;
+        int maxPartition;
+        int tasknum = _contract.parmTaskNum();
+        int minPartition;
+
+        query = new Query(SysOperationHelper::base64Decode(_contract.parmPackedQuery()));
+
+        queryRun = new QueryRun(query);
+        
+        while(queryRun.next())
+        {
+            if(queryRun.changed(tableNum(salesTable)))
+            {
+                salesTable = queryRun.get(tableNum(salesTable));
+
+                partition++;
+
+                staging.clear();
+                staging.ExecutionId = _executionId;
+                staging.SalesId = salesTable.SalesId;
+                staging.Status = METCancelSalesOrderStatus::Pending;
+                staging.PartitionId = partition mod tasknum;
+                staging.insert();
+            }     
+        }
+
+        select minof(PartitionId) from staging where staging.ExecutionId == _executionId;
+        minPartition = staging.PartitionId;
+
+        select maxof(PartitionId) from staging where staging.ExecutionId == _executionId;
+        maxPartition = staging.PartitionId;
+
+        return [minPartition, maxPartition];
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBatchTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create batch tasks for each partition of the staging table. Each task will execute the METCancelSalesOrderTaskService service. A cleanup task will be created to run after all tasks have completed.
+    /// </summary>
+    /// <param name = "_ExecutionId"></param>
+    /// <param name = "_mintaskcount"></param>
+    /// <param name = "_maxtaskcount"></param>
+    private void createBatchTasks(guid _ExecutionId, int _mintaskcount,int _maxtaskcount)
+    {
+        BatchHeader batchHeader;
+        SysOperationServiceController cleanController;
+        SysOperationServiceController taskController;
+        int Tasks;
+
+        BatchHeader = BatchHeader::getCurrentBatchHeader();
+
+        if(!BatchHeader)
+        {
+            BatchHeader = BatchHeader::construct();
+        }
+
+        cleanController = this.createCleanupTask(_ExecutionId, batchHeader, _maxtaskcount);
+
+        for(int i = _mintaskcount; i <= _maxtaskcount; i++)
+        {
+            taskController = this.createTasks(_ExecutionId, batchHeader, i);
+            batchHeader.addDependency(cleanController, taskController, BatchDependencyStatus::FinishedOrError);
+        }
+
+        
+        BatchHeader.Save();
+           
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Create tasks for each partition of the staging table. Each task will execute the METCancelSalesOrderTaskService service.
+    /// </summary>
+    /// <param name = "_executionId"></param>
+    /// <param name = "_batchHeader"></param>
+    /// <param name = "_task"></param>
+    /// <returns></returns>
+    private SysOperationServiceController createTasks(guid _executionId, BatchHeader _batchHeader, int _task)
+    {
+        SysOperationServiceController controller;
+        METCancelSalesOrderTaskContract contract;
+        BatchInfo batchInfo;
+                
+        controller = new  SysOperationServiceController(classStr(METCancelSalesOrderTaskService),
+                                                        methodStr(metcancelsalesordertaskservice, run), 
+                                                        SysOperationExecutionMode::Asynchronous);
+        controller.parmShowDialog(false);
+        controller.parmLoadFromSysLastValue(false);
+        contract = controller.getDataContractObject();
+        contract.parmExecutionId(_executionId);
+        contract.parmTask(_task);
+        batchinfo = controller.batchInfo();
+        batchInfo.parmcaption(strfmt("@Met:CancelOrderWorker",  _task));
+
+        _batchHeader.addRuntimeTask(controller, 0);        
+        return controller;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createCleanupTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// create cleanup task to run after all tasks have completed. This task will execute the METCancelSalesOrderCleanupService service.
+    /// </summary>
+    /// <param name = "_executionId"></param>
+    /// <param name = "_batchHeader"></param>
+    /// <param name = "_taskcount"></param>
+    /// <returns></returns>
+    private SysOperationServiceController createCleanupTask(guid _executionId, BatchHeader _batchHeader, int _taskcount)
+    {
+        SysOperationServiceController controller;
+        METCancelSalesOrderCleanupContract contract = new METCancelSalesOrderCleanupContract();
+        BatchInfo batchInfo;
+
+        controller = new SysOperationServiceController(classStr(METCancelSalesOrderCleanupService), 
+                                                       methodStr(METCancelSalesOrderCleanupService, cleanup), 
+                                                       SysOperationExecutionMode::Asynchronous);
+
+        controller.parmShowDialog(false);
+        controller.parmLoadFromSysLastValue(false);
+        contract = controller.getDataContractObject() as METCancelSalesOrderCleanupContract;
+        contract.parmExecutionId(_executionId);
+        
+        batchinfo = controller.batchInfo();
+        batchInfo.parmcaption("@MET:CancelorderCleanup");
+              
+        _batchHeader.addRuntimeTask(controller, _taskcount);
+        return controller;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
