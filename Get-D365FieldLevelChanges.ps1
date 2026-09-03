@@ -1,13 +1,29 @@
 <#
 .SYNOPSIS
-    Detects field-level metadata changes (Added / Deleted / Data Type Changed) between two
+    Detects field-level AND structural metadata changes (Added / Deleted / Data Type Changed /
+    Relations / Indexes / Field Groups / Delete Actions / Table Properties) between two
     git commits for D365 F&O AxTable, AxTableExtension, AxDataEntityView, and
     AxDataEntityViewExtension XML files.
 
 .DESCRIPTION
     Designed to run as a post-deployment step in an Azure DevOps Release pipeline.
     Compares the metadata XML at $FromCommit vs $ToCommit and produces a CSV report
-    listing every field-level change, per object, with the change type.
+    listing every change, per object, with the change type.
+
+    NOTE ON SCOPE: In addition to field-level changes, this version also diffs the
+    Relations, Indexes, FieldGroups, and DeleteActions sections (whole-node XML
+    comparison), plus any scalar/leaf table-level properties (e.g. whichever
+    property represents the clustered index, PrimaryIndex, TableGroup, etc.).
+    This closes the gap where a file shows up as "changed" in git but the field
+    comparison alone reports "changes: 0" because the actual difference was a
+    relation deletion, cluster key change, or similar structural edit outside
+    <Fields>.
+
+    Because Relations/Indexes/FieldGroups/DeleteActions are compared via normalized
+    raw XML (OuterXml, whitespace-collapsed) rather than structured property-by-property
+    comparison, this can also flag purely cosmetic XML differences (e.g. attribute
+    reordering) as "Modified". If that becomes noisy, replace Get-NamedChildElements /
+    Compare-NamedNodes with structured parsers similar to Get-FieldsFromXml.
 
 .PARAMETER RepoPath
     Local path to the git repository (checked out) - e.g. $(System.DefaultWorkingDirectory)/CoreBuildGITRepo
@@ -272,6 +288,106 @@ function Compare-ObjectFields {
     return $changes
 }
 
+function Get-NamedChildElements {
+    <#
+        Generic section-level extractor. Pulls every child element under a given
+        parent node (e.g. Relations, Indexes, FieldGroups, DeleteActions), keyed by
+        its <Name> child, with a whitespace-normalized OuterXml snapshot used purely
+        for equality comparison (not structured field-by-field comparison).
+    #>
+    param([xml]$Xml, [string]$ParentNodeName, [string]$KeyChildName = "Name")
+
+    $result = @{}
+    $root = $Xml.DocumentElement
+    if (-not $root) { return $result }
+
+    $parent = $root[$ParentNodeName]
+    if (-not $parent) { return $result }
+
+    $children = @($parent.ChildNodes | Where-Object { $_.NodeType -eq [System.Xml.XmlNodeType]::Element })
+    foreach ($child in $children) {
+        $keyNode = $child[$KeyChildName]
+        $key = if ($keyNode) { $keyNode.InnerText } else { "unnamed_$($result.Count)" }
+        if ([string]::IsNullOrWhiteSpace($key)) { continue }
+        $result[$key] = ($child.OuterXml -replace '\s+', ' ').Trim()
+    }
+    return $result
+}
+
+function Compare-NamedNodes {
+    <#
+        Generic section-level differ - Added / Deleted / Modified - for whatever
+        was extracted by Get-NamedChildElements. Modified is a whole-node string
+        comparison, so it will catch relation deletions, cluster key / index
+        definition changes, field group membership changes, etc. It can also flag
+        cosmetic-only XML differences; see the header note for the tradeoff.
+    #>
+    param(
+        [hashtable]$OldNodes,
+        [hashtable]$NewNodes,
+        [string]$ObjectName,
+        [string]$ObjectType,
+        [string]$FilePath,
+        [string]$Category
+    )
+
+    $changes = @()
+
+    foreach ($name in $NewNodes.Keys) {
+        if (-not $OldNodes.ContainsKey($name)) {
+            $changes += [PSCustomObject]@{
+                ObjectType = $ObjectType; ObjectName = $ObjectName; FilePath = $FilePath
+                FieldName  = "$Category`: $name"; ChangeType = "$Category Added"
+                OldRawType = $null; OldEDT = $null; NewRawType = $null; NewEDT = $null
+            }
+        }
+    }
+    foreach ($name in $OldNodes.Keys) {
+        if (-not $NewNodes.ContainsKey($name)) {
+            $changes += [PSCustomObject]@{
+                ObjectType = $ObjectType; ObjectName = $ObjectName; FilePath = $FilePath
+                FieldName  = "$Category`: $name"; ChangeType = "$Category Deleted"
+                OldRawType = $null; OldEDT = $null; NewRawType = $null; NewEDT = $null
+            }
+        }
+    }
+    foreach ($name in $NewNodes.Keys) {
+        if ($OldNodes.ContainsKey($name) -and $OldNodes[$name] -ne $NewNodes[$name]) {
+            $changes += [PSCustomObject]@{
+                ObjectType = $ObjectType; ObjectName = $ObjectName; FilePath = $FilePath
+                FieldName  = "$Category`: $name"; ChangeType = "$Category Modified"
+                OldRawType = $null; OldEDT = $null; NewRawType = $null; NewEDT = $null
+            }
+        }
+    }
+
+    return $changes
+}
+
+function Get-SimpleTablePropertiesFromXml {
+    <#
+        Catches scalar/leaf table-level properties directly under the root element
+        (e.g. whichever property represents the clustered index, PrimaryIndex,
+        TableGroup, etc.) without needing to hardcode the exact tag name. Any root
+        child element that itself has no element children is treated as a simple
+        property and captured by name/value.
+    #>
+    param([xml]$Xml)
+
+    $props = @{}
+    $root = $Xml.DocumentElement
+    if (-not $root) { return $props }
+
+    foreach ($child in $root.ChildNodes) {
+        if ($child.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+        $hasElementChildren = @($child.ChildNodes | Where-Object { $_.NodeType -eq [System.Xml.XmlNodeType]::Element }).Count -gt 0
+        if (-not $hasElementChildren) {
+            $props[$child.Name] = $child.InnerText
+        }
+    }
+    return $props
+}
+
 function ConvertTo-FriendlyType {
     <#
         Converts D365's internal type codes (e.g. AxTableFieldEnum) into plain-English
@@ -319,6 +435,9 @@ $changedFiles = git diff --name-only $FromCommit $ToCommit |
 
 Write-Host "Found $($changedFiles.Count) changed metadata files" -ForegroundColor Cyan
 
+# Sections (besides Fields/FieldModifications) diffed as whole named nodes.
+$structuralSections = @("Relations", "Indexes", "FieldGroups", "DeleteActions")
+
 $allChanges = @()
 
 foreach ($file in $changedFiles) {
@@ -363,7 +482,7 @@ foreach ($file in $changedFiles) {
         continue
     }
 
-    # Normal case - object exists at both commits, compare fields
+    # Normal case - object exists at both commits, compare fields + structure
     if ($oldContent -and $newContent) {
         try {
             [xml]$oldXml = $oldContent
@@ -375,7 +494,31 @@ foreach ($file in $changedFiles) {
             $changes = @(Compare-ObjectFields -OldFields $oldFields -NewFields $newFields `
                 -ObjectName $objectName -ObjectType $objectType -FilePath $file)
 
-            Write-Host "  Processed: $file (old fields: $($oldFields.Count), new fields: $($newFields.Count), changes: $($changes.Count))" -ForegroundColor DarkGray
+            # Structural sections: Relations, Indexes (incl. cluster key changes),
+            # FieldGroups, DeleteActions - whole-node comparison so nothing here is
+            # silently missed just because field names/types/count didn't change.
+            foreach ($section in $structuralSections) {
+                $oldNodes = Get-NamedChildElements -Xml $oldXml -ParentNodeName $section
+                $newNodes = Get-NamedChildElements -Xml $newXml -ParentNodeName $section
+                $changes += @(Compare-NamedNodes -OldNodes $oldNodes -NewNodes $newNodes `
+                    -ObjectName $objectName -ObjectType $objectType -FilePath $file -Category $section.TrimEnd('s'))
+            }
+
+            # Scalar/leaf table-level properties (e.g. clustered index pointer, TableGroup, etc.)
+            $oldProps = Get-SimpleTablePropertiesFromXml -Xml $oldXml
+            $newProps = Get-SimpleTablePropertiesFromXml -Xml $newXml
+            foreach ($propName in $newProps.Keys) {
+                if ($oldProps.ContainsKey($propName) -and $oldProps[$propName] -ne $newProps[$propName]) {
+                    $changes += [PSCustomObject]@{
+                        ObjectType = $objectType; ObjectName = $objectName; FilePath = $file
+                        FieldName  = "Property: $propName"; ChangeType = "Table Property Changed"
+                        OldRawType = $oldProps[$propName]; OldEDT = $null
+                        NewRawType = $newProps[$propName]; NewEDT = $null
+                    }
+                }
+            }
+
+            Write-Host "  Processed: $file (old fields: $($oldFields.Count), new fields: $($newFields.Count), total changes: $($changes.Count))" -ForegroundColor DarkGray
 
             $allChanges += $changes
         } catch {
@@ -397,6 +540,19 @@ $friendlyChangeTypeMap = @{
     "Mandatory Flag Changed"          = "Mandatory Setting Changed"
     "Field Added (New Object)"        = "New Field Added (New Object Created)"
     "Field Deleted (Object Removed)"  = "Field Removed (Object Deleted)"
+    "Relation Added"                  = "Relation Added"
+    "Relation Deleted"                = "Relation Removed"
+    "Relation Modified"               = "Relation Changed"
+    "Index Added"                     = "Index Added"
+    "Index Deleted"                   = "Index Removed"
+    "Index Modified"                  = "Index Changed (fields, clustering, and/or uniqueness)"
+    "FieldGroup Added"                = "Field Group Added"
+    "FieldGroup Deleted"              = "Field Group Removed"
+    "FieldGroup Modified"             = "Field Group Changed"
+    "DeleteAction Added"              = "Delete Action Added"
+    "DeleteAction Deleted"            = "Delete Action Removed"
+    "DeleteAction Modified"           = "Delete Action Changed"
+    "Table Property Changed"          = "Table Property Changed"
 }
 
 $priorityMap = @{
@@ -406,6 +562,19 @@ $priorityMap = @{
     "Field Deleted (Object Removed)"  = "High - Review Required"
     "Data Type Changed"               = "High - Review Required"
     "Mandatory Flag Changed"          = "Medium - Review Required"
+    "Relation Deleted"                = "High - Review Required"
+    "Relation Added"                  = "Medium - Review Required"
+    "Relation Modified"               = "Medium - Review Required"
+    "Index Deleted"                   = "High - Review Required"
+    "Index Modified"                  = "High - Review Required"
+    "Index Added"                     = "Info"
+    "FieldGroup Deleted"              = "Medium - Review Required"
+    "FieldGroup Added"                = "Info"
+    "FieldGroup Modified"             = "Medium - Review Required"
+    "DeleteAction Deleted"            = "High - Review Required"
+    "DeleteAction Added"              = "Medium - Review Required"
+    "DeleteAction Modified"           = "High - Review Required"
+    "Table Property Changed"          = "High - Review Required"
 }
 $prioritySortOrder = @{ "High - Review Required" = 1; "Medium - Review Required" = 2; "Info" = 3 }
 
@@ -429,6 +598,33 @@ $friendlyReport = foreach ($c in $allChanges) {
         "Mandatory Flag Changed" {
             "Field '$($c.FieldName)' in $($c.ObjectType) '$($c.ObjectName)' mandatory setting changed from '$($c.OldMandatory)' to '$($c.NewMandatory)'."
         }
+        "Relation Added" {
+            "$($c.FieldName) was added on $($c.ObjectType) '$($c.ObjectName)'."
+        }
+        "Relation Deleted" {
+            "$($c.FieldName) was removed from $($c.ObjectType) '$($c.ObjectName)'. Review dependent forms/processes that relied on this relation."
+        }
+        "Relation Modified" {
+            "$($c.FieldName) definition changed on $($c.ObjectType) '$($c.ObjectName)'."
+        }
+        "Index Added" {
+            "$($c.FieldName) was added on $($c.ObjectType) '$($c.ObjectName)'."
+        }
+        "Index Deleted" {
+            "$($c.FieldName) was removed from $($c.ObjectType) '$($c.ObjectName)'."
+        }
+        "Index Modified" {
+            "$($c.FieldName) changed on $($c.ObjectType) '$($c.ObjectName)' - this includes clustered index / key changes. Verify which index and whether it affects performance or uniqueness."
+        }
+        "FieldGroup*" {
+            "$($c.FieldName) changed on $($c.ObjectType) '$($c.ObjectName)'."
+        }
+        "DeleteAction*" {
+            "$($c.FieldName) changed on $($c.ObjectType) '$($c.ObjectName)'. Review cascade delete behavior."
+        }
+        "Table Property Changed" {
+            "$($c.FieldName) on $($c.ObjectType) '$($c.ObjectName)' changed from '$($c.OldRawType)' to '$($c.NewRawType)'."
+        }
         default {
             "Field '$($c.FieldName)' in $($c.ObjectType) '$($c.ObjectName)' was modified."
         }
@@ -440,8 +636,8 @@ $friendlyReport = foreach ($c in $allChanges) {
         "Field Name"    = $c.FieldName
         "Change Type"   = $friendlyChangeType
         "Priority"      = $priority
-        "Previous Type" = if ($oldFriendly) { $oldFriendly } else { "(new field)" }
-        "New Type"      = if ($newFriendly) { $newFriendly } else { "(removed)" }
+        "Previous Type" = if ($oldFriendly) { $oldFriendly } elseif ($c.OldRawType) { $c.OldRawType } else { "(new)" }
+        "New Type"      = if ($newFriendly) { $newFriendly } elseif ($c.NewRawType) { $c.NewRawType } else { "(removed)" }
         "Description"   = $description
         "File Path"     = $c.FilePath
     }
@@ -462,8 +658,8 @@ $friendlyReport | Group-Object Priority | Sort-Object { $prioritySortOrder[$_.Na
 }
 Write-Host "`nFull report saved to: $OutputPath" -ForegroundColor Green
 
-# Fail the pipeline step if you want deletions/type-changes to require manual review:
+# Fail the pipeline step if you want deletions/type-changes/structural changes to require manual review:
 # $breaking = $friendlyReport | Where-Object { $_.Priority -eq "High - Review Required" }
 # if ($breaking.Count -gt 0) {
-#     Write-Host "##vso[task.logissue type=warning]$($breaking.Count) high-priority field change(s) detected. Review $OutputPath"
+#     Write-Host "##vso[task.logissue type=warning]$($breaking.Count) high-priority change(s) detected. Review $OutputPath"
 # }
