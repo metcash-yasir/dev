@@ -7,8 +7,11 @@
 
 .DESCRIPTION
     Designed to run as a post-deployment step in an Azure DevOps Release pipeline.
-    Compares the metadata XML at $FromCommit vs $ToCommit and produces a CSV report
-    listing every change, per object, with the change type.
+    Compares the metadata XML at $FromCommit vs $ToCommit and prints a table of every
+    change, per object, with the change type - directly to the pipeline log.
+    (CSV export is temporarily disabled since the output file isn't reachable off the
+    build agent without an extra "Publish Artifact" pipeline step - see the commented-out
+    Export-Csv line near the end of the script for how to re-enable it once that's set up.)
 
     NOTE ON SCOPE: In addition to field-level changes, this version also diffs the
     Relations, Indexes, FieldGroups, and DeleteActions sections (whole-node XML
@@ -64,7 +67,10 @@ param(
     [Parameter(Mandatory = $false)]
     [string]$ToCommit = "HEAD",
 
-    [Parameter(Mandatory = $true)]
+    # Not used right now - CSV export is disabled in favor of printing the report
+    # to the console as a table. Kept as an optional param so the wrapper script
+    # doesn't need to change, and so file export can be switched back on later.
+    [Parameter(Mandatory = $false)]
     [string]$OutputPath
 )
 
@@ -93,7 +99,6 @@ if ([string]::IsNullOrWhiteSpace($FromCommit)) {
 $quickCheck = git diff --name-only $FromCommit $ToCommit
 if (-not $quickCheck) {
     Write-Host "No changes found between $FromCommit and $ToCommit. Nothing to report." -ForegroundColor Yellow
-    @() | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
     exit 0
 }
 
@@ -436,7 +441,14 @@ $changedFiles = git diff --name-only $FromCommit $ToCommit |
 Write-Host "Found $($changedFiles.Count) changed metadata files" -ForegroundColor Cyan
 
 # Sections (besides Fields/FieldModifications) diffed as whole named nodes.
-$structuralSections = @("Relations", "Indexes", "FieldGroups", "DeleteActions")
+# Explicit singular names below (do NOT derive with TrimEnd('s') - "Indexes" -> "Indexe" is wrong
+# and silently breaks the $friendlyChangeTypeMap / $priorityMap lookups further down).
+$structuralSections = @{
+    "Relations"     = "Relation"
+    "Indexes"       = "Index"
+    "FieldGroups"   = "FieldGroup"
+    "DeleteActions" = "DeleteAction"
+}
 
 $allChanges = @()
 
@@ -461,6 +473,7 @@ foreach ($file in $changedFiles) {
                     NewRawType = $newFields[$name].Type; NewEDT = $newFields[$name].ExtendedDataType
                 }
             }
+            Write-Host "  Processed: $file (NEW OBJECT - did not exist at $FromCommit - $($newFields.Count) field(s) added)" -ForegroundColor DarkGray
         } catch { Write-Warning "Failed to parse new file: $file - $_" }
         continue
     }
@@ -478,6 +491,7 @@ foreach ($file in $changedFiles) {
                     NewRawType = $null; NewEDT = $null
                 }
             }
+            Write-Host "  Processed: $file (OBJECT REMOVED - no longer exists at $ToCommit - $($oldFields.Count) field(s) removed)" -ForegroundColor DarkGray
         } catch { Write-Warning "Failed to parse old file: $file - $_" }
         continue
     }
@@ -497,11 +511,12 @@ foreach ($file in $changedFiles) {
             # Structural sections: Relations, Indexes (incl. cluster key changes),
             # FieldGroups, DeleteActions - whole-node comparison so nothing here is
             # silently missed just because field names/types/count didn't change.
-            foreach ($section in $structuralSections) {
+            foreach ($section in $structuralSections.Keys) {
+                $singularCategory = $structuralSections[$section]
                 $oldNodes = Get-NamedChildElements -Xml $oldXml -ParentNodeName $section
                 $newNodes = Get-NamedChildElements -Xml $newXml -ParentNodeName $section
                 $changes += @(Compare-NamedNodes -OldNodes $oldNodes -NewNodes $newNodes `
-                    -ObjectName $objectName -ObjectType $objectType -FilePath $file -Category $section.TrimEnd('s'))
+                    -ObjectName $objectName -ObjectType $objectType -FilePath $file -Category $singularCategory)
             }
 
             # Scalar/leaf table-level properties (e.g. clustered index pointer, TableGroup, etc.)
@@ -519,6 +534,10 @@ foreach ($file in $changedFiles) {
             }
 
             Write-Host "  Processed: $file (old fields: $($oldFields.Count), new fields: $($newFields.Count), total changes: $($changes.Count))" -ForegroundColor DarkGray
+            if ($changes.Count -gt 0) {
+                $breakdown = ($changes | Group-Object ChangeType | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ", "
+                Write-Host "    -> $breakdown" -ForegroundColor DarkGray
+            }
 
             $allChanges += $changes
         } catch {
@@ -645,8 +664,32 @@ $friendlyReport = foreach ($c in $allChanges) {
 
 $friendlyReport = @($friendlyReport | Sort-Object { $prioritySortOrder[$_.Priority] }, "Object Type", "Object Name")
 
-# Export report
-$friendlyReport | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+# ---- Print report as a table directly in the pipeline log ----
+# (CSV export is disabled for now since the file isn't reachable off the build
+# agent without an extra "Publish Artifact" pipeline step - printing to the log
+# instead so the report is visible without any pipeline changes.)
+
+Write-Host "`n================================ FIELD & METADATA CHANGE REPORT ================================" -ForegroundColor Cyan
+
+if ($friendlyReport.Count -eq 0) {
+    Write-Host "No reportable changes found." -ForegroundColor Yellow
+} else {
+    $tableText = $friendlyReport |
+        Select-Object "Object Type", "Object Name", "Field Name", "Change Type", "Priority", "Previous Type", "New Type" |
+        Format-Table -AutoSize |
+        Out-String -Width 4096
+
+    Write-Host $tableText
+
+    Write-Host "-------------------------------------- Details --------------------------------------" -ForegroundColor Cyan
+    foreach ($row in $friendlyReport) {
+        Write-Host "  [$($row.Priority)] $($row.'Object Type') / $($row.'Object Name') - $($row.'Field Name')" -ForegroundColor White
+        Write-Host "      $($row.Description)" -ForegroundColor Gray
+        Write-Host "      File: $($row.'File Path')" -ForegroundColor DarkGray
+    }
+}
+
+Write-Host "==================================================================================================" -ForegroundColor Cyan
 
 Write-Host "`nSummary:" -ForegroundColor Green
 $friendlyReport | Group-Object "Change Type" | ForEach-Object {
@@ -656,10 +699,15 @@ Write-Host "`nBreakdown by priority:" -ForegroundColor Green
 $friendlyReport | Group-Object Priority | Sort-Object { $prioritySortOrder[$_.Name] } | ForEach-Object {
     Write-Host "  $($_.Name): $($_.Count)" -ForegroundColor Yellow
 }
-Write-Host "`nFull report saved to: $OutputPath" -ForegroundColor Green
+
+# When ready to go back to a downloadable file, re-enable this line and add a
+# "Publish Pipeline Artifact" (or "Publish Build Artifacts") task after this
+# PowerShell step in the pipeline, pointing at $(OutputPath):
+# $friendlyReport | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+# Write-Host "`nFull report saved to: $OutputPath" -ForegroundColor Green
 
 # Fail the pipeline step if you want deletions/type-changes/structural changes to require manual review:
 # $breaking = $friendlyReport | Where-Object { $_.Priority -eq "High - Review Required" }
 # if ($breaking.Count -gt 0) {
-#     Write-Host "##vso[task.logissue type=warning]$($breaking.Count) high-priority change(s) detected. Review $OutputPath"
+#     Write-Host "##vso[task.logissue type=warning]$($breaking.Count) high-priority change(s) detected. Review the log above."
 # }
