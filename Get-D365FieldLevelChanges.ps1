@@ -664,17 +664,51 @@ $friendlyReport = foreach ($c in $allChanges) {
 
 $friendlyReport = @($friendlyReport | Sort-Object { $prioritySortOrder[$_.Priority] }, "Object Type", "Object Name")
 
+# ---- Build a display-only version that collapses brand-new objects ----
+# When a whole object is new, listing every one of its fields individually is
+# noise (25+ rows for one new table). Collapse those into a single summary row
+# per object. Everything else (deletions, type changes, structural changes on
+# EXISTING objects) stays fully detailed since those are what actually need review.
+# NOTE: this collapsing is display-only - $friendlyReport itself (used for the
+# Summary / Priority breakdown counts below) is untouched, so those counts still
+# reflect the true number of underlying field-level changes.
+$newObjectRows = @($friendlyReport | Where-Object { $_."Change Type" -like "New Field Added (New Object Created)*" })
+$otherRows     = @($friendlyReport | Where-Object { $_."Change Type" -notlike "New Field Added (New Object Created)*" })
+
+$collapsedNewObjectRows = $newObjectRows | Group-Object "Object Name" | ForEach-Object {
+    $first = $_.Group[0]
+    [PSCustomObject]@{
+        "Object Type"   = $first."Object Type"
+        "Object Name"   = $_.Name
+        "Field Name"    = "(all fields)"
+        "Change Type"   = "New Object Created"
+        "Priority"      = "Info"
+        "Previous Type" = "(new)"
+        "New Type"      = "-"
+        "Description"   = "New object created with $($_.Count) field(s). See git history for full field list if needed."
+        "File Path"     = $first."File Path"
+    }
+}
+
+$displayReport = @($otherRows + $collapsedNewObjectRows) | Sort-Object { $prioritySortOrder[$_.Priority] }, "Object Type", "Object Name"
+
 # ---- Print report as a table directly in the pipeline log ----
 # (CSV export is disabled for now since the file isn't reachable off the build
 # agent without an extra "Publish Artifact" pipeline step - printing to the log
 # instead so the report is visible without any pipeline changes.)
 
-Write-Host "`n================================ FIELD & METADATA CHANGE REPORT ================================" -ForegroundColor Cyan
+$reportGeneratedAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss (K)"
 
-if ($friendlyReport.Count -eq 0) {
+Write-Host "`n================================ FIELD & METADATA CHANGE REPORT ================================" -ForegroundColor Cyan
+Write-Host "Report generated: $reportGeneratedAt" -ForegroundColor Cyan
+Write-Host "Commit range:     $FromCommit -> $ToCommit" -ForegroundColor Cyan
+Write-Host "Repo path:        $RepoPath" -ForegroundColor Cyan
+Write-Host ""
+
+if ($displayReport.Count -eq 0) {
     Write-Host "No reportable changes found." -ForegroundColor Yellow
 } else {
-    $tableText = $friendlyReport |
+    $tableText = $displayReport |
         Select-Object "Object Type", "Object Name", "Field Name", "Change Type", "Priority", "Previous Type", "New Type" |
         Format-Table -AutoSize |
         Out-String -Width 4096
@@ -682,7 +716,7 @@ if ($friendlyReport.Count -eq 0) {
     Write-Host $tableText
 
     Write-Host "-------------------------------------- Details --------------------------------------" -ForegroundColor Cyan
-    foreach ($row in $friendlyReport) {
+    foreach ($row in $displayReport) {
         Write-Host "  [$($row.Priority)] $($row.'Object Type') / $($row.'Object Name') - $($row.'Field Name')" -ForegroundColor White
         Write-Host "      $($row.Description)" -ForegroundColor Gray
         Write-Host "      File: $($row.'File Path')" -ForegroundColor DarkGray
@@ -690,9 +724,14 @@ if ($friendlyReport.Count -eq 0) {
 }
 
 Write-Host "==================================================================================================" -ForegroundColor Cyan
+Write-Host "Report generated: $reportGeneratedAt" -ForegroundColor Cyan
 
 Write-Host "`nSummary:" -ForegroundColor Green
-$friendlyReport | Group-Object "Change Type" | ForEach-Object {
+if ($newObjectRows.Count -gt 0) {
+    $newObjectCount = ($newObjectRows | Group-Object "Object Name").Count
+    Write-Host "  New objects created: $newObjectCount (totaling $($newObjectRows.Count) new field(s) - see collapsed rows above)" -ForegroundColor Yellow
+}
+$friendlyReport | Where-Object { $_."Change Type" -notlike "New Field Added (New Object Created)*" } | Group-Object "Change Type" | ForEach-Object {
     Write-Host "  $($_.Name): $($_.Count)" -ForegroundColor Yellow
 }
 Write-Host "`nBreakdown by priority:" -ForegroundColor Green
