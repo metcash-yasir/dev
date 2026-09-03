@@ -12,7 +12,7 @@ class METABNValidationJobTaskService extends METSysOperationTaskService
     METABNValidationJobQueue abnValidationJobQueue;
     guid                     topPickingProcessId;
     AddressCountryRegionId   countryRegionId;
-    
+
 }
 ]]></Declaration>
 		<Methods>
@@ -25,7 +25,7 @@ class METABNValidationJobTaskService extends METSysOperationTaskService
     protected void initialise()
     {
         METABNValidationJobContract contract;
-        
+
         super();
 
         // get the topPickingProcessId from the contract
@@ -94,20 +94,20 @@ class METABNValidationJobTaskService extends METSysOperationTaskService
     private boolean getDataFromTopPickingQueue(guid _processId, boolean _readPast)
     {
         #OCCRetryCount
-    
+
         METABNValidationJobQueue topPickingQueue;
         int                      backOffWait;
-    
+
         Microsoft.Dynamics.Ax.Xpp.DeadlockException deadLockException;
         Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
         Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
-        
+
         topPickingQueue.readPast(_readPast);
 
         try
         {
             ttsbegin;
-    
+
             select firstonly pessimisticlock topPickingQueue
                 where topPickingQueue.ProcessId == _processId;
 
@@ -124,7 +124,7 @@ class METABNValidationJobTaskService extends METSysOperationTaskService
                 DictTable abnValidJobQueueDictTable = new DictTable(tableNum(METABNValidationJobQueue));
                 abnValidationJobQueue = abnValidJobQueueDictTable.makeRecord();
             }
-           
+
             ttscommit;
         }
         catch (deadLockException)
@@ -188,32 +188,116 @@ class METABNValidationJobTaskService extends METSysOperationTaskService
 				<Name>execute</Name>
 				<Source><![CDATA[
     /// <summary>
-    /// Executes the process.
+    /// Executes the process and logs telemetry for the ABN web service call.
     /// </summary>
     private void execute()
     {
-        METATOWebServiceHelper atoWebServiceHelper;
-        
-        atoWebServiceHelper = METATOWebServiceHelper::construct(
-                                                      CustTable::find(abnValidationJobQueue.CustAccount));
-        
-        if (atoWebServiceHelper.callWebService(abnValidationJobQueue.ABN))
+        METATOWebServiceHelper       atoWebServiceHelper;
+        System.Diagnostics.Stopwatch stopwatch;
+        System.Exception             clrException;
+        boolean                      callSucceeded;
+        int                          infologLineBefore;
+        int64                        durationMilliseconds;
+        str                          failureType;
+        str                          errorMessage;
+
+        stopwatch         = System.Diagnostics.Stopwatch::StartNew();
+        infologLineBefore = infolog.line();
+
+        try
         {
-            switch (abnValidationJobQueue.RefTableId)
+            atoWebServiceHelper = METATOWebServiceHelper::construct(
+                                      CustTable::find(abnValidationJobQueue.CustAccount));
+
+            callSucceeded        = atoWebServiceHelper.callWebService(abnValidationJobQueue.ABN);
+            durationMilliseconds = stopwatch.get_ElapsedMilliseconds();
+
+            if (!callSucceeded)
             {
-                case tableNum(TaxRegistration):
-                    atoWebServiceHelper.updateTaxRegistration(
-                                        TaxRegistration::find(abnValidationJobQueue.RefRecId));
-                    break;
-                
-                case tableNum(TaxVATNumTable):
-                    atoWebServiceHelper.updateTaxVATNumTable(
-                                        TaxVATNumTable::find(abnValidationJobQueue.ABN, countryRegionId));
-                    break;
-                
-                default:
-                    throw error(error::wrongUseOfFunction(funcName()));
+                // Service reachable but the call did not succeed.
+                // Prefer the error captured by the helper; fall back to the infolog.
+                errorMessage = atoWebServiceHelper.parmLastErrorMessage();
+
+                if (!errorMessage)
+                {
+                    errorMessage = METABNValidationTelemetryHelper::infologMessages(
+                                       infologLineBefore + 1, infolog.line());
+                }
+
+                METABNValidationTelemetryHelper::logFailure(
+                    abnValidationJobQueue,
+                    METABNValidationTelemetryHelper::failureTypeFromMessage(errorMessage),
+                    errorMessage,
+                    durationMilliseconds);
+
+                return;
             }
+
+            METABNValidationTelemetryHelper::logSuccess(abnValidationJobQueue, durationMilliseconds);
+
+            this.updateValidationResult(atoWebServiceHelper);
+        }
+        catch (Exception::CLRError)
+        {
+            // Transport level errors that METWebService does not handle internally surface here.
+            clrException = CLRInterop::getLastException();
+            errorMessage = METABNValidationTelemetryHelper::clrExceptionMessage(clrException);
+            failureType  = METABNValidationTelemetryHelper::failureTypeFromClrException(clrException);
+
+            METABNValidationTelemetryHelper::logFailure(
+                abnValidationJobQueue,
+                failureType,
+                errorMessage,
+                stopwatch.get_ElapsedMilliseconds());
+
+            // Converted to Exception::Error so processTask keeps draining the queue
+            // instead of the CLR error terminating the whole batch task.
+            throw error(strFmt("@MET:ABNValidationCallFailed",
+                               abnValidationJobQueue.ABN,
+                               abnValidationJobQueue.CustAccount,
+                               errorMessage));
+        }
+        catch (Exception::Error)
+        {
+            errorMessage = METABNValidationTelemetryHelper::infologMessages(
+                               infologLineBefore + 1, infolog.line());
+
+            METABNValidationTelemetryHelper::logFailure(
+                abnValidationJobQueue,
+                callSucceeded ? METABNValidationFailureTypes::UpdateError
+                              : METABNValidationFailureTypes::UnhandledException,
+                errorMessage,
+                stopwatch.get_ElapsedMilliseconds());
+
+            throw Exception::Error;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateValidationResult</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Applies the validation result to the referenced record.
+    /// </summary>
+    /// <param name = "_atoWebServiceHelper">The web service helper holding the response.</param>
+    private void updateValidationResult(METATOWebServiceHelper _atoWebServiceHelper)
+    {
+        switch (abnValidationJobQueue.RefTableId)
+        {
+            case tableNum(TaxRegistration):
+                _atoWebServiceHelper.updateTaxRegistration(
+                    TaxRegistration::find(abnValidationJobQueue.RefRecId));
+                break;
+
+            case tableNum(TaxVATNumTable):
+                _atoWebServiceHelper.updateTaxVATNumTable(
+                    TaxVATNumTable::find(abnValidationJobQueue.ABN, countryRegionId));
+                break;
+
+            default:
+                throw error(error::wrongUseOfFunction(funcName()));
         }
     }
 
