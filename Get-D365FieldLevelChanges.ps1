@@ -131,6 +131,22 @@ function Get-FileContentAtCommit {
     }
 }
 
+function Get-FileChangeDate {
+    <#
+        Returns the commit date/time of the most recent commit that touched this
+        file within the ($FromCommit, $ToCommit] window - i.e. when this specific
+        object was actually changed, not just when the report ran.
+    #>
+    param([string]$FromCommit, [string]$ToCommit, [string]$FilePath)
+    try {
+        $dateStr = git log -1 --format=%cI "$FromCommit..$ToCommit" -- "$FilePath" 2>$null
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($dateStr)) { return "Unknown" }
+        return $dateStr.Trim()
+    } catch {
+        return "Unknown"
+    }
+}
+
 function Get-FieldsFromXml {
     <#
         Returns a hashtable keyed by field Name, containing Type (i:type attribute)
@@ -459,6 +475,7 @@ foreach ($file in $changedFiles) {
 
     $oldContent = Get-FileContentAtCommit -Commit $FromCommit -FilePath $file
     $newContent = Get-FileContentAtCommit -Commit $ToCommit -FilePath $file
+    $changedOn  = Get-FileChangeDate -FromCommit $FromCommit -ToCommit $ToCommit -FilePath $file
 
     # Handle new files (didn't exist before) - everything is "added"
     if (-not $oldContent -and $newContent) {
@@ -467,13 +484,13 @@ foreach ($file in $changedFiles) {
             $newFields = Get-FieldsFromXml -Xml $newXml
             foreach ($name in $newFields.Keys) {
                 $allChanges += [PSCustomObject]@{
-                    ObjectType = $objectType; ObjectName = $objectName; FilePath = $file
+                    ObjectType = $objectType; ObjectName = $objectName; FilePath = $file; ChangedOn = $changedOn
                     FieldName  = $name; ChangeType = "Field Added (New Object)"
                     OldRawType = $null; OldEDT = $null
                     NewRawType = $newFields[$name].Type; NewEDT = $newFields[$name].ExtendedDataType
                 }
             }
-            Write-Host "  Processed: $file (NEW OBJECT - did not exist at $FromCommit - $($newFields.Count) field(s) added)" -ForegroundColor DarkGray
+            Write-Host "  Processed: $file (NEW OBJECT - did not exist at $FromCommit - $($newFields.Count) field(s) added - changed on $changedOn)" -ForegroundColor DarkGray
         } catch { Write-Warning "Failed to parse new file: $file - $_" }
         continue
     }
@@ -485,13 +502,13 @@ foreach ($file in $changedFiles) {
             $oldFields = Get-FieldsFromXml -Xml $oldXml
             foreach ($name in $oldFields.Keys) {
                 $allChanges += [PSCustomObject]@{
-                    ObjectType = $objectType; ObjectName = $objectName; FilePath = $file
+                    ObjectType = $objectType; ObjectName = $objectName; FilePath = $file; ChangedOn = $changedOn
                     FieldName  = $name; ChangeType = "Field Deleted (Object Removed)"
                     OldRawType = $oldFields[$name].Type; OldEDT = $oldFields[$name].ExtendedDataType
                     NewRawType = $null; NewEDT = $null
                 }
             }
-            Write-Host "  Processed: $file (OBJECT REMOVED - no longer exists at $ToCommit - $($oldFields.Count) field(s) removed)" -ForegroundColor DarkGray
+            Write-Host "  Processed: $file (OBJECT REMOVED - no longer exists at $ToCommit - $($oldFields.Count) field(s) removed - changed on $changedOn)" -ForegroundColor DarkGray
         } catch { Write-Warning "Failed to parse old file: $file - $_" }
         continue
     }
@@ -533,10 +550,26 @@ foreach ($file in $changedFiles) {
                 }
             }
 
-            Write-Host "  Processed: $file (old fields: $($oldFields.Count), new fields: $($newFields.Count), total changes: $($changes.Count))" -ForegroundColor DarkGray
-            if ($changes.Count -gt 0) {
-                $breakdown = ($changes | Group-Object ChangeType | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ", "
-                Write-Host "    -> $breakdown" -ForegroundColor DarkGray
+            # Stamp ChangedOn onto every change record produced for this file
+            # (Compare-ObjectFields / Compare-NamedNodes don't know about it, so add it here).
+            $changes = $changes | ForEach-Object {
+                $_ | Add-Member -NotePropertyName ChangedOn -NotePropertyValue $changedOn -Force -PassThru
+            }
+
+            # Split into field-level vs structural/other so the log line can't be
+            # misread as "field count is the same, so what does total changes:1 mean?"
+            $fieldLevelChangeTypes = @("Field Added", "Field Deleted", "Data Type Changed", "Mandatory Flag Changed")
+            $fieldLevelChanges     = @($changes | Where-Object { $_.ChangeType -in $fieldLevelChangeTypes })
+            $structuralChanges     = @($changes | Where-Object { $_.ChangeType -notin $fieldLevelChangeTypes })
+
+            Write-Host "  Processed: $file (fields: $($oldFields.Count) -> $($newFields.Count) | field-level changes: $($fieldLevelChanges.Count) | other (index/relation/property) changes: $($structuralChanges.Count) | changed on $changedOn)" -ForegroundColor DarkGray
+            if ($fieldLevelChanges.Count -gt 0) {
+                $fieldBreakdown = ($fieldLevelChanges | Group-Object ChangeType | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ", "
+                Write-Host "    -> FIELD CHANGES: $fieldBreakdown" -ForegroundColor Yellow
+            }
+            if ($structuralChanges.Count -gt 0) {
+                $structuralBreakdown = ($structuralChanges | Group-Object ChangeType | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ", "
+                Write-Host "    -> OTHER (non-field) CHANGES: $structuralBreakdown" -ForegroundColor DarkGray
             }
 
             $allChanges += $changes
@@ -657,6 +690,7 @@ $friendlyReport = foreach ($c in $allChanges) {
         "Priority"      = $priority
         "Previous Type" = if ($oldFriendly) { $oldFriendly } elseif ($c.OldRawType) { $c.OldRawType } else { "(new)" }
         "New Type"      = if ($newFriendly) { $newFriendly } elseif ($c.NewRawType) { $c.NewRawType } else { "(removed)" }
+        "Changed On"    = if ($c.ChangedOn) { $c.ChangedOn } else { "Unknown" }
         "Description"   = $description
         "File Path"     = $c.FilePath
     }
@@ -685,6 +719,7 @@ $collapsedNewObjectRows = $newObjectRows | Group-Object "Object Name" | ForEach-
         "Priority"      = "Info"
         "Previous Type" = "(new)"
         "New Type"      = "-"
+        "Changed On"    = $first."Changed On"
         "Description"   = "New object created with $($_.Count) field(s). See git history for full field list if needed."
         "File Path"     = $first."File Path"
     }
@@ -709,7 +744,7 @@ if ($displayReport.Count -eq 0) {
     Write-Host "No reportable changes found." -ForegroundColor Yellow
 } else {
     $tableText = $displayReport |
-        Select-Object "Object Type", "Object Name", "Field Name", "Change Type", "Priority", "Previous Type", "New Type" |
+        Select-Object "Object Type", "Object Name", "Field Name", "Change Type", "Priority", "Changed On", "Previous Type", "New Type" |
         Format-Table -AutoSize |
         Out-String -Width 4096
 
@@ -718,12 +753,33 @@ if ($displayReport.Count -eq 0) {
     Write-Host "-------------------------------------- Details --------------------------------------" -ForegroundColor Cyan
     foreach ($row in $displayReport) {
         Write-Host "  [$($row.Priority)] $($row.'Object Type') / $($row.'Object Name') - $($row.'Field Name')" -ForegroundColor White
+        Write-Host "      Changed on: $($row.'Changed On')" -ForegroundColor Gray
         Write-Host "      $($row.Description)" -ForegroundColor Gray
         Write-Host "      File: $($row.'File Path')" -ForegroundColor DarkGray
     }
 }
 
 Write-Host "==================================================================================================" -ForegroundColor Cyan
+
+# ---- Quick view: field-level changes only (on existing objects) ----
+# Isolates just Field Added / Field Deleted / Data Type Changed / Mandatory Flag Changed
+# on objects that already existed - i.e. the core "did a field change" question - separate
+# from structural noise (index/relation changes) and brand-new object creation.
+$fieldLevelOnly = @($otherRows | Where-Object {
+    $_."Change Type" -in @("New Field Added", "Field Removed", "Data Type Changed", "Mandatory Setting Changed")
+})
+
+Write-Host "`n-------------------------------- FIELD-LEVEL CHANGES ONLY (existing objects) --------------------------------" -ForegroundColor Magenta
+if ($fieldLevelOnly.Count -eq 0) {
+    Write-Host "  None - no field additions/removals/type changes on existing objects in this window." -ForegroundColor Yellow
+} else {
+    $fieldLevelOnly |
+        Select-Object "Object Type", "Object Name", "Field Name", "Change Type", "Changed On", "Previous Type", "New Type" |
+        Format-Table -AutoSize |
+        Out-String -Width 4096 |
+        Write-Host
+}
+Write-Host "-----------------------------------------------------------------------------------------------------------" -ForegroundColor Magenta
 Write-Host "Report generated: $reportGeneratedAt" -ForegroundColor Cyan
 
 Write-Host "`nSummary:" -ForegroundColor Green
