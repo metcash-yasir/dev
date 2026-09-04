@@ -13,10 +13,11 @@ abstract class METCreateCSDTransferOrder
     List                      salesLineList,
                               profileRuleList;
     Map                       transferOrderMap;
+    Map                       transferOrderSOTOMap;
     Map                       transferOrderTOSOne;
     Set                       transferIdSet;
     RecordInsertList          transferLineInsertList;
-    boolean                   doSetStagingLane;
+    boolean                   doSetStagingLane, IstransferSOTO;
     Qty                       unitConvFactor,
                               unitConvConvertedQty,
                               unitConvStoredQty;
@@ -90,7 +91,8 @@ abstract class METCreateCSDTransferOrder
     {
         transferOrderTOSOne     = new Map(Types::String, Types::Record);
         transferIdSet           = new Set(Types::String);
-        transferOrderMap        = new Map(Types::String, Types::Class);
+        transferOrderMap        = new Map(Types::Record, Types::Class);
+        transferOrderSOTOMap    = new Map(Types::String, Types::Class);
         transferLineInsertList  = new RecordInsertList(tableNum(InventTransferLine));
         profile                 = METFulfilmentProfile::find(profileId);
         toInventLocation        = InventLocation::find(profile.InventLocationId);
@@ -755,9 +757,15 @@ abstract class METCreateCSDTransferOrder
             
             this.initRecords();
 
-            //Bug 405875: UAT - CSD Perishables TO's not created on Extraction - Start.
-            this.insertTransferOrderRecords();
-            //Bug 405875: UAT - CSD Perishables TO's not created on Extraction - End.
+            // Based on SOTO fill the data in map and insert the records in database.
+            if(IstransferSOTO)
+            {
+                this.insertTransferOrderSOTORecords();
+            }
+            else
+            {
+                this.insertTransferOrderRecords();
+            }
 
             this.createCSDWave();
             this.updateTMSCarries();
@@ -827,6 +835,57 @@ abstract class METCreateCSDTransferOrder
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>insertTransferOrderSOTORecords</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Bug 420280: CSD Perishable TO's being split not 1-1 on creation
+    /// Inserts transfer order records in database.
+    /// </summary>
+    private void insertTransferOrderSOTORecords()
+    {
+        MapEnumerator mapEnum;
+ 
+        mapEnum = transferOrderSOTOMap.getEnumerator() as MapEnumerator;
+
+        while (mapEnum && mapEnum.moveNext())
+        {
+            SetEnumerator       setEnum;
+            Set                 transferLineSet;
+            InventTransferTable transferTableLocal;
+            InventTransferLine  transferLineLocal;
+            str                 transferId;
+
+            transferTableLocal.clear();
+
+            transferId = mapEnum.currentKey();
+           
+            transferTableLocal = transferOrderTOSOne.lookup(transferId);
+       
+            transferTableLocal.TransferId =  InventTransferTable::numberSeq().num();
+
+            transferTableLocal.insert();
+
+            transferLineSet  = mapEnum.currentValue();
+            setEnum = transferLineSet.getEnumerator() as SetEnumerator;
+
+            while (setEnum && setEnum.moveNext())
+            {
+                transferLineLocal = setEnum.current();
+                transferLineLocal.TransferId = transferTableLocal.TransferId;
+
+                transferLineInsertList.add(transferLineLocal);
+            }
+
+            //Transfer order set is needed for CSD wavelines creation.
+            transferIdSet.add(transferTableLocal.TransferId);
+        }
+
+        transferLineInsertList.insertDatabase();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>insertTransferOrderRecords</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -846,15 +905,11 @@ abstract class METCreateCSDTransferOrder
             Set                 transferLineSet;
             InventTransferTable transferTableLocal;
             InventTransferLine  transferLineLocal;
-            str                 transferId;
 
             transferTableLocal.clear();
 
-            transferId = mapEnum.currentKey();
-           //transferTableLocal = mapEnum.currentKey();
-            // retrieve the header buffer saved earlier
-            transferTableLocal = transferOrderTOSOne.lookup(transferId);
-       
+            transferTableLocal = mapEnum.currentKey();
+            
             transferTableLocal.TransferId =  InventTransferTable::numberSeq().num();
 
             transferTableLocal.insert();
@@ -896,19 +951,39 @@ abstract class METCreateCSDTransferOrder
         }
         //CB679 - Event order and Backorder processes for NDC & CSD - end
         
-        if (!transferOrderMap.exists(transferTable.TransferId))
+        // For SO to TO one to one, we need to create a new header for each line, so we will use the transferId as key and store the header buffer in a separate map.
+        if(IstransferSOTO)
         {
-            transferLineSet = new Set(Types::Record);
-            // remember header buffer for this key so you can insert header later
-            transferOrderTOSOne.insert(transferTable.TransferId, transferTable);
+            if (!transferOrderSOTOMap.exists(transferTable.TransferId))
+            {
+                transferLineSet = new Set(Types::Record);
+                // remember header buffer for this key so you can insert header later
+                transferOrderTOSOne.insert(transferTable.TransferId, transferTable);
+            }
+            else
+            {
+                transferLineSet = transferOrderSOTOMap.lookup(transferTable.TransferId);
+            }
+
+            transferLineSet.add(transferLine);
+            transferOrderSOTOMap.insert(transferTable.TransferId, transferLineSet);
         }
         else
         {
-            transferLineSet = transferOrderMap.lookup(transferTable.TransferId);
-        }
+            if (!transferOrderMap.exists(transferTable))
+            {
+                transferLineSet = new Set(Types::Record);
+            }
+            else
+            {
+                transferLineSet = transferOrderMap.lookup(transferTable);
+            }
 
-        transferLineSet.add(transferLine);
-        transferOrderMap.insert(transferTable.TransferId, transferLineSet);
+            transferLineSet.add(transferLine);
+            transferOrderMap.insert(transferTable, transferLineSet);
+
+        }
+       
     }
 
 ]]></Source>
