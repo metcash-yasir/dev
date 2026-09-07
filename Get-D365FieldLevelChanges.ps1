@@ -43,7 +43,20 @@
     The "after" commit hash (this deployment's source commit). Defaults to HEAD.
 
 .PARAMETER OutputPath
-    Where to write the CSV report.
+    Where to write the CSV report. (Currently unused - see note above.)
+
+.PARAMETER SendGridKey
+    (Optional) SendGrid API key. If supplied together with -EmailTo, an email
+    report is sent via SendGrid's v3 mail/send API - but ONLY when there is at
+    least one reportable change (no email is sent on a "nothing changed" run).
+
+.PARAMETER EmailFrom
+    (Optional) The "from" address for the email report. Should be a verified
+    sender/domain in your SendGrid account, e.g. noReply_d365CBPipeline@metcash.com.
+
+.PARAMETER EmailTo
+    (Optional) Comma-separated recipient address(es) for the email report.
+    Email sending is skipped entirely if this or -SendGridKey is not supplied.
 
 .EXAMPLE
     # Nightly pipeline usage - "whatever changed in the last 24 hours", no commit tracking needed
@@ -52,6 +65,11 @@
 .EXAMPLE
     # Manual / ad-hoc usage with explicit commits
     .\Get-D365FieldLevelChanges.ps1 -RepoPath "K:\CoreBuildGITRepo" -FromCommit "abc123" -ToCommit "def456" -OutputPath "K:\Reports\FieldChanges.csv"
+
+.EXAMPLE
+    # With email report on changes
+    .\Get-D365FieldLevelChanges.ps1 -RepoPath "K:\CoreBuildGITRepo" -SinceHours 24 `
+        -SendGridKey "$(SendGridKey)" -EmailFrom "$(SenderEmail)" -EmailTo "you@metcash.com"
 #>
 
 param(
@@ -71,7 +89,16 @@ param(
     # to the console as a table. Kept as an optional param so the wrapper script
     # doesn't need to change, and so file export can be switched back on later.
     [Parameter(Mandatory = $false)]
-    [string]$OutputPath
+    [string]$OutputPath,
+
+    [Parameter(Mandatory = $false)]
+    [string]$SendGridKey,
+
+    [Parameter(Mandatory = $false)]
+    [string]$EmailFrom,
+
+    [Parameter(Mandatory = $false)]
+    [string]$EmailTo
 )
 
 Set-Location $RepoPath
@@ -444,6 +471,147 @@ function ConvertTo-FriendlyType {
     return $category
 }
 
+function ConvertTo-ReportHtml {
+    <#
+        Builds a simple, readable HTML email body from the report data:
+        summary counts, high-priority items in full, new objects as a compact
+        list, and field-level changes on existing objects called out separately
+        (since that's the primary thing being watched for).
+    #>
+    param(
+        [array]$DisplayReport,
+        [array]$FieldLevelOnly,
+        [array]$NewObjectRows,
+        [int]$HighPriorityCount,
+        [int]$InfoCount,
+        [string]$ReportGeneratedAt,
+        [string]$FromCommit,
+        [string]$ToCommit,
+        [string]$RepoPath
+    )
+
+    $style = @"
+<style>
+  body { font-family: Segoe UI, Arial, sans-serif; font-size: 13px; color: #222; }
+  h2 { color: #0b5394; margin-bottom: 4px; }
+  h3 { margin-bottom: 4px; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 16px; }
+  th, td { border: 1px solid #ccc; padding: 5px 8px; text-align: left; font-size: 12px; }
+  th { background-color: #0b5394; color: white; }
+  tr:nth-child(even) { background-color: #f5f5f5; }
+  .high { color: #b30000; font-weight: bold; }
+  .info { color: #555; }
+  .meta { color: #555; font-size: 12px; margin-bottom: 12px; }
+</style>
+"@
+
+    $highRows = @($DisplayReport | Where-Object { $_.Priority -eq "High - Review Required" })
+
+    $highTableRows = if ($highRows.Count -gt 0) {
+        ($highRows | ForEach-Object {
+            "<tr><td>$($_.'Object Type')</td><td>$($_.'Object Name')</td><td>$($_.'Field Name')</td><td>$($_.'Change Type')</td><td>$($_.'Changed On')</td><td>$($_.Description)</td></tr>"
+        }) -join "`n"
+    } else {
+        "<tr><td colspan='6'>None</td></tr>"
+    }
+
+    $fieldTableRows = if ($FieldLevelOnly.Count -gt 0) {
+        ($FieldLevelOnly | ForEach-Object {
+            "<tr><td>$($_.'Object Type')</td><td>$($_.'Object Name')</td><td>$($_.'Field Name')</td><td>$($_.'Change Type')</td><td>$($_.'Changed On')</td><td>$($_.'Previous Type')</td><td>$($_.'New Type')</td></tr>"
+        }) -join "`n"
+    } else {
+        "<tr><td colspan='7'>None - no field additions/removals/type changes on existing objects.</td></tr>"
+    }
+
+    $newObjectTableRows = if ($NewObjectRows.Count -gt 0) {
+        ($NewObjectRows | Group-Object "Object Name" | ForEach-Object {
+            $first = $_.Group[0]
+            "<tr><td>$($first.'Object Type')</td><td>$($_.Name)</td><td>$($_.Count)</td><td>$($first.'Changed On')</td></tr>"
+        }) -join "`n"
+    } else {
+        "<tr><td colspan='4'>None</td></tr>"
+    }
+
+    $html = @"
+<html>
+<head>$style</head>
+<body>
+  <h2>D365 F&amp;O Metadata Change Report</h2>
+  <div class="meta">
+    Report generated: $ReportGeneratedAt<br/>
+    Commit range: $FromCommit -&gt; $ToCommit<br/>
+    Repo path: $RepoPath
+  </div>
+
+  <h3>Summary</h3>
+  <p><span class="high">High - Review Required: $HighPriorityCount</span> &nbsp;|&nbsp; <span class="info">Info: $InfoCount</span></p>
+
+  <h3>High Priority - Review Required</h3>
+  <table>
+    <tr><th>Object Type</th><th>Object Name</th><th>Field Name</th><th>Change Type</th><th>Changed On</th><th>Description</th></tr>
+    $highTableRows
+  </table>
+
+  <h3>Field-Level Changes on Existing Objects</h3>
+  <table>
+    <tr><th>Object Type</th><th>Object Name</th><th>Field Name</th><th>Change Type</th><th>Changed On</th><th>Previous Type</th><th>New Type</th></tr>
+    $fieldTableRows
+  </table>
+
+  <h3>New Objects Created</h3>
+  <table>
+    <tr><th>Object Type</th><th>Object Name</th><th>Field Count</th><th>Changed On</th></tr>
+    $newObjectTableRows
+  </table>
+
+  <p style="color:#888; font-size:11px;">Automatically generated by the D365 metadata change detection pipeline step.</p>
+</body>
+</html>
+"@
+
+    return $html
+}
+
+function Send-ChangeReportEmail {
+    <#
+        Sends the HTML report via SendGrid's v3 mail/send API. Silently does
+        nothing (with a log note) if ApiKey/From/To aren't all supplied - so this
+        is safe to call unconditionally from Main without extra guard logic
+        everywhere else.
+    #>
+    param(
+        [string]$ApiKey,
+        [string]$FromAddress,
+        [string]$ToAddresses,
+        [string]$Subject,
+        [string]$HtmlBody
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ApiKey) -or [string]::IsNullOrWhiteSpace($FromAddress) -or [string]::IsNullOrWhiteSpace($ToAddresses)) {
+        Write-Host "Email not sent - SendGridKey/EmailFrom/EmailTo not all supplied." -ForegroundColor DarkGray
+        return
+    }
+
+    $toList = $ToAddresses -split ',' | ForEach-Object { @{ email = $_.Trim() } }
+
+    $payload = @{
+        personalizations = @(@{ to = @($toList) })
+        from             = @{ email = $FromAddress }
+        subject          = $Subject
+        content          = @(@{ type = "text/html"; value = $HtmlBody })
+    } | ConvertTo-Json -Depth 10
+
+    try {
+        Invoke-RestMethod -Uri "https://api.sendgrid.com/v3/mail/send" `
+            -Method Post `
+            -Headers @{ Authorization = "Bearer $ApiKey"; "Content-Type" = "application/json" } `
+            -Body $payload | Out-Null
+        Write-Host "Email report sent to: $ToAddresses" -ForegroundColor Green
+    } catch {
+        Write-Warning "Failed to send email report via SendGrid: $($_.Exception.Message)"
+    }
+}
+
 # ---- Main ----
 
 Write-Host "Getting changed files between $FromCommit and $ToCommit..." -ForegroundColor Cyan
@@ -791,8 +959,32 @@ $friendlyReport | Where-Object { $_."Change Type" -notlike "New Field Added (New
     Write-Host "  $($_.Name): $($_.Count)" -ForegroundColor Yellow
 }
 Write-Host "`nBreakdown by priority:" -ForegroundColor Green
+$highPriorityCount = 0
+$infoCount = 0
 $friendlyReport | Group-Object Priority | Sort-Object { $prioritySortOrder[$_.Name] } | ForEach-Object {
     Write-Host "  $($_.Name): $($_.Count)" -ForegroundColor Yellow
+    if ($_.Name -eq "High - Review Required") { $highPriorityCount = $_.Count }
+    if ($_.Name -eq "Info") { $infoCount = $_.Count }
+}
+
+# ---- Email the report via SendGrid - only when there is something to report ----
+# (Send-ChangeReportEmail itself no-ops safely if SendGridKey/EmailFrom/EmailTo
+# weren't all supplied, so this call is always safe to leave in place.)
+if ($friendlyReport.Count -gt 0) {
+    $emailHtml = ConvertTo-ReportHtml -DisplayReport $displayReport -FieldLevelOnly $fieldLevelOnly `
+        -NewObjectRows $newObjectRows -HighPriorityCount $highPriorityCount -InfoCount $infoCount `
+        -ReportGeneratedAt $reportGeneratedAt -FromCommit $FromCommit -ToCommit $ToCommit -RepoPath $RepoPath
+
+    $emailSubject = if ($highPriorityCount -gt 0) {
+        "D365 Metadata Change Report - $highPriorityCount High Priority item(s) - $reportGeneratedAt"
+    } else {
+        "D365 Metadata Change Report - $reportGeneratedAt"
+    }
+
+    Send-ChangeReportEmail -ApiKey $SendGridKey -FromAddress $EmailFrom -ToAddresses $EmailTo `
+        -Subject $emailSubject -HtmlBody $emailHtml
+} else {
+    Write-Host "No reportable changes - email skipped." -ForegroundColor DarkGray
 }
 
 # When ready to go back to a downloadable file, re-enable this line and add a
