@@ -1,0 +1,558 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesOrderCancellationUIBuilder</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/*
+================================================================================
+ METSalesOrderCancellationUIBuilder
+================================================================================
+ Attaches multi-select lookups to the Legal entity and Sales order fields on
+ the batch dialog, and clears the Sales order selection whenever Legal entity
+ changes - a previously selected order may not be valid for the new scope.
+
+ DELIBERATE DESIGN CHOICE - read before changing:
+ The "only offer orders/lines that are actually flagged" and "restricted to
+ the selected legal entities" requirements are enforced authoritatively in
+ METSalesOrderCancellationService (isCompanyInScope / isSalesIdInScope), not
+ by filtering what appears in this dialog's lookup. Dynamically re-querying
+ the Sales order lookup's candidate list (cross-company, joined to the flag
+ tables, refreshed live as Legal entity changes) would need deep
+ SysLookupMultiSelectCtrl API fidelity I can't compile-check from here.
+ Server-side re-validation is strictly safer anyway - client-side filtering
+ alone is never sufficient for a production batch - so this file stays
+ intentionally simple: standard multi-select pickers over DataArea /
+ SalesTable, plus the clear-on-change handler. A user who selects an
+ unflagged or out-of-scope order simply has it silently skipped by the
+ service, exactly as if they'd left it deselected.
+
+ MUST VERIFY IN VISUAL STUDIO BEFORE GO-LIVE (see peer review):
+   - SysLookupMultiSelectCtrl constructor name/signature used below
+     (constructWithQuery is the common convention, not confirmed against
+     your class library version).
+   - registerOverrideMethod() as the mechanism to hook the Legal entity
+     control's modified() event.
+   - parmSelectedValues() / equivalent getter-setter names for reading and
+     clearing the controls' current selections.
+ This is standard, common D365 boilerplate (multi-select company pickers are
+ a well-worn pattern across many implementations), so a mismatch should be a
+ quick fix once opened in the class browser - but please verify before this
+ ships, since I cannot compile-check X++ from here.
+================================================================================
+*/
+public class METSalesOrderCancellationUIBuilder
+    extends SysOperationAutomaticUIBuilder
+{
+    DialogField                dialogLegalEntityScope;
+    DialogField                dialogSalesIdScope;
+    SysLookupMultiSelectCtrl   legalEntityCtrl;
+    SysLookupMultiSelectCtrl   salesIdCtrl;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>addDialogField</Name>
+				<Source><![CDATA[
+    protected DialogField addDialogField(
+        IdentifierName _methodName,
+        Object          _dataContract = this.dataContractObject())
+    {
+        DialogField dialogField;
+
+        switch (_methodName)
+        {
+            case methodStr(
+                METSalesOrderCancellationContract,
+                parmLegalEntityScope):
+
+                dialogLegalEntityScope = this.dialog().addField(
+                    extendedTypeStr(Description),
+                    literalStr('Legal entity'),
+                    literalStr('Optional. Leave blank to process all enabled legal entities.'));
+
+                dialogField = dialogLegalEntityScope;
+                break;
+
+            case methodStr(
+                METSalesOrderCancellationContract,
+                parmSalesIdScope):
+
+                dialogSalesIdScope = this.dialog().addField(
+                    extendedTypeStr(Description),
+                    literalStr('Sales order'),
+                    literalStr('Optional. Select legal entities first to choose specific eligible sales orders. Leave blank to process all flagged orders in scope.'));
+
+                dialogField = dialogSalesIdScope;
+                break;
+
+            default:
+                dialogField = super(_methodName, _dataContract);
+                break;
+        }
+
+        return dialogField;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postBuild</Name>
+				<Source><![CDATA[
+    public void postBuild()
+    {
+        super();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>postRun</Name>
+				<Source><![CDATA[
+    public void postRun()
+    {
+        FormRun   formRun;
+        Container legalEntityValueField;
+        Container salesIdValueField;
+
+        super();
+
+        if (!this.dialog() || !this.dialog().dialogForm())
+        {
+            throw error(
+                'Unable to initialize the sales order cancellation dialog.');
+        }
+
+        formRun = this.dialog().dialogForm().formRun();
+
+        if (!formRun)
+        {
+            throw error(
+                'Unable to obtain FormRun for the sales order cancellation dialog.');
+        }
+
+        legalEntityValueField =
+            [tableNum(DataArea), fieldNum(DataArea, Id)];
+
+        salesIdValueField =
+            [tableNum(SalesTable), fieldNum(SalesTable, SalesId)];
+
+        if (dialogLegalEntityScope)
+        {
+            legalEntityCtrl =
+                SysLookupMultiSelectCtrl::constructWithQuery(
+                    formRun,
+                    dialogLegalEntityScope.control(),
+                    this.buildLegalEntityQuery(),
+                    false,
+                    legalEntityValueField);
+        }
+
+        if (dialogSalesIdScope)
+        {
+            salesIdCtrl =
+                SysLookupMultiSelectCtrl::constructWithQuery(
+                    formRun,
+                    dialogSalesIdScope.control(),
+                    this.buildSalesIdQuery(conNull()),
+                    false,
+                    salesIdValueField);
+
+            salesIdCtrl.set(conNull());
+            this.updateSalesOrderControlState(conNull());
+        }
+
+        // Register this only after constructWithQuery() has finished creating
+        // both multi-select controllers. Registering it in postBuild() is too
+        // early and can leave the Sales order control on its initial empty
+        // query even though a legal entity is displayed in the dialog.
+        if (dialogLegalEntityScope && dialogLegalEntityScope.control())
+        {
+            dialogLegalEntityScope.registerOverrideMethod(
+                methodStr(FormStringControl, modified),
+                methodStr(
+                    METSalesOrderCancellationUIBuilder,
+                    legalEntityModified),
+                this);
+        }
+
+        if (dialogSalesIdScope && dialogSalesIdScope.control())
+        {
+            dialogSalesIdScope.control().registerOverrideMethod(
+                methodStr(FormStringControl, enter),
+                methodStr(
+                    METSalesOrderCancellationUIBuilder,
+                    salesOrderEnter),
+                this);
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    public void getFromDialog()
+    {
+        METSalesOrderCancellationContract contract;
+
+        super();
+
+        contract = this.dataContractObject();
+
+        if (!contract)
+        {
+            return;
+        }
+
+        if (legalEntityCtrl)
+        {
+            contract.parmLegalEntityScope(
+                this.getSelectedLegalEntities(
+                    dialogLegalEntityScope.control()));
+        }
+        else
+        {
+            contract.parmLegalEntityScope(conNull());
+        }
+
+        if (salesIdCtrl)
+        {
+            contract.parmSalesIdScope(
+                salesIdCtrl.getSelectedFieldValues());
+        }
+        else
+        {
+            contract.parmSalesIdScope(conNull());
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildLegalEntityQuery</Name>
+				<Source><![CDATA[
+    protected Query buildLegalEntityQuery()
+    {
+        Query                   query;
+        QueryBuildDataSource    dataAreaQbds;
+        QueryBuildFieldList     fieldList;
+
+        query = new Query();
+        dataAreaQbds = query.addDataSource(tableNum(DataArea));
+
+        // Prevent technical fields such as RecId, Partition and RecVersion
+        // from appearing in the lookup.
+        fieldList = dataAreaQbds.fields();
+        fieldList.dynamic(NoYes::No);
+        fieldList.clearFieldList();
+        fieldList.addField(fieldNum(DataArea, Id));
+        fieldList.addField(fieldNum(DataArea, Name));
+        dataAreaQbds.addSortField(fieldNum(DataArea, Id));
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSelectedLegalEntities</Name>
+				<Source><![CDATA[
+    protected Container getSelectedLegalEntities(
+        FormStringControl _control = null)
+    {
+        Container   selectedRecordIds;
+        Container   selectedLegalEntities;
+        RefRecId    selectedRecordId;
+        DataArea    dataArea;
+        DataAreaId  displayedLegalEntity;
+        int         selectedIndex;
+
+        selectedLegalEntities = conNull();
+
+        if (legalEntityCtrl)
+        {
+            // get() returns the record IDs selected by the multi-select
+            // control. Resolve those IDs back to their DataAreaId values.
+            selectedRecordIds = legalEntityCtrl.get();
+
+            for (selectedIndex = 1;
+            selectedIndex <= conLen(selectedRecordIds);
+            selectedIndex++)
+            {
+                selectedRecordId = conPeek(
+                    selectedRecordIds,
+                    selectedIndex);
+
+                select firstOnly Id from dataArea
+                    where dataArea.RecId == selectedRecordId;
+
+                if (dataArea.Id)
+                {
+                    selectedLegalEntities += dataArea.Id;
+                }
+            }
+
+            // Retain the standard selected-field API as a fallback for
+            // platform versions that populate it before get().
+            if (conLen(selectedLegalEntities) == 0)
+            {
+                selectedLegalEntities =
+                    legalEntityCtrl.getSelectedFieldValues();
+            }
+        }
+
+        // Final fallback for a single company already displayed in the host
+        // control when the multi-select state has not yet been committed.
+        if (conLen(selectedLegalEntities) == 0 && _control)
+        {
+            displayedLegalEntity = strLRTrim(_control.text());
+
+            if (displayedLegalEntity)
+            {
+                selectedLegalEntities = [displayedLegalEntity];
+            }
+        }
+
+        return selectedLegalEntities;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>buildSalesIdQuery</Name>
+				<Source><![CDATA[
+    protected Query buildSalesIdQuery(Container _legalEntities)
+    {
+        Query                   query;
+        QueryBuildDataSource    salesTableQbds;
+        Set                     eligibleSalesTableRecIds;
+        SetEnumerator           recIdEnumerator;
+        DataAreaId              company;
+        int                     companyIndex;
+
+        query = new Query();
+        salesTableQbds = query.addDataSource(tableNum(SalesTable));
+        this.addSalesLookupFields(salesTableQbds);
+
+        if (conLen(_legalEntities) == 0)
+        {
+            salesTableQbds
+                .addRange(fieldNum(SalesTable, RecId))
+                .value(SysQuery::value(0));
+
+            return query;
+        }
+
+        // Resolve header-flag OR line-flag eligibility first. RecId is used
+        // instead of SalesId because it is unique across legal entities.
+        eligibleSalesTableRecIds =
+            this.collectEligibleSalesTableRecIds(_legalEntities);
+
+        if (eligibleSalesTableRecIds.elements() == 0)
+        {
+            salesTableQbds
+                .addRange(fieldNum(SalesTable, RecId))
+                .value(SysQuery::value(0));
+
+            return query;
+        }
+
+        query.allowCrossCompany(true);
+
+        for (companyIndex = 1;
+        companyIndex <= conLen(_legalEntities);
+        companyIndex++)
+        {
+            company = conPeek(_legalEntities, companyIndex);
+
+            if (company)
+            {
+                query.addCompanyRange(company);
+            }
+        }
+
+        // Several ranges on the same field are OR conditions. Adding one
+        // exact RecId range per eligible order avoids valueIn/container
+        // formatting issues in the multi-select lookup.
+        recIdEnumerator = eligibleSalesTableRecIds.getEnumerator();
+
+        while (recIdEnumerator.moveNext())
+        {
+            salesTableQbds
+                .addRange(fieldNum(SalesTable, RecId))
+                .value(SysQuery::value(recIdEnumerator.current()));
+        }
+
+        salesTableQbds
+            .addRange(fieldNum(SalesTable, SalesStatus))
+            .value(queryValue(SalesStatus::Backorder));
+
+        return query;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>collectEligibleSalesTableRecIds</Name>
+				<Source><![CDATA[
+    protected Set collectEligibleSalesTableRecIds(
+        Container _legalEntities)
+    {
+        Set             eligibleSalesTableRecIdSet;
+        DataAreaId      company;
+        SalesTable      salesTable;
+        SalesTable      parentSalesTable;
+        SalesLine       salesLine;
+        METSalesTable   metSalesTable;
+        METSalesLine    metSalesLine;
+        int             companyIndex;
+
+        eligibleSalesTableRecIdSet = new Set(Types::Int64);
+
+        for (companyIndex = 1;
+        companyIndex <= conLen(_legalEntities);
+        companyIndex++)
+        {
+            company = conPeek(_legalEntities, companyIndex);
+
+            if (!company)
+            {
+                continue;
+            }
+
+            changeCompany(company)
+            {
+                while select RecId from salesTable
+                    where salesTable.SalesStatus == SalesStatus::Backorder
+                    exists join metSalesTable
+                        where metSalesTable.salesTable == salesTable.RecId
+                           && metSalesTable.OrderCancellationRequired == NoYes::Yes
+                {
+                    eligibleSalesTableRecIdSet.add(salesTable.RecId);
+                }
+
+                // Start from the flagged line, exactly as the service does.
+                // The previous nested exists joins did not reliably return
+                // the parent SalesTable row for line-only flags.
+                while select SalesId from salesLine
+                    exists join metSalesLine
+                        where metSalesLine.salesLine == salesLine.RecId
+                           && metSalesLine.LineCancellationRequired == NoYes::Yes
+                {
+                    parentSalesTable = SalesTable::find(
+                        salesLine.SalesId);
+
+                    if (parentSalesTable.RecId
+                        && parentSalesTable.SalesStatus
+                            == SalesStatus::Backorder)
+                    {
+                        eligibleSalesTableRecIdSet.add(
+                            parentSalesTable.RecId);
+                    }
+                }
+            }
+        }
+
+        return eligibleSalesTableRecIdSet;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addSalesLookupFields</Name>
+				<Source><![CDATA[
+    protected void addSalesLookupFields(
+        QueryBuildDataSource _salesTableQbds)
+    {
+        QueryBuildFieldList fieldList;
+
+        fieldList = _salesTableQbds.fields();
+        fieldList.dynamic(NoYes::No);
+        fieldList.clearFieldList();
+
+        // Keep the lookup limited to business-facing columns.
+        fieldList.addField(fieldNum(SalesTable, SalesId));
+        fieldList.addField(fieldNum(SalesTable, SalesName));
+        fieldList.addField(fieldNum(SalesTable, DataAreaId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>updateSalesOrderControlState</Name>
+				<Source><![CDATA[
+    protected void updateSalesOrderControlState(
+        Container _selectedLegalEntities)
+    {
+        FormStringControl salesOrderControl;
+
+        if (dialogSalesIdScope)
+        {
+            salesOrderControl = dialogSalesIdScope.control();
+
+            if (salesOrderControl)
+            {
+                // Never hide or disable the parameter.  When no legal entity
+                // is selected, buildSalesIdQuery() supplies an empty query.
+                salesOrderControl.visible(true);
+                salesOrderControl.enabled(true);
+                salesOrderControl.allowEdit(true);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>legalEntityModified</Name>
+				<Source><![CDATA[
+    public boolean legalEntityModified(FormStringControl _control)
+    {
+        boolean     ret;
+        Container   selectedLegalEntities;
+
+        ret = _control.modified();
+        selectedLegalEntities =
+            this.getSelectedLegalEntities(_control);
+
+        if (salesIdCtrl)
+        {
+            // Never retain Sales IDs selected for a previous company scope.
+            salesIdCtrl.set(conNull());
+            salesIdCtrl.refreshQuery(
+                this.buildSalesIdQuery(selectedLegalEntities));
+        }
+
+        this.updateSalesOrderControlState(selectedLegalEntities);
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>salesOrderEnter</Name>
+				<Source><![CDATA[
+    public void salesOrderEnter(FormStringControl _control)
+    {
+        Container selectedLegalEntities;
+
+        _control.enter();
+
+        selectedLegalEntities = this.getSelectedLegalEntities(
+            dialogLegalEntityScope.control());
+
+        if (salesIdCtrl)
+        {
+            salesIdCtrl.refreshQuery(
+                this.buildSalesIdQuery(selectedLegalEntities));
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>

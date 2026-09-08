@@ -1,0 +1,430 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesOrderCancellationService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/*
+================================================================================
+ METSalesOrderCancellationService
+================================================================================
+ Business logic for the sales order / sales order line cancellation batch.
+ Invoked (async, batch-only) via METSalesOrderCancellationController.
+
+ Business rule:
+   Phase 1 - full-order cancellation. Every open SalesTable whose companion
+             METSalesTable.METOrderCancellationRequired = Yes is cancelled in
+             its entirety (every open line), then the header flag is reset
+             to No.
+   Phase 2 - line-only cancellation. Every open SalesLine whose companion
+             METSalesLine.METLineCancellationRequired = Yes is individually
+             cancelled, then that line's flag is reset to No.
+   Phase 2 runs strictly after Phase 1 completes within each company, so
+   lines already swept up in a header cancellation are naturally excluded -
+   no extra cross-check needed. Any line that also carried a stray
+   METLineCancellationRequired = Yes flag while being cancelled under Phase 1
+   has that flag cleared as part of Phase 1 too, so nothing is left
+   dangling for Phase 2 to pick up a second time.
+
+   Legal entity / Sales order scope (from the dialog) are re-validated here
+   server-side (isCompanyInScope / isSalesIdInScope) rather than trusted from
+   the UI - see METSalesOrderCancellationUIBuilder for why. An empty scope
+   means "no restriction" at that level.
+
+   Applies to open orders only (SalesStatus - see #OpenOrderStatus).
+   Records are committed in batches of METCustParameters.CancelCount, which
+   also bounds the size of each Dual-write payload.
+
+ MUST VERIFY BEFORE GO-LIVE - see the accompanying peer review for detail:
+   1. SalesUpdateRemain construction (newSalesUpdateRemain()) - only the
+      ExtensionOf (METSalesUpdateRemain_Extension) was available, not the
+      base class, so the constructor call is inferred from convention, not
+      confirmed against your actual base class.
+   2. METSalesTable's FK field name back to SalesTable (assumed `salesTable`,
+      inferred from METSalesLine's confirmed `salesLine` field) - used in the
+      Phase 1 query join.
+   3. "Open order" definition (assumed SalesStatus::Backorder).
+   4. METCustParameters.CancelCount is the confirmed field name from the code
+      you shared - if your commit-limit field is actually named differently
+      (e.g. CountLimit), it's a one-line rename in initializeCommitLimit().
+================================================================================
+*/
+public class METSalesOrderCancellationService extends SysOperationServiceBase
+{
+    Container legalEntityScope;
+    Container salesIdScope;
+    private Counter cancelCount;
+    private boolean isCancelOpenOrderLineProcessing;
+    private Counter cancelLimit;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    public void process(METSalesOrderCancellationContract _contract)
+    {
+        DataArea   dataArea;
+        DataAreaId dataAreaId;
+        int        scopeIndex;
+
+        if (!_contract)
+        {
+            throw error('Sales order cancellation contract is missing.');
+        }
+
+        legalEntityScope = _contract.parmLegalEntityScope();
+        salesIdScope      = _contract.parmSalesIdScope();
+
+        // Blank legal-entity selection means all companies.
+        if (conLen(legalEntityScope) == 0)
+        {
+            while select Id from dataArea
+            {
+                this.processCompany(dataArea.Id);
+            }
+        }
+        else
+        {
+            // Process only the selected companies.
+            for (scopeIndex = 1;
+            scopeIndex <= conLen(legalEntityScope);
+            scopeIndex++)
+            {
+                dataAreaId = conPeek(legalEntityScope, scopeIndex);
+
+                if (this.isValidCompany(dataAreaId))
+                {
+                    this.processCompany(dataAreaId);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isValidCompany</Name>
+				<Source><![CDATA[
+    protected boolean isValidCompany(DataAreaId _dataAreaId)
+    {
+        DataArea dataArea;
+
+        select firstOnly RecId from dataArea
+            where dataArea.Id == _dataAreaId;
+
+        return dataArea.RecId != 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isSalesIdInScope</Name>
+				<Source><![CDATA[
+    protected boolean isSalesIdInScope(SalesId _salesId)
+    {
+        // Blank sales-order selection means all flagged sales orders.
+        return conLen(salesIdScope) == 0
+            || conFind(salesIdScope, _salesId) > 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCompany</Name>
+				<Source><![CDATA[
+    protected void processCompany(DataAreaId _dataAreaId)
+    {
+        changeCompany(_dataAreaId)
+        {
+            cancelLimit = METCustParameters::find().CancelCount;
+            if (cancelLimit <= 0)
+            {
+                throw error(strFmt(
+                    'MET cancellation batch size must be greater than zero in company %1.',
+                    curExt()));
+            }
+            // A header flag has priority and cancels the complete order.
+            this.processHeaderCancellations();
+
+            // Then process orders having only line cancellation flags.
+            this.processLineCancellations();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processHeaderCancellations</Name>
+				<Source><![CDATA[
+    protected void processHeaderCancellations()
+    {
+        SalesTable    salesTable;
+        METSalesTable metSalesTable;
+
+        while select SalesId from salesTable
+            where salesTable.SalesStatus == SalesStatus::Backorder
+            exists join metSalesTable
+                where metSalesTable.salesTable == salesTable.RecId
+                   && metSalesTable.OrderCancellationRequired == NoYes::Yes
+        {
+            if (this.isSalesIdInScope(salesTable.SalesId))
+            {
+                this.cancelOrder(salesTable.SalesId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processLineCancellations</Name>
+				<Source><![CDATA[
+    protected void processLineCancellations()
+    {
+        SalesLine    salesLine;
+        METSalesLine metSalesLine;
+
+        while select RecId, SalesId from salesLine
+            where salesLine.SalesStatus == SalesStatus::Backorder
+            exists join metSalesLine
+                where metSalesLine.salesLine == salesLine.RecId
+                   && metSalesLine.LineCancellationRequired == NoYes::Yes
+        {
+            if (this.isSalesIdInScope(salesLine.SalesId))
+            {
+                this.cancelSingleLine(salesLine.RecId);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelOrder</Name>
+				<Source><![CDATA[
+    protected void cancelOrder(SalesId _salesId)
+    {
+        SalesTable         salesTable;
+        SalesLine          salesLine;
+        METSalesTable      metSalesTable;
+        SalesUpdateRemain  salesUpdateRemain;
+
+        ttsbegin;
+
+        select firstOnly forUpdate salesTable
+            where salesTable.SalesId     == _salesId
+               && salesTable.SalesStatus == SalesStatus::Backorder;
+
+        select firstOnly metSalesTable
+            where metSalesTable.salesTable == salesTable.RecId
+               && metSalesTable.OrderCancellationRequired == NoYes::Yes;
+
+        if (!salesTable.RecId || !metSalesTable.RecId)
+        {
+            ttscommit;
+            return;
+        }
+
+        salesUpdateRemain = SalesUpdateRemain::construct();
+
+        // Header flag: cancel every open line.
+        while select forUpdate salesLine
+            order by LineNum
+            where salesLine.SalesId     == salesTable.SalesId
+               && salesLine.SalesStatus == SalesStatus::Backorder
+        {
+            if (!this.cancelLine(salesUpdateRemain, salesLine))
+            {
+                throw error(strFmt(
+                    'Sales order %1 line %2 could not be cancelled.',
+                    salesLine.SalesId,
+                    salesLine.LineNum));
+            }
+        }
+
+        // Standard logic updates the header after the last line is cancelled.
+        salesTable.reread();
+
+        if (salesTable.SalesStatus != SalesStatus::Canceled)
+        {
+            throw error(strFmt(
+                'Sales order %1 could not be cancelled.',
+                salesTable.SalesId));
+        }
+
+        // The complete order succeeded, so clear all cancellation flags.
+        this.clearLineFlags(salesTable.SalesId);
+
+        // Cancellation can update related custom records. Select the latest
+        // flag record to avoid updating it with an old RecVersion.
+        metSalesTable.clear();
+
+        select firstOnly forUpdate metSalesTable
+            where metSalesTable.salesTable == salesTable.RecId
+               && metSalesTable.OrderCancellationRequired == NoYes::Yes;
+
+        if (metSalesTable.RecId)
+        {
+            metSalesTable.OrderCancellationRequired = NoYes::No;
+            metSalesTable.update();
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelSingleLine</Name>
+				<Source><![CDATA[
+    protected void cancelSingleLine(RefRecId _salesLineRecId)
+    {
+        SalesLine         salesLine;
+        METSalesLine      metSalesLine;
+        SalesUpdateRemain salesUpdateRemain;
+
+        ttsbegin;
+
+        select firstOnly forUpdate salesLine
+            where salesLine.RecId == _salesLineRecId;
+
+        select firstOnly metSalesLine
+            where metSalesLine.salesLine == salesLine.RecId
+               && metSalesLine.LineCancellationRequired == NoYes::Yes;
+
+        if (!salesLine.RecId || !metSalesLine.RecId)
+        {
+            ttscommit;
+            return;
+        }
+
+        salesUpdateRemain = SalesUpdateRemain::construct();
+
+        if (!this.cancelLine(salesUpdateRemain, salesLine))
+        {
+            throw error(strFmt(
+                'Sales order %1 line %2 could not be cancelled.',
+                salesLine.SalesId,
+                salesLine.LineNum));
+        }
+
+        // updateDeliverRemainder can trigger other logic that updates
+        // METSalesLine. Re-select it so this buffer has the latest RecVersion.
+        metSalesLine.clear();
+
+        select firstOnly forUpdate metSalesLine
+            where metSalesLine.salesLine == salesLine.RecId
+               && metSalesLine.LineCancellationRequired == NoYes::Yes;
+
+        if (metSalesLine.RecId)
+        {
+            metSalesLine.LineCancellationRequired = NoYes::No;
+            metSalesLine.update();
+        }
+
+        ttscommit;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelLine</Name>
+				<Source><![CDATA[
+    protected boolean cancelLine(
+        SalesUpdateRemain _salesUpdateRemain,
+        SalesLine         _salesLine)
+    {
+        boolean cancelled;
+
+        if (_salesLine.SalesStatus == SalesStatus::Canceled)
+        {
+            return true;
+        }
+
+        if (_salesLine.SalesStatus != SalesStatus::Backorder)
+        {
+            return false;
+        }
+
+        cancelled = _salesUpdateRemain.updateDeliverRemainder(
+            _salesLine,
+            0,
+            0);
+
+        _salesLine.reread();
+
+        // Only run our logic if ttsLevel is 1 or 2
+        if (cancelLimit > 0 && appl.ttsLevel() <= 1)
+        {
+            cancelCount++;
+
+            if (cancelCount >= cancelLimit)
+            {
+                int level = appl.ttsLevel();
+
+                // Commit/Begin exactly 'level' times
+                this.doTtsCommit(level);
+                this.doTtsBegin(level);
+
+                cancelCount = 0;
+            }
+        }
+        // If ttsLevel >= 2 → none of our code executes
+
+        return cancelled
+            && _salesLine.SalesStatus == SalesStatus::Canceled;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearLineFlags</Name>
+				<Source><![CDATA[
+    protected void clearLineFlags(SalesId _salesId)
+    {
+        METSalesLine metSalesLine;
+        SalesLine    salesLine;
+
+        while select forUpdate metSalesLine
+            where metSalesLine.LineCancellationRequired == NoYes::Yes
+            exists join salesLine
+                where salesLine.RecId   == metSalesLine.salesLine
+                   && salesLine.SalesId == _salesId
+        {
+            metSalesLine.LineCancellationRequired = NoYes::No;
+            metSalesLine.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doTtsCommit</Name>
+				<Source><![CDATA[
+    private void doTtsCommit(int _times)
+    {
+        for (int i = 1; i <= _times; i++)
+        {
+            ttsCommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doTtsBegin</Name>
+				<Source><![CDATA[
+    private void doTtsBegin(int _times)
+    {
+        for (int i = 1; i <= _times; i++)
+        {
+            ttsBegin;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
