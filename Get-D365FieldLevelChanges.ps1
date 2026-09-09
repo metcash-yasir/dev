@@ -1003,7 +1003,7 @@ if ($friendlyReport.Count -gt 0) {
         -ReportGeneratedAt $reportGeneratedAtDisplay -Branch $Branch
 
     $reportDateOnly = Get-Date -Format "yyyy-MM-dd"
-    $emailSubject = "D365 Metadata Change Report - $Branch - $reportDateOnly"
+    $emailSubject = "D365 Metadata Change Report - $Branch (Branch name) - $reportDateOnly"
 
     Send-ChangeReportEmail -ApiKey $SendGridKey -FromAddress $EmailFrom -ToAddresses $EmailTo `
         -Subject $emailSubject -HtmlBody $emailHtml
