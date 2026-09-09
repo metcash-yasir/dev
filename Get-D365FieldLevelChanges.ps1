@@ -505,7 +505,6 @@ function ConvertTo-ReportHtml {
   th, td { border: 1px solid #ccc; padding: 5px 8px; text-align: left; font-size: 12px; }
   th { background-color: #0b5394; color: white; }
   tr:nth-child(even) { background-color: #f5f5f5; }
-  .high { color: #b30000; font-weight: bold; }
   .info { color: #555; }
   .meta { color: #555; font-size: 12px; margin-bottom: 12px; }
 </style>
@@ -549,7 +548,7 @@ function ConvertTo-ReportHtml {
   </div>
 
   <h3>Summary</h3>
-  <p><span class="high">Action Required: $HighPriorityCount</span> &nbsp;|&nbsp; <span class="info">Info: $InfoCount</span></p>
+  <p><span class="info">Action Required: $HighPriorityCount</span> &nbsp;|&nbsp; <span class="info">Info: $InfoCount</span></p>
 
   <h3>Action Required Items</h3>
   <table>
