@@ -913,8 +913,24 @@ $displayReport = @($otherRows + $collapsedNewObjectRows) | Sort-Object { $priori
 
 $reportGeneratedAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss (K)"
 
+# Build a two-timezone display string (Sydney + India) for the report header/footer,
+# computed from one UTC anchor so both zones are always consistent with each other
+# regardless of what timezone the build agent itself happens to run in.
+$utcNow = (Get-Date).ToUniversalTime()
+try {
+    $sydneyTz  = [System.TimeZoneInfo]::FindSystemTimeZoneById("AUS Eastern Standard Time")
+    $indiaTz   = [System.TimeZoneInfo]::FindSystemTimeZoneById("India Standard Time")
+    $sydneyStr = [System.TimeZoneInfo]::ConvertTimeFromUtc($utcNow, $sydneyTz).ToString("yyyy-MM-dd HH:mm:ss")
+    $indiaStr  = [System.TimeZoneInfo]::ConvertTimeFromUtc($utcNow, $indiaTz).ToString("yyyy-MM-dd HH:mm:ss")
+    $reportGeneratedAtDisplay = "$sydneyStr AEST/AEDT (Sydney) | $indiaStr IST (India)"
+} catch {
+    # Windows timezone IDs not found (e.g. non-Windows agent) - fall back to UTC only
+    Write-Warning "Could not resolve Sydney/India timezones - falling back to UTC for report timestamp display."
+    $reportGeneratedAtDisplay = "$reportGeneratedAt (UTC-based)"
+}
+
 Write-Host "`n================================ FIELD & METADATA CHANGE REPORT ================================" -ForegroundColor Cyan
-Write-Host "Report generated: $reportGeneratedAt" -ForegroundColor Cyan
+Write-Host "Report generated: $reportGeneratedAtDisplay" -ForegroundColor Cyan
 Write-Host "Commit range:     $FromCommit -> $ToCommit" -ForegroundColor Cyan
 Write-Host "Repo path:        $RepoPath" -ForegroundColor Cyan
 Write-Host ""
@@ -959,7 +975,7 @@ if ($fieldLevelOnly.Count -eq 0) {
         Write-Host
 }
 Write-Host "-----------------------------------------------------------------------------------------------------------" -ForegroundColor Magenta
-Write-Host "Report generated: $reportGeneratedAt" -ForegroundColor Cyan
+Write-Host "Report generated: $reportGeneratedAtDisplay" -ForegroundColor Cyan
 
 Write-Host "`nSummary:" -ForegroundColor Green
 if ($newObjectRows.Count -gt 0) {
@@ -984,7 +1000,7 @@ $friendlyReport | Group-Object Priority | Sort-Object { $prioritySortOrder[$_.Na
 if ($friendlyReport.Count -gt 0) {
     $emailHtml = ConvertTo-ReportHtml -DisplayReport $displayReport -FieldLevelOnly $fieldLevelOnly `
         -NewObjectRows $newObjectRows -HighPriorityCount $highPriorityCount -InfoCount $infoCount `
-        -ReportGeneratedAt $reportGeneratedAt -Branch $Branch
+        -ReportGeneratedAt $reportGeneratedAtDisplay -Branch $Branch
 
     $emailSubject = "D365 Metadata Change Report - $reportGeneratedAt"
 
