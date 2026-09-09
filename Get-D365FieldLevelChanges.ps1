@@ -46,22 +46,26 @@
     Where to write the CSV report. (Currently unused - see note above.)
 
 .PARAMETER SendGridKey
-    (Optional) SendGrid API key. If supplied together with -EmailTo, an email
-    report is sent via SendGrid's v3 mail/send API - but ONLY when there is at
-    least one reportable change (no email is sent on a "nothing changed" run).
+    (Optional) SendGrid API key. If supplied together with a non-empty $env:EmailTo,
+    an email report is sent via SendGrid's v3 mail/send API - but ONLY when there is
+    at least one reportable change (no email is sent on a "nothing changed" run).
 
 .PARAMETER EmailFrom
     (Optional) The "from" address for the email report. Should be a verified
     sender/domain in your SendGrid account, e.g. noReply_d365CBPipeline@metcash.com.
 
-.PARAMETER EmailTo
-    (Optional) Comma-separated recipient address(es) for the email report.
-    Email sending is skipped entirely if this or -SendGridKey is not supplied.
-
 .PARAMETER Branch
     (Optional) The branch name being compared (e.g. "test"). Purely cosmetic -
     shown in the email report header instead of raw commit hashes/repo path,
     since that's more meaningful to a reader who isn't looking at the pipeline log.
+
+.NOTES
+    Recipient email addresses are NOT a script parameter. They're read directly
+    from the $env:EmailTo environment variable (set this as a Release pipeline
+    variable named "EmailTo", comma-separated for multiple recipients). Azure
+    DevOps automatically exposes Release variables as environment variables to
+    any script task in that release, so recipients can be added/changed purely
+    in the pipeline's Variables tab - no wrapper or script edit needed.
 
 .EXAMPLE
     # Nightly pipeline usage - "whatever changed in the last 24 hours", no commit tracking needed
@@ -72,9 +76,9 @@
     .\Get-D365FieldLevelChanges.ps1 -RepoPath "K:\CoreBuildGITRepo" -FromCommit "abc123" -ToCommit "def456" -OutputPath "K:\Reports\FieldChanges.csv"
 
 .EXAMPLE
-    # With email report on changes
+    # With email report on changes (EmailTo comes from $env:EmailTo, set as a pipeline variable)
     .\Get-D365FieldLevelChanges.ps1 -RepoPath "K:\CoreBuildGITRepo" -SinceHours 24 `
-        -SendGridKey "$(SendGridKey)" -EmailFrom "$(SenderEmail)" -EmailTo "you@metcash.com"
+        -SendGridKey "$(SendGridKey)" -EmailFrom "$(SenderEmail)"
 #>
 
 param(
@@ -103,13 +107,16 @@ param(
     [string]$EmailFrom,
 
     [Parameter(Mandatory = $false)]
-    [string]$EmailTo,
-
-    [Parameter(Mandatory = $false)]
     [string]$Branch = "Unknown"
 )
 
 Set-Location $RepoPath
+
+# EmailTo is read directly from the pipeline environment rather than passed in
+# as a script parameter - Azure DevOps automatically exposes Release variables
+# (like EmailTo) as environment variables to any script task in that release,
+# so no wrapper change is needed each time recipients are updated.
+$EmailTo = $env:EmailTo
 
 # If no explicit FromCommit was given, resolve one automatically based on SinceHours.
 # This is the "whatever changed during the day" mode for a nightly pipeline - no commit
