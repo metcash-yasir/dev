@@ -505,7 +505,7 @@ function ConvertTo-ReportHtml {
 </style>
 "@
 
-    $highRows = @($DisplayReport | Where-Object { $_.Priority -eq "High - Review Required" })
+    $highRows = @($DisplayReport | Where-Object { $_.Priority -eq "Action Required" })
 
     $highTableRows = if ($highRows.Count -gt 0) {
         ($highRows | ForEach-Object {
@@ -544,9 +544,9 @@ function ConvertTo-ReportHtml {
   </div>
 
   <h3>Summary</h3>
-  <p><span class="high">High - Review Required: $HighPriorityCount</span> &nbsp;|&nbsp; <span class="info">Info: $InfoCount</span></p>
+  <p><span class="high">Action Required: $HighPriorityCount</span> &nbsp;|&nbsp; <span class="info">Info: $InfoCount</span></p>
 
-  <h3>High Priority - Review Required</h3>
+  <h3>Action Required Items</h3>
   <table>
     <tr><th>Object Type</th><th>Object Name</th><th>Field Name</th><th>Change Type</th><th>Changed On</th><th>Description</th></tr>
     $highTableRows
@@ -778,25 +778,25 @@ $friendlyChangeTypeMap = @{
 $priorityMap = @{
     "Field Added"                     = "Info"
     "Field Added (New Object)"        = "Info"
-    "Field Deleted"                   = "High - Review Required"
-    "Field Deleted (Object Removed)"  = "High - Review Required"
-    "Data Type Changed"               = "High - Review Required"
-    "Mandatory Flag Changed"          = "Medium - Review Required"
-    "Relation Deleted"                = "High - Review Required"
-    "Relation Added"                  = "Medium - Review Required"
-    "Relation Modified"               = "Medium - Review Required"
-    "Index Deleted"                   = "High - Review Required"
-    "Index Modified"                  = "High - Review Required"
+    "Field Deleted"                   = "Action Required"
+    "Field Deleted (Object Removed)"  = "Action Required"
+    "Data Type Changed"               = "Action Required"
+    "Mandatory Flag Changed"          = "Review Suggested"
+    "Relation Deleted"                = "Action Required"
+    "Relation Added"                  = "Review Suggested"
+    "Relation Modified"               = "Review Suggested"
+    "Index Deleted"                   = "Action Required"
+    "Index Modified"                  = "Action Required"
     "Index Added"                     = "Info"
-    "FieldGroup Deleted"              = "Medium - Review Required"
+    "FieldGroup Deleted"              = "Review Suggested"
     "FieldGroup Added"                = "Info"
-    "FieldGroup Modified"             = "Medium - Review Required"
-    "DeleteAction Deleted"            = "High - Review Required"
-    "DeleteAction Added"              = "Medium - Review Required"
-    "DeleteAction Modified"           = "High - Review Required"
-    "Table Property Changed"          = "High - Review Required"
+    "FieldGroup Modified"             = "Review Suggested"
+    "DeleteAction Deleted"            = "Action Required"
+    "DeleteAction Added"              = "Review Suggested"
+    "DeleteAction Modified"           = "Action Required"
+    "Table Property Changed"          = "Action Required"
 }
-$prioritySortOrder = @{ "High - Review Required" = 1; "Medium - Review Required" = 2; "Info" = 3 }
+$prioritySortOrder = @{ "Action Required" = 1; "Review Suggested" = 2; "Info" = 3 }
 
 $friendlyReport = foreach ($c in $allChanges) {
     $oldFriendly = ConvertTo-FriendlyType -RawType $c.OldRawType -Edt $c.OldEDT
@@ -963,7 +963,7 @@ $highPriorityCount = 0
 $infoCount = 0
 $friendlyReport | Group-Object Priority | Sort-Object { $prioritySortOrder[$_.Name] } | ForEach-Object {
     Write-Host "  $($_.Name): $($_.Count)" -ForegroundColor Yellow
-    if ($_.Name -eq "High - Review Required") { $highPriorityCount = $_.Count }
+    if ($_.Name -eq "Action Required") { $highPriorityCount = $_.Count }
     if ($_.Name -eq "Info") { $infoCount = $_.Count }
 }
 
@@ -975,11 +975,7 @@ if ($friendlyReport.Count -gt 0) {
         -NewObjectRows $newObjectRows -HighPriorityCount $highPriorityCount -InfoCount $infoCount `
         -ReportGeneratedAt $reportGeneratedAt -FromCommit $FromCommit -ToCommit $ToCommit -RepoPath $RepoPath
 
-    $emailSubject = if ($highPriorityCount -gt 0) {
-        "D365 Metadata Change Report - $highPriorityCount High Priority item(s) - $reportGeneratedAt"
-    } else {
-        "D365 Metadata Change Report - $reportGeneratedAt"
-    }
+    $emailSubject = "D365 Metadata Change Report - $reportGeneratedAt"
 
     Send-ChangeReportEmail -ApiKey $SendGridKey -FromAddress $EmailFrom -ToAddresses $EmailTo `
         -Subject $emailSubject -HtmlBody $emailHtml
@@ -994,7 +990,7 @@ if ($friendlyReport.Count -gt 0) {
 # Write-Host "`nFull report saved to: $OutputPath" -ForegroundColor Green
 
 # Fail the pipeline step if you want deletions/type-changes/structural changes to require manual review:
-# $breaking = $friendlyReport | Where-Object { $_.Priority -eq "High - Review Required" }
+# $breaking = $friendlyReport | Where-Object { $_.Priority -eq "Action Required" }
 # if ($breaking.Count -gt 0) {
 #     Write-Host "##vso[task.logissue type=warning]$($breaking.Count) high-priority change(s) detected. Review the log above."
 # }
