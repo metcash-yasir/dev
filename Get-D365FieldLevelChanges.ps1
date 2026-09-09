@@ -58,6 +58,11 @@
     (Optional) Comma-separated recipient address(es) for the email report.
     Email sending is skipped entirely if this or -SendGridKey is not supplied.
 
+.PARAMETER Branch
+    (Optional) The branch name being compared (e.g. "test"). Purely cosmetic -
+    shown in the email report header instead of raw commit hashes/repo path,
+    since that's more meaningful to a reader who isn't looking at the pipeline log.
+
 .EXAMPLE
     # Nightly pipeline usage - "whatever changed in the last 24 hours", no commit tracking needed
     .\Get-D365FieldLevelChanges.ps1 -RepoPath "K:\CoreBuildGITRepo" -SinceHours 24 -OutputPath "K:\Reports\FieldChanges.csv"
@@ -98,7 +103,10 @@ param(
     [string]$EmailFrom,
 
     [Parameter(Mandatory = $false)]
-    [string]$EmailTo
+    [string]$EmailTo,
+
+    [Parameter(Mandatory = $false)]
+    [string]$Branch = "Unknown"
 )
 
 Set-Location $RepoPath
@@ -485,9 +493,7 @@ function ConvertTo-ReportHtml {
         [int]$HighPriorityCount,
         [int]$InfoCount,
         [string]$ReportGeneratedAt,
-        [string]$FromCommit,
-        [string]$ToCommit,
-        [string]$RepoPath
+        [string]$Branch
     )
 
     $style = @"
@@ -539,8 +545,7 @@ function ConvertTo-ReportHtml {
   <h2>D365 F&amp;O Metadata Change Report</h2>
   <div class="meta">
     Report generated: $ReportGeneratedAt<br/>
-    Commit range: $FromCommit -&gt; $ToCommit<br/>
-    Repo path: $RepoPath
+    Branch: $Branch
   </div>
 
   <h3>Summary</h3>
@@ -973,7 +978,7 @@ $friendlyReport | Group-Object Priority | Sort-Object { $prioritySortOrder[$_.Na
 if ($friendlyReport.Count -gt 0) {
     $emailHtml = ConvertTo-ReportHtml -DisplayReport $displayReport -FieldLevelOnly $fieldLevelOnly `
         -NewObjectRows $newObjectRows -HighPriorityCount $highPriorityCount -InfoCount $infoCount `
-        -ReportGeneratedAt $reportGeneratedAt -FromCommit $FromCommit -ToCommit $ToCommit -RepoPath $RepoPath
+        -ReportGeneratedAt $reportGeneratedAt -Branch $Branch
 
     $emailSubject = "D365 Metadata Change Report - $reportGeneratedAt"
 
