@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METDallasPicklistRegCompleteService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+/// <summary>
+/// The <c>METDallasPicklistRegCompleteService</c> class is a service class used for the MET Dallas picklist registration completion process.
+/// </summary>
+ class METDallasPicklistRegCompleteService extends SysOperationServiceBase
+{
+    METDallasPicklistRegCompleteContract contract;
+    BatchHeader batchHeader;
+    Set taskIdSet;
+    
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Processes the MET Dallas picklist registration sales confirmation.
+    /// </summary>
+    /// <param name = "_contract">Data contract.</param>
+    public void process(METDallasPicklistRegCompleteContract _contract)
+    {
+        contract = _contract;
+        
+        this.createBatchTasks();
+        this.scheduleBatchTask();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>createBatchTasks</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Schedules batch tasks.
+    /// </summary>
+    private void createBatchTasks()
+    {
+        METDallasPicklistRegCompleteContract metDataContract;
+        SysOperationServiceController controller;
+        container routeIdCon;
+        Set routeIdSet, routeIdFiltered;
+        int bundlesize;
+        int totalTasks;
+        int counter;
+        int taskNumber = 1;
+        
+        METProcMetrics procMetrics = METProcMetrics::construct(METBatchLogOperation::DallasPicklistRegistration);
+        taskIdSet = new Set(Types::Class);
+
+        batchHeader = this.getCurrentBatchHeader();
+
+        if (batchHeader == null)
+        {
+            batchHeader = batchHeader::construct();
+        }
+        
+        totalTasks = contract.parmParallelTasksNumber();
+
+        if (totalTasks <= 0)
+        {
+            totalTasks = 1;
+        }
+        
+        routeIdSet = Set::create(contract.parmWMSOrderTransRouteSet());
+
+        if (routeIdSet.elements() == 0)
+        {
+            return;
+        }
+
+        routeIdFiltered = this.getRouteIdFilteredSet(routeIdSet);
+
+        if (routeIdFiltered.elements() == 0)
+        {
+            return;
+        }
+
+        procMetrics.setTotalCount(routeIdFiltered.elements());
+        procMetrics.beginTrace("@MET:ProcessStarted");
+        procMetrics.startDescriptionTime(2, "@MET:DallasPicklistRegCompleteScheduled");
+        
+        bundleSize = real2int(roundUp((routeIdFiltered.elements() / totalTasks), 1.0));
+
+        SetEnumerator setEnum = routeIdFiltered.getEnumerator();
+
+        using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
+        {
+            while (setEnum.moveNext())
+            {
+                WMSPickingRouteID routeId = setEnum.current();
+
+                counter += 1;
+
+                if (counter == 1)
+                {
+                    routeIdCon = conNull();
+                }
+
+                routeIdCon += routeId;
+                
+                if (counter == bundlesize)
+                {
+                    controller = new SysOperationServiceController(
+                                                classStr(METPickingListRegistrationPostingJob),
+                                                methodStr(METPickingListRegistrationPostingJob, picklistRegistrationCompleteInBundle));
+
+                    controller.parmDialogCaption(strFmt("@MET:DallasPicklistRegCompleteSubtask", taskNumber));
+
+                    metDataContract = controller.getDataContractObject() as METDallasPicklistRegCompleteContract;
+                    metDataContract.parmRouteIdCon(routeIdCon);
+
+                    batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
+                    
+                    counter = 0;
+
+                    taskIdSet.add(controller);
+                    taskNumber++;
+                }
+            }
+  
+            if (counter > 0)
+            {
+                controller = new SysOperationServiceController(
+                                                classStr(METPickingListRegistrationPostingJob),
+                                                methodStr(METPickingListRegistrationPostingJob, picklistRegistrationCompleteInBundle));
+
+                controller.parmDialogCaption(strFmt("@MET:DallasPicklistRegCompleteSubtask", taskNumber));
+
+                metDataContract = controller.getDataContractObject() as METDallasPicklistRegCompleteContract;
+                metDataContract.parmRouteIdCon(routeIdCon);
+
+                batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
+                taskIdSet.add(controller);
+            }
+
+            procMetrics.endTrace();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>scheduleBatchTask</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Schedules the batch task for the MET Dallas picklist registration completion process.
+    /// </summary>
+    private void scheduleBatchTask()
+    {
+        SysOperationServiceController controller =  METDallasPicklistRegSalesConfirmController::construct(contract.parmWMSOrderTransRouteSet(), 
+                                                                                                          contract.parmParallelTasksNumber());
+        
+        batchHeader.addRuntimeTask(controller, this.getCurrentBatchTask().RecId);
+
+        if (taskIdSet.elements() > 0)
+        {
+            SetEnumerator taskEnum = taskIdSet.getEnumerator() as SetEnumerator;
+
+            while (taskEnum && taskEnum.moveNext())
+            {
+                SysOperationServiceController transactionTaskController = taskEnum.current();
+                batchHeader.addDependency(controller, transactionTaskController, BatchDependencyStatus::FinishedOrError);
+            }
+        }
+        
+        batchHeader.save();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getRouteIdFilteredSet</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets a filtered set of route IDs based on the expedition status of the corresponding WMS picking routes. Only routes that are not complete are included in the filtered set.
+    /// </summary>
+    /// <param name = "_routeIdSet">Route Id set.</param>
+    /// <returns>Filtered route Id set.</returns>
+    private Set getRouteIdFilteredSet(Set _routeIdSet)
+    {
+        WMSPickingRoute wmsPickingRoute;
+        Set routeIdFiltered;
+
+        routeIdFiltered = new Set(Types::String);
+
+        SetEnumerator setEnum = _routeIdSet.getEnumerator();
+
+        while (setEnum.moveNext())
+        {
+            WMSPickingRouteID routeId = setEnum.current();
+            wmsPickingRoute = WMSPickingRoute::find(routeId);
+            if (wmsPickingRoute && wmsPickingRoute.expeditionStatus != WMSExpeditionStatus::Complete)
+            {
+                routeIdFiltered.add(routeId);
+            }
+        }
+
+        return routeIdFiltered;
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
