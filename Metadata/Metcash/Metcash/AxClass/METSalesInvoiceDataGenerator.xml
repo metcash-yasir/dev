@@ -124,8 +124,8 @@ public class METSalesInvoiceDataGenerator
             }
             else
             {
-                bundlingHeaderFooterTmp.METHeaderLineGSTValue += strFmt('%1', 0) + '\n';
-                bundlingHeaderFooterTmp.METHeaderLineTotExclGSTValue  += strFmt('%1',0) + '\n';
+                bundlingHeaderFooterTmp.METHeaderLineGSTValue += strFmt('%1', 0.00) + '\n';
+                bundlingHeaderFooterTmp.METHeaderLineTotExclGSTValue  += strFmt('%1',0.00) + '\n';
 
                 // For return sales type, the value should be shown as negative in invoice.
                 bundlingHeaderFooterTmp.KPMGHeaderChargesValue          += strFmt('%1',markupTrans.CalculatedAmount) + '\n';
@@ -256,8 +256,7 @@ public class METSalesInvoiceDataGenerator
         licenceCustTobaccoMap = new Map(Types::String, Types::String);
         licenceMetcashMap = new Map(Types::String, Types::String);
 
-        while select OrderNum from orderLines
-            group by OrderNum
+        while select orderLines
             where orderLines.ShipmentId == shipmentId
             join CustAccount, SiteId from shipmentLoadHeader
                 where shipmentLoadHeader.ShipmentId == orderLines.ShipmentId
@@ -270,17 +269,27 @@ public class METSalesInvoiceDataGenerator
             outer join LicenceNumber from metMetcashLicenceTobacco
                 where metMetcashLicenceTobacco.InventSiteId == shipmentLoadHeader.SiteId &&
                       metMetcashLicenceTobacco.Type == METLicenceType::Tobacco
-            exists join inventItemOrderSetup
+            join ItemType from inventItemOrderSetup
                 where inventItemOrderSetup.SiteId == shipmentLoadHeader.SiteId &&
                       inventItemOrderSetup.ItemId == orderLines.ItemId
         {
             if (inventItemOrderSetup.ItemType == METConstants::T)
             {
-                licenceCustTobaccoMap.insert(orderLines.OrderNum, metCustomerLicenceTobacco.LicenceNumber);
-            
-                licenceMetcashMap.insert(orderLines.OrderNum, metMetcashLicenceTobacco.LicenceNumber);
+                if (!licenceCustTobaccoMap.exists(orderLines.OrderNum))
+                {
+                    licenceCustTobaccoMap.insert(orderLines.OrderNum, metCustomerLicenceTobacco.LicenceNumber);
+                }
+
+                if (!licenceMetcashMap.exists(shipmentLoadHeader.SiteId))
+                {
+                    licenceMetcashMap.insert(shipmentLoadHeader.SiteId, metMetcashLicenceTobacco.LicenceNumber);
+                }
             }
-            licenceCustLiqMap.insert(orderLines.OrderNum, metCustomerLicenceLiquor.LicenceNumber);
+
+            if (!licenceCustLiqMap.exists(orderLines.OrderNum))
+            {
+                licenceCustLiqMap.insert(orderLines.OrderNum, metCustomerLicenceLiquor.LicenceNumber);
+            }
         }
     }
 
@@ -590,21 +599,36 @@ public class METSalesInvoiceDataGenerator
         {
             taxValuePct = 0;
 
+            // Incident 424568: WILO - Demand - WET and GST Flags and $ values incorrect on some items on PDF INV - ALM
+            // To avoid going in if (lastInventTransId != taxTrans.InventTransId) the first iteration of the loop
+            if (!lastInventTransId)
+            {
+                lastInventTransId = taxTrans.InventTransId;
+            }
+
+            if (lastInventTransId != taxTrans.InventTransId)
+            {
+                taxByInventTransId.insert(lastInventTransId, [taxByCode.pack(), taxValuePct]);
+                taxByCode = new Map(Types::String, Types::Real);
+                lastInventTransId = taxTrans.InventTransId;
+            }
+
             if (!taxValuePct && taxTrans.TaxValue)
             {
                 taxValuePct = taxTrans.TaxValue;
             }
 
             real prev = taxByCode.exists(taxTrans.TaxCode) ? taxByCode.lookup(taxTrans.TaxCode) : 0;
-            taxByCode.insert(taxTrans.TaxCode, prev + taxTrans.SourceTaxAmountCur);
-
-            if (lastInventTransId != taxTrans.InventTransId)
-            {
-                lastInventTransId = taxTrans.InventTransId;
-                taxByInventTransId.insert(taxTrans.InventTransId, [taxByCode.pack(), taxValuePct]);
-                taxByCode = new Map(Types::String, Types::Real);
-            }
+            taxByCode.insert(taxTrans.TaxCode, prev + taxTrans.SourceTaxAmountCur);                 
         }
+
+        // Incident 424568: WILO - Demand - WET and GST Flags and $ values incorrect on some items on PDF INV - ALM
+        // For the last InventTransId
+        if (taxByCode.elements())
+        {
+            taxByInventTransId.insert(lastInventTransId, [taxByCode.pack(), taxValuePct]);
+        }
+
         return taxByInventTransId;
     }
 
@@ -806,18 +830,23 @@ public class METSalesInvoiceDataGenerator
         }
 
         boolean isALMReport;
-        if (metSalesOrderTypes.SalesInvoiceReportDesignName == METConstants::ALMDirectsCTInvoice)
+        // Incident 424568: WILO - Demand - WET and GST Flags and $ values incorrect on some items on PDF INV - ALM
+        // For ALM and ALMExportSalesInvoice, if we have WET the GST column must be Y
+        if (metSalesOrderTypes.SalesInvoiceReportDesignName == METConstants::ALM
+        ||  metSalesOrderTypes.SalesInvoiceReportDesignName == METConstants::ALMExportSalesInvoice)
         {
             isALMReport = NoYes::Yes;
         }
-
+        
         bundleSalesInvoiceTmp.METGST = (bundleSalesInvoiceTmp.METGSTValue != 0) ? METConstants::Y : METConstants::N;
         bundleSalesInvoiceTmp.METWET = (bundleSalesInvoiceTmp.METWETValue != 0) ? METConstants::Y : METConstants::N;
         
 
         if (isALMReport)
         {
-            bundleSalesInvoiceTmp.METGST = (bundleSalesInvoiceTmp.METWETValue != 0) ? METConstants::Y : METConstants::N;
+            // Incident 424568: WILO - Demand - WET and GST Flags and $ values incorrect on some items on PDF INV - ALM
+            // if there is GST or WEG, the GST flag must be Y
+            bundleSalesInvoiceTmp.METGST = (bundleSalesInvoiceTmp.METGSTTotal != 0) ? METConstants::Y : METConstants::N;
             bundleSalesInvoiceTmp.METSupplierInvoiceGST =  bundleSalesInvoiceTmp.METGSTTotal;
         }
         
@@ -879,11 +908,11 @@ public class METSalesInvoiceDataGenerator
             if (_custInvoiceTrans.SalesUnit == METConstants::unitEach)
             {
                 // Final Case Cost
-                bundleSalesInvoiceTmp.metcaseCost = bundleSalesInvoiceTmp.METCost + (combinedCharges + brokenCaseFeeAmt)*uomConversion;
+                bundleSalesInvoiceTmp.metcaseCost = bundleSalesInvoiceTmp.METCost + convertedCharges + (brokenCaseFeeAmt * uomConversion);
             }
             else
             {
-                bundleSalesInvoiceTmp.metcaseCost = bundleSalesInvoiceTmp.METCost + convertedCharges + brokenCaseFeeAmt;
+                bundleSalesInvoiceTmp.metcaseCost = bundleSalesInvoiceTmp.METCost + combinedCharges + brokenCaseFeeAmt;
             }
            
         }
@@ -1075,7 +1104,7 @@ public class METSalesInvoiceDataGenerator
         //Bug 418899 end 
 
         // === Bug 351188 - ALM invoice picked cases / broken cases logic ===
-        isALMReport = parentIndustryKey == METConstants::ALM ? true : false;
+        isALMReport = (parentIndustryKey == METConstants::ALM || parentIndustryKey == METConstants::ALMExportSalesInvoice) ? true : false;
         boolean pickedCasesOrBrokenCases;
 
         METLegalEntityType metLegalEntityType = companyInfo.METLegalEntityType;
@@ -1311,9 +1340,6 @@ public class METSalesInvoiceDataGenerator
             // Qty Supplied = picked broken cases value.
             caseLine.Qty = _qty;
 
-            // Qty Ordered = 0 for broken case/EA line.
-            caseLine.METOrderedQty = 0;
-
             // UOM = EA for broken case line.
             caseLine.SalesUnitTxt = METConstants::unitEach;
 
@@ -1345,6 +1371,12 @@ public class METSalesInvoiceDataGenerator
                 caseLine.METCost       = 0;
                 caseLine.METLucInclGST = 0;
                 caseLine.METGSTTotal   = 0;
+            }
+
+            if (caseLine.SalesUnitTxt != METConstants::unitEach)
+            {
+                // Qty Ordered = 0 for broken case/Not EA line.
+                caseLine.METOrderedQty = 0;
             }
         }
         else
@@ -1408,8 +1440,8 @@ public class METSalesInvoiceDataGenerator
 
         this.generateHeaderKPMGFields(bundlingHeaderFooterTmp, _custInvoiceJour);
 
-        bundlingHeaderFooterTmp.METBranchName = _salesTable.InventLocationId;
-        bundlingHeaderFooterTmp.METBranchNumber = inventLocation.Name;
+        bundlingHeaderFooterTmp.METBranchName = inventLocation.Name;
+        bundlingHeaderFooterTmp.METBranchNumber = _salesTable.InventLocationId;
 
         bundlingHeaderFooterTmp.METShipToPhone = shipToPhone;
         bundlingHeaderFooterTmp.METInvoiceToPhone = invoiceToPhone;
@@ -1454,9 +1486,9 @@ public class METSalesInvoiceDataGenerator
         bundlingHeaderFooterTmp.PurchaseOrder           = _custInvoiceJour.PurchaseOrder;
         bundlingHeaderFooterTmp.InvoiceAccount          = _custInvoiceJour.InvoiceAccount;
          
-        bundlingHeaderFooterTmp.METCustTobaccoLicense = licenceCustTobaccoMap.exists(_salesTable.CustAccount) ? licenceCustTobaccoMap.lookup(_salesTable.CustAccount) : "";
-   
-        bundlingHeaderFooterTmp.METCustLiquorLicense    = licenceCustLiqMap.exists(_salesTable.CustAccount) ? licenceCustLiqMap.lookup(_salesTable.CustAccount) : "";;
+        bundlingHeaderFooterTmp.METCustTobaccoLicense = licenceCustTobaccoMap.exists(_salesTable.SalesId) ? licenceCustTobaccoMap.lookup(_salesTable.SalesId) : "";       
+        
+        bundlingHeaderFooterTmp.METCustLiquorLicense    = licenceCustLiqMap.exists(_salesTable.SalesId) ? licenceCustLiqMap.lookup(_salesTable.SalesId) : "";
         
         bundlingHeaderFooterTmp.METTobaccoLicense = licenceMetcashMap.exists(_salesTable.InventSiteId) ? licenceMetcashMap.lookup(_salesTable.InventSiteId) : "";
         
@@ -1513,6 +1545,7 @@ public class METSalesInvoiceDataGenerator
 
         MarkupTrans markupTransloc;
         MarkupTable markupTableloc;
+        TaxTrans    taxTrans;
         //Header Delivery and Admin fees
         select sum(Value),MarkupCategory from markupTransloc
                 where markupTransloc.TransRecId    == _custInvoiceJour.recid && markupTransloc.TransTableId  == _custInvoiceJour.TableId
@@ -1550,6 +1583,15 @@ public class METSalesInvoiceDataGenerator
             && custInvoiceTransloc.InvoiceDate == _custInvoiceJour.InvoiceDate && custInvoiceTransloc.TaxItemGroup == METConstants::GSTFree;
 
         bundlingHeaderFooterTmp.metGSTFree = custInvoiceTransloc.LineAmount + custInvoiceTransloc.LineAmountTax;
+
+        // Sum the tax amount in the accounting currency (TaxAmountMST)
+        select sum(SourceBaseAmountCur) from taxTrans
+        where taxTrans.Voucher       == _custInvoiceJour.LedgerVoucher
+           && taxTrans.TransDate     == _custInvoiceJour.InvoiceDate
+            && taxTrans.TaxCode == METConstants::GSTFree;
+
+        bundlingHeaderFooterTmp.METGSTFreePosted = abs(taxTrans.SourceBaseAmountCur);
+
         //bug 285404 end
         bundlingHeaderFooterTmp.METRemittanceEmail      = remitEmail;
 
@@ -1566,8 +1608,7 @@ public class METSalesInvoiceDataGenerator
             bundlingHeaderFooterTmp.METSupplierInvoice      = metCBCTInvoiceHeaderTable.TaxInvoiceNum;// supplier inv no
             bundlingHeaderFooterTmp.METSupplierName         = metCBCTInvoiceHeaderTable.getVendName(); //suplier name
             bundlingHeaderFooterTmp.METVendorAccount        = metCBCTInvoiceHeaderTable.VendorAccount; //suplier Id
-            bundlingHeaderFooterTmp.METDeliverToAddress     = _salesTable.deliveryAddress().Address; //For ALMCT invoice
-        }
+         }
 
         //Update Charge through invoice details
         if (_metSalesOrderTypes.SalesInvoiceReportDesignName == METConstants::FoodCTInvoice)
@@ -1782,7 +1823,7 @@ public class METSalesInvoiceDataGenerator
             // Initialized to 0 to prevent previous loop values from carrying over
             real mdfvalue = 0;
 
-            select firstonly Qty from custInvoiceTransloc
+            select firstonly Qty, METActualWeight from custInvoiceTransloc
             where custInvoiceTransloc.InventTransId == custInvoiceTrans.InventTransId;
                 
             if (metSalesLinePriceComponent.Component == METConstants::DeliveryFee && !ismdfcalculated) // for delivery add mdf value
@@ -1804,7 +1845,16 @@ public class METSalesInvoiceDataGenerator
              
             // Calculate the total for this specific line iteration
             currentComponent = metSalesLinePriceComponent.Component;
-            calculatedLineTotal = ((metSalesLinePriceComponent.value * custInvoiceTransloc.Qty) + mdfvalue);
+
+            // Incident 424864: WILO - Demand - Rebates/Fees Extended Details displaying incorrect values on PDF Inv - MFG
+            // Handle CW items
+            SalesInvoicedQty qty = custInvoiceTransloc.Qty;
+            if (custInvoiceTransloc.METActualWeight)
+            {
+                qty = custInvoiceTransloc.METActualWeight;
+            }
+
+            calculatedLineTotal = ((metSalesLinePriceComponent.value * qty) + mdfvalue);
 
             // Aggregate into the Map (If it exists, add to it. If not, insert it.)
             if (componentTotalMap.exists(currentComponent))
@@ -1817,7 +1867,9 @@ public class METSalesInvoiceDataGenerator
                 componentTotalMap.insert(currentComponent, calculatedLineTotal);
             }
             
-            _salesInvoiceHeaderFooterTmp.METHeaderLineChargesTotal += metSalesLinePriceComponent.value * custInvoiceTransloc.Qty;
+            // Incident 424864: WILO - Demand - Rebates/Fees Extended Details displaying incorrect values on PDF Inv - MFG
+            // Handle CW items
+            _salesInvoiceHeaderFooterTmp.METHeaderLineChargesTotal += metSalesLinePriceComponent.value * qty;
         }
 
         // Loop through the map after the while select finishes to build the final string

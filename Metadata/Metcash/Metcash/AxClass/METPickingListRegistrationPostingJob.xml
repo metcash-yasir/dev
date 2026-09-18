@@ -71,7 +71,22 @@ final class METPickingListRegistrationPostingJob
                     // reread the record otherwise the current buffer still has the previous status
                     orderTrans.reread();
 
-                    orderTrans.metShortPickDeliveryReminderUpd();
+                    if (orderTrans.inventTransType == InventTransType::Sales)
+                    {                     
+                        WMSPickingLineQty    qtyOrig    = METWMSOrderTrans::find(orderTrans.RecId).qtyOrig;
+                        if (qtyOrig > orderTrans.qty)
+                        {
+                            METDallasPicklistRegPendingProcess::insertData(orderTrans.RecId, orderTrans.RouteId);
+                        }
+                    }
+                    else if (orderTrans.inventTransType == InventTransType::TransferOrderShip)
+                    {
+                        InventTransferLine  inventTransferLine  = InventTransferLine::findTransIdShip(orderTrans.inventTransId, true);
+                        if (inventTransferLine && inventTransferLine.QtyTransfer > orderTrans.qty)
+                        {
+                            METDallasPicklistRegPendingProcess::insertData(orderTrans.RecId, orderTrans.RouteId);
+                        }
+                    }                    
 
                     // Bug 246341: CB387 - Dallas Picklist Registration - zero pick quantity is updating the picking list registration when importing using data entity Picklist registration entity
                     // For 0 pick, status updated to cancel, we also need to cancel the SO line deliver remainder.
@@ -257,7 +272,13 @@ final class METPickingListRegistrationPostingJob
             if (salesTable)
             {
                 SalesFormLetter salesFormLetter = SalesFormLetter::construct(DocumentStatus::Confirmation);
-                salesFormLetter.update(salesTable, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), SalesUpdate::All);
+                salesFormLetter.update(salesTable, 
+                    DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), 
+                    SalesUpdate::All,
+                    AccountOrder::None,
+                    salesFormLetter.salesParmUpdate().Proforma,
+                    NoYes::Yes,
+                    NoYes::Yes);
             }
             
             if (_procMetrics)
@@ -407,6 +428,8 @@ final class METPickingListRegistrationPostingJob
     /// </param>
     public void picklistRegistrationCompleteInBundle(METDallasPicklistRegCompleteContract _contract)
     {
+        #OCCRetryCount
+
         WMSPickingRoute wmsPickingRoute;
         WMSPickingRouteID pickingRouteId;
 
@@ -434,66 +457,189 @@ final class METPickingListRegistrationPostingJob
                     wmsPickingRoute = WMSPickingRoute::find(pickingRouteId, true);
                     wmsPickingRoute.checkFinishRoute();
 
+                    ttsCommit;
+
                     if (wmsPickingRoute.transType == InventTransType::TransferOrderShip && wmsPickingRoute.expeditionStatus == WMSExpeditionStatus::Complete)
                     {
+                        ttsbegin;
                         //Added for Task 282558: CB913/CB162 - Campbells -Integration - Campbells Transfer Order Receipt
                         if (METCampbellTransferOrderProcessor::construct().processCampbellsTransferOrder(InventTransferTable::find(wmsPickingRoute.transRefId), true) == false)
                         {
                             throw error (strFmt("@MET:ProcessFailedTO", wmsPickingRoute.transRefId));
                         }
+
+                        ttsCommit;
                     }
                   
-                    ttsCommit;
-
                     if (procMetrics)
                     {
                         procMetrics.incDescriptionCount(2, 1);
                         procMetrics.endDescriptionTime(2);
                     }
                 }
-                catch (Exception::Error)
+                catch(Exception::Deadlock)
                 {
-                    if (appl.ttsLevel() > 0)
-                    {
-                        ttsAbort;
-                    }
-
-                    error(strFmt("@MET:METPicklistRouteProcessError", wmsPickingRoute.PickingRouteID));
-                }
-                catch (Exception::Deadlock)
-                {
-                    if (appl.ttsLevel() > 0)
-                    {
-                        ttsAbort;
-                    }
-
-                    error(strFmt("@MET:METPicklistRouteProcessDeadlock", wmsPickingRoute.PickingRouteID));
+                    retry;
                 }
                 catch (Exception::UpdateConflict)
                 {
-                    if (appl.ttsLevel() > 0)
+                    if (appl.ttsLevel() == 0)
                     {
-                        ttsAbort;
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            throw Exception::UpdateConflictNotRecovered;
+                        }
+                        else
+                        {
+                            retry;
+                        }
                     }
-
-                    error(strFmt("@MET:METPicklistRouteProcessUpdateConflict", wmsPickingRoute.PickingRouteID));
+                    else
+                    {
+                        throw Exception::UpdateConflict;
+                    }
                 }
-                catch (Exception::CLRError)
+                catch(Exception::Error)
                 {
-                    if (appl.ttsLevel() > 0)
-                    {
-                        ttsAbort;
-                    }
-
-                    error(strFmt("@MET:METPicklistRouteProcessCLRError", wmsPickingRoute.PickingRouteID));
+                    error(strFmt("@MET:PickListPost", wmsPickingRoute.transRefId));
                 }
-            
+
                 procMetrics.incProcessedCountWithDocument(pickingRouteId);
             }
 
             procMetrics.endTrace();
         }
 
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shortPickDeliveryReminderUpdInBundle</Name>
+				<Source><![CDATA[
+    public void shortPickDeliveryReminderUpdInBundle(METDallasPicklistRegPendingProcessContract _contract)
+    {
+        #OCCRetryCount
+        System.Exception ex;
+
+        METDallasPicklistRegPendingProcess pendingProcess;
+        WMSOrderTrans orderTrans;
+        RefRecId pendingProcessRecId;
+
+        container picklistPendingRecords = _contract.conPicklistPendingRecords();
+
+        for (int i = 1; i <= conlen(picklistPendingRecords); i++)
+        {
+            pendingProcessRecId = conPeek(picklistPendingRecords, i);
+            int     startLine = infologLine();
+
+            try
+            {
+                ttsbegin;
+
+                select firstonly forupdate pendingProcess
+                    where pendingProcess.RecId == PendingProcessRecId;
+
+                if (pendingProcess)
+                {
+                    pendingProcess.ProcessStartDateTime = DateTimeUtil::getSystemDateTime();
+                    pendingProcess.Status = METOrderExtractionPendingProcessStatus::Processing;
+
+                    orderTrans = WMSOrderTrans::find(pendingProcess.WMSOrderTransRecId);
+
+                    if (orderTrans)
+                    {
+                        orderTrans.metShortPickDeliveryReminderUpd();
+                    }
+
+                    pendingProcess.ProcessEndDateTime = DateTimeUtil::getSystemDateTime();
+                    pendingProcess.Status = METOrderExtractionPendingProcessStatus::Completed;
+
+                    pendingProcess.update();
+            
+                }
+                
+                ttscommit;
+            }
+            catch (Exception::DuplicateKeyException)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::DuplicateKeyExceptionNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::DuplicateKeyException;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+            catch (ex)
+            {
+                select firstonly forupdate pendingProcess
+                    where pendingProcess.RecId == PendingProcessRecId;
+
+                if (pendingProcess)
+                {
+                    ttsbegin;
+
+                    pendingProcess.Status = METOrderExtractionPendingProcessStatus::Failed;
+                    pendingProcess.ProcessEndDateTime = DateTimeUtil::getSystemDateTime();
+                    pendingProcess.RetryCount += 1;
+                    pendingProcess.Error = METPickingListRegistrationPostingJob::getInfologSince(startLine);
+
+                    pendingProcess.update();
+                    ttscommit;
+                }
+            }
+            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInfologSince</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the infolog since the specified line number.
+    /// </summary>
+    /// <param name = "_fromLine">From line.</param>
+    /// <returns>The infolog messages since the specified line number.</returns>
+    public static str getInfologSince(int _fromLine)
+    {
+        container                con = infolog.copy(_fromLine + 1, infologLine());
+        SysInfologEnumerator     enumerator = SysInfologEnumerator::newData(con);
+        str                      ret;
+
+        while (enumerator.moveNext())
+        {
+            ret += SysInfologMessageStruct::construct(enumerator.currentMessage()).message() + '\n';
+        }
+        return ret;
     }
 
 ]]></Source>
