@@ -3,19 +3,24 @@
 	<Name>METSalesOrderHeaderDualWriteUpdate</Name>
 	<SourceCode>
 		<Declaration><![CDATA[
-public class METSalesOrderHeaderDualWriteUpdate extends RunBaseBatch implements BatchRetryable
+public class METSalesOrderHeaderDualWriteUpdate extends METBatchMultipleThreadBase implements BatchRetryable
 {
     Integer            numOfRecords;
-    
+
     DialogField        dlgNumOfRecords;
-    
+
+    PositiveNumber      maxTaskCount;
+    DialogField         dlgMaxTaskCount;
+
     QueryRun       queryRun;
-    
+
     #define.CurrentVersion(1)
     #localmacro.CurrentList
-        numOfRecords
+        numOfRecords,
+        maxTaskCount,
+        batchIdentifier
     #endmacro
-    
+
 }
 ]]></Declaration>
 		<Methods>
@@ -26,10 +31,25 @@ public class METSalesOrderHeaderDualWriteUpdate extends RunBaseBatch implements 
     {
         DialogRunbase       dialog = super();
         ;
-        dlgNumOfRecords       = dialog.addFieldValue(extendedtypestr(Integer), numOfRecords, "Number of records", "Number of open records that is ready to sync");
+        dlgNumOfRecords       = dialog.addFieldValue(extendedtypestr(Integer), numOfRecords, "@MET:SalesOrderHeaderDualWriteUpdateNumOfRecords", "@MET:SalesOrderHeaderDualWriteUpdateNumOfRecordsHelp");
         dlgNumOfRecords.enabled(false);
 
+        dialog.addGroup("@MET:SalesOrderHeaderDualWriteUpdatePerformanceSettings");
+        dlgMaxTaskCount     = dialog.addFieldValue(extendedtypestr(PositiveNumber), maxTaskCount, "@MET:SalesOrderHeaderDualWriteUpdateMaxTaskCount", "@MET:SalesOrderHeaderDualWriteUpdateMaxTaskCountHelp");
+
         return dialog;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getFromDialog</Name>
+				<Source><![CDATA[
+    public boolean getFromDialog()
+    {
+        maxTaskCount = dlgMaxTaskCount.value();
+
+        return super();
     }
 
 ]]></Source>
@@ -57,7 +77,7 @@ public class METSalesOrderHeaderDualWriteUpdate extends RunBaseBatch implements 
         qBR = SysQuery::findOrCreateRange(qbds, fieldnum(METSalesTable, DualWriteRequired));
         qBR.value(queryValue(NoYes::Yes));
         qBR.status(RangeStatus::Locked);
-        
+
         queryRun = new QueryRun(query);
     }
 
@@ -122,12 +142,25 @@ public class METSalesOrderHeaderDualWriteUpdate extends RunBaseBatch implements 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>run</Name>
+				<Name>runStartTask</Name>
 				<Source><![CDATA[
-    public void run()
+    public void runStartTask()
+    {
+        info(strFmt("@MET:SalesOrderHeaderDualWriteUpdateStart", numOfRecords));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runThreadTask</Name>
+				<Source><![CDATA[
+    public void runThreadTask()
     {
         int                     processedCounter;
         METSalesTable           metSalesTable, metSalesTableUpdate;
+        QueryBuildDataSource    qbds = queryRun.query().dataSourceTable(tablenum(METSalesTable));
+
+        qbds.addRange(fieldnum(METSalesTable, RecId)).value(batchIdentifier);
 
         while (queryRun.next())
         {
@@ -151,19 +184,81 @@ public class METSalesOrderHeaderDualWriteUpdate extends RunBaseBatch implements 
             }
             catch (Exception::Error)
             {
-                error(strFmt("METSalesOrderHeaderDualWriteUpdate: failed to update DualWriteRequired for SalesId %1 (RecId %2)", metSalesTable.SalesId, metSalesTable.RecId));
+                error(strFmt("@MET:SalesOrderHeaderDualWriteUpdateErrorFailed", metSalesTable.SalesId, metSalesTable.RecId));
             }
             catch (Exception::Deadlock)
             {
-                error(strFmt("METSalesOrderHeaderDualWriteUpdate: deadlock while updating SalesId %1 (RecId %2)", metSalesTable.SalesId, metSalesTable.RecId));
+                error(strFmt("@MET:SalesOrderHeaderDualWriteUpdateErrorDeadlock", metSalesTable.SalesId, metSalesTable.RecId));
             }
             catch (Exception::UpdateConflict)
             {
-                error(strFmt("METSalesOrderHeaderDualWriteUpdate: update conflict while updating SalesId %1 (RecId %2)", metSalesTable.SalesId, metSalesTable.RecId));
+                error(strFmt("@MET:SalesOrderHeaderDualWriteUpdateErrorUpdateConflict", metSalesTable.SalesId, metSalesTable.RecId));
             }
         }
 
-        info(strfmt(" %1 record(s) processed", processedCounter));
+        info(strFmt("@MET:SalesOrderHeaderDualWriteUpdateThreadProcessed", processedCounter, batchIdentifier));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>runFinalTask</Name>
+				<Source><![CDATA[
+    public void runFinalTask()
+    {
+        int remaining;
+
+        remaining = SysQuery::countTotal(queryRun);
+
+        info(strFmt("@MET:SalesOrderHeaderDualWriteUpdateFinal", remaining));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getBatchIdentifiersRangeCon</Name>
+				<Source><![CDATA[
+    public container getBatchIdentifiersRangeCon()
+    {
+        container  res;
+        QueryRun   queryRunLocal = new QueryRun(queryRun.query());
+
+        QueryBuildDataSource   qBDS = queryRunLocal.query().dataSourceTable(tablenum(METSalesTable));
+        int                    totalRecords, curRecord, recordsPerBatch;
+        RecId                  fromRecId, toRecId;
+
+        qBDS.sortClear();
+        qBDS.addSortField(fieldnum(METSalesTable, RecId));
+
+        totalRecords = SysQuery::countTotal(queryRunLocal);
+        recordsPerBatch = maxTaskCount > 0 ? totalRecords div maxTaskCount : totalRecords;
+        if (! recordsPerBatch)
+        {
+            recordsPerBatch = 1;
+        }
+
+        while (queryRunLocal.next())
+        {
+            METSalesTable   metSalesTable = queryRunLocal.get(tablenum(METSalesTable));
+            if (! fromRecId)
+            {
+                fromRecId = metSalesTable.RecId;
+            }
+            curRecord++;
+            toRecId = metSalesTable.RecId;
+            if ((curRecord mod recordsPerBatch) == 0)
+            {
+                res += SysQuery::range(fromRecId, toRecId);
+                fromRecId = 0;
+                curRecord = 0;
+            }
+        }
+        if (curRecord && fromRecId && toRecId)
+        {
+            res += SysQuery::range(fromRecId, toRecId);
+        }
+
+        return res;
     }
 
 ]]></Source>
@@ -174,16 +269,6 @@ public class METSalesOrderHeaderDualWriteUpdate extends RunBaseBatch implements 
     public boolean showQueryValues()
     {
         return true;
-    }
-
-]]></Source>
-			</Method>
-			<Method>
-				<Name>canRunInNewSession</Name>
-				<Source><![CDATA[
-    public boolean canRunInNewSession()
-    {
-        return false;
     }
 
 ]]></Source>
@@ -233,7 +318,7 @@ public class METSalesOrderHeaderDualWriteUpdate extends RunBaseBatch implements 
 				<Source><![CDATA[
     static ClassDescription description()
     {
-        return "Dual write sales order header updates";
+        return "@MET:SalesOrderHeaderDualWriteUpdate";
     }
 
 ]]></Source>
