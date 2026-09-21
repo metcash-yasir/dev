@@ -78,6 +78,8 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
         //CB238 - xDock
         InventTransferTable inventTransferTable = InventTransferTable::find(_dataContract.parmTransferId());
 
+        // Task 424597
+        boolean reservationRequired = this.isReservationRequired(_dataContract);
 
         ttsbegin;
         while select forupdate metInventTransferLineCancel
@@ -86,7 +88,9 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
                 && (metInventTransferLineCancel.OrderExtractStatus != METOrderExtractStatus::Extracted)
                 && inventTransferLineCancel.TransferId == inventTransferTable.TransferId
         {
-            if (inventTransferLineCancel.displayQtyReservedPhysical() == 0)
+            // Task 424597: the no-stock cancellation relies on reserved quantity. Without reservation
+            // every line has zero reserved quantity and would be cancelled, so skip it.
+            if (reservationRequired && inventTransferLineCancel.displayQtyReservedPhysical() == 0)
             {
                 inventTransferLineCancel.selectForUpdate(true);
                 //If there is less stock than the QtyTransfer, then set QtyRemainShip to the available stock
@@ -97,7 +101,7 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
                 SalesLine   salesLine;
                 SalesTable  salesTable;
 
-                select firstonly METAllowBackOrders, RecId from salesTable 
+                select firstonly METAllowBackOrders, RecId from salesTable
                 join salesLine
                     where salesTable.SalesId == salesLine.SalesId
                     && salesLine.InventTransId == metInventTransferLineCancel.SalesLineTransId;
@@ -128,11 +132,22 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
        
         inventTransferParmTable.TransferId          = _dataContract.parmTransferId();
         inventTransferParmTable.UpdateType          = InventTransferUpdateType::PickingList;
-        // CB715_TransferOrderExtract
-        // generate picklist for the order lines where reservation has occurred
-        //inventTransferParmTable.PickUpdateQty       = InventTransferPickUpdateQty::AvailableQty;
-        inventTransferParmTable.PickUpdateQty       = InventTransferPickUpdateQty::ReservedQty;
-        inventTransferParmTable.Reservation         = NoYes::Yes;
+
+        // Task 424597: batch job parameters override the CB715 defaults
+        if (_dataContract.parmOverridePickingListParms())
+        {
+            inventTransferParmTable.PickUpdateQty   = _dataContract.parmPickUpdateQty();
+            inventTransferParmTable.Reservation     = _dataContract.parmReservation();
+        }
+        else
+        {
+            // CB715_TransferOrderExtract
+            // generate picklist for the order lines where reservation has occurred
+            //inventTransferParmTable.PickUpdateQty       = InventTransferPickUpdateQty::AvailableQty;
+            inventTransferParmTable.PickUpdateQty   = InventTransferPickUpdateQty::ReservedQty;
+            inventTransferParmTable.Reservation     = NoYes::Yes;
+        }
+
         inventTransferParmTable.EditLines           = NoYes::Yes;
         inventTransferParmTable.TransDate           = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
         
@@ -140,7 +155,7 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
         inventTransferParmTable.AutoReceiveQty = this.shouldAutoReceive(_dataContract.parmTransferId());
 
         // CB715_TransferOrderExtract
-        // This will populate inventTransferParmLine with only TO lines where extraction status=”Ready for extract” only.
+        // This will populate inventTransferParmLine with only TO lines where extraction status="Ready for extract" only.
         //inventTransferUpd = InventTransferUpdPick::NewParmBuffer(inventTransferParmTable);
         inventTransferUpd = InventTransferUpdPick::METNewParmBuffer(inventTransferParmTable);
         
@@ -243,7 +258,6 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
  
         try
         {
-             
             //CB929 - Create final leg TO's for cross dock transfer order
             InventTransferTable transferTable = InventTransferTable::find(_dataContract.parmTransferId());
             if(extractFinalLegTO == false && transferTable.metInventTransferTableExt().InternalCrossDock)
@@ -263,7 +277,11 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
             {
                 this.applySubstitutions(_dataContract.parmTransferId());
  
-                this.applyTransferOrderReservation(_dataContract.parmTransferId()); //CB678 reservation for TO
+                // Task 424597: skip CB678 reservation when the batch job runs with Reservation = No
+                if (this.isReservationRequired(_dataContract))
+                {
+                    this.applyTransferOrderReservation(_dataContract.parmTransferId()); //CB678 reservation for TO
+                }
             }
  
             [InventTransferJour, inventTransferParmTable] = this.pick(_dataContract);
@@ -315,7 +333,6 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
  
             //CB628 - Send order to TMS after the pick list is posted.
             METTMSEngineOrderProccess::construct(METTMSEngineExecutionMode::TransferOrderPickinglist, wmsPickingRoute, wmsPickingRoute.pickingRouteID, true).run();
-            
         }
         catch (Exception::Deadlock)
         {
@@ -559,6 +576,22 @@ class METTransferPickingListGenerationTaskService extends SysOperationServiceBas
     public WHSHandlingWeight defaultCatchWeightReserveQuantity(ItemId _itemId, InventHandlingQty _handlingQty)
     {
         return PdsGlobal::pdsIsCWItem(_itemId) ? PdsCatchWeight::minInventQty(_itemId, _handlingQty) : 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isReservationRequired</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Task 424597: Reservation is performed unless the batch job explicitly turned it off.
+    /// </summary>
+    /// <param name = "_dataContract">Task contract</param>
+    /// <returns>true when CB678 reservation and no-stock line cancellation must run</returns>
+    private boolean isReservationRequired(METTransferPickingListGenerationTaskContract _dataContract)
+    {
+        return !_dataContract.parmOverridePickingListParms()
+            || _dataContract.parmReservation() == NoYes::Yes;
     }
 
 ]]></Source>
