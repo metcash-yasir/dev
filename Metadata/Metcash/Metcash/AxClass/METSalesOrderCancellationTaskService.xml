@@ -1,0 +1,473 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+	<Name>METSalesOrderCancellationTaskService</Name>
+	<SourceCode>
+		<Declaration><![CDATA[
+public class METSalesOrderCancellationTaskService extends METSysOperationTaskService
+{
+    guid     topPickingProcessId;
+    RefRecId salesTableRecId;
+    SalesId  salesId;
+    int      cancelCount;
+    int      cancelLimit;
+
+}
+]]></Declaration>
+		<Methods>
+			<Method>
+				<Name>process</Name>
+				<Source><![CDATA[
+    public void process(METSalesOrderCancellationContract _contract)
+    {
+        this.processInternal(_contract);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>initialise</Name>
+				<Source><![CDATA[
+    protected void initialise()
+    {
+        METSalesOrderCancellationContract contract;
+
+        super();
+
+        contract = dataContract as METSalesOrderCancellationContract;
+        topPickingProcessId = contract.parmProcessId();
+        cancelLimit = METCustParameters::find().CancelCount;
+
+        if (cancelLimit <= 0)
+        {
+            throw error('Cancel lines limit must be greater than zero.');
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processTask</Name>
+				<Source><![CDATA[
+    public void processTask(boolean _readPast)
+    {
+        while (this.getSalesOrderFromQueue(topPickingProcessId, _readPast))
+        {
+            try
+            {
+                this.execute(salesTableRecId);
+            }
+            catch (Exception::Error)
+            {
+                Global::exceptionTextFallThrough();
+                error(strFmt(
+                    'Cancellation of sales order %1 was not successful',
+                    salesId));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getSalesOrderFromQueue</Name>
+				<Source><![CDATA[
+    private RefRecId getSalesOrderFromQueue(
+        guid    _processId,
+        boolean _readPast)
+    {
+        METSalesOrderCancellationQueue queueRecord;
+        #OCCRetryCount
+        int backOffWait;
+        Microsoft.Dynamics.Ax.Xpp.DeadlockException deadlockException;
+        Microsoft.Dynamics.Ax.Xpp.UpdateConflictException updateConflictException;
+        Microsoft.Dynamics.Ax.Xpp.TransientSqlConnectionError transientSqlConnectionError;
+
+        queueRecord.readPast(_readPast);
+
+        try
+        {
+            ttsbegin;
+
+            select firstOnly pessimisticLock queueRecord
+                order by RecId
+                where queueRecord.ProcessId == _processId;
+
+            if (queueRecord.RecId)
+            {
+                salesTableRecId = queueRecord.SalesTableRecId;
+                salesId = queueRecord.SalesId;
+                queueRecord.delete();
+            }
+            else
+            {
+                salesTableRecId = 0;
+                salesId = '';
+            }
+
+            ttscommit;
+        }
+        catch (deadlockException)
+        {
+            if (appl.ttsLevel() == 0
+                && xSession::currentRetryCount() < #RetryNum)
+            {
+                backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                sleep(xSession::currentRetryCount() * backOffWait);
+                retry;
+            }
+
+            throw deadlockException;
+        }
+        catch (updateConflictException)
+        {
+            if (appl.ttsLevel() == 0
+                && xSession::currentRetryCount() < #RetryNum)
+            {
+                backOffWait = RandomGenerate::construct().randomInt(100, 5000);
+                sleep(xSession::currentRetryCount() * backOffWait);
+                retry;
+            }
+
+            if (appl.ttsLevel() == 0)
+            {
+                throw Exception::UpdateConflictNotRecovered;
+            }
+
+            throw updateConflictException;
+        }
+        catch (transientSqlConnectionError)
+        {
+            if (SysTransientSqlConnectionErrorHandler::retryTransientSqlConnectionError())
+            {
+                retry;
+            }
+
+            throw transientSqlConnectionError;
+        }
+
+        return salesTableRecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>execute</Name>
+				<Source><![CDATA[
+    private void execute(RefRecId _salesTableRecId)
+    {
+        SalesTable salesTable;
+        METSalesTable metSalesTable;
+
+        select firstOnly salesTable
+            where salesTable.RecId == _salesTableRecId;
+
+        if (!salesTable.RecId)
+        {
+            return;
+        }
+
+        select firstOnly metSalesTable
+            where metSalesTable.SalesTable == salesTable.RecId;
+
+        // The header flag has priority for this sales order.
+        if (metSalesTable.RecId
+            && metSalesTable.OrderCancellationRequired == NoYes::Yes)
+        {
+            this.cancelOrder(salesTable.SalesId);
+        }
+        else
+        {
+            this.processSelectedLines(salesTable.RecId);
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processSelectedLines</Name>
+				<Source><![CDATA[
+    private void processSelectedLines(RefRecId _salesTableRecId)
+    {
+        METSalesOrderCancellationContract contract =
+            dataContract as METSalesOrderCancellationContract;
+        Query query = contract.getQuery();
+        QueryBuildDataSource qbdsSalesTable;
+        QueryRun queryRun;
+        SalesLine salesLine;
+        METSalesLine metSalesLine;
+        Set processedLines = new Set(Types::Int64);
+
+        qbdsSalesTable = query.dataSourceTable(tableNum(SalesTable));
+        qbdsSalesTable.addRange(fieldNum(SalesTable, RecId)).value(
+            queryValue(_salesTableRecId));
+
+        queryRun = new QueryRun(query);
+
+        while (queryRun.next())
+        {
+            salesLine = queryRun.get(tableNum(SalesLine));
+
+            if (!salesLine.RecId || processedLines.in(salesLine.RecId))
+            {
+                continue;
+            }
+
+            processedLines.add(salesLine.RecId);
+
+            select firstOnly metSalesLine
+                where metSalesLine.SalesLine == salesLine.RecId;
+
+            if (metSalesLine.RecId
+                && metSalesLine.LineCancellationRequired == NoYes::Yes)
+            {
+                try
+                {
+                    this.cancelSingleLine(salesLine.RecId);
+                }
+                catch (Exception::Error)
+                {
+                    Global::exceptionTextFallThrough();
+                    error(strFmt(
+                        'Cancellation of sales order %1, line %2, item %3 was not successful',
+                        salesLine.SalesId,
+                        salesLine.LineNum,
+                        salesLine.ItemId));
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelOrder</Name>
+				<Source><![CDATA[
+    private void cancelOrder(SalesId _salesId)
+    {
+        SalesTable salesTable;
+        SalesLine salesLine;
+        METSalesTable metSalesTable;
+        SalesUpdateRemain salesUpdateRemain;
+
+        ttsbegin;
+
+        select firstOnly forUpdate salesTable
+            where salesTable.SalesId == _salesId
+               && salesTable.SalesStatus == SalesStatus::Backorder;
+
+        select firstOnly metSalesTable
+            where metSalesTable.SalesTable == salesTable.RecId
+               && metSalesTable.OrderCancellationRequired == NoYes::Yes;
+
+        if (!salesTable.RecId || !metSalesTable.RecId)
+        {
+            ttscommit;
+            return;
+        }
+
+        salesUpdateRemain = SalesUpdateRemain::construct();
+
+        while select forUpdate salesLine
+            order by LineNum
+            where salesLine.SalesId == salesTable.SalesId
+               && salesLine.SalesStatus == SalesStatus::Backorder
+        {
+            if (!this.cancelLine(salesUpdateRemain, salesLine))
+            {
+                throw error(strFmt(
+                    'Cancellation of sales order %1, line %2, item %3 was not successful',
+                    salesLine.SalesId,
+                    salesLine.LineNum,
+                    salesLine.ItemId));
+            }
+        }
+
+        salesTable.reread();
+
+        if (salesTable.SalesStatus != SalesStatus::Canceled)
+        {
+            throw error(strFmt(
+                'Cancellation of sales order %1 was not successful',
+                salesTable.SalesId));
+        }
+
+        this.clearLineFlags(salesTable.SalesId);
+
+        metSalesTable.clear();
+
+        select firstOnly forUpdate metSalesTable
+            where metSalesTable.SalesTable == salesTable.RecId
+               && metSalesTable.OrderCancellationRequired == NoYes::Yes;
+
+        if (metSalesTable.RecId)
+        {
+            metSalesTable.OrderCancellationRequired = NoYes::No;
+            metSalesTable.ConfimRequired = NoYes::Yes;
+            metSalesTable.update();
+        }
+
+        ttscommit;
+
+        info(strFmt(
+            'Sales order %1 has been cancelled',
+            salesTable.SalesId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelSingleLine</Name>
+				<Source><![CDATA[
+    private void cancelSingleLine(RefRecId _salesLineRecId)
+    {
+        SalesLine salesLine;
+        METSalesLine metSalesLine;
+        SalesUpdateRemain salesUpdateRemain;
+
+        ttsbegin;
+
+        select firstOnly forUpdate salesLine
+            where salesLine.RecId == _salesLineRecId;
+
+        select firstOnly metSalesLine
+            where metSalesLine.SalesLine == salesLine.RecId
+               && metSalesLine.LineCancellationRequired == NoYes::Yes;
+
+        if (!salesLine.RecId || !metSalesLine.RecId)
+        {
+            ttscommit;
+            return;
+        }
+
+        salesUpdateRemain = SalesUpdateRemain::construct();
+
+        if (!this.cancelLine(salesUpdateRemain, salesLine))
+        {
+            throw error(strFmt(
+                'Cancellation of sales order %1, line %2, item %3 was not successful',
+                salesLine.SalesId,
+                salesLine.LineNum,
+                salesLine.ItemId));
+        }
+
+        metSalesLine.clear();
+
+        select firstOnly forUpdate metSalesLine
+            where metSalesLine.SalesLine == salesLine.RecId
+               && metSalesLine.LineCancellationRequired == NoYes::Yes;
+
+        if (metSalesLine.RecId)
+        {
+            metSalesLine.LineCancellationRequired = NoYes::No;
+            metSalesLine.update();
+        }
+
+        ttscommit;
+
+        info(strFmt(
+            'Sales order %1, line %2, item %3 has been cancelled',
+            salesLine.SalesId,
+            salesLine.LineNum,
+            salesLine.ItemId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>cancelLine</Name>
+				<Source><![CDATA[
+    private boolean cancelLine(
+        SalesUpdateRemain _salesUpdateRemain,
+        SalesLine         _salesLine)
+    {
+        boolean cancelled;
+
+        if (_salesLine.SalesStatus == SalesStatus::Canceled)
+        {
+            return true;
+        }
+
+        if (_salesLine.SalesStatus != SalesStatus::Backorder)
+        {
+            return false;
+        }
+
+        cancelled = _salesUpdateRemain.updateDeliverRemainder(
+            _salesLine,
+            0,
+            0);
+
+        _salesLine.reread();
+
+        // Preserve the tested CancelCount commit behavior.
+        if (cancelLimit > 0 && appl.ttsLevel() <= 1)
+        {
+            cancelCount++;
+
+            if (cancelCount >= cancelLimit)
+            {
+                int level = appl.ttsLevel();
+
+                this.doTtsCommit(level);
+                this.doTtsBegin(level);
+
+                cancelCount = 0;
+            }
+        }
+
+        return cancelled
+            && _salesLine.SalesStatus == SalesStatus::Canceled;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>clearLineFlags</Name>
+				<Source><![CDATA[
+    private void clearLineFlags(SalesId _salesId)
+    {
+        METSalesLine metSalesLine;
+        SalesLine salesLine;
+
+        while select forUpdate metSalesLine
+            where metSalesLine.LineCancellationRequired == NoYes::Yes
+            exists join salesLine
+                where salesLine.RecId == metSalesLine.SalesLine
+                   && salesLine.SalesId == _salesId
+        {
+            metSalesLine.LineCancellationRequired = NoYes::No;
+            metSalesLine.update();
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doTtsCommit</Name>
+				<Source><![CDATA[
+    private void doTtsCommit(int _times)
+    {
+        for (int i = 1; i <= _times; i++)
+        {
+            ttscommit;
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>doTtsBegin</Name>
+				<Source><![CDATA[
+    private void doTtsBegin(int _times)
+    {
+        for (int i = 1; i <= _times; i++)
+        {
+            ttsbegin;
+        }
+    }
+
+]]></Source>
+			</Method>
+		</Methods>
+	</SourceCode>
+</AxClass>
