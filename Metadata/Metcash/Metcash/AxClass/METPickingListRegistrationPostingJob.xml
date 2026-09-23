@@ -418,6 +418,49 @@ final class METPickingListRegistrationPostingJob
 ]]></Source>
 			</Method>
 			<Method>
+				<Name>picklistRegistrationCompleteFinal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether the picklist registration for the specified order is complete and performs any required finalization.
+    /// Verifies that all picklist lines for the order have been processed, updates related shipment/transfer state,
+    /// triggers downstream processing (for example transfer-order post-processing), and records any pending actions.
+    /// </summary>
+    /// <param name="orderTrans">The order transaction record to evaluate and finalize.</param>
+    /// <returns>
+    /// True when the picklist registration for the order is complete and finalization succeeded; otherwise false.
+    /// </returns>
+    public void picklistRegistrationCompleteFinal(METDallasPicklistRegCompleteContract _contract)
+    {
+        METSalesOrderShipmentLoadLines      loadLine;
+        WMSOrderTrans                       orderTrans;
+        container                           allRoute = _contract.parmAllRouteIdCon();
+        WMSPickingRouteID                   routeId;
+        Set                                 processedShipmentIdSet = new Set(Types::String);
+
+        for (int i = 1; i <= conlen(allRoute); i++)
+        {
+            routeId = conpeek(allRoute, i);
+
+            while select ShipmentId from loadLine
+                group by loadLine.ShipmentId
+                where loadLine.ShipmentId
+                exists join orderTrans
+                    where orderTrans.RecId == loadLine.WMSOrderTransRecId
+                        && orderTrans.routeId == routeId
+            {
+                if (!processedShipmentIdSet.in(loadLine.ShipmentId))
+                {
+                    processedShipmentIdSet.add(loadLine.ShipmentId);
+
+                    METSalesOrderShipmentLoadHeader::updatePickComplete(loadLine.ShipmentId);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
 				<Name>picklistRegistrationCompleteInBundle</Name>
 				<Source><![CDATA[
     /// <summary>
@@ -428,6 +471,8 @@ final class METPickingListRegistrationPostingJob
     /// </param>
     public void picklistRegistrationCompleteInBundle(METDallasPicklistRegCompleteContract _contract)
     {
+        #OCCRetryCount
+
         WMSPickingRoute wmsPickingRoute;
         WMSPickingRouteID pickingRouteId;
 
@@ -455,60 +500,53 @@ final class METPickingListRegistrationPostingJob
                     wmsPickingRoute = WMSPickingRoute::find(pickingRouteId, true);
                     wmsPickingRoute.checkFinishRoute();
 
+                    ttsCommit;
+
                     if (wmsPickingRoute.transType == InventTransType::TransferOrderShip && wmsPickingRoute.expeditionStatus == WMSExpeditionStatus::Complete)
                     {
+                        ttsbegin;
                         //Added for Task 282558: CB913/CB162 - Campbells -Integration - Campbells Transfer Order Receipt
                         if (METCampbellTransferOrderProcessor::construct().processCampbellsTransferOrder(InventTransferTable::find(wmsPickingRoute.transRefId), true) == false)
                         {
                             throw error (strFmt("@MET:ProcessFailedTO", wmsPickingRoute.transRefId));
                         }
+
+                        ttsCommit;
                     }
                   
-                    ttsCommit;
-
                     if (procMetrics)
                     {
                         procMetrics.incDescriptionCount(2, 1);
                         procMetrics.endDescriptionTime(2);
                     }
                 }
-                catch (Exception::Error)
+                catch(Exception::Deadlock)
                 {
-                    if (appl.ttsLevel() > 0)
-                    {
-                        ttsAbort;
-                    }
-
-                    error(strFmt("@MET:METPicklistRouteProcessError", wmsPickingRoute.PickingRouteID));
-                }
-                catch (Exception::Deadlock)
-                {
-                    if (appl.ttsLevel() > 0)
-                    {
-                        ttsAbort;
-                    }
-
-                    error(strFmt("@MET:METPicklistRouteProcessDeadlock", wmsPickingRoute.PickingRouteID));
+                    retry;
                 }
                 catch (Exception::UpdateConflict)
                 {
-                    if (appl.ttsLevel() > 0)
+                    if (appl.ttsLevel() == 0)
                     {
-                        ttsAbort;
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            throw Exception::UpdateConflictNotRecovered;
+                        }
+                        else
+                        {
+                            retry;
+                        }
                     }
-
-                    error(strFmt("@MET:METPicklistRouteProcessUpdateConflict", wmsPickingRoute.PickingRouteID));
+                    else
+                    {
+                        throw Exception::UpdateConflict;
+                    }
                 }
-                catch (Exception::CLRError)
+                catch(Exception::Error)
                 {
-                    if (appl.ttsLevel() > 0)
-                    {
-                        ttsAbort;
-                    }
-
-                    error(strFmt("@MET:METPicklistRouteProcessCLRError", wmsPickingRoute.PickingRouteID));
+                    error(strFmt("@MET:PickListPost", wmsPickingRoute.transRefId));
                 }
-            
+
                 procMetrics.incProcessedCountWithDocument(pickingRouteId);
             }
 
