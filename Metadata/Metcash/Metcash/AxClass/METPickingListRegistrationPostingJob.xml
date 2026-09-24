@@ -82,7 +82,7 @@ final class METPickingListRegistrationPostingJob
                     else if (orderTrans.inventTransType == InventTransType::TransferOrderShip)
                     {
                         InventTransferLine  inventTransferLine  = InventTransferLine::findTransIdShip(orderTrans.inventTransId, true);
-                        if (inventTransferLine && inventTransferLine.QtyTransfer > orderTrans.qty)
+                        if (inventTransferLine && inventTransferLine.QtyTransfer > orderTrans.qty && METInventTransferTableExt::isCampbellsWarehouse(inventTransferLine.inventDim().InventLocationId))
                         {
                             METDallasPicklistRegPendingProcess::insertData(orderTrans.RecId, orderTrans.RouteId);
                         }
@@ -266,21 +266,26 @@ final class METPickingListRegistrationPostingJob
             {
                 _procMetrics.startDescriptionTime(2, "@SYS330592");
             }
-           
+
             SalesTable salesTable = SalesTable::find(_salesId);
 
             if (salesTable)
             {
                 SalesFormLetter salesFormLetter = SalesFormLetter::construct(DocumentStatus::Confirmation);
-                salesFormLetter.update(salesTable, 
-                    DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), 
-                    SalesUpdate::All,
-                    AccountOrder::None,
-                    salesFormLetter.salesParmUpdate().Proforma,
-                    NoYes::Yes,
-                    NoYes::Yes);
+                salesFormLetter.update(salesTable, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), SalesUpdate::All);
+
+                CustConfirmJour custConfirmJour;
+
+                select firstonly custConfirmJour
+                    order by RecId desc
+                    where custConfirmJour.SalesId == _salesId;
+
+                if (custConfirmJour.RecId)
+                {
+                    custConfirmJour.printJournal();
+                }
             }
-            
+
             if (_procMetrics)
             {
                 _procMetrics.incDescriptionCount(2, 1);
@@ -420,47 +425,42 @@ final class METPickingListRegistrationPostingJob
 			<Method>
 				<Name>picklistRegistrationCompleteFinal</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether the picklist registration for the specified order is complete and performs any required finalization.
+    /// Verifies that all picklist lines for the order have been processed, updates related shipment/transfer state,
+    /// triggers downstream processing (for example transfer-order post-processing), and records any pending actions.
+    /// </summary>
+    /// <param name="orderTrans">The order transaction record to evaluate and finalize.</param>
+    /// <returns>
+    /// True when the picklist registration for the order is complete and finalization succeeded; otherwise false.
+    /// </returns>
     public void picklistRegistrationCompleteFinal(METDallasPicklistRegCompleteContract _contract)
     {
-        METSalesOrderShipmentLoadHeader     loadHeader;
-        METSalesOrderShipmentLoadLines      loadLine, loadLineCheck;
+        METSalesOrderShipmentLoadLines      loadLine;
         WMSOrderTrans                       orderTrans;
-        WMSPickingRoute                     orderRoute;
         container                           allRoute = _contract.parmAllRouteIdCon();
         WMSPickingRouteID                   routeId;
+        Set                                 processedShipmentIdSet = new Set(Types::String);
 
         for (int i = 1; i <= conlen(allRoute); i++)
         {
             routeId = conpeek(allRoute, i);
 
-            while select orderTrans
-                where orderTrans.routeId == routeId
+            while select ShipmentId from loadLine
+                group by loadLine.ShipmentId
+                where loadLine.ShipmentId
+                exists join orderTrans
+                    where orderTrans.RecId == loadLine.WMSOrderTransRecId
+                        && orderTrans.routeId == routeId
             {
-                select RecId, ShipmentId from loadLine
-                    where loadLine.PickingListComplete == NoYes::No
-                        && loadLine.WMSOrderTransRecId == orderTrans.RecId
-                        && orderTrans.routeId == routeId;
-
-                if (loadLine.RecId == 0)
+                if (!processedShipmentIdSet.in(loadLine.ShipmentId))
                 {
-                    select shipmentId from loadLineCheck
-                        where  loadLineCheck.ShipmentId == loadLine.ShipmentId;
+                    processedShipmentIdSet.add(loadLine.ShipmentId);
 
-                    ttsbegin;
-                    select forupdate loadHeader
-                        where loadHeader.ShipmentId == loadLineCheck.ShipmentId;
-
-                    if (loadHeader.RecId)
-                    {
-                        loadHeader.ShipmentPickComplete = NoYes::Yes;
-                        loadHeader.update();
-                        Info(strFmt("Shipment updated with pick complete as Yes", loadHeader.ShipmentId));
-                    }
-                    ttscommit;
+                    METSalesOrderShipmentLoadHeader::updatePickComplete(loadLine.ShipmentId);
                 }
             }
         }
-
     }
 
 ]]></Source>
