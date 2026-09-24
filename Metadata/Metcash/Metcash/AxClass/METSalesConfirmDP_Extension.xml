@@ -11,6 +11,14 @@
 internal final class METSalesConfirmDP_Extension
 {
     private boolean isPickedCaseslIneProcessed;
+    private SalesTotals metCachedSalesTotals;
+    private SalesId metCachedSalesTotalsSalesId;
+    private Map metCachedTaxAmountByTrans;
+    private Map metCachedWetAmountByTrans;
+    private CompanyInfo metCachedCompanyInfo;
+    private Map metCachedSiteInventDimId;
+    private RecId metLastCustConfirmTransRecId;
+    private SalesQty metLastSalesQty;
 }
 ]]></Declaration>
 		<Methods>
@@ -30,11 +38,11 @@ internal final class METSalesConfirmDP_Extension
         #PrintMgmtSetup
 
         SysDocuBrandDetails docuBrandDetails;
-        CompanyInfo           companyInfo           = CompanyInfo::find();
+        CompanyInfo           companyInfo           = this.getCachedCompanyInfo();
         SalesConfirmHeaderTmp salesConfirmHeaderTmp = next initializeSalesOrderConfirmationHeader();
         SalesTable            salesTable            = SalesTable::find(salesConfirmHeaderTmp.SalesId);
         METIndustryKeyTable   industryKey           = METIndustryKeyTable::find(METCustTable::find(salesTable.CustAccount).IndustryKey);
-        
+
         SalesConfirmContract salesConfirmContract = this.parmSalesConfirmContract();
         SRSCatalogItemName name = salesConfirmContract.parmMetcashReportName();
 
@@ -96,7 +104,7 @@ internal final class METSalesConfirmDP_Extension
     {
         SalesConfirmDetailsTmp  salesConfirmTmp;
         SalesQty                reserveQty;
-        
+
         CustConfirmTrans        custConfirmTrans = _confirmationLineSelection.parmCustConfirmTrans();
         SalesLine               SalesLine        = custConfirmTrans.salesLine();
         METSalesLine            METSalesLine     = METSalesLine::find(SalesLine.RecId);
@@ -104,8 +112,11 @@ internal final class METSalesConfirmDP_Extension
         METCase                 pickedBrokenCases = custConfirmTrans.METPickedBrokenCases;
         Qty                     qtyInSalesUOM;
 
+        metLastCustConfirmTransRecId = custConfirmTrans.RecId;
+        metLastSalesQty               = SalesLine.SalesQty;
+
         salesConfirmTmp = next initializeSalesOrderConfirmationLine(_salesConfirmHeaderTmp, _confirmationLineSelection);
-       
+
         if (METSalesLine.SubstitutionType == METSalesItemSubstitutionType::AlternateSuggestion)
         {
             salesConfirmTmp.METSubstituteOriginalItemID     = SalesLine.ItemId;
@@ -113,11 +124,10 @@ internal final class METSalesConfirmDP_Extension
             salesConfirmTmp.METItemStatus                   = custConfirmTrans.METReasonId;
             salesConfirmTmp.METSubstituteAlternateItemID    = METSalesLine.SubstituteItemID;
             salesConfirmTmp.METSubstituteAlternateItemName  = InventTable::find(METSalesLine.SubstituteItemID).productName(SystemParameters::getSystemLanguageId());
-            
+
         }
 
         salesConfirmTmp.METLineNo              = real2int(custConfirmTrans.LineNum);
-        salesConfirmTmp.Name                   = SalesLine.itemName();
         salesConfirmTmp.METBarCode             = SalesLine.BarCode;
         salesConfirmTmp.METIndicators          = salesLine.getSalesLineInvoiceIndicator(true);
         salesConfirmTmp.METReasonId            = custConfirmTrans.METReasonId;
@@ -134,52 +144,23 @@ internal final class METSalesConfirmDP_Extension
                 salesConfirmTmp.METReasonId = metInventItemOrderSetup.UnavailReason;
             }
         }
-        
-        TmpTaxWorkTrans tmpTaxWorkTrans;
-        SalesTotals salesTotals = SalesTotals::construct(salesLine.salesTable());
-        salesTotals.calc();
-        tmpTaxWorkTrans.setTmpData(salesTotals.tax().tmpTaxWorkTrans());
 
-        METLegalEntityType metLegalEntityType = CompanyInfo::find().METLegalEntityType;
-		
-        while select tmpTaxWorkTrans
-            where tmpTaxWorkTrans.InventTransId == salesLine.InventTransId
-        {
-            if ((strScan(tmpTaxWorkTrans.TaxCode, METConstants::TaxCodeWEG, 1, strLen(tmpTaxWorkTrans.TaxCode))) || 
-                (strScan(tmpTaxWorkTrans.TaxCode, METConstants::TaxCodeGST, 1, strLen(tmpTaxWorkTrans.TaxCode))))
-            {
-                if (!salesConfirmTmp.TaxAmount)
-                {
-                    salesConfirmTmp.TaxAmount = abs(tmpTaxWorkTrans.SourceRegulateAmountCur);
-                }
-                else
-                {
-                    salesConfirmTmp.TaxAmount = salesConfirmTmp.TaxAmount + abs(tmpTaxWorkTrans.SourceRegulateAmountCur);
-                }
-            }
-            else if (strScan(tmpTaxWorkTrans.TaxCode, METConstants::TaxCodeWET, 1, strLen(tmpTaxWorkTrans.TaxCode)) && metLegalEntityType == metLegalEntityType::Liquor)
-            {
-                if (!salesConfirmTmp.METWetAmount)
-                {
-                    salesConfirmTmp.METWetAmount = abs(tmpTaxWorkTrans.SourceRegulateAmountCur);
-                }
-                else
-                {
-                    salesConfirmTmp.METWetAmount = salesConfirmTmp.METWetAmount + abs(tmpTaxWorkTrans.SourceRegulateAmountCur);
-                }
-                 
-            }
-        }
+        this.primeSalesTotalsCache(salesLine);
+
+        METLegalEntityType metLegalEntityType = this.getCachedCompanyInfo().METLegalEntityType;
+
+        salesConfirmTmp.TaxAmount    = this.getCachedTaxAmount(salesLine.InventTransId);
+        salesConfirmTmp.METWetAmount = this.getCachedWetAmount(salesLine.InventTransId);
 
         salesConfirmTmp.SalesPrice  = this.getSalesLineBaseCost(salesLine.InventTransId);
 
-        if (CompanyInfo::find().METLegalEntityType == metLegalEntityType::Liquor
+        if (this.getCachedCompanyInfo().METLegalEntityType == metLegalEntityType::Liquor
               && pickedCases != 0
               || pickedBrokenCases != 0)
         {
             if (pickedCases != 0
                 && !isPickedCaseslIneProcessed)
-            {           
+            {
                 salesConfirmTmp.METSupplyQty = pickedCases;
                 salesConfirmTmp.METTotalPriceExclGST = salesConfirmTmp.SalesPrice  * salesConfirmTmp.METSupplyQty;
                 salesConfirmTmp.TaxAmount = salesConfirmTmp.TaxAmount * salesConfirmTmp.METSupplyQty;
@@ -191,7 +172,7 @@ internal final class METSalesConfirmDP_Extension
                     salesConfirmTmp.METTotalCartonsAdded       = salesConfirmTmp.Qty;
                 }
             }
-          
+
             if (pickedBrokenCases != 0
                   && isPickedCaseslIneProcessed)
             {
@@ -212,17 +193,17 @@ internal final class METSalesConfirmDP_Extension
                 {
                     qtyInSalesUOM = salesConfirmTmp.METSupplyQty;
                 }
-              
+
                 salesConfirmTmp.METTotalPriceExclGST = salesConfirmTmp.SalesPrice * qtyInSalesUOM;
                 salesConfirmTmp.TaxAmount = salesConfirmTmp.TaxAmount * qtyInSalesUOM;
-                salesConfirmTmp.METWetAmount = SalesConfirmTmp.METWetAmount * qtyInSalesUOM;   
-                         
+                salesConfirmTmp.METWetAmount = SalesConfirmTmp.METWetAmount * qtyInSalesUOM;
+
                 if (!SalesLine.PdsCWQty)
                 {
                     salesConfirmTmp.METTotalCartonsSupplied = qtyInSalesUOM;
                 }
             }
-            
+
             salesConfirmTmp.METTotalPriceIncGST  = salesConfirmTmp.METTotalPriceExclGST + salesConfirmTmp.METWetAmount + salesConfirmTmp.TaxAmount;
         }
         else
@@ -241,7 +222,7 @@ internal final class METSalesConfirmDP_Extension
                 salesConfirmTmp.METWetAmount         = salesConfirmTmp.METWetAmount;
                 salesConfirmTmp.METTotalPriceIncGST  = salesConfirmTmp.METTotalPriceExclGST + salesConfirmTmp.METWetAmount + salesConfirmTmp.TaxAmount;
             }
-       
+
             if (!SalesLine.PdsCWQty)
             {
                 // Bug 225226: CB175 - SO Confirmation - Qty Supplied not aligned on Service Level Summary table and Line Detail
@@ -256,9 +237,9 @@ internal final class METSalesConfirmDP_Extension
                 salesConfirmTmp.METTotalCartonsAdded = this.getTotalCartonBasedSellUnitAndQty(salesLine, salesLine.SalesUnit, salesLine.SalesQty, defaultSellUnit);
             }
         }
-        
+
         // Bug 248887: CB175 - Ordered Qty Mapped Incorrectly, Supplied Qty Not Populated at Time Report is Generated
-        // custConfirmTrans.Qty is init from SalesParmLine.DeliverNow which is not the ordered qty        
+        // custConfirmTrans.Qty is init from SalesParmLine.DeliverNow which is not the ordered qty
         salesConfirmTmp.METRebate               = this.getSalesLinePriceComponent(salesLine.InventTransId, true);
         salesConfirmTmp.METRebateFees           = MarkupTrans::findValue(tableNum(CustConfirmTrans), custConfirmTrans.RecId).CalculatedAmount;
         salesConfirmTmp.METSalesLineQtyOrdered  = custConfirmTrans.METSalesLineQtyOrdered;
@@ -273,8 +254,99 @@ internal final class METSalesConfirmDP_Extension
         {
             salesConfirmTmp.METIsPromotionInd  = NoYes::Yes;
         }
-            
+
         return salesConfirmTmp;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCachedCompanyInfo</Name>
+				<Source><![CDATA[
+    private CompanyInfo getCachedCompanyInfo()
+    {
+        if (!metCachedCompanyInfo)
+        {
+            metCachedCompanyInfo = CompanyInfo::find();
+        }
+
+        return metCachedCompanyInfo;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>primeSalesTotalsCache</Name>
+				<Source><![CDATA[
+    private void primeSalesTotalsCache(SalesLine _salesLine)
+    {
+        if (metCachedSalesTotals && metCachedSalesTotalsSalesId == _salesLine.SalesId)
+        {
+            return;
+        }
+
+        TmpTaxWorkTrans     tmpTaxWorkTrans;
+        METLegalEntityType  metLegalEntityType = this.getCachedCompanyInfo().METLegalEntityType;
+
+        metCachedSalesTotals = SalesTotals::construct(_salesLine.salesTable());
+        metCachedSalesTotals.calc();
+        metCachedSalesTotalsSalesId = _salesLine.SalesId;
+
+        tmpTaxWorkTrans.setTmpData(metCachedSalesTotals.tax().tmpTaxWorkTrans());
+
+        metCachedTaxAmountByTrans = new Map(Types::String, Types::Real);
+        metCachedWetAmountByTrans = new Map(Types::String, Types::Real);
+
+        while select tmpTaxWorkTrans
+        {
+            if ((strScan(tmpTaxWorkTrans.TaxCode, METConstants::TaxCodeWEG, 1, strLen(tmpTaxWorkTrans.TaxCode))) ||
+                (strScan(tmpTaxWorkTrans.TaxCode, METConstants::TaxCodeGST, 1, strLen(tmpTaxWorkTrans.TaxCode))))
+            {
+                this.accumulateMapAmount(metCachedTaxAmountByTrans, tmpTaxWorkTrans.InventTransId, abs(tmpTaxWorkTrans.SourceRegulateAmountCur));
+            }
+            else if (strScan(tmpTaxWorkTrans.TaxCode, METConstants::TaxCodeWET, 1, strLen(tmpTaxWorkTrans.TaxCode)) && metLegalEntityType == metLegalEntityType::Liquor)
+            {
+                this.accumulateMapAmount(metCachedWetAmountByTrans, tmpTaxWorkTrans.InventTransId, abs(tmpTaxWorkTrans.SourceRegulateAmountCur));
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>accumulateMapAmount</Name>
+				<Source><![CDATA[
+    private void accumulateMapAmount(Map _map, InventTransId _key, Amount _amount)
+    {
+        Amount existingAmount;
+
+        if (_map.exists(_key))
+        {
+            existingAmount = _map.lookup(_key);
+            _map.remove(_key);
+        }
+
+        _map.insert(_key, existingAmount + _amount);
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCachedTaxAmount</Name>
+				<Source><![CDATA[
+    private Amount getCachedTaxAmount(InventTransId _inventTransId)
+    {
+        return metCachedTaxAmountByTrans.exists(_inventTransId) ? metCachedTaxAmountByTrans.lookup(_inventTransId) : 0;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getCachedWetAmount</Name>
+				<Source><![CDATA[
+    private Amount getCachedWetAmount(InventTransId _inventTransId)
+    {
+        return metCachedWetAmountByTrans.exists(_inventTransId) ? metCachedWetAmountByTrans.lookup(_inventTransId) : 0;
     }
 
 ]]></Source>
@@ -296,8 +368,7 @@ internal final class METSalesConfirmDP_Extension
 
         if (_includeInRebatesOrFees)
         {
-            select InventTransId, sum(value) from metSalesLinePriceComponent
-                group by InventTransId
+            select sum(value) from metSalesLinePriceComponent
                 join metComponentCode
                     where metSalesLinePriceComponent.Component == metComponentCode.Component
                     && metSalesLinePriceComponent.InventTransId == _inventTransId
@@ -305,8 +376,7 @@ internal final class METSalesConfirmDP_Extension
         }
         else
         {
-            select InventTransId, sum(value) from metSalesLinePriceComponent
-                group by InventTransId
+            select sum(value) from metSalesLinePriceComponent
                 join metComponentCode
                     where metSalesLinePriceComponent.Component == metComponentCode.Component
                     && metSalesLinePriceComponent.InventTransId == _inventTransId
@@ -314,8 +384,7 @@ internal final class METSalesConfirmDP_Extension
         }
 
         return metSalesLinePriceComponent.Value;
-
-            }
+    }
 
 ]]></Source>
 			</Method>
@@ -330,22 +399,33 @@ internal final class METSalesConfirmDP_Extension
     /// </param>
     protected void insertSalesOrderConfirmationLine(SalesConfirmDetailsTmp _salesConfirmDetailsTmp)
     {
-        SalesLine           salesline;
-        CustConfirmTrans    custConfirmTrans;
+        SalesQty salesQty;
 
-        select SalesQty from salesline
-            exists join custConfirmTrans
-                where custConfirmTrans.RecId == _salesConfirmDetailsTmp.CustConfirmTrans &&
-                      custConfirmTrans.InventTransId == salesline.InventTransId;
-   
+        if (metLastCustConfirmTransRecId == _salesConfirmDetailsTmp.CustConfirmTrans)
+        {
+            salesQty = metLastSalesQty;
+        }
+        else
+        {
+            SalesLine           salesline;
+            CustConfirmTrans    custConfirmTrans;
+
+            select SalesQty from salesline
+                exists join custConfirmTrans
+                    where custConfirmTrans.RecId == _salesConfirmDetailsTmp.CustConfirmTrans &&
+                          custConfirmTrans.InventTransId == salesline.InventTransId;
+
+            salesQty = salesline.SalesQty;
+        }
+
         if (!isPickedCaseslIneProcessed)
         {
-            _salesConfirmDetailsTmp.Qty = salesline.SalesQty;
+            _salesConfirmDetailsTmp.Qty = salesQty;
         }
         _salesConfirmDetailsTmp.Name = InventTable::find(_salesConfirmDetailsTmp.ItemId).productName(SystemParameters::getSystemLanguageId());
 
         next insertSalesOrderConfirmationLine(_salesConfirmDetailsTmp);
-            
+
     }
 
 ]]></Source>
@@ -366,7 +446,7 @@ internal final class METSalesConfirmDP_Extension
     {
         CustConfirmTrans custConfirmTrans = _confirmationLineSelection.parmCustConfirmTrans();
 
-        if (CompanyInfo::find().METLegalEntityType == metLegalEntityType::Liquor)
+        if (this.getCachedCompanyInfo().METLegalEntityType == metLegalEntityType::Liquor)
         {
             if (custConfirmTrans.METPickedCases != 0
                 && custConfirmTrans.METPickedBrokenCases != 0)
@@ -382,7 +462,7 @@ internal final class METSalesConfirmDP_Extension
             }
         }
 
-        return next createSalesOrderConfirmationLine(_salesConfirmHeaderTmp, _confirmationLineSelection);        
+        return next createSalesOrderConfirmationLine(_salesConfirmHeaderTmp, _confirmationLineSelection);
     }
 
 ]]></Source>
@@ -443,11 +523,24 @@ internal final class METSalesConfirmDP_Extension
 
         salesLineInventDim = _salesLine.inventDim();
 
-        // Default Order Settings are maintained at Item + Site level
-        inventDimInventItemSalesSetup.clear();
-        inventDimInventItemSalesSetup.InventSiteId = salesLineInventDim.InventSiteId;
+        if (!metCachedSiteInventDimId)
+        {
+            metCachedSiteInventDimId = new Map(Types::String, Types::String);
+        }
 
-        inventItemSalesSetupInventDimId = InventDim::findOrCreate(inventDimInventItemSalesSetup).InventDimId;
+        if (metCachedSiteInventDimId.exists(salesLineInventDim.InventSiteId))
+        {
+            inventItemSalesSetupInventDimId = metCachedSiteInventDimId.lookup(salesLineInventDim.InventSiteId);
+        }
+        else
+        {
+            // Default Order Settings are maintained at Item + Site level
+            inventDimInventItemSalesSetup.clear();
+            inventDimInventItemSalesSetup.InventSiteId = salesLineInventDim.InventSiteId;
+
+            inventItemSalesSetupInventDimId = InventDim::findOrCreate(inventDimInventItemSalesSetup).InventDimId;
+            metCachedSiteInventDimId.insert(salesLineInventDim.InventSiteId, inventItemSalesSetupInventDimId);
+        }
 
         inventItemSalesSetup = InventItemSalesSetup::find(_salesLine.ItemId, inventItemSalesSetupInventDimId);
 
