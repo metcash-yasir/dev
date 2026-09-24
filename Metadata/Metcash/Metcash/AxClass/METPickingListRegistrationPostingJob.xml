@@ -71,21 +71,28 @@ final class METPickingListRegistrationPostingJob
                     // reread the record otherwise the current buffer still has the previous status
                     orderTrans.reread();
 
-                    orderTrans.metShortPickDeliveryReminderUpd();
+                    if (orderTrans.inventTransType == InventTransType::Sales)
+                    {                     
+                        WMSPickingLineQty    qtyOrig    = METWMSOrderTrans::find(orderTrans.RecId).qtyOrig;
+                        if (qtyOrig > orderTrans.qty)
+                        {
+                            METDallasPicklistRegPendingProcess::insertData(orderTrans.RecId, orderTrans.RouteId);
+                        }
+                    }
+                    else if (orderTrans.inventTransType == InventTransType::TransferOrderShip)
+                    {
+                        InventTransferLine  inventTransferLine  = InventTransferLine::findTransIdShip(orderTrans.inventTransId, true);
+                        if (inventTransferLine && inventTransferLine.QtyTransfer > orderTrans.qty && METInventTransferTableExt::isCampbellsWarehouse(inventTransferLine.inventDim().InventLocationId))
+                        {
+                            METDallasPicklistRegPendingProcess::insertData(orderTrans.RecId, orderTrans.RouteId);
+                        }
+                    }                    
 
                     // Bug 246341: CB387 - Dallas Picklist Registration - zero pick quantity is updating the picking list registration when importing using data entity Picklist registration entity
                     // For 0 pick, status updated to cancel, we also need to cancel the SO line deliver remainder.
                     // For picking list with multiple lines, status is updated to picked first, then when everything is processed status is updated to completed
                     if (orderTrans.expeditionStatus != WMSExpeditionStatus::Activated)
                     {
-                        WMSPickingRoute pickingRouteLocal = orderTrans.wmsPickingRoute();
-
-                        if (pickingRouteLocal.expeditionStatus != WMSExpeditionStatus::Complete)
-                        {
-                            pickingRouteLocal.checkFinishRoute();
-                            orderTrans.reread();
-                        }
-
                         if (orderTrans.inventTransType == InventTransType::TransferOrderShip && this.isPickingListRegistrationCompleteForOrder(orderTrans))
                         {
                             //Added for Task 282558: CB913/CB162 - Campbells -Integration - Campbells Transfer Order Receipt
@@ -265,7 +272,13 @@ final class METPickingListRegistrationPostingJob
             if (salesTable)
             {
                 SalesFormLetter salesFormLetter = SalesFormLetter::construct(DocumentStatus::Confirmation);
-                salesFormLetter.update(salesTable, DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), SalesUpdate::All);
+                salesFormLetter.update(salesTable, 
+                    DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone()), 
+                    SalesUpdate::All,
+                    AccountOrder::None,
+                    salesFormLetter.salesParmUpdate().Proforma,
+                    NoYes::Yes,
+                    NoYes::Yes);
             }
             
             if (_procMetrics)
@@ -392,29 +405,284 @@ final class METPickingListRegistrationPostingJob
             {
                 SalesId salesId = conpeek(salesOrderCon, i);
 
-                switch(metLegalEntityType)
+                if (metLegalEntityType != METLegalEntityType::None)
                 {
-                    case METLegalEntityType::Liquor:
-                        this.salesOrderConfirm(salesId, procMetrics);
-                        break;
-
-                    case METLegalEntityType::Food:
-
-                        CustConfirmJour custConfirmJour;
-
-                        select count(RecId) from custConfirmJour
-                            where custConfirmJour.SalesId == salesId;
-
-                        if (CustConfirmJour.RecId == 0)
-                        {
-                            this.salesOrderConfirm(salesId, procMetrics);
-                        }
-                        break;
+                    this.salesOrderConfirm(salesId, procMetrics);
                 }
             }
 
             procMetrics.endTrace();
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>picklistRegistrationCompleteFinal</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Determines whether the picklist registration for the specified order is complete and performs any required finalization.
+    /// Verifies that all picklist lines for the order have been processed, updates related shipment/transfer state,
+    /// triggers downstream processing (for example transfer-order post-processing), and records any pending actions.
+    /// </summary>
+    /// <param name="orderTrans">The order transaction record to evaluate and finalize.</param>
+    /// <returns>
+    /// True when the picklist registration for the order is complete and finalization succeeded; otherwise false.
+    /// </returns>
+    public void picklistRegistrationCompleteFinal(METDallasPicklistRegCompleteContract _contract)
+    {
+        METSalesOrderShipmentLoadLines      loadLine;
+        WMSOrderTrans                       orderTrans;
+        container                           allRoute = _contract.parmAllRouteIdCon();
+        WMSPickingRouteID                   routeId;
+        Set                                 processedShipmentIdSet = new Set(Types::String);
+
+        for (int i = 1; i <= conlen(allRoute); i++)
+        {
+            routeId = conpeek(allRoute, i);
+
+            while select ShipmentId from loadLine
+                group by loadLine.ShipmentId
+                where loadLine.ShipmentId
+                exists join orderTrans
+                    where orderTrans.RecId == loadLine.WMSOrderTransRecId
+                        && orderTrans.routeId == routeId
+            {
+                if (!processedShipmentIdSet.in(loadLine.ShipmentId))
+                {
+                    processedShipmentIdSet.add(loadLine.ShipmentId);
+
+                    METSalesOrderShipmentLoadHeader::updatePickComplete(loadLine.ShipmentId);
+                }
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>picklistRegistrationCompleteInBundle</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// This method is used to complete the picklist registration in bundle
+    /// </summary>
+    /// <param name = "_contract">
+    /// <c>METDallasPicklistRegCompleteContract</c>.
+    /// </param>
+    public void picklistRegistrationCompleteInBundle(METDallasPicklistRegCompleteContract _contract)
+    {
+        #OCCRetryCount
+
+        WMSPickingRoute wmsPickingRoute;
+        WMSPickingRouteID pickingRouteId;
+
+        container routeIdCon = _contract.parmRouteIdCon();
+
+        METProcMetrics procMetrics = METProcMetrics::construct(METBatchLogOperation::DallasPicklistRegistration);
+        procMetrics.setTotalCount(conlen(routeIdCon));
+        procMetrics.beginTrace('Process started');
+
+        using (METProcMetricsScope procMetricsScope = METProcMetricsScope::constructWithErrorHandling(procMetrics))
+        {
+            for (int i = 1; i <= conlen(routeIdCon); i++)
+            {
+                try
+                {
+                    if (procMetrics)
+                    {
+                        procMetrics.startDescriptionTime(2, "@MET:DallasPicklistRegComplete");
+                    }
+           
+                    pickingRouteId = conpeek(routeIdCon, i);
+                    
+                    ttsBegin;
+                    
+                    wmsPickingRoute = WMSPickingRoute::find(pickingRouteId, true);
+                    wmsPickingRoute.checkFinishRoute();
+
+                    ttsCommit;
+
+                    if (wmsPickingRoute.transType == InventTransType::TransferOrderShip && wmsPickingRoute.expeditionStatus == WMSExpeditionStatus::Complete)
+                    {
+                        ttsbegin;
+                        //Added for Task 282558: CB913/CB162 - Campbells -Integration - Campbells Transfer Order Receipt
+                        if (METCampbellTransferOrderProcessor::construct().processCampbellsTransferOrder(InventTransferTable::find(wmsPickingRoute.transRefId), true) == false)
+                        {
+                            throw error (strFmt("@MET:ProcessFailedTO", wmsPickingRoute.transRefId));
+                        }
+
+                        ttsCommit;
+                    }
+                  
+                    if (procMetrics)
+                    {
+                        procMetrics.incDescriptionCount(2, 1);
+                        procMetrics.endDescriptionTime(2);
+                    }
+                }
+                catch(Exception::Deadlock)
+                {
+                    retry;
+                }
+                catch (Exception::UpdateConflict)
+                {
+                    if (appl.ttsLevel() == 0)
+                    {
+                        if (xSession::currentRetryCount() >= #RetryNum)
+                        {
+                            throw Exception::UpdateConflictNotRecovered;
+                        }
+                        else
+                        {
+                            retry;
+                        }
+                    }
+                    else
+                    {
+                        throw Exception::UpdateConflict;
+                    }
+                }
+                catch(Exception::Error)
+                {
+                    error(strFmt("@MET:PickListPost", wmsPickingRoute.transRefId));
+                }
+
+                procMetrics.incProcessedCountWithDocument(pickingRouteId);
+            }
+
+            procMetrics.endTrace();
+        }
+
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>shortPickDeliveryReminderUpdInBundle</Name>
+				<Source><![CDATA[
+    public void shortPickDeliveryReminderUpdInBundle(METDallasPicklistRegPendingProcessContract _contract)
+    {
+        #OCCRetryCount
+        System.Exception ex;
+
+        METDallasPicklistRegPendingProcess pendingProcess;
+        WMSOrderTrans orderTrans;
+        RefRecId pendingProcessRecId;
+
+        container picklistPendingRecords = _contract.conPicklistPendingRecords();
+
+        for (int i = 1; i <= conlen(picklistPendingRecords); i++)
+        {
+            pendingProcessRecId = conPeek(picklistPendingRecords, i);
+            int     startLine = infologLine();
+
+            try
+            {
+                ttsbegin;
+
+                select firstonly forupdate pendingProcess
+                    where pendingProcess.RecId == PendingProcessRecId;
+
+                if (pendingProcess)
+                {
+                    pendingProcess.ProcessStartDateTime = DateTimeUtil::getSystemDateTime();
+                    pendingProcess.Status = METOrderExtractionPendingProcessStatus::Processing;
+
+                    orderTrans = WMSOrderTrans::find(pendingProcess.WMSOrderTransRecId);
+
+                    if (orderTrans)
+                    {
+                        orderTrans.metShortPickDeliveryReminderUpd();
+                    }
+
+                    pendingProcess.ProcessEndDateTime = DateTimeUtil::getSystemDateTime();
+                    pendingProcess.Status = METOrderExtractionPendingProcessStatus::Completed;
+
+                    pendingProcess.update();
+            
+                }
+                
+                ttscommit;
+            }
+            catch (Exception::DuplicateKeyException)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::DuplicateKeyExceptionNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::DuplicateKeyException;
+                }
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+            catch (ex)
+            {
+                select firstonly forupdate pendingProcess
+                    where pendingProcess.RecId == PendingProcessRecId;
+
+                if (pendingProcess)
+                {
+                    ttsbegin;
+
+                    pendingProcess.Status = METOrderExtractionPendingProcessStatus::Failed;
+                    pendingProcess.ProcessEndDateTime = DateTimeUtil::getSystemDateTime();
+                    pendingProcess.RetryCount += 1;
+                    pendingProcess.Error = METPickingListRegistrationPostingJob::getInfologSince(startLine);
+
+                    pendingProcess.update();
+                    ttscommit;
+                }
+            }
+            
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getInfologSince</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Gets the infolog since the specified line number.
+    /// </summary>
+    /// <param name = "_fromLine">From line.</param>
+    /// <returns>The infolog messages since the specified line number.</returns>
+    public static str getInfologSince(int _fromLine)
+    {
+        container                con = infolog.copy(_fromLine + 1, infologLine());
+        SysInfologEnumerator     enumerator = SysInfologEnumerator::newData(con);
+        str                      ret;
+
+        while (enumerator.moveNext())
+        {
+            ret += SysInfologMessageStruct::construct(enumerator.currentMessage()).message() + '\n';
+        }
+        return ret;
     }
 
 ]]></Source>

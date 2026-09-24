@@ -9,17 +9,133 @@
 [ExtensionOf(tableStr(VendInvoiceInfoLine))]
 final class METVendInvoiceInfoLine_Extension
 {
-
 }
 ]]></Declaration>
 		<Methods>
+			<Method>
+				<Name>metIsIntercompanyOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Check if the Purchase order is either replenishment or a fulfillment order.
+    /// </summary>
+    /// <returns>True if the Purchase order is either replenishment or a fulfillment order</returns>
+    public boolean metIsIntercompanyOrder()
+    {
+        boolean     intercompanyOrder   = false;
+        PurchLine   purchLine           = PurchLine::findRecId(this.PurchLineRecId);
+
+        intercompanyOrder = PurchTable::find(this.OrigPurchId).METIntercompanyTransferReplenishment == NoYes::Yes
+        || SalesTable::find(purchLine.METReplenishmentSOReference).METIntercompanyTransferFulfillment == NoYes::Yes;
+
+        return intercompanyOrder;
+    }
+
+]]></Source>
+			</Method>
 			<Method>
 				<Name>insert</Name>
 				<Source><![CDATA[
     public void insert(boolean _defaultRelatedTables)
     {
-        this.MetClaimLine = this.metCheckClaimNeeded();
         next insert(_defaultRelatedTables);
+
+        if (!this.MetClaimLine && !this.MetSystemClaimLine)
+        {
+            this.metUpdateReceiptData();
+
+            if (!this.metIsIntercompanyOrder()
+                && this.ReasonTableRef == 0 
+                && (this.checkIfQuantityMatch(true, this.METReceiptedQuantity, this.METReceiptedCWQuantity) == LastMatchVarianceOptions::Warning))
+            {
+                this.metInitReasonCode(this.metGetVarianceReasonCodes(METVarianceCategory::Quantity), true);
+            }
+
+            if (this.MetPriceVarianceReasonCode == 0 && (this.PurchPrice != this.METReceiptedUnit))
+            {
+                this.metInitReasonCode(this.metGetVarianceReasonCodes(METVarianceCategory::Price), true);
+            }
+        }
+
+        this.MetClaimLine = this.MetSystemClaimLine ? NoYes::No : this.metCheckClaimNeeded();
+
+        this.doUpdate();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metCreateInvoiceSubLine</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Creates a vendor invoice subline for EDI invoice if it does not already exist.
+    /// </summary>
+    public void metCreateInvoiceSubLine()
+    {
+        if (this.METReceiptedQuantity == 0)
+        {
+            if (this.vendInvoiceInfoTable().METEDIInvoice && !VendInvoiceInfoSubLine::existForLine(this.RecId))
+            {
+                VendInvoiceInfoSubLine subLine;
+                subLine.clear();
+                subLine.initFromLine(this);
+                subLine.defaultRow();
+
+                VendPackingSlipTrans trans;
+                select trans where trans.InventTransId == this.InventTransId;
+                subLine.initFromVendPackingSlipTrans(trans);
+                subLine.insert();
+                this.InventNow = subLine.InventNow;
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metUpdateReceiptData</Name>
+				<Source><![CDATA[
+    private void metUpdateReceiptData()
+    {
+        PurchLine purchLine;
+        METPurchLine metPurchLine;
+
+        this.metCreateInvoiceSubLine();
+
+        boolean isCW = PdsGlobal::pdsIsCWItem(this.ItemId);
+
+        if (!isCW && this.METReceiptedQuantity == 0)
+        {
+            this.METReceiptedQuantity = this.purchQtyMatched();
+            this.METReceiptedUnit = this.purchLine().PurchPrice;
+            this.METReceiptedLineNetAmount = CurrencyExchangeHelper::amount((this.METReceiptedUnit * this.METReceiptedQuantity), this.CurrencyCode);
+        }
+        if (isCW)
+        {
+            if (this.METReceiptedRWQuantity == 0)
+            {
+                select firstOnly PurchPrice, ItemId, RecId from purchLine
+                    where (this.InventTransId && purchLine.InventTransId == this.InventTransId)
+                    || (this.PurchLineRecId && purchLine.RecId == this.PurchLineRecId)
+                outer join InventItemBasePrice from metPurchLine
+                    where metPurchLine.PurchLine == purchLine.RecId;
+
+                real unitPrice = metPurchLine.InventItemBasePrice ? metPurchLine.InventItemBasePrice : purchLine.PurchPrice;
+
+                this.METReceiptedUnit       = unitPrice;
+                this.PurchPrice             = unitPrice;
+                this.METReceiptedCWQuantity = this.pdsCWQtyMatched();
+                this.METReceiptedRWUnit     = InventTable::find(this.ItemId).inventUnitId();
+                this.METReceiptedRWQuantity = this.InventNow;
+                this.METReceiptedLineNetAmount = CurrencyExchangeHelper::amount((this.METReceiptedUnit * this.METReceiptedRWQuantity), this.CurrencyCode);
+                this.METInvoiceRWQuantity   = this.METInvoiceRWQuantity ? this.METInvoiceRWQuantity : this.METReceiptedRWQuantity;
+                this.modifiedField(fieldNum(VendInvoiceInfoLine, METInvoiceRWQuantity));
+            }
+            // Update the line amount if the invoice line is a CW item and the price has been modified
+            else if (this.PurchPrice)
+            {
+                this.modifiedField(fieldNum(VendInvoiceInfoLine, PurchPrice));
+            }
+        }
     }
 
 ]]></Source>
@@ -29,7 +145,56 @@ final class METVendInvoiceInfoLine_Extension
 				<Source><![CDATA[
     public void update()
     {
-        this.MetClaimLine = this.metCheckClaimNeeded();
+        boolean isCW = PdsGlobal::pdsIsCWItem(this.ItemId);
+		
+        boolean forceReasonUpdate = true;
+
+        if (this.MetSystemClaimLine) //This is a claim CR line created to balance the variance amount and no need to calculate the variance and update the reason codes.
+        {
+            forceReasonUpdate = false;
+        }
+        else if (this.MetClaimLine)
+        {
+            //This indicates that the invoice line has some variance the same flag is set on the variance adjustment line as well,
+            //so we need to ensure we are not setting reason code again for adjustment lines.
+            VendInvoiceInfoLine infoLineOrig = this.orig();
+            if (infoLineOrig.METPriceVarianceReal == this.METPriceVarianceReal || infoLineOrig.METQuantityVariance == this.METQuantityVariance)
+            {
+                forceReasonUpdate = false;//There is not change in price and quantity so reason code reset is not required.
+            }
+        }
+
+        if (forceReasonUpdate)
+        {
+            this.metUpdateReceiptData();
+            boolean isIntercompany = this.metIsIntercompanyOrder();
+            METQuantityVariance qtyVar = this.displayQuantityVariance();
+
+            if (!isIntercompany
+                && this.ReasonTableRef == 0 
+                && !isCW
+                && (this.checkIfQuantityMatch(true, this.METReceiptedQuantity, this.METReceiptedCWQuantity) == LastMatchVarianceOptions::Warning))
+            {
+                this.metInitReasonCode(this.metGetVarianceReasonCodes(METVarianceCategory::Quantity), true);
+            }
+            else if (!isIntercompany && isCW && this.ReasonTableRef == 0 && qtyVar)
+            {
+                METVarianceType qtyVarType = qtyVar > 0 ? METVarianceType::QuantityVarianceOver : METVarianceType::QuantityVarianceUnder;
+                ReasonTable qtyReason = ReasonTable::metFindReasonCodeForVarianceType(qtyVarType);
+                if (qtyReason)
+                {
+                    this.metInitReasonCode(qtyReason, true);
+                }
+            }
+
+            if (this.MetPriceVarianceReasonCode == 0 && this.PurchPrice != this.METReceiptedUnit)
+            {
+                this.metInitReasonCode(this.metGetVarianceReasonCodes(METVarianceCategory::Price), true);
+            }
+        }
+
+        this.MetClaimLine = this.MetSystemClaimLine ? NoYes::No : this.metCheckClaimNeeded();
+
         next update();
     }
 
@@ -51,12 +216,42 @@ final class METVendInvoiceInfoLine_Extension
 
         switch(_fieldId)
         {
+            case fieldNum(VendInvoiceInfoLine, ItemId):
+                if (this.ItemId && !this.MetSystemClaimLine)
+                {
+                    ReasonTable noDelReason = this.metGetNoDeliveryReasonCode();
+                    if (noDelReason.RecId)
+                    {
+                        this.ReasonTableRef = ReasonTableRef::createReasonTableRef(noDelReason.Reason, noDelReason.Description);
+                        this.MetPriceVarianceReasonCode = 0;
+                        this.MetClaimLine = noDelReason.METClaim;
+                        this.MetExtCommentQty = noDelReason.MetExtComment;
+                    }
+                }
+                break;
             case fieldNum(VendInvoiceInfoLine, ReceiveNow):
             case fieldNum(VendInvoiceInfoLine, PdsCWReceiveNow):
             case fieldNum(VendInvoiceInfoLine, PurchPrice):
+            case fieldNum(VendInvoiceInfoLine, METInvoiceRWQuantity):
+                boolean isCW = PdsGlobal::pdsIsCWItem(this.ItemId);
+                
                 if (!this.isNonPO())
                 {
                     this.metFetchInitializeReasonCode();
+                }
+
+                if (isCW && !this.MetSystemClaimLine)
+                {
+                    this.METReceiptedLineNetAmount = CurrencyExchangeHelper::amount((this.METReceiptedRWQuantity * this.METReceiptedUnit), this.CurrencyCode);
+                    this.METQuantityVariance = this.METInvoiceRWQuantity - this.METReceiptedRWQuantity;
+                    this.METPriceVarianceReal = this.PurchPrice - this.METReceiptedUnit;
+                    this.VendDocumentLineMap::setLineAmount(this.METInvoiceRWQuantity);
+                }
+
+                if(!isCW && !this.MetSystemClaimLine)
+                {
+                    this.METPriceVarianceReal   = this.displayPriceVariance();
+                    this.METQuantityVariance    = this.displayQuantityVariance();
                 }
                 break;
             case fieldNum(VendInvoiceInfoLine, TaxItemGroup):
@@ -203,6 +398,11 @@ final class METVendInvoiceInfoLine_Extension
     /// <returns>METVarianceType</returns>
     private METVarianceType metGetQuantityVarianceType()
     {
+        if (PdsGlobal::pdsIsCWItem(this.ItemId))
+        {
+            return (this.METInvoiceRWQuantity > this.METReceiptedRWQuantity) ? METVarianceType::QuantityVarianceOver : METVarianceType::QuantityVarianceUnder;
+        }
+
         return (this.ReceiveNow > this.purchQtyMatched() || this.PdsCWReceiveNow > this.pdsCWQtyMatched()) ? METVarianceType::QuantityVarianceOver : METVarianceType::QuantityVarianceUnder;
     }
 
@@ -218,6 +418,29 @@ final class METVendInvoiceInfoLine_Extension
     private METVarianceType metGetPriceVarianceType()
     {
         return this.priceVariancePercent() > 0 ? METVarianceType::PriceVarianceOver : METVarianceType::PriceVarianceUnder;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metGetReasonCodeForIntercompanyOrder</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the reason code for the variance type.
+    /// </summary>
+    /// <param name = "_varianceType">Variance type</param>
+    /// <param name = "_createClaim">True/false</param>
+    /// <returns>Reason code</returns>
+    public ReasonTable metGetReasonCodeForIntercompanyOrder(METVarianceType _varianceType)
+    {
+        ReasonTable reason;
+
+        select firstonly reason
+            where reason.METVarianceType == _varianceType
+            && reason.METInvoiceMatch == NoYes::Yes
+            && reason.METClaim == NoYes::No;
+
+        return reason;
     }
 
 ]]></Source>
@@ -244,7 +467,14 @@ final class METVendInvoiceInfoLine_Extension
             varianceType = this.metGetQuantityVarianceType();
         }
 
-        retReasonCode = ReasonTable::metFindReasonCodeForVarianceType(varianceType);
+        if (!this.metIsIntercompanyOrder())
+        {
+            retReasonCode = ReasonTable::metFindReasonCodeForVarianceType(varianceType);
+        }
+        else
+        {
+            retReasonCode = this.metGetReasonCodeForIntercompanyOrder(varianceType);
+        }
 
         return retReasonCode;
     }
@@ -259,6 +489,16 @@ final class METVendInvoiceInfoLine_Extension
     /// </summary>
     public void metFetchInitializeReasonCode()
     {
+        if (this.ItemId && this.metGetNoDeliveryReasonCode().RecId)
+        {
+            return;
+        }
+
+        if (this.MetClaimLine || this.MetSystemClaimLine)
+        {
+            return;
+        }
+
         this.MetExtComment = '';
         this.MetExtCommentQty = '';
         this.MetClaimLine =  NoYes::No;
@@ -266,14 +506,73 @@ final class METVendInvoiceInfoLine_Extension
         this.ReasonTableRef = 0;
         this.MetPriceVarianceReasonCode = 0;
 
-        if (this.checkIfQuantityMatch(true, this.METReceiptedQuantity, this.METReceiptedCWQuantity) == LastMatchVarianceOptions::Warning)
+        boolean isCW = PdsGlobal::pdsIsCWItem(this.ItemId);
+        PurchTable purchTable = this.purchLine().purchTable();
+        boolean isIntercompany = purchTable && (purchTable.InterCompanyOrder || purchTable.InterCompanyDirectDelivery || purchTable.METIntercompanyTransferReplenishment);
+
+        if (isCW)
         {
-            this.metInitReasonCode(this.metGetVarianceReasonCodes(METVarianceCategory::Quantity), true);
+            // Quantity Variance for CW item
+            METQuantityVariance qtyVar = this.displayQuantityVariance();
+            if (qtyVar != 0)
+            {
+                if (isIntercompany)
+                {
+                    // BR-CW05 & BR-CW06: Intercompany invoice qty variance should NOT auto-assign reason code
+                    this.ReasonTableRef = 0;
+                }
+                else
+                {
+                    // BR-CW01 (Invoiced > Receipted -> QuantityVarianceOver) & BR-CW02 (Invoiced < Receipted -> QuantityVarianceUnder)
+                    METVarianceType qtyVarType = qtyVar > 0 ? METVarianceType::QuantityVarianceOver : METVarianceType::QuantityVarianceUnder;
+                    ReasonTable qtyReason = ReasonTable::metFindReasonCodeForVarianceType(qtyVarType);
+                    if (qtyReason)
+                    {
+                        this.metInitReasonCode(qtyReason, true);
+                    }
+                }
+            }
+
+            // Price Variance for CW item
+            METPriceVarianceReal priceVar = this.displayPriceVariance();
+            if (priceVar != 0)
+            {
+                if (isIntercompany && priceVar > 0)
+                {
+                    // BR-CW07: Intercompany price variance overcharge (Claim = No)
+                    ReasonTable priceReason;
+                    select firstonly priceReason
+                        where priceReason.METVarianceType == METVarianceType::PriceVarianceOver
+                           && priceReason.METInvoiceMatch == NoYes::Yes
+                           && priceReason.METClaim == NoYes::No;
+                    if (priceReason)
+                    {
+                        this.metInitReasonCode(priceReason, true);
+                    }
+                }
+                else
+                {
+                    // BR-CW03 (Over charge) & BR-CW04 (Under charge)
+                    METVarianceType priceVarType = priceVar > 0 ? METVarianceType::PriceVarianceOver : METVarianceType::PriceVarianceUnder;
+                    ReasonTable priceReason = ReasonTable::metFindReasonCodeForVarianceType(priceVarType);
+                    if (priceReason)
+                    {
+                        this.metInitReasonCode(priceReason, true);
+                    }
+                }
+            }
         }
-       
-        if (this.PurchPrice != this.METReceiptedUnit)
+        else
         {
-            this.metInitReasonCode(this.metGetVarianceReasonCodes(METVarianceCategory::Price), true);
+            if (this.checkIfQuantityMatch(true, this.METReceiptedQuantity, this.METReceiptedCWQuantity) == LastMatchVarianceOptions::Warning)
+            {
+                this.metInitReasonCode(this.metGetVarianceReasonCodes(METVarianceCategory::Quantity), true);
+            }
+       
+            if (this.PurchPrice != this.METReceiptedUnit)
+            {
+                this.metInitReasonCode(this.metGetVarianceReasonCodes(METVarianceCategory::Price), true);
+            }
         }
        
     }
@@ -303,6 +602,7 @@ final class METVendInvoiceInfoLine_Extension
                 this.MetExtCommentQty = !this.MetExtCommentQty ? _reasonCode.MetExtComment : this.MetExtCommentQty;
             }
 
+            this.MetClaimLine = _reasonCode.METClaim;
             this.MetAutoApprove = _reasonCode.METApprove;
         }
     }
@@ -348,9 +648,8 @@ final class METVendInvoiceInfoLine_Extension
         this.MetAutoApprove         = _reasonTable.METApprove;
         
         this.METVarianceItemId      = _vendInvoiceInfoLine.ItemId;
-        this.METPriceVarianceReal   = _vendInvoiceInfoLine.displayPriceVariance();
-        this.METQuantityVariance    = _vendInvoiceInfoLine.displayQuantityVariance();
-        this.METCWQuantityVariance  = _vendInvoiceInfoLine.displayCWQuantityVariance();
+        this.METPriceVarianceReal   = _vendInvoiceInfoLine.METPriceVarianceReal;
+        this.METQuantityVariance    = _vendInvoiceInfoLine.METQuantityVariance;
         this.METIsAutoGenerated        = NoYes::Yes;
        
         //boolean qtyFailure = _reasonTable.METVarianceType == METVarianceType::QuantityVarianceOver || _reasonTable.METVarianceType == METVarianceType::QuantityVarianceUnder;
@@ -363,7 +662,7 @@ final class METVendInvoiceInfoLine_Extension
         }
         else
         {
-            this.PurchPrice                 = abs(_vendInvoiceInfoLine.PurchPrice - purchLine.PurchPrice);
+            this.PurchPrice                 = _isCatchWeight ? abs(_vendInvoiceInfoLine.PurchPrice - _vendInvoiceInfoLine.METReceiptedUnit): abs(_vendInvoiceInfoLine.PurchPrice - purchLine.PurchPrice);
             this.MetPriceVarianceReasonCode = ReasonTableRef::createReasonTableRef(_reasonTable.Reason, _reasonTable.Description);
             this.MetExtComment              = _vendInvoiceInfoLine.MetExtComment == '' ? _reasonTable.MetExtComment : _vendInvoiceInfoLine.MetExtComment;
         }
@@ -380,16 +679,7 @@ final class METVendInvoiceInfoLine_Extension
             }
             else
             {
-                this.PdsCWReceiveNow    = _vendInvoiceInfoLine.PdsCWReceiveNow - _vendInvoiceInfoLine.pdsCWQtyMatched();
-
-                this.ReceiveNow         = EcoResProductUnitConverter::convertForReleasedProduct(
-                                            inventTable.ItemId,
-                                            this.InventDimId,
-                                            this.PdsCWReceiveNow,
-                                            EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(inventTable.inventUnitId()),
-                                            EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(this.purchLine().PurchUnit),
-                                            NoYes::Yes,
-                                            NoYes::No);
+                this.ReceiveNow         = _vendInvoiceInfoLine.METInvoiceRWQuantity - _vendInvoiceInfoLine.METReceiptedRWQuantity;
 
             }
 
@@ -404,16 +694,7 @@ final class METVendInvoiceInfoLine_Extension
             }
             else
             {
-                this.PdsCWReceiveNow    = (_vendInvoiceInfoLine.metCWIsPartialQty() ? _vendInvoiceInfoLine.PdsCWReceiveNow : _vendInvoiceInfoLine.pdsCWQtyMatched()) * factor;
-
-                this.ReceiveNow = EcoResProductUnitConverter::convertForReleasedProduct(
-                                            inventTable.ItemId,
-                                            this.InventDimId,
-                                            this.PdsCWReceiveNow,
-                                            EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(inventTable.inventUnitId()),
-                                            EcoResReleasedProductUnitConverter::findUnitRecIdBySymbol(this.purchLine().PurchUnit),
-                                            NoYes::Yes,
-                                            NoYes::No);
+                this.ReceiveNow = _vendInvoiceInfoLine.METInvoiceRWQuantity;
             }
         }
 
@@ -433,16 +714,18 @@ final class METVendInvoiceInfoLine_Extension
     {
         boolean                 useCatchWeight          = this.PdsCWReceiveNow ? true : false;
 
-        this.PurchPrice         = this.purchLine().PurchPrice;
+        this.PurchPrice         = useCatchWeight ? this.METReceiptedUnit : this.purchLine().PurchPrice;
         this.modifiedField(fieldNum(VendInvoiceInfoLine, PurchPrice));
 
         if(!_priceResetOnly)
         {
             this.PdsCWReceiveNow    = this.pdsCWQtyMatched();
             this.ReceiveNow         = this.purchQtyMatched();
+            this.METInvoiceRWQuantity = this.METReceiptedRWQuantity;
             this.ReasonTableRef     = 0;
             this.MetPriceVarianceReasonCode = 0;
-
+            this.MetExtComment = '';
+            this.MetExtCommentQty = '';
             this.vendDocumentLineInterface().modifiedReceiveNowWithPromptDefault(useCatchWeight, UnknownNoYes::Yes);
             this.modifiedField(fieldNum(VendInvoiceInfoLine, ReceiveNow));
         }
@@ -492,6 +775,11 @@ final class METVendInvoiceInfoLine_Extension
     /// <returns>METQuantityVariance</returns>
     public display METQuantityVariance displayQuantityVariance()
     {
+        if (PdsGlobal::pdsIsCWItem(this.ItemId))
+        {
+            return this.METInvoiceRWQuantity - this.METReceiptedRWQuantity;
+        }
+
         return this.ReceiveNow - this.METReceiptedQuantity;
     }
 
@@ -506,21 +794,23 @@ final class METVendInvoiceInfoLine_Extension
     /// <returns>METPriceVarianceReal</returns>
     public display METPriceVarianceReal displayPriceVariance()
     {
-        return this.PurchPrice - this.METReceiptedUnit;
-    }
+        ReasonTable reason;
+        ReasonTableRef reasonTableRef;
 
-]]></Source>
-			</Method>
-			<Method>
-				<Name>displayCWQuantityVariance</Name>
-				<Source><![CDATA[
-    /// <summary>
-    /// Returns the CW quantity variance.
-    /// </summary>
-    /// <returns>METCWQuantityVariance</returns>
-    public display METCWQuantityVariance displayCWQuantityVariance()
-    {
-        return this.PdsCWReceiveNow - this.METReceiptedCWQuantity;
+        if (this.ReasonTableRef)
+        {
+            select firstonly Reason, METClaim, METVarianceType from reason
+                exists join reasonTableRef
+                where reasonTableRef.Reason == reason.Reason
+                    && reasonTableRef.RecId == this.ReasonTableRef;
+
+            if (reason.METVarianceType == METVarianceType::QuantityVarianceNoDelivery)
+            {
+                return 0.0;
+            }
+        }
+
+        return this.PurchPrice - this.METReceiptedUnit;
     }
 
 ]]></Source>
@@ -571,6 +861,199 @@ final class METVendInvoiceInfoLine_Extension
                && markupTable.METIsOffRemittance;
 
         return markupTrans.RecId;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metGetNoDeliveryReasonCode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if this line is associated with a No Delivery variance reason.
+    /// </summary>
+    /// <returns>The ReasonTable record if associated, otherwise an empty record.</returns>
+    public ReasonTable metGetNoDeliveryReasonCode()
+    {
+        ReasonTable reasonCode;
+        if (this.ItemId)
+        {
+            select firstonly reasonCode
+            where reasonCode.METItem == this.ItemId
+               && reasonCode.METVarianceType == METVarianceType::QuantityVarianceNoDelivery;
+        }
+        return reasonCode;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metValidateReasonCode</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the reason code.
+    /// </summary>
+    public boolean metValidateReasonCode()
+    {
+        ReasonTable reasonCode;
+        ReasonTableRef reasonRef;
+        boolean ret = true;
+
+        if (this.ItemId)
+        {
+            select firstonly reasonCode
+                join reasonRef
+            where reasonRef.Reason == reasonCode.Reason
+                && (reasonRef.RecId == this.ReasonTableRef || reasonRef.RecId == this.MetPriceVarianceReasonCode)
+                && reasonCode.METItem != this.ItemId
+                && reasonCode.METVarianceType == METVarianceType::QuantityVarianceNoDelivery;
+
+            if (reasonCode.RecId)
+            {
+                ret = checkFailed("@MET:InvalidReasonCodeVal");
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metIsEligibleForNoDelivery</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Checks if the pending vendor invoice line is eligible for No Delivery processing.
+    /// </summary>
+    /// <returns>True if eligible, otherwise false.</returns>
+    public boolean metIsEligibleForNoDelivery()
+    {
+        VendInvoiceInfoTable header = this.vendInvoiceInfoTable();
+
+        if (!header)
+        {
+            select firstonly header
+            where header.TableRefId == this.TableRefId
+               && header.ParmId == this.ParmId;
+        }
+
+        if (!header 
+            || !header.PurchId 
+            || header.METChargeThrough == NoYes::Yes
+            || header.METCrossDock == NoYes::Yes
+            || header.METRDA == NoYes::Yes
+            || header.isLandedCostEnabled())
+        {
+            return false;
+        }
+
+        PurchTable purchTable = this.purchLine().purchTable();
+        if (purchTable 
+            && (purchTable.InterCompanyOrder 
+            || purchTable.InterCompanyDirectDelivery 
+            || purchTable.METIntercompanyTransferReplenishment
+            || purchTable.InterCompanyCustPurchOrderFormNum))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metValidatePositiveOnly</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates if the quantity and price are positive when the reason code has METPositiveOnly checked.
+    /// </summary>
+    /// <param name = "_showError">Boolean to show standard checkFailed</param>
+    /// <returns>True if valid, otherwise false</returns>
+    public boolean metValidatePositiveOnly(boolean _showError = true)
+    {
+        boolean ret = true;
+        ReasonTable reasonCode;
+        ReasonTableRef reasonRef;
+
+        if (this.ReasonTableRef)
+        {
+            select firstonly METVarianceType from reasonCode
+            join reasonRef
+            where reasonRef.Reason == reasonCode.Reason
+               && reasonRef.RecId == this.ReasonTableRef;
+        
+            if (reasonCode.METVarianceType == METVarianceType::QuantityVarianceNoDelivery && (this.ReceiveNow < 0 || this.PurchPrice < 0 || this.LineAmount < 0))
+            {
+                ret = _showError ? checkFailed("@MET:NegativeValuesNotAllowed") : false;
+            }
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateWrite</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates the record before writing.
+    /// </summary>
+    /// <returns>Boolean indicating validation success</returns>
+    public boolean validateWrite()
+    {
+        boolean ret = next validateWrite();
+
+        if (ret && !this.MetSystemClaimLine)
+        {
+            ret = this.metValidatePositiveOnly(true);
+        }
+
+        if (ret)
+        {
+            ret = this.metValidateReasonCode();
+        }
+
+        return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>validateField</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Validates field values.
+    /// </summary>
+    /// <param name = "_fieldId">Field ID to validate</param>
+    /// <param name = "_purchLine">Associated purchase line record; optional</param>
+    /// <returns>True if validation is successful; otherwise, false</returns>
+    public boolean validateField(FieldId _fieldId, PurchLine _purchLine)
+    {
+        boolean ret = next validateField(_fieldId, _purchLine);
+
+        if (ret)
+        {
+            if (_fieldId == fieldNum(VendInvoiceInfoLine, ItemId))
+            {
+                ReasonTable reasonCode = this.metGetNoDeliveryReasonCode();
+                if (reasonCode.RecId)
+                {
+                    if (!this.metIsEligibleForNoDelivery())
+                    {
+                        ret = checkFailed("@MET:NoDeliveryServiceItemNotAllowed");
+                    }
+                }
+            }
+            else if (_fieldId == fieldNum(VendInvoiceInfoLine, ReceiveNow)
+             || _fieldId == fieldNum(VendInvoiceInfoLine, PurchPrice)
+             || _fieldId == fieldNum(VendInvoiceInfoLine, LineAmount))
+            {
+                ret = this.metValidatePositiveOnly(true);
+            }
+        }
+
+        return ret;
     }
 
 ]]></Source>

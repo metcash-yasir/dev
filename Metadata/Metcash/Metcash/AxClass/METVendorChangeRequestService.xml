@@ -9,7 +9,7 @@
 class METVendorChangeRequestService
 {
     Set vendorChangerequestsProcessed;
-    Map basePricePendingItems;          
+    Map basePricePendingItems;
 
     //Task110346_CB409-D365ToPIM-Supplier change request- start
     private List        vendAccountNumberList;              //C - Task 259910: CB409 - PE-128: D365 to PIM
@@ -18,12 +18,16 @@ class METVendorChangeRequestService
     private ItemId      itemNumber;
     private VendAccount vendAccountNumber;
     //Task110346_CB409-D365ToPIM-Supplier change request- end
+    private Map          itemWarehouseCoverage;
     boolean             calledFromPackChange;
 
     InventParameters inventParameters = InventParameters::find();
 
     MetChangeReqEffectiveDate currentDate;
 
+    System.Text.StringBuilder       logMessage = new System.Text.StringBuilder();
+    METVendorChangeRequestLog       log;
+    RecordInsertList                logList = new RecordInsertList(tableNum(METVendorChangeRequestLog));
 
 }
 ]]></Declaration>
@@ -47,10 +51,13 @@ class METVendorChangeRequestService
             SetIterator  vendorProcessedItr;
             RecId        processedChangeRrequestRecId;
             METSalesItemSubstitutionParentChild salesItemSubstitutionParentChild;
+            boolean      logThisRecord;
+            boolean      loggingEnabled;
             inventSiteId = _data.parmInventSiteId();
             vendorChangerequestsProcessed = new Set(Types::Int64);
             basePricePendingItems = new Map(Types::String, Types::Class);
             currentDate = DateTimeUtil::date(DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), DateTimeUtil::getUserPreferredTimeZone()));
+            loggingEnabled = METVendParameters::find().VendorChangeRequestLog;
             //Task110346_CB409-D365ToPIM-Supplier change request- start
             boolean validateVendorChangeRequests = true;
             //Task110346_CB409-D365ToPIM-Supplier change request- end
@@ -66,35 +73,68 @@ class METVendorChangeRequestService
                 coverageWareHouseIdList                 = new List(Types::String);
                 coverageWhsIdVendAccountNumberList      = new List(Types::String);
                 //Bug 303894- end
+                itemWarehouseCoverage                   = new Map(Types::String, Types::Class);
 
                 //Bug 351481 - start
                 vendAccountNumber = '';
                 //Bug 351481 - end
 
+                logThisRecord = false;
+
                 if(!inventSiteId ||
                     (inventSiteId && (metVendorChangeRequest.SiteId == inventSiteId)) ||
                     (calledFromPackChange && inventSiteId && _data.parmItemId() && (metVendorChangeRequest.SiteId == inventSiteId) && (metVendorChangeRequest.ItemId == _data.parmItemId())))
                 {
+                    if (Global::isRunningOnBatch())
+                    {
+                        log.BatchJobId = BatchHeader::getCurrentBatchTask().BatchJobId;
+                    }
+
+                    logThisRecord           = loggingEnabled;
+                    logMessage              = new System.Text.StringBuilder();
+                    logMessage.Append('\nVendor change request found. Processing started. Item: '+ metVendorChangeRequest.ItemId +' site: '+metVendorChangeRequest.SiteId+' warehouse: '+metVendorChangeRequest.InventLocationId);
+                    log.ItemId                  = metVendorChangeRequest.ItemId;
+                    log.SiteId                  = metVendorChangeRequest.SiteId;
+                    log.ChangeReqEffectiveDate  = metVendorChangeRequest.ChangeReqEffectiveDate;
+                    log.InventLocationId        = metVendorChangeRequest.InventLocationId;
+                    log.VendorChangeRecid       = metVendorChangeRequest.RecId;
+
                     validateVendorChangeRequests = this.validateVendorChangeRequests(metVendorChangeRequest);
+                }
+                else
+                {
+                    logMessage.Append('\nVendor change request skipped - does not match the requested site filter. Item: '+metVendorChangeRequest.ItemId+' site: '+metVendorChangeRequest.SiteId+' requested site: '+inventSiteId);
                 }
 
                 //Task110346_CB409-D365ToPIM-Supplier change request- start
                 if (validateVendorChangeRequests && !coverageWareHouseIdList.empty() && !vendAccountNumberList.empty())
                 {
                     //NS - Task 259910: CB409 - PE-128: D365 to PIM
-                    ListIterator coverageWhsIdItr       = new ListIterator(coverageWareHouseIdList);
-                    
-                    while (coverageWhsIdItr.more())
-                    {
-                        //Bug 303894- start
-                        this.addVendorCombinationsForWarehouse( coverageWhsIdItr.value(), vendAccountNumberList);
+                    MapEnumerator itemCoverageEnumerator = itemWarehouseCoverage.getEnumerator();
+                    ItemId        eventItemId;
+                    List          itemWarehouses;
+                    ListIterator  itemWhsItr;
 
-                        coverageWhsIdItr.next();
-                        //Bug 303894- end
+                    while (itemCoverageEnumerator.moveNext())
+                    {
+                        eventItemId    = itemCoverageEnumerator.currentKey();
+                        itemWarehouses = itemCoverageEnumerator.currentValue();
+
+                        coverageWhsIdVendAccountNumberList = new List(Types::String);
+                        itemWhsItr = new ListIterator(itemWarehouses);
+                        while (itemWhsItr.more())
+                        {
+                            //Bug 303894- start
+                            this.addVendorCombinationsForWarehouse(itemWhsItr.value(), vendAccountNumberList);
+
+                            itemWhsItr.next();
+                            //Bug 303894- end
+                        }
+
+                        logMessage.Append('\nTriggering supplier change completion business event. Item: '+eventItemId);
+                        this.triggerSupplierChangeCompleteBusinessEvent(eventItemId, coverageWhsIdVendAccountNumberList);
                     }
                     //NE - Task 259910: CB409 - PE-128: D365 to PIM
-                    
-                    this.triggerSupplierChangeCompleteBusinessEvent(itemNumber, coverageWhsIdVendAccountNumberList);
 
                     vendorProcessedItr = new SetIterator(vendorChangerequestsProcessed);
                     // iterate processed recIds and run base price job for matching completed change requests
@@ -110,6 +150,7 @@ class METVendorChangeRequestService
 
                         if (metVendorChangeRequestProcessed.RecId)
                         {
+                            logMessage.Append('\nQueuing base price recalculation for site: '+metVendorChangeRequestProcessed.SiteId+' item: '+metVendorChangeRequestProcessed.ItemId);
                             this.addBasePricePendingItem(metVendorChangeRequestProcessed.SiteId, metVendorChangeRequestProcessed.ItemId);
                         }
 
@@ -120,12 +161,20 @@ class METVendorChangeRequestService
                     while select salesItemSubstitutionParentChild
                             where salesItemSubstitutionParentChild.ParentItemID == metVendorChangeRequest.ItemId
                     {
+                        logMessage.Append('\nQueuing base price recalculation for substitution child item. Site: '+salesItemSubstitutionParentChild.InventSiteId+' item: '+salesItemSubstitutionParentChild.ChildItemID);
                         this.addBasePricePendingItem(salesItemSubstitutionParentChild.InventSiteId, salesItemSubstitutionParentChild.ChildItemID);
                     }
 
                     coverageWareHouseIdList = new List(Types::String);
                 }
                 //Task110346_CB409-D365ToPIM-Supplier change request- end
+
+                if (logThisRecord)
+                {
+                    log.Message = logMessage.ToString();
+                    logList.add(log);
+                    log.clear();
+                }
             }
 
             // Run a single base price recalculation/update job per site for all changed items to avoid conflicts when multiple items share the same base price version.
@@ -139,37 +188,45 @@ class METVendorChangeRequestService
                 this.runBasePriceVersionJob(basePriceSiteId, basePriceItemSet);
             }
 
+            logList.insertDatabase();
             ttscommit;
         }
         catch (Exception::CLRError)
         {
+            logMessage.Append('\nCLR error occurred.');
             netExcepn = CLRInterop::getLastException();
             throw error(netExcepn.ToString());
         }
         catch (Exception::Deadlock)
         {
+            logMessage.Append('\nDeadlock occurred - retrying.');
             retry;
         }
         catch (Exception::UpdateConflict)
         {
+            logMessage.Append('\nUpdate conflict occurred.');
             if (appl.ttsLevel() == 0)
             {
                 if (xSession::currentRetryCount() >= #RetryNum)
                 {
+                    logMessage.Append('\nUpdate conflict not recovered - retry limit reached.');
                     throw Exception::UpdateConflictNotRecovered;
                 }
                 else
                 {
+                    logMessage.Append('\nRetrying after update conflict.');
                     retry;
                 }
             }
             else
             {
+                logMessage.Append('\nUpdate conflict occurred inside a nested transaction - rethrowing.');
                 throw Exception::UpdateConflict;
             }
         }
         catch
         {
+            logMessage.Append('\nUnhandled exception occurred.');
             exceptionTextFallThrough();
         }
     }
@@ -197,6 +254,7 @@ class METVendorChangeRequestService
 
         if (parentChangeRequest.RecId)
         {
+            logMessage.Append('\nAn open parent change request blocks this record. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId+' Parent change request RecId: '+int642str(parentChangeRequest.RecId));
             return false;
         }
 
@@ -207,12 +265,19 @@ class METVendorChangeRequestService
             && inventDim.InventLocationId == _metVendorChangeRequest.InventLocationId
             && inventDim.InventSiteId == _metVendorChangeRequest.SiteId;
 
+        if (log.ReqItemTableRecid == 0 && reqItemTable.RecId)
+        {
+            log.ReqItemTableRecid = reqItemTable.RecId;
+        }
+
         if (reqItemTable.RecId && reqItemTable.ReqPOType == ReqPOType::Purch && reqItemTable.METInterCompanySourced == NoYes::No)
         {
+            logMessage.Append('\nProcessing vendor change request for standard purchase coverage. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId+' warehouse: '+_metVendorChangeRequest.InventLocationId);
             this.updateItemSubrangeAndPOTORecords(reqItemTable, _metVendorChangeRequest);
         }
         else if (reqItemTable.RecId && reqItemTable.ReqPOType == ReqPOType::Purch && reqItemTable.METInterCompanySourced == NoYes::Yes)
         {
+            logMessage.Append('\nProcessing intercompany vendor change request. Item: '+_metVendorChangeRequest.ItemId+' site: '+_metVendorChangeRequest.SiteId+' warehouse: '+_metVendorChangeRequest.InventLocationId);
             //CB886_IntercompanyFulfilmentProcess
             ReqItemTable    reqItemTableInterComp;
             InventDim       invDimInterComp;
@@ -228,6 +293,7 @@ class METVendorChangeRequestService
 
             if (reqItemTableInterComp.RecId)
             {
+                logMessage.Append('\nItem coverage record found for intercompany vendor change request. Item: '+reqItemTableInterComp.ItemId+' site: '+_metVendorChangeRequest.SiteId+' warehouse: '+_metVendorChangeRequest.InventLocationId);
                 ret = this.validateInterCompanyVendorChangeRequest(inventParameters.METInterCompanyPurchaseLegalEntity, _metVendorChangeRequest.ItemId, _metVendorChangeRequest.SiteId, reqItemTableInterComp.METIntercompanySourcedWarehouse);
                 if (ret)
                 {
@@ -237,6 +303,7 @@ class METVendorChangeRequestService
                 }
                 else
                 {
+                    logMessage.Append('\nIntercompany source still pending. Marking as Error. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId);
                     _metVendorChangeRequest.selectForUpdate(true);
                     _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
                     _metVendorChangeRequest.ChangeRequestLog += strFmt("@MET:PendingVCRInIntComp", inventParameters.METInterCompanyPurchaseLegalEntity, _metVendorChangeRequest.ItemId, reqItemTableInterComp.METIntercompanySourcedWarehouse);
@@ -248,6 +315,7 @@ class METVendorChangeRequestService
 
             if (!reqItemTableInterComp.RecId && !vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
             {
+                logMessage.Append('\nNo intercompany item coverage found. Marking as Error. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId);
                 _metVendorChangeRequest.selectForUpdate(true);
                 _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
                 _metVendorChangeRequest.ChangeRequestLog += "@MET:NoItemCoverageError";
@@ -259,6 +327,7 @@ class METVendorChangeRequestService
         }
         else if (reqItemTable.ReqPOType == ReqPOType::Transfer)
         {
+            logMessage.Append('\nProcessing vendor change request for Transfer type coverage. Item: '+_metVendorChangeRequest.ItemId+', Site: '+_metVendorChangeRequest.SiteId+' warehouse: '+_metVendorChangeRequest.InventLocationId);
             ReqItemTable reqTransfer;
             InventDim invDimTransfer;
             InventDim invDimPurch;
@@ -282,6 +351,7 @@ class METVendorChangeRequestService
 
             if (!reqPurch.RecId && !vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
             {
+                logMessage.Append('\nRelated purchase-side item coverage was not found for the transfer-order vendor change request. Item: '+_metVendorChangeRequest.ItemId+' site: '+_metVendorChangeRequest.SiteId+' warehouse: '+_metVendorChangeRequest.InventLocationId);
                 _metVendorChangeRequest.selectForUpdate(true);
                 _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
                 _metVendorChangeRequest.ChangeRequestLog += "@MET:NoItemCoverageError";
@@ -302,14 +372,25 @@ class METVendorChangeRequestService
 
                 if (!metVendorChangeRequestPO.RecId && metReqPurch.PendingVendAccountNumber == '' && !vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
                 {
+                    logMessage.Append(strFmt('\nNo related purchase-side vendor change request was found and the purchase-side pending vendor is blank. Processing the transfer-order vendor change request directly. Item: %1, Transfer Site: %2, Transfer Warehouse: %3.',
+                        _metVendorChangeRequest.ItemId, _metVendorChangeRequest.SiteId, _metVendorChangeRequest.InventLocationId));
                     this.updateItemSubrangeAndPOTORecords(reqTransfer, _metVendorChangeRequest);
                 }
                 else if (metVendorChangeRequestPO.RecId)
                 {
-                    this.validateVendorChangeRequests(metVendorChangeRequestPO);
+                    logMessage.Append(strFmt('\nRelated purchase-side vendor change request found. Purchase Request RecId: %1, Item: %2, Site: %3, Warehouse: %4. Processing the purchase-side vendor change request before processing the transfer-order request.',
+                        metVendorChangeRequestPO.RecId,
+                        metVendorChangeRequestPO.ItemId,
+                        metVendorChangeRequestPO.SiteId,
+                        metVendorChangeRequestPO.InventLocationId));
+                    ret = this.validateVendorChangeRequests(metVendorChangeRequestPO);
                 }
                 else if (this.validateVendorChangeRequest(_metVendorChangeRequest, reqTransfer))
                 {
+                    logMessage.Append(strFmt('\nTransfer-order vendor change request validation completed successfully. No purchase-side vendor change request requires prior processing. Processing the transfer-order vendor change request directly. Item: %1, Site: %2, Warehouse: %3.',
+                        _metVendorChangeRequest.ItemId,
+                        _metVendorChangeRequest.SiteId,
+                        _metVendorChangeRequest.InventLocationId));
                     this.processNoErrorRecords(_metVendorChangeRequest, reqTransfer);
                     this.updateVendorChangeRequestStatus(_metVendorChangeRequest);
                 }
@@ -317,6 +398,7 @@ class METVendorChangeRequestService
         }
         else if (!reqItemTable.RecId && !vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
         {
+            logMessage.Append('\nItem coverage is not found. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId);
             _metVendorChangeRequest.selectForUpdate(true);
             _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
             _metVendorChangeRequest.ChangeRequestLog += "@MET:NoItemCoverageError";
@@ -324,8 +406,10 @@ class METVendorChangeRequestService
             vendorChangerequestsProcessed.add(_metVendorChangeRequest.RecId);
             ret = false;
         }
-     
+
         this.updateWaitingStatusForRecords(_metVendorChangeRequest);
+
+        logMessage.Append('\nVendor change request validation pass completed. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId+' Result: '+(ret ? 'true' : 'false'));
 
         return ret;
     }
@@ -349,6 +433,7 @@ class METVendorChangeRequestService
                                                         InventLocationId _locationId)
     {
         boolean ret = true;
+        logMessage.Append('\nValidating the inter company change request. Item: '+_itemId+' Site: '+_siteId+' warehouse: '+_locationId+' company: '+_legalEntity);
 
         changecompany(_legalEntity)
         {
@@ -359,6 +444,8 @@ class METVendorChangeRequestService
                 ret = false;
             }
         }
+
+        logMessage.Append(ret ? ' - successful.' : ' - failed, source company request still open.');
         return ret;
     }
 
@@ -375,17 +462,20 @@ class METVendorChangeRequestService
     public void processItemSubRange(MetVendorChangeRequest _metVendorChangeRequest, ReqItemTable _reqItemTable)
     {
         METSubrangeId   subRangeValue;
-         
+
+        logMessage.Append('\nProcessing the item subrange records. Item: '+_metVendorChangeRequest.ItemId+' site: '+_metVendorChangeRequest.SiteId);
         //Check the subrange value
         subRangeValue = this.getSubRangeValue(_metVendorChangeRequest.ItemId, _metVendorChangeRequest.SiteId);
 
         if (subRangeValue)
         {
+            logMessage.Append('\nSubrange value found: '+subRangeValue);
             this.processVendChangeReqInterCompData(_metVendorChangeRequest, _reqItemTable); //Current item
             this.processItemSubRangeChilds(_metVendorChangeRequest, subRangeValue); //Current item subrange
         }
         else
         {
+            logMessage.Append('\nNo subrange value found for this item.');
             this.processVendChangeReqInterCompData(_metVendorChangeRequest, _reqItemTable);
         }
     }
@@ -405,11 +495,14 @@ class METVendorChangeRequestService
         METInventItemOrderSetup metInventItemOrderSetup;
         MetVendorChangeRequest  MetVendorChangeRequestItemSub;
 
+        logMessage.Append('\nProcessing the sub range items. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId+' Subrange: '+_subRangeValue);
+
         while select metInventItemOrderSetup
             where metInventItemOrderSetup.ItemId != _metVendorChangeRequest.ItemId
                 && metInventItemOrderSetup.SiteId == _metVendorChangeRequest.SiteId
                 && metInventItemOrderSetup.SubrangeId == _subRangeValue
         {
+            logMessage.Append('\nValidating the sub range change request. Item: '+metInventItemOrderSetup.ItemId+' Site: '+metInventItemOrderSetup.SiteId);
             this.validateVendorChangeRequestsInterComp(metInventItemOrderSetup.ItemId, metInventItemOrderSetup.SiteId);
         }
 
@@ -445,7 +538,7 @@ class METVendorChangeRequestService
                 && reqItemTable.ItemId == _itemId
                 && inventDim.InventLocationId == vendorChangeRequest.InventLocationId
                 && inventDim.InventSiteId == _siteId;
-        
+
         if (reqItemTable.RecId && reqItemTable.ReqPOType == ReqPOType::Purch && reqItemTable.METInterCompanySourced == NoYes::Yes)
         {
             ReqItemTable    reqItemTableInterComp;
@@ -462,14 +555,18 @@ class METVendorChangeRequestService
 
             if (reqItemTableInterComp.RecId)
             {
+                logMessage.Append('\nIntercompany item coverage found. Item coverage RecId: '+int642str(reqItemTableInterComp.RecId)+' for Item: '+vendorChangeRequest.ItemId+' Site: '+vendorChangeRequest.SiteId);
+                logMessage.Append('\nValidating the intercompany vendor change request. Item: '+vendorChangeRequest.ItemId+' Site: '+vendorChangeRequest.SiteId);
                 if (this.validateInterCompanyVendorChangeRequest(inventParameters.METInterCompanyPurchaseLegalEntity, vendorChangeRequest.ItemId, vendorChangeRequest.SiteId, vendorChangeRequest.InventLocationId))
                 {
+                    logMessage.Append('\nProcessing the intercompany vendor change for subrange item. Item: '+reqItemTable.ItemId+' Site: '+vendorChangeRequest.SiteId);
                     this.processVendChangeReqInterCompData(vendorChangeRequest, reqItemTable);
                 }
             }
 
             if (!reqItemTableInterComp.RecId && !vendorChangerequestsProcessed.in(vendorChangeRequest.RecId))
             {
+                logMessage.Append('\nNo intercompany item coverage found. Marking as Error. Item: '+vendorChangeRequest.ItemId+' Site: '+vendorChangeRequest.SiteId);
                 vendorChangeRequest.selectForUpdate(true);
                 vendorChangeRequest.Status = METVendChangeReqStatus::Error;
                 vendorChangeRequest.ChangeRequestLog += "@MET:NoItemCoverageError";
@@ -496,6 +593,8 @@ class METVendorChangeRequestService
 
         MetVendorChangeRequest metVendorChangeRequest;
 
+        logMessage.Append('\nResetting future-dated records at site '+_metVendorChangeRequest.SiteId+' back to Waiting.');
+
         update_recordset metVendorChangeRequest
             setting Status = METVendChangeReqStatus::Waiting
             where metVendorChangeRequest.ChangeReqEffectiveDate > currentDate
@@ -519,15 +618,26 @@ class METVendorChangeRequestService
         ItemId itemId;
         METSIteControllingAndSubOrdinateSetup cControllingSiteSetup;
 
+        if (_metVendorChangeRequest.ItemId == _reqItemTable.ItemId)
+        {
+            logMessage.Append('\n\n\nVendor change request ItemId '+_reqItemTable.ItemId+' Site: '+_metVendorChangeRequest.SiteId+' Warehouse: '+_metVendorChangeRequest.InventLocationId+' started.\nUpdating item coverage vendor and clearing pending vendor account and date. Process started');
+        }
+        else
+        {
+            logMessage.Append('\n\n\nChild item processing started for vendor change request. Parent Item: '+_metVendorChangeRequest.ItemId+', Child Item: '+_reqItemTable.ItemId+', Site: '+_metVendorChangeRequest.SiteId+', Warehouse: '+_metVendorChangeRequest.InventLocationId+'.\nUpdating child item coverage vendor and clearing pending vendor account and date.');
+        }
+
         //CB915_CampbellsSupplierChangeProcess - start
         cControllingSiteSetup = METSIteControllingAndSubOrdinateSetup::findBySite(_metVendorChangeRequest.SiteId);
 
         if (cControllingSiteSetup.RecId)
         {
+            logMessage.Append('\nControlling and subordinate relationship found for these Item: '+_metVendorChangeRequest.ItemId+' site: '+_metVendorChangeRequest.SiteId);
             if (cControllingSiteSetup.IsControllingSite == NoYes::No && _cascadeCSubordinateSite == false)
             {
                 if (!this.validateControllingSiteCompletion(_metVendorChangeRequest, cControllingSiteSetup))
                 {
+                    logMessage.Append('\nControlling site: '+cControllingSiteSetup.ControllingSiteId+' has not completed its own vendor change request. Skipping this record for now.');
                     return;
                 }
             }
@@ -546,12 +656,19 @@ class METVendorChangeRequestService
         //Modified the below condition to fix the Bug 280999 -CB886 - Supplier Change not processed for Child Codes
         if (_reqItemTable.RecId && pendingVendAccount)
         {
+            logMessage.Append('\nUpdating item coverage vendor. Current vendor: '+_reqItemTable.VendId+', Pending vendor: '+pendingVendAccount);
             ttsbegin;
             _reqItemTable.reread();
             _reqItemTable.selectForUpdate(true);
             _reqItemTable.VendId = pendingVendAccount;
             _reqItemTable.update();
             ttscommit;
+            logMessage.Append('\nItem coverage vendor updated successfully. Previous vendor: '+vendAccount+' updated vendor: '+_reqItemTable.VendId);
+            this.addItemWarehouseCoverage(_reqItemTable.ItemId, _metVendorChangeRequest.InventLocationId);
+        }
+        else
+        {
+            logMessage.Append('\nNo pending vendor account found on item coverage - vendor field left unchanged.');
         }
 
         //Task110346_CB409-D365ToPIM-Supplier change request- add Pending vendor account - start
@@ -559,21 +676,25 @@ class METVendorChangeRequestService
         {
             vendAccountNumber = pendingVendAccount;
             vendAccountNumberList.addEnd(vendAccountNumber);
+            logMessage.Append('\nVendor account added to the business-event vendor list. Vendor: '+vendAccountNumber);
         }
 
         //set item number
         if (itemNumber != _reqItemTable.ItemId)
         {
             itemNumber = _reqItemTable.ItemId;
+            logMessage.Append('\nSetting the Item: '+itemNumber);
         }
 
         //add inventlocation
         coverageWareHouseIdList.addEnd(_metVendorChangeRequest.InventLocationId);
         //Task110346_CB409-D365ToPIM-Supplier change request- end
+        logMessage.Append('\nWarehouse added to the business-event coverage list. Warehouse: '+_metVendorChangeRequest.InventLocationId);
 
         // Clear the pending vendor number and date when there is no error.
         this.clearPendingVendorAccountFields(_reqItemTable.RecId);
 
+        logMessage.Append('\nClosing active vendor price records for the previous vendor. Item: '+itemNumber+' Site: '+_metVendorChangeRequest.SiteId);
         // Pricelist of vendor to close
         GUPVendPriceAdmTable gupVendPriceAdmTable;
         GUPVendPriceAdmTrans gupVendPriceAdmTrans;
@@ -587,7 +708,7 @@ class METVendorChangeRequestService
             && gupVendPriceAdmTrans.ItemNum == itemNumber
             && gupVendPriceAdmTrans.ToDate == Global::dateNull()
             && (!calledFromPackChange
-                || (calledFromPackChange 
+                || (calledFromPackChange
                     && gupVendPriceAdmTrans.ItemNum == itemNumber));
 
         // Vendor Price term agreements to close.
@@ -606,13 +727,15 @@ class METVendorChangeRequestService
                     && (gupPricingRuleConditionView.Attribute1 == itemNumber
                         || gupPricingRuleConditionView.Attribute2 == itemNumber)
         {
-            gupPriceTermJournalTrans.ValidTo = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+            logMessage.Append('\nClosing active vendor price term agreement. Item: '+_metVendorChangeRequest.ItemId+' site: '+_metVendorChangeRequest.SiteId);
+            gupPriceTermJournalTrans.ValidTo = (_metVendorChangeRequest.ChangeReqEffectiveDate - 1);
             gupPriceTermJournalTrans.update();
         }
 
         //CB915_CampbellsSupplierChangeProcess - start
         if (cControllingSiteSetup.RecId && cControllingSiteSetup.IsControllingSite)
         {
+            logMessage.Append('\n\n\nStarting vendor change processing for controlling site: '+cControllingSiteSetup.SiteId);
             METVendorChangeRequest subordinateVendorRequest;
             METSIteControllingAndSubOrdinateSetup subordinateSetup;
 
@@ -643,13 +766,18 @@ class METVendorChangeRequestService
 
                 if (this.validateVendorChangeRequest(subordinateVendorRequest, reqItemTableCSite))
                 {
+                    logMessage.Append('\n\n\nProcessing vendor change request for subordinate site. Controlling site: '+cControllingSiteSetup.SiteId+' Subordinate site: '+subordinateVendorRequest.SiteId+' ItemId: '+itemNumber);
                     this.processNoErrorRecords(subordinateVendorRequest, reqItemTableCSite, itemNumber, true);
                     this.updateVendorChangeRequestStatus(subordinateVendorRequest);
+                    logMessage.Append('\n\n\nProcessing child records for subordinate site. Controlling site: '+cControllingSiteSetup.SiteId+' Subordinate site: '+subordinateVendorRequest.SiteId+' ItemId: '+itemNumber);
                     this.updateChangeReqForParentChildItem(subordinateVendorRequest);
                 }
             }
+            logMessage.Append('\nVendor change processing completed for controlling site: '+cControllingSiteSetup.SiteId);
             //CB915_CampbellsSupplierChangeProcess - end
         }
+
+        logMessage.Append('\nVendor change request ItemId '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId+' '+_metVendorChangeRequest.InventLocationId+' is completed for item coverage and updating the vendor field and clearing the pending vendor account and date');
     }
 
 ]]></Source>
@@ -675,28 +803,37 @@ class METVendorChangeRequestService
         // Update the item coverage vendor with the pending vendor number.
         VendAccount vendAccount = _reqItemTable.VendId;
         VendAccount pendingVendAccount = METReqItemTable::find(_reqItemTable.RecId).PendingVendAccountNumber;
+        logMessage.Append('\nThe intercompany vendor change request ItemId '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId+' warehouse: '+_metVendorChangeRequest.InventLocationId+' process started');
 
         if (_reqItemTable.RecId)
         {
+            logMessage.Append('\nUpdating item coverage vendor for intercompany sourcing. Current vendor: '+_reqItemTable.VendId+' new vendor: '+pendingVendAccount);
             _reqItemTable.selectForUpdate(true);
             _reqItemTable.VendId = pendingVendAccount;
             _reqItemTable.update();
+
+            logMessage.Append('\nIntercompany item coverage vendor updated successfully. Old vendor: '+vendAccount+' new vendor: '+_reqItemTable.VendId);
+            this.addItemWarehouseCoverage(_reqItemTable.ItemId, _metVendorChangeRequest.InventLocationId);
         }
 
         if (vendAccountNumber != pendingVendAccount)
         {
             vendAccountNumber = pendingVendAccount;
             vendAccountNumberList.addEnd(vendAccountNumber);
+            logMessage.Append('\nVendor account added to the business-event vendor list. Vendor: '+vendAccountNumber);
         }
 
         //set item number
         if (itemNumber != _reqItemTable.ItemId)
         {
             itemNumber = _reqItemTable.ItemId;
+            logMessage.Append('\nSetting the Item: '+itemNumber);
         }
 
         // Clear the pending vendor number and date when there is no error.
         this.clearPendingVendorAccountFields(_reqItemTable.RecId);
+
+        logMessage.Append('\nClosing active vendor price records for the previous vendor. Item: '+itemNumber+' Site: '+_metVendorChangeRequest.SiteId);
 
         // Pricelist of vendor to close
         GUPVendPriceAdmTable gupVendPriceAdmTable;
@@ -710,7 +847,7 @@ class METVendorChangeRequestService
             && gupVendPriceAdmTable.AccountRelation == vendAccount
             && gupVendPriceAdmTrans.ToDate == Global::dateNull()
             && (!calledFromPackChange
-                || (calledFromPackChange 
+                || (calledFromPackChange
                     && gupVendPriceAdmTrans.ItemNum == itemNumber));
 
 
@@ -727,7 +864,8 @@ class METVendorChangeRequestService
                       && gupPriceTermJournalTable.InventSiteId == _metVendorChangeRequest.SiteId
                       && gupPriceTermJournalTable.AccountRelation == vendAccount
             {
-                gupPriceTermJournalTrans.ValidTo = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+                logMessage.Append('\nClosing active vendor price term agreement. Item: '+_metVendorChangeRequest.ItemId+' site: '+_metVendorChangeRequest.SiteId);
+                gupPriceTermJournalTrans.ValidTo = (_metVendorChangeRequest.ChangeReqEffectiveDate - 1);
                 gupPriceTermJournalTrans.update();
             }
         }
@@ -744,11 +882,13 @@ class METVendorChangeRequestService
                       && (gupPricingRuleConditionView.Attribute1 == itemNumber
                           || gupPricingRuleConditionView.Attribute2 == itemNumber)
             {
-                gupPriceTermJournalTrans.ValidTo = DateTimeUtil::getToday(DateTimeUtil::getUserPreferredTimeZone());
+                logMessage.Append('\nClosing active vendor price term agreement (pack change). Item: '+_metVendorChangeRequest.ItemId+' site: '+_metVendorChangeRequest.SiteId);
+                gupPriceTermJournalTrans.ValidTo = (_metVendorChangeRequest.ChangeReqEffectiveDate - 1);
                 gupPriceTermJournalTrans.update();
             }
         }
         this.updateVendorChangeRequestStatus(_metVendorChangeRequest);
+        logMessage.Append('\nIntercompany vendor change request processing completed. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId+' warehouse: '+_metVendorChangeRequest.InventLocationId);
     }
 
 ]]></Source>
@@ -769,7 +909,8 @@ class METVendorChangeRequestService
         InventDim inventDimLoc;
         METChangeRequestLog errorLog;
         METVendorChangeRequest vendorChangeReq;
-        
+
+        logMessage.Append('\nVendor change and item coverage request validation started. Item: '+_metVendorChangeRequest.ItemId+' site: '+_metVendorChangeRequest.SiteId);
         METInventItemOrderSetup metInventItemOrderSetup = METInventItemOrderSetup::findByItemAndSite(_metVendorChangeRequest.ItemId, _metVendorChangeRequest.SiteId);
         ItemId subRangeItem = metInventItemOrderSetup.SubrangeId;
         METTempItemPackChg tempItemPackChange = metInventItemOrderSetup.TempItemPackChg;
@@ -781,6 +922,7 @@ class METVendorChangeRequestService
         if (!cSiteSetup.RecId)
         //CB915_CampbellsSupplierChangeProcess - end
         {
+            logMessage.Append('\nChecking for open purchase orders that could prevent the vendor change. Item: '+_metVendorChangeRequest.ItemId+' site: '+_metVendorChangeRequest.SiteId+' warehouse: '+_metVendorChangeRequest.InventLocationId);
             if (subRangeItem)
             {
                 select firstonly RecId from purchLine
@@ -806,7 +948,7 @@ class METVendorChangeRequestService
                     && inventDimLoc.InventLocationId == _metVendorChangeRequest.InventLocationId
                     && inventDimLoc.InventSiteId == _metVendorChangeRequest.SiteId;
             }
-       
+
             if (purchLine.RecId)
             {
                 if (subRangeItem)
@@ -818,20 +960,26 @@ class METVendorChangeRequestService
                     errorLog = strFmt("@MET:ErrorOpenPO", _metVendorChangeRequest.ItemId);
                 }
 
+                logMessage.Append('\nOpen purchase order found. Vendor change validation failed. Details: '+errorLog);
+
                 ret = false;
             }
         }
 
+        logMessage.Append('\nValidating pending vendor account and effective date on item coverage. Item: '+_metVendorChangeRequest.ItemId+' site: '+_metVendorChangeRequest.SiteId);
         METReqItemTable metReqItemTable = METReqItemTable::find(_reqItemTable.RecId);
 
         if (!metReqItemTable.PendingVendAccountNumber || !metReqItemTable.PendingVendChangeDate)
         {
+            logMessage.Append('\nValidation failed - pending vendor account or pending vendor change date missing.');
             errorLog += "@MET:ErrorPendingVendorMiss";
             ret = false;
         }
 
+        logMessage.Append('\nChecking for pending temporary item pack changes. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId);
         if (tempItemPackChange)
         {
+            logMessage.Append('\nValidation failed - pending temporary item pack change exists: '+tempItemPackChange);
             errorLog += strFmt("@MET:ErrorPendingPackChanges", _metVendorChangeRequest.ItemId);
             ret = false;
         }
@@ -845,6 +993,7 @@ class METVendorChangeRequestService
             InventDim                             inventDimCSite;
 
             cControllingSite = (!cSiteSetup.IsControllingSite) ? cSiteSetup.controllingSiteSetup() : cSiteSetup;
+            logMessage.Append(strFmt("\nValidating vendor change request against controlling site. Current site: %1, Controlling site: %2.", _metVendorChangeRequest.SiteId, cControllingSite.SiteId));
 
             select firstonly RecId from reqItemTableCSite
                 join InventLocationId, InventSiteId from inventDimCSite
@@ -853,7 +1002,7 @@ class METVendorChangeRequestService
                         && inventDimCSite.InventSiteId == cControllingSite.SiteId
                 join PendingVendAccountNumber from metReqItemTableCSite
                         where metReqItemTableCSite.RefRecId == reqItemTableCSite.RecId;
-                
+
             if (!metReqItemTableCSite.PendingVendAccountNumber)
             {
                 MetVendorChangeRequest metVendorChangeRequesCSite;
@@ -866,6 +1015,7 @@ class METVendorChangeRequestService
 
                 if (metVendorChangeRequesCSite.RecId)
                 {
+                    logMessage.Append('\nValidation failed - active subordinate-site vendor change request found. Site: '+metVendorChangeRequesCSite.SiteId+' ItemId: '+metVendorChangeRequesCSite.ItemId);
                     errorLog += strFmt("@MET:SupplierChangeSubordinateSiteError");
                     ret = false;
                 }
@@ -875,6 +1025,7 @@ class METVendorChangeRequestService
 
         if (ret && !vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
         {
+            logMessage.Append('\nVendor change request validation successful. Status updated to Waiting.');
             _metVendorChangeRequest.selectForUpdate(true);
             _metVendorChangeRequest.Status = METVendChangeReqStatus::Waiting;
             _metVendorChangeRequest.ChangeRequestLog = '';
@@ -884,6 +1035,7 @@ class METVendorChangeRequestService
         {
             if (!vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
             {
+                logMessage.Append('\nVendor change request record status updated as Error. Details: '+errorLog);
                 _metVendorChangeRequest.selectForUpdate(true);
                 _metVendorChangeRequest.Status = METVendChangeReqStatus::Error;
                 _metVendorChangeRequest.ChangeRequestLog = errorLog;
@@ -891,6 +1043,8 @@ class METVendorChangeRequestService
                 vendorChangerequestsProcessed.add(_metVendorChangeRequest.RecId);
             }
         }
+
+        logMessage.Append('\nVendor change request and item coverage validation completed. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId);
 
         return ret;
     }
@@ -910,7 +1064,7 @@ class METVendorChangeRequestService
     {
         METInventItemOrderSetup metInventItemOrderSetup = METInventItemOrderSetup::findByItemAndSite(_itemId, _siteId);
         METSubrangeId           subRangeValue           = metInventItemOrderSetup.SubrangeId;
-        
+
         return subRangeValue;
     }
 
@@ -928,22 +1082,29 @@ class METVendorChangeRequestService
     {
         if (!vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
         {
+            logMessage.Append('\nUpdating the vendor change status '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId+' as ');
             _metVendorChangeRequest.selectForUpdate(true);
 
             if (_metVendorChangeRequestPO.RecId)
             {
+                logMessage.Append(enum2Str(_metVendorChangeRequestPO.Status)+' (mirrored from RecId '+int642str(_metVendorChangeRequestPO.RecId)+')');
                 _metVendorChangeRequest.Status = _metVendorChangeRequestPO.Status;
                 _metVendorChangeRequest.ChangeRequestLog = _metVendorChangeRequestPO.ChangeRequestLog;
             }
             else
             {
+                logMessage.Append('Completed');
                 _metVendorChangeRequest.Status = METVendChangeReqStatus::Completed;
                 _metVendorChangeRequest.ChangeRequestLog = strFmt("@MET:VendorUpdateSuccess", DateTimeUtil::applyTimeZoneOffset(DateTimeUtil::utcNow(), DateTimeUtil::getUserPreferredTimeZone()));
             }
-        
+
             _metVendorChangeRequest.selectForUpdate(true);
             _metVendorChangeRequest.update();
             vendorChangerequestsProcessed.add(_metVendorChangeRequest.RecId);
+        }
+        else
+        {
+            logMessage.Append('\nSkipped status update for '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId+' - RecId already marked processed this run.');
         }
     }
 
@@ -963,9 +1124,11 @@ class METVendorChangeRequestService
 
         if (metReqItemTable.RecId)
         {
+            logMessage.Append('\nClearing pending vendor account and pending vendor change date from item coverage. Pending vendor: '+metReqItemTable.PendingVendAccountNumber+' date: '+datetime2Str(metReqItemTable.PendingVendChangeDate));
             metReqItemTable.PendingVendAccountNumber = '';
             metReqItemTable.PendingVendChangeDate = utcdatetimenull();
             metReqItemTable.update();
+            logMessage.Append('\nPending vendor account and pending vendor change date cleared from item coverage.');
         }
     }
 
@@ -996,13 +1159,15 @@ class METVendorChangeRequestService
                 && metVendorChangeRequestTransfer.InventLocationId == inventDim.InventLocationId
                 && metVendorChangeRequestTransfer.Status != METVendChangeReqStatus::Completed
         {
-            if (_metVendorChangeRequest.Status != METVendChangeReqStatus::Error 
+            if (_metVendorChangeRequest.Status != METVendChangeReqStatus::Error
                && this.validateVendorChangeRequest(metVendorChangeRequestTransfer, reqItemTableTransfer))
             {
+                logMessage.Append('\n\n\nProcessing transfer-order coverage related to the purchase-side vendor change request. PO Item: '+_metVendorChangeRequest.ItemId+' PO Site: '+_metVendorChangeRequest.SiteId+' TO Item: '+metVendorChangeRequestTransfer.ItemId+' Site id: '+metVendorChangeRequestTransfer.SiteId);
                 this.processNoErrorRecords(metVendorChangeRequestTransfer, reqItemTableTransfer);
             }
 
             this.updateVendorChangeRequestStatus(metVendorChangeRequestTransfer, _metVendorChangeRequest);
+            logMessage.Append('\nProcessing related transfer-order child records. Item: '+metVendorChangeRequestTransfer.ItemId+' '+metVendorChangeRequestTransfer.SiteId+'\n\n');
             this.updateRelatedChilds(metVendorChangeRequestTransfer);
         }
     }
@@ -1035,9 +1200,14 @@ class METVendorChangeRequestService
         {
             if (_metVendorChangeRequest.Status != METVendChangeReqStatus::Error)
             {
+                logMessage.Append('\nProcessing vendor change request for child item. Child item: '+childReqItem.ItemId+' Site: '+childInventDim.InventSiteId);
                 //Modified the below condition to fix the Bug 280999 - CB886 - Supplier Change not processed for Child Codes
                 this.processNoErrorRecords(_metVendorChangeRequest, childReqItem, childReqItem.ItemId);
-            }            
+            }
+            else
+            {
+                logMessage.Append('\nSkipping child item cascade - parent request is in Error status. Child item: '+childReqItem.ItemId+' Site: '+childInventDim.InventSiteId);
+            }
         }
     }
 
@@ -1053,6 +1223,7 @@ class METVendorChangeRequestService
     private void updateChangeReqForParentChildItemInterCompPO(METVendorChangeRequest _metVendorChangeRequest)
     {
         METSalesItemSubstitutionParentChild parent;
+        logMessage.Append('\nFinding the intercompany child record for the parent record. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId);
 
         while select parent
             where parent.ParentItemID == _metVendorChangeRequest.ItemId
@@ -1085,6 +1256,7 @@ class METVendorChangeRequestService
 
             if (tempVendChangeReq.RecId && !vendorChangerequestsProcessed.in(tempVendChangeReq.RecId))
             {
+                logMessage.Append('\n\n\nProcessing the temporary pack change record. Item: '+tempVendChangeReq.ItemId+' site: '+tempVendChangeReq.SiteId+'\n\n');
                 tempVendChangeReq.Status = _metVendorChangeRequest.Status;
                 tempVendChangeReq.ChangeRequestLog = _metVendorChangeRequest.ChangeRequestLog;
                 tempVendChangeReq.update();
@@ -1107,8 +1279,11 @@ class METVendorChangeRequestService
     /// <param name = "_metVendorChangeRequest">_metVendorChangeRequest</param>
     private void updateRelatedChilds(MetVendorChangeRequest _metVendorChangeRequest)
     {
+        logMessage.Append('\nProcessing vendor change requests for temporary-pack child items. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId);
         this.updateTemporaryItemPackChangeRecords(_metVendorChangeRequest);
+        logMessage.Append('\n\nProcessing vendor change requests for substitution child items. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId);
         this.updateChangeReqForParentChildItem(_metVendorChangeRequest);
+        logMessage.Append('\nProcessing vendor change requests for transfer-order child items. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId);
         this.updateTransferOrderRelatedToPO(_metVendorChangeRequest);
     }
 
@@ -1123,6 +1298,7 @@ class METVendorChangeRequestService
     /// <param name = "_metVendorChangeRequest">_metVendorChangeRequest</param>
     private void updateRelatedChildsInterCompPO(MetVendorChangeRequest _metVendorChangeRequest)
     {
+        logMessage.Append('\nProcessing intercompany linked child records. Item: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId);
         this.updateChangeReqForParentChildItemInterCompPO(_metVendorChangeRequest);
     }
 
@@ -1140,15 +1316,17 @@ class METVendorChangeRequestService
     private boolean updateItemSubrangeAndPOTORecords(ReqItemTable _reqItemTable, METVendorChangeRequest _metVendorChangeRequest)
     {
         boolean ret;
-        
+
         ret = this.validateVendorChangeRequest(_metVendorChangeRequest, _reqItemTable);
-        
+
         if (ret)
         {
+            logMessage.Append('\nAll vendor change request validations passed. ItemId: '+_metVendorChangeRequest.ItemId+' Site: '+_metVendorChangeRequest.SiteId+' warehouse: '+_metVendorChangeRequest.InventLocationId);
             this.processNoErrorRecords(_metVendorChangeRequest, _reqItemTable);
             this.updateVendorChangeRequestStatus(_metVendorChangeRequest);
         }
 
+        logMessage.Append('\n\nProcessing related child records for the vendor change request. Item: '+_metVendorChangeRequest.ItemId+' site: '+_metVendorChangeRequest.SiteId+'\n\n');
         this.updateRelatedChilds(_metVendorChangeRequest);
 
         return ret;
@@ -1170,7 +1348,12 @@ class METVendorChangeRequestService
     {
         if (BusinessEventsConfigurationReader::isBusinessEventEnabled(classStr(METSupplierChangeCompletedBusinessEvent)))
         {
+            logMessage.Append('\nBusiness event is enabled - sending supplier change completed event for item: '+_itemId);
             METSupplierChangeCompletedBusinessEvent::newFromSupplierChangeCompleted(_itemId, _coverageWhsIdVendAccountNumberList).send();
+        }
+        else
+        {
+            logMessage.Append('\nBusiness event is disabled - skipping supplier change completed event for item: '+_itemId);
         }
     }
 
@@ -1233,6 +1416,28 @@ class METVendorChangeRequestService
             coverageWhsIdVendAccountNumberList.addEnd(strFmt("%1-%2", _warehouseId, vendAccountNumberItr.value()));
             vendAccountNumberItr.next();
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>addItemWarehouseCoverage</Name>
+				<Source><![CDATA[
+    private void addItemWarehouseCoverage(ItemId _itemId, InventLocationId _warehouseId)
+    {
+        List itemWarehouses;
+
+        if (itemWarehouseCoverage.exists(_itemId))
+        {
+            itemWarehouses = itemWarehouseCoverage.lookup(_itemId);
+        }
+        else
+        {
+            itemWarehouses = new List(Types::String);
+            itemWarehouseCoverage.insert(_itemId, itemWarehouses);
+        }
+
+        itemWarehouses.addEnd(_warehouseId);
     }
 
 ]]></Source>
@@ -1328,7 +1533,7 @@ class METVendorChangeRequestService
         gupItemBasePriceCalcJob_All.setMETQuery(query);
 
         processBatchInfo = gupItemBasePriceCalcJob_All.batchInfo();
-        
+
         processBatchInfo.parmRetriesOnFailure(noOfRetriesOnFailure);
         processBatchInfo.parmCaption("@MET:VendChgReqBase" + strFmt(" - %1, %2 items", _siteId, _itemIdSet.elements()));
 
@@ -1375,6 +1580,7 @@ class METVendorChangeRequestService
 
         if (!controllingSiteId)
         {
+            logMessage.Append('\nNo controlling site mapped for this subordinate site - allowing through.');
             // No controlling site mapped - nothing to validate against, allow it through
             return true;
         }
@@ -1400,6 +1606,7 @@ class METVendorChangeRequestService
 
         if (metReqItemTableCSite.PendingVendAccountNumber || openRequestCSite.RecId)
         {
+            logMessage.Append('\nControlling site '+controllingSiteId+' has not completed its own vendor change yet. Pending vendor present: '+(metReqItemTableCSite.PendingVendAccountNumber ? 'true' : 'false')+' Open request found: '+(openRequestCSite.RecId ? 'true' : 'false'));
             // Controlling site hasn't completed its own change yet - block and log per FSD
             if (!vendorChangerequestsProcessed.in(_metVendorChangeRequest.RecId))
             {
@@ -1410,6 +1617,10 @@ class METVendorChangeRequestService
                 vendorChangerequestsProcessed.add(_metVendorChangeRequest.RecId);
             }
             ret = false;
+        }
+        else
+        {
+            logMessage.Append('\nControlling site '+controllingSiteId+' has completed its own vendor change - proceeding.');
         }
 
         return ret;

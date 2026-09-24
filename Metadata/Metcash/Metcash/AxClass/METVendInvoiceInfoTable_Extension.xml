@@ -21,38 +21,44 @@ final class METVendInvoiceInfoTable_Extension
 
         ret = ret && this.metCheckInvoice();
 
-        ret = ret && this.metIsOriginalInvoicePosted();
-
         return ret;
     }
 
 ]]></Source>
 			</Method>
 			<Method>
-				<Name>metIsOriginalInvoicePosted</Name>
+				<Name>delete</Name>
 				<Source><![CDATA[
-    private boolean metIsOriginalInvoicePosted()
+    public void delete()
     {
-        boolean ret = true;
 
-        if (this.METClaimInvoice && this.METClaimForInvoice)
+        VendInvoiceInfoTable infoTable = this;
+
+        next delete();
+
+        if (infoTable.METEDIInvoice)
         {
-            VendInvoiceInfoTable infoTable;
+            VendInvoiceInfoTable infoTableCR;
+            VendInvoiceJour infoJour;
 
-            select firstonly RecId from infoTable
-                where infoTable.METClaimInvoice == NoYes::No
-                && infoTable.InvoiceAccount == this.InvoiceAccount
-                && infoTable.OrderAccount == this.OrderAccount
-                && infoTable.DocumentDate == this.DocumentDate
-                && infoTable.Num == this.METClaimForInvoice;
+            select firstonly forupdate infoTableCR
+                where infoTableCR.METClaimForInvoice == infoTable.Num
+                && infoTableCR.InvoiceAccount == infoTable.InvoiceAccount
+                && infoTableCR.PurchId == infoTable.PurchId
+                && infoTableCR.METClaimInvoice == NoYes::Yes;
 
-            if (infoTable.RecId)
+            select firstonly infoJour
+                where infoJour.InvoiceId == this.Num
+                && infoJour.PurchId == this.PurchId
+                && infoJour.InvoiceAccount == this.InvoiceAccount;
+
+            if (infoTableCR && !infoJour)
             {
-                ret = false;
+                ttsbegin;
+                infoTableCR.delete();
+                ttscommit;
             }
         }
-
-        return ret;
     }
 
 ]]></Source>
@@ -504,10 +510,16 @@ final class METVendInvoiceInfoTable_Extension
     public display METClaimInvoiceNumber displayClaimInvoiceNumber()
     {
         METClaimInvoiceNumber claimNumber;
-
+        //409418 - Per request the invoice number length is truncated to 16 characters including the -CR suffix.
+        //Instead of first 13 characters we are now taking the last 13 characters of the original invoice number.
         if (this.Num && this.displayMETHasClaimLines())
         {
-            claimNumber = strFmt("@MET:PlaceHolder", this.Num, METConstants::VendInvoiceInfoCreditNoteSuffix);
+            int invLength = strLen(this.Num);
+
+
+            claimNumber = invLength > 13 ? subStr(this.Num, (strLen(this.Num) - 12), 13) : this.Num;
+
+            claimNumber = strFmt("@MET:PlaceHolder", claimNumber, METConstants::VendInvoiceInfoCreditNoteSuffix);
         }
 
         return claimNumber;
@@ -580,6 +592,95 @@ final class METVendInvoiceInfoTable_Extension
         }
 
         return ret;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metSetEDIGRNStatus</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Bug 410627 Set the EDI GRN status to Waiting when no packing slip is found for an EDI invoice;
+    /// otherwise, set the status to GRN.
+    /// </summary>
+    public void metSetEDIGRNStatus()
+    {
+        if (this.METEDIInvoice)
+        {
+            if (this.packingSlipId(this)
+                && (this.METEDIGrnStatusValue == METEDIGrnStatus::NA 
+                || this.METEDIGrnStatusValue == METEDIGrnStatus::Waiting))
+            {
+                this.METEDIGrnStatusValue = METEDIGrnStatus::GRN;
+                this.documentDate = VendInvoiceInfoTable::metInvoiceDateForMultipleReceipt(this);
+                this.modifiedField(fieldNum(VendInvoiceInfoTable, DocumentDate));
+            }
+            else if (this.packingSlipId(this) == '' && this.METEDIGrnStatusValue == METEDIGrnStatus::NA)
+            {
+                this.METEDIGrnStatusValue = METEDIGrnStatus::Waiting;
+                this.TransDate = dateNull();
+                this.DocumentDate = dateNull();
+                this.editFixedDueDate(true, dateNull());
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>update</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// update
+    /// </summary>
+    public void update()
+    {
+        this.metSetEDIGRNStatus();
+
+        next update();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metInvoiceDateForMultipleReceipt</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Get the invoice date from the receipts.
+    /// </summary>
+    /// <param name = "_vendInvoiceInfoTable">VendInvoiceInfoTable</param>
+    /// <returns>InvoiceDate</returns>
+    public static InvoiceDate metInvoiceDateForMultipleReceipt(VendInvoiceInfoTable _vendInvoiceInfoTable)
+    {
+        InvoiceDate             invoiceDate;
+        VendPackingSlipJour     vendPackingSlipJour;
+        VendPackingSlipTrans    vendPackingSlipTrans;
+        VendInvoiceInfoSubLine  vendInvoiceInfoSubLine;
+        VendInvoiceInfoLine     vendInvoiceInfoLine;
+
+        if (VendParameters::find().METDefaultInvDate)
+        {
+            select firstonly DeliveryDate from vendPackingSlipJour order by DeliveryDate asc
+                exists join vendPackingSlipTrans
+                where vendPackingSlipTrans.VendPackingSlipJour == vendPackingSlipJour.RecId
+                    exists join VendInvoiceInfoSubLine
+                    where VendInvoiceInfoSubLine.JournalRefRecId == vendPackingSlipTrans.RecId
+                    && VendInvoiceInfoSubLine.JournalRefTableId == tableNum(VendPackingSlipTrans)
+                        exists join vendInvoiceInfoLine
+                        where vendInvoiceInfoLine.RecId == VendInvoiceInfoSubLine.LineRefRecId
+                        && vendInvoiceInfoLine.ParmId == _vendInvoiceInfoTable.ParmId
+                        && vendInvoiceInfoLine.TableRefId == _vendInvoiceInfoTable.TableRefId;
+
+            if (vendPackingSlipJour && vendPackingSlipJour.DeliveryDate != _vendInvoiceInfoTable.DocumentDate)
+            {
+                invoiceDate = vendPackingSlipJour.DeliveryDate;
+            }
+            else
+            {
+                invoiceDate = _vendInvoiceInfoTable.DocumentDate;
+            }
+        }
+        return invoiceDate;
     }
 
 ]]></Source>

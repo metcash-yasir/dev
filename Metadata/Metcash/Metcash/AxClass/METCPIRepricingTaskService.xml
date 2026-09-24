@@ -12,6 +12,7 @@ class METCPIRepricingTaskService extends METSysOperationTaskService
 {
     guid topPickingProcessId;
     SalesId salesId;
+    boolean cpIFlag;
     
 }
 ]]></Declaration>
@@ -25,7 +26,10 @@ class METCPIRepricingTaskService extends METSysOperationTaskService
     /// <param name="_contract">The CPI repricing data contract.</param>
     public void process(METCPIRepricingContract _contract)
     {
+        cpIFlag = _contract.parmCPIFlag();
+
         this.processInternal(_contract);
+
     }
 
 ]]></Source>
@@ -63,9 +67,7 @@ class METCPIRepricingTaskService extends METSysOperationTaskService
         {
             try
             {
-                ttsbegin;
                 this.execute();
-                ttscommit;
             }
             catch (Exception::Error)
             {
@@ -186,41 +188,98 @@ class METCPIRepricingTaskService extends METSysOperationTaskService
     /// </summary>
     private void execute()
     {
-        #OCCRetryCount
+        const int METRetryNum = 2;
         SalesLine                    salesLine;
         METSalesLine                 metSalesLine;
+        METInventTable               metInventTable;
+        
+        SalesTable salesTable = SalesTable::find(salesId);
 
-        try
+        setPrefix(strFmt("@MET:CPISOPricing %1", salesTable.SalesId));
+
+        if (salesTable.METOrderExtractStatus == METOrderExtractStatus::Open)
         {
-            if (SalesTable::find(salesId).METOrderExtractStatus == METOrderExtractStatus::Open)
-            {
-                ttsbegin;
+            try
+            {            
+                // Bug 416940: Manage Legislative Charges - Error in in CPI Sales order Repricing batch job
+                // Broke down the 1 long single transactions into 4 smaller transactions to avoid deadlocks and update conflicts
+                // Removed forupdate locks, unnecessary loops and multiple db trips
 
-                // Process SalesLines linked to the current SalesId
-                while select forupdate salesLine
-                    where salesLine.SalesId == salesId
-                {
-                    // Delete the components after line is reserved for event orders
-                    salesLine.metDeletePriceComponents();
-
-                    if (salesLine.metSalesLine().BonusType == METBonusType::DiscountBonus)
+                // Delete the components for entire order
+                if (cpIFlag)
+                {   
+                    salesTable.metCPIDeletePriceComponents();
+                    // Cancel bonus lines (should not be that many)
+                    // Note the cancellation will trigger Dual Write
+                    while select salesLine
+                    join  metSalesLine
+                     where salesLine.SalesId == salesId
+                        && metSalesLine.SalesLine == salesLine.RecId
+                        && metSalesLine.BonusType == METBonusType::DiscountBonus
+                        && salesLine.SalesStatus != SalesStatus::Canceled
+                          exists join METInventTable
+                            where METInventTable.ItemId == salesLine.ItemId
+                                && METInventTable.METTariffItemCodeBaseRecid != 0
                     {
-                        SalesUpdateRemain::updateDeliveryRemainder(salesLine, 0, 0);
+                        salesLine.metCancelSalesOrderLine();
                     }
 
-                    select firstonly forupdate metSalesLine
-                    where metSalesLine.salesLine == salesLine.RecId;
-
-                    if (metSalesLine.RecId && metSalesLine.OrderedQuantity < salesLine.SalesQty)
+                    // Update the flag for Repricing to A or U based on the indicator
+                    ttsbegin;
+                    while select salesLine
+                    join forupdate metSalesLine
+                     where salesLine.SalesId == salesId
+                        && metSalesLine.SalesLine == salesLine.RecId
+                        && salesLine.SalesStatus != SalesStatus::Canceled
                     {
-                        metSalesLine.OrderedQuantity = salesLine.SalesQty;
+                        metSalesLine.Indicators  = METInventTable::find(salesLine.ItemId).METTariffItemCodeBaseRecid != 0 ? METConstants::A : METConstants::U;
                         metSalesLine.update();
                     }
+                    ttscommit;
+                }
+                else
+                {   
+                    salesTable.metDeletePriceComponents();
+
+                    // Cancel bonus lines (should not be that many)
+                    // Note the cancellation will trigger Dual Write
+                    while select salesLine
+                    join metSalesLine
+                     where salesLine.SalesId == salesId
+                        && metSalesLine.SalesLine == salesLine.RecId
+                        && metSalesLine.BonusType == METBonusType::DiscountBonus
+                        && salesLine.SalesStatus != SalesStatus::Canceled
+                    {
+                        salesLine.metCancelSalesOrderLine();
+                    }
+                    
+                    // Update the flag for Repricing to A
+                    ttsbegin;
+                    while select salesLine
+                    join forupdate metSalesLine
+                     where salesLine.SalesId == salesId
+                        && metSalesLine.SalesLine == salesLine.RecId
+                        && salesLine.SalesStatus != SalesStatus::Canceled
+                    {
+                        metSalesLine.Indicators = METConstants::A;
+                        metSalesLine.update();
+                    }
+                    ttscommit;
 
                 }
 
+                // Update pre-quota qty
+                // Note the OrderedQuantity will trigger Dual Write
+                ttsbegin;
+                update_recordset salesLine
+                    setting SalesQty = metSalesLine.OrderedQuantity
+                    join metSalesLine
+                        where metSalesLine.SalesLine == salesLine.RecId
+                            && salesLine.SalesId == salesId;
+                ttscommit;
+
                 // Update SalesTable header
-                SalesTable salesTable = SalesTable::find(salesId);
+                ttsbegin;
                 METSalesTable metSalesTable = salesTable.metSalesTable();
 
                 metSalesTable.selectForUpdate(true);
@@ -230,36 +289,36 @@ class METCPIRepricingTaskService extends METSysOperationTaskService
 
                 ttscommit;
             }
-        }
-        catch (Exception::Deadlock)
-        {
-            // Retry logic for deadlocks
-            if (xSession::currentRetryCount() < #RetryNum)
+            catch (Exception::Deadlock)
             {
-                retry;
+                if (xSession::currentRetryCount() >= METRetryNum)
+                {
+                    throw Exception::Deadlock;
+                }
+                else
+                {
+                    retry;
+                }
             }
-            else
+            catch (Exception::UpdateConflict)
             {
-                throw Exception::Deadlock;
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= METRetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
             }
-        }
-        catch (Exception::UpdateConflict)
-        {
-            // Retry logic for update conflicts
-            if (appl.ttsLevel() == 0 && xSession::currentRetryCount() < #RetryNum)
-            {
-                retry;
-            }
-            else
-            {
-                throw Exception::UpdateConflictNotRecovered;
-            }
-        }
-        catch (Exception::Error)
-        {
-            // Catch-all for unexpected errors
-            Global::exceptionTextFallThrough();
-        }
+        }        
     }
 
 ]]></Source>

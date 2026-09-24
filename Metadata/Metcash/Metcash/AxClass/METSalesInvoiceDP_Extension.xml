@@ -143,8 +143,8 @@ final class METSalesInvoiceDP_Extension
         salesInvoiceHeaderFooterTmp.METInvoiceReportInternetBankingNotes = custFormLetterParameters.METInvoiceReportInternetBankingNotes;
         //salesInvoiceHeaderFooterTmp.METEFTAccountDetails    = strFmt('BSB: %1 A/C: %2', eftBankAccount.BankSortCode, eftBankAccount.AccountNum);
        
-        salesInvoiceHeaderFooterTmp.METEFTAccountDetails    = subStr(metCustTable.BPayReference, 1, 6);
-        salesInvoiceHeaderFooterTmp.METEFTReferenceText     = subStr(metCustTable.BPayReference, strLen(metCustTable.BPayReference) - 8, 9);
+        salesInvoiceHeaderFooterTmp.METEFTAccountDetails    = subStr(metCustTable.BsbReference, 1, 6);
+        salesInvoiceHeaderFooterTmp.METEFTReferenceText     = subStr(metCustTable.BsbReference, strLen(metCustTable.BsbReference) - 8, 9);
         salesInvoiceHeaderFooterTmp.METStatementDate        = salesInvoiceHeaderFooterTmp.InvoiceDate;
         salesInvoiceHeaderFooterTmp.METBPayBillerCode       = metCustTable.BPayBillerCode;
         salesInvoiceHeaderFooterTmp.METBPayReference        = metCustTable.BPayReference;
@@ -152,7 +152,7 @@ final class METSalesInvoiceDP_Extension
         salesInvoiceHeaderFooterTmp.METCustGroup            = custTable.CustGroup;
         salesInvoiceHeaderFooterTmp.METRepCode              = metCustTable.SalesRepCode;//custTable.metGetCustomerAttribute(custTable.AccountNum, METConstants::Agentnumber);
         salesInvoiceHeaderFooterTmp.METBPayMessage          = custFormLetterParameters.METBpayMessageToCustomer;
-        salesInvoiceHeaderFooterTmp.METDeliverToName        = dirpartyTable.Name;
+        salesInvoiceHeaderFooterTmp.METDeliverToName        = dirpartyTable.NameAlias;
         //salesInvoiceHeaderFooterTmp.METDeliverToAddress     = salesTable.deliveryAddress().Address;
         salesInvoiceHeaderFooterTmp.METDeliverToAddress     = custTable.metGetDeliveryaddress();
         salesInvoiceHeaderFooterTmp.METPaymTerms            = salesTable.Payment;
@@ -311,7 +311,6 @@ final class METSalesInvoiceDP_Extension
             salesInvoiceHeaderFooterTmp.METSupplierInvoice      = metCBCTInvoiceHeaderTable.TaxInvoiceNum;// supplier inv no
             salesInvoiceHeaderFooterTmp.METSupplierName         = metCBCTInvoiceHeaderTable.getVendName(); //suplier name
             salesInvoiceHeaderFooterTmp.METVendorAccount        = metCBCTInvoiceHeaderTable.VendorAccount; //suplier Id
-            salesInvoiceHeaderFooterTmp.METDeliverToAddress     = salesTable.deliveryAddress().Address; //For ALMCT invoice
         }
 
         //Update Charge through invoice details
@@ -420,6 +419,7 @@ final class METSalesInvoiceDP_Extension
         str currentComponent;
         real calculatedLineTotal;
         real currentMapTotal;
+        boolean ismdfcalculated;
 
         // charges eg service fee is calculated here
         while select sum(Value) from metSalesLinePriceComponent
@@ -437,9 +437,10 @@ final class METSalesInvoiceDP_Extension
             select firstonly Qty from custInvoiceTransloc
                 where custInvoiceTransloc.InventTransId == custInvoiceTrans.InventTransId;
                 
-            if (metSalesLinePriceComponent.Component == METConstants::DeliveryFee) // for delivery add mdf value
+            if (metSalesLinePriceComponent.Component == METConstants::DeliveryFee && !ismdfcalculated) // for delivery add mdf value
             {
                 markupTrans markupTrans;
+                ismdfcalculated = true;
 
                 select firstonly CalculatedAmount from markupTrans
                 where markupTrans.TransTableId      == _custInvoiceJour.TableId
@@ -604,10 +605,19 @@ final class METSalesInvoiceDP_Extension
         salesInvoiceTmp.METCountryCode      = metInventTable.CountryCode;
         salesInvoiceTmp.METGTIN             = salesLine.BarCode;
 
-        // === Bug 351188 - ALM invoice picked cases / broken cases logic ===
-        SRSReportDesignName reportDesignName = METSalesOrderTypes::find(_custInvoiceJour.salesTable().METSalesOrderType).SalesInvoiceReportDesignName;
+        // Bug 418899 start - added for all reports if required
+        METWHSPhysDimUOMSite metWHSPhysDimUOMSite;
 
-        boolean isALMReport = (reportDesignName == METConstants::ALM || reportDesignName == METConstants::ALMExportSalesInvoice);
+        select firstonly NetWeight from metWHSPhysDimUOMSite
+                    where metWHSPhysDimUOMSite.ItemId == salesline.ItemId
+                    && metWHSPhysDimUOMSite.UOM == salesline.SalesUnit
+                    && metWHSPhysDimUOMSite.SiteId == salesline.inventDim().InventSiteId;
+            
+        salesInvoiceTmp.metNetWeight = metWHSPhysDimUOMSite.NetWeight * salesInvoiceTmp.qty;
+        //Bug 418899 end 
+
+        // === Bug 351188 - ALM invoice picked cases / broken cases logic ===
+        boolean isALMReport = (parentIndustryKey == METConstants::ALM || parentIndustryKey == METConstants::ALMExportSalesInvoice) ? true : false;
 
         METLegalEntityType metLegalEntityType = CompanyInfo::find().METLegalEntityType;
         if (metLegalEntityType == METLegalEntityType::Liquor && isALMReport)
@@ -616,6 +626,7 @@ final class METSalesInvoiceDP_Extension
             context.custInvoiceTrans = _custInvoiceTrans;
             context.salesLine = salesLine;
         }
+       
     }
 
 ]]></Source>
@@ -664,17 +675,19 @@ final class METSalesInvoiceDP_Extension
 			<Method>
 				<Name>getProductCategory</Name>
 				<Source><![CDATA[
-    private container getProductCategory(VendAccount _vendorAccount)
+    private container getProductCategory(VendAccount _vendorAccount, METCBCTNumber _number)
     {
         METVendTable metVendTable;
-        InventTable inventTable;
-        
-        select firstonly DefaultDimension from inventTable
+        METCBCTInvoiceLine  cbcTInvoiceLine;
+
+        select firstonly FinancialDimension from cbcTInvoiceLine
+            where cbcTInvoiceLine.VendCustType == METCBCTVendCust::Vend
+               && cbcTInvoiceLine.HeaderNumber == _number
             exists join metVendTable
-            where metVendTable.AccountNum == _vendorAccount
-            && metVendTable.ChargeThroughServiceItemId == inventTable.ItemId;
+                where metVendTable.AccountNum == _vendorAccount
+                && metVendTable.ChargeThroughServiceItemId == cbcTInvoiceLine.ItemId;
         
-        return this.getDimensionDisplayValue(inventTable.DefaultDimension ,METConstants::Department);
+        return this.getDimensionDisplayValue(cbcTInvoiceLine.FinancialDimension ,METConstants::Department);
     }
 
 ]]></Source>
@@ -821,7 +834,7 @@ final class METSalesInvoiceDP_Extension
             metSalesCTInvoiceTmp.Number                 =   metCBCTInvoiceHeaderTable.Number;            
             
             [metSalesCTInvoiceTmp.ProdCATDimensionValue,
-                metSalesCTInvoiceTmp.ProductCategoryName] = this.getProductCategory(metSalesCTInvoiceTmp.VendorAccount);
+                metSalesCTInvoiceTmp.ProductCategoryName] = this.getProductCategory(metSalesCTInvoiceTmp.VendorAccount,  metCBCTInvoiceHeaderTable.Number);
 
             metSalesCTInvoiceTmp.DiscValue1 = this.getMarkupValue(_custInvoiceJour.RecId, metCBCTInvoiceHeaderTable.Number, METChargeType::ChargeThroughDiscCode1);
             metSalesCTInvoiceTmp.Disc1Amt = -1 * abs(metSalesCTInvoiceTmp.VendInvoiceAmtInclGST * metSalesCTInvoiceTmp.DiscValue1/100); //282469 passing value as same sign as in markup setup
@@ -910,13 +923,13 @@ final class METSalesInvoiceDP_Extension
         DimensionAttributeValueSetStorage dimStorage = DimensionAttributeValueSetStorage::find(_defaultDimension);
         RecId attributeValueRecId = dimStorage.getValueByDimensionAttribute(DimensionAttribute::findByName(_dimName).RecId);
         DimensionAttributeValue attributeValue = DimensionAttributeValue::find(attributeValueRecId);
-        DimensionFinancialTag finTag = DimensionFinancialTag::find(0);
-        DimensionAttributeDirCategory dimAttributeDirCategory;
+        DimensionFinancialTag finTag;
+        DimensionAttributeDirCategory dimensionAttributeDirCategory;
 
-        select firstonly finTag
-            exists join dimAttributeDirCategory where
-                dimAttributeDirCategory.DimensionAttribute == attributeValue.DimensionAttribute &&
-                finTag.FinancialTagCategory == dimAttributeDirCategory.DirCategory;
+        select firstonly DirCategory from dimensionAttributeDirCategory
+                    where dimensionAttributeDirCategory.DimensionAttribute == attributeValue.DimensionAttribute;
+
+        finTag = DimensionFinancialTag::findByFinancialTagCategoryAndValue(dimensionAttributeDirCategory.DirCategory, attributeValue.DisplayValue);
 
         return [finTag.Value, finTag.Description];
     }
@@ -991,10 +1004,6 @@ final class METSalesInvoiceDP_Extension
 
             // Qty Supplied = picked broken cases value
             caseLine.Qty            = _qty;
-
-            // Qty Ordered = 0 for broken case lines
-            caseLine.METOrderedQty  = 0;
-
             // UOM = EA for broken case lines
             caseLine.SalesUnitTxt   = METConstants::unitEach;
 
@@ -1011,7 +1020,11 @@ final class METSalesInvoiceDP_Extension
                 caseLine.METGSTTotal = (_salesInvoiceTmpBase.METGSTTotal/qtyInEA) * caseLine.Qty;
             }
 
-            
+            if (caseLine.SalesUnitTxt != METConstants::unitEach)
+            {
+                // Qty Ordered = 0 for broken case/Not EA line.
+                caseLine.METOrderedQty = 0;
+            }
             
         }
         else

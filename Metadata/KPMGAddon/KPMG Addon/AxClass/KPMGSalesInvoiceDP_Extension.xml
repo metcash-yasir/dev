@@ -31,7 +31,7 @@ final class KPMGSalesInvoiceDP_Extension
         MarkupTrans markupTrans,markupTransBuf;
         CustInvoiceJour custInvoiceJourBuf;
         TaxTrans taxTransBuf;
-        #define.Admin('Admin')
+        #define.Admin('Admin') 
 
         salesTable = SalesTable::find(salesInvoiceHeaderFooterTmp.SalesId);
         salesInvoiceHeaderFooterTmp.KPMGDeliveryName        = salesTable.DeliveryName;
@@ -45,26 +45,57 @@ final class KPMGSalesInvoiceDP_Extension
         boolean     isReturnOrder = salesTable.SalesType == SalesType::ReturnItem;
         
         //updated code to group based on the code and sum the values.
-        while select MarkupCode, CalculatedAmount,MarkupCategory, Value from markupTrans// group by markupTrans.MarkupCode, markupTrans.Value, markupTrans.MarkupCategory
-            where markupTrans.TransTableId == _custInvoiceJour.TableId
-            && markupTrans.TransRecId == _custInvoiceJour.RecId
-            && markupTrans.CalculatedAmount != 0
+        while select MarkupCode, CalculatedAmount, MarkupCategory, Value, METChargesMethod, METAdvancedCalculation, ModuleType, Txt from markupTrans
+        where markupTrans.TransTableId == _custInvoiceJour.TableId &&
+          markupTrans.TransRecId == _custInvoiceJour.RecId &&
+          markupTrans.CalculatedAmount != 0
         {
-            // Lasernet change request - show all markups including
-            if (markupTrans.MarkupCategory == MarkupCategory::Fixed)
+            MarkupAutoLine markupAutoLine;
+            MarkupAutoTable markupAutoTable;
+
+            if (markupTrans.METAdvancedCalculation)
             {
-                salesInvoiceHeaderFooterTmp.KPMGHeaderCharges  += markupTrans.MarkupCode  + ' ' + METConstants::Dollar  +  num2Str(markupTrans.Value, 1,2, 1,0) + '\n';
-               
-            }
-            else if (markupTrans.MarkupCategory == MarkupCategory::Percent)
-            {
-                salesInvoiceHeaderFooterTmp.KPMGHeaderCharges  += markupTrans.MarkupCode  +  ' ' +  num2Str(markupTrans.Value, 1,2, 1,0) +  METConstants::Percent + '\n';
+                select firstOnly Description from markupAutoTable
+            where markupAutoTable.METAdvancedCalculation == NoYes::Yes
+        exists join markupAutoLine
+            where markupAutoLine.TableRecId == markupAutoTable.RecId
+              && markupAutoLine.TableTableId == markupAutoTable.TableId
+              && markupAutoLine.METChargesMethod == markupTrans.METChargesMethod
+              && markupAutoLine.Value == markupTrans.Value
+              && markupAutoLine.MarkupCode == markupTrans.MarkupCode;
             }
             else
             {
-                salesInvoiceHeaderFooterTmp.KPMGHeaderCharges  += markupTrans.MarkupCode +  ' ' +  num2Str(markupTrans.Value, 1,2, 1,0) + '\n';
+                select firstOnly Description from markupAutoTable
+            where markupAutoTable.METAdvancedCalculation == NoYes::No
+        exists join markupAutoLine
+            where markupAutoLine.TableRecId == markupAutoTable.RecId
+              && markupAutoLine.TableTableId == markupAutoTable.TableId
+              && markupAutoLine.MarkupCategory == markupTrans.MarkupCategory
+              && markupAutoLine.Value == markupTrans.Value
+              && markupAutoLine.MarkupCode == markupTrans.MarkupCode;
             }
-          
+
+            if (!markupAutoTable.Description)
+            {
+                if (markupTrans.MarkupCode == METConstants::MDF)
+                {
+                    markupAutoTable.Description = METConstants::MDFDesc;
+                }
+                else if (markupTrans.markuptable().Txt)
+                {
+                    markupAutoTable.Description = markupTrans.markuptable().Txt;
+                }
+                else
+                {
+                    markupAutoTable.Description = markupTrans.Txt;
+                }
+            }
+     
+     
+            // Lasernet change request - show all markups including
+            salesInvoiceHeaderFooterTmp.KPMGHeaderCharges += markupAutoTable.Description +  ' ' +  num2str(markupTrans.Value, 0, 3, 1, 0) + '\n';
+
             if (markupTrans.MarkupCode == #Admin)
             {
                 salesInvoiceHeaderFooterTmp.METAdminFeeSymbol = (markupTrans.MarkupCategory == MarkupCategory::Fixed) ? METConstants::Dollar : METConstants::Percent;
@@ -359,6 +390,12 @@ final class KPMGSalesInvoiceDP_Extension
         if(metTaxTransStd.TaxCode == METConstants::WET)
         {
             salesInvoiceTmp.METWETValue = abs(metTaxTransStd.SourceTaxAmountCur);
+
+            if(salestableloc.SalesType == SalesType::ReturnItem)
+            {
+                salesInvoiceTmp.METWETValue = -1 * abs(salesInvoiceTmp.METWETValue);
+            }
+
             salesInvoiceTmp.METWET = (salesInvoiceTmp.METWETValue != 0) ? 'Y' : 'N';
 
             if (isALMReport)
@@ -393,10 +430,21 @@ final class KPMGSalesInvoiceDP_Extension
         //Base cost custom change for ALM reports.
         real linecharges;
         real uomConversion = 1.0;
+        boolean isBonusLine = (strScan(salesInvoiceTmp.METINDS, METConstants::BonusInd, 1, strLen(salesInvoiceTmp.METINDS)) > 0);
 
         if (parentIndustryKey == METConstants::ALMOrderType)// and report name alm
         {
-            salesInvoiceTmp.METCost = this.getconversionValue(_custInvoiceTrans,salesLine);
+            if (isBonusLine)
+            {
+                salesInvoiceTmp.METCost       = 0;
+                salesInvoiceTmp.METLucInclGST = (salestableloc.SalesType == SalesType::ReturnItem) ? salesInvoiceTmp.METLucInclGST : salesInvoiceTmp.METDeliveryFee;
+                salesInvoiceTmp.METLucExclGST = 0; 
+                salesInvoiceTmp.METCaseCost   = 0; 
+            }
+            else
+            {
+                salesInvoiceTmp.METCost = this.getconversionValue(_custInvoiceTrans, salesLine);
+            } 
             // only for ALM.
             linecharges = this.getLinecharges(_custInvoiceTrans,salesLine);
         
@@ -436,16 +484,32 @@ final class KPMGSalesInvoiceDP_Extension
         }
         
 
-        salesInvoiceTmp.METRebatesFees = salesLine.metgetSalesLinePriceComponent(salesLine.InventTransId, NoYes::Yes) * _custInvoiceTrans.qty;
+        // 1. Sum only line charges from MarkupTrans where the Description matches METComponentCode with IncludeInRebatesOrFees == Yes
+        
+        MarkupTrans markupTransLine;
+        METComponentCode metComponentCode;
+        real lineRebatesFees = 0;
+
+        while select CalculatedAmount from markupTransLine
+    where markupTransLine.TransTableId == _custInvoiceTrans.TableId
+       && markupTransLine.TransRecId   == _custInvoiceTrans.RecId
+    exists join metComponentCode
+        where metComponentCode.Component   == markupTransLine.Txt
+           && metComponentCode.IncludeInRebatesOrFees == NoYes::Yes
+        {
+            lineRebatesFees += markupTransLine.CalculatedAmount;
+        }
+
+        salesInvoiceTmp.METRebatesFees = lineRebatesFees;
 
         if (parentIndustryKey == METConstants::MFG || parentIndustryKey == METConstants::CSDCustName)
         {
             if (salestableloc.SalesType == SalesType::ReturnItem)
             {
                 // Sum price components and line charges (MarkupAmount) strictly for return orders
-                real totalRebatesFees = (salesLine.metgetSalesLinePriceComponent(salesLine.InventTransId, NoYes::Yes) * _custInvoiceTrans.qty) + salesInvoiceTmp.MarkupAmount;
+               // real totalRebatesFees = (salesLine.metgetSalesLinePriceComponent(salesLine.InventTransId, NoYes::Yes) * _custInvoiceTrans.qty) + salesInvoiceTmp.MarkupAmount;
 
-                salesInvoiceTmp.METRebatesFees     = -1 * abs(totalRebatesFees);
+                salesInvoiceTmp.METRebatesFees     = -1 * abs(lineRebatesFees);
                 salesInvoiceTmp.lineAmount         = _custInvoiceTrans.LineAmount + salesInvoiceTmp.METRebatesFees;
                 salesInvoiceTmp.LineAmountInclTax  = salesInvoiceTmp.lineAmount + salesInvoiceTmp.metgstvalue;
                 salesInvoiceTmp.METLucExclGST      = salesInvoiceTmp.lineAmount;
@@ -522,12 +586,9 @@ final class KPMGSalesInvoiceDP_Extension
                 select sum(value) from metSalesLinePriceComponentloc
                     where metSalesLinePriceComponentloc.Component == METConstants::brokenCaseFee && metSalesLinePriceComponentloc.InventTransId == salesLine.inventtransid;
 
-                if (priceComponentTmp.RecId)
-                {
-                    salesInvoiceTmp.METLucInclGST = -1 * abs(priceComponentTmp.ExtValue + salesInvoiceTmp.METWETValue + salesInvoiceTmp.METDeliveryFee + salesInvoiceTmp.METGSTTotal + metSalesLinePriceComponentloc.Value);
+                salesInvoiceTmp.METLucInclGST = -1 * abs(priceComponentTmp.ExtValue + salesInvoiceTmp.METWETValue + salesInvoiceTmp.METDeliveryFee + salesInvoiceTmp.METGSTTotal + metSalesLinePriceComponentloc.Value);
 
-                    salesInvoiceTmp.METLucExclGST = -1 * abs(salesInvoiceTmp.METLucInclGST - salesInvoiceTmp.METGSTTotal);
-                }
+                salesInvoiceTmp.METLucExclGST = -1 * abs(salesInvoiceTmp.METLucInclGST - salesInvoiceTmp.METGSTTotal);
 
                 //salesInvoiceTmp.METLucInclGST = -1 * abs(salesInvoiceTmp.METLucInclGST);
             }
@@ -564,14 +625,14 @@ final class KPMGSalesInvoiceDP_Extension
         }
 
         //Bug 405074 - CR - UAT - DEMAND - LIQUOR - Validate that PE Pricing - Raise a manual order in PE as a Bonus Stock Override - did not invoice correctly - start.
-        if (salesInvoiceTmp.METINDS == METConstants::BonusInd)
+        if (parentIndustryKey == METConstants::ALMOrderType && isBonusLine)
         {
-            salesInvoiceTmp.METCaseCost = 0;
+            salesInvoiceTmp.METCaseCost   = 0;
             salesInvoiceTmp.METLucInclGST = (salestableloc.SalesType == SalesType::ReturnItem) ? salesInvoiceTmp.METLucInclGST : salesInvoiceTmp.METDeliveryFee;
-            salesInvoiceTmp.METLucExclGST = 0;
+            salesInvoiceTmp.METLucExclGST = 0; 
+            salesInvoiceTmp.metcost       = 0;
         }
         //Bug 405074 - CR - UAT - DEMAND - LIQUOR - Validate that PE Pricing - Raise a manual order in PE as a Bonus Stock Override - did not invoice correctly - end.
-
     }
 
 ]]></Source>

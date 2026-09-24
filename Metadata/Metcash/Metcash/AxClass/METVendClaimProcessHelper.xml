@@ -148,6 +148,19 @@ internal final class METVendClaimProcessHelper
         this.initCostingVersion();
 
         activationDate = DateTimeUtil::getSystemDate(DateTimeUtil::getUserPreferredTimeZone());
+
+        utcDateTime utcNow;
+        utcDateTime      localNow;
+        TimeZone preferredTimeZone;
+
+        utcNow           = DateTimeUtil::utcNow();
+        preferredTimeZone = DateTimeUtil::getUserPreferredTimeZone();
+
+        info(strFmt("GUP Item Base Price processing started. UTC Now: %1 | Preferred TZ: %3 | Activation Date: %4 | Site: %5", DateTimeUtil::toStr(utcNow),
+                                                                                                                                enum2Str(preferredTimeZone), 
+                                                                                                                                date2Str(activationDate, 123, DateDay::Digits2, DateSeparator::Slash, DateMonth::Digits2, DateSeparator::Slash, DateYear::Digits4),
+                                                                                                                                siteId));
+       
         while select forupdate itemBasePriceLoc
             where itemBasePriceLoc.PriceType == GUPBasePriceType::BasePriceInventoryCost
                 &&  itemBasePriceLoc.Calculated == NoYes::Yes
@@ -158,6 +171,17 @@ internal final class METVendClaimProcessHelper
                 where inventDim.inventDimId == itemBasePriceLoc.InventDimId
                 &&  inventDim.InventSiteId == siteId                
         {
+            info(strFmt("Record selected: RecId=%1 | ItemId=%2 | InventDimId=%3 | " + "PriceType=%4 | Calculated=%5 | FromDate=%6 | " + "ClaimEnabled=%7 | ClaimCreated=%8 | Site=%9",
+            itemBasePriceLoc.RecId,
+            itemBasePriceLoc.ItemId,
+            itemBasePriceLoc.InventDimId,
+            enum2Str(itemBasePriceLoc.PriceType),
+            enum2Str(itemBasePriceLoc.Calculated),
+            date2Str(itemBasePriceLoc.FromDate, 123,  DateDay::Digits2, DateSeparator::Slash, DateMonth::Digits2, DateSeparator::Slash, DateYear::Digits4),
+            enum2Str(itemBasePriceLoc.METVendClaimEnabled),
+            enum2Str(itemBasePriceLoc.METVendClaimCreated),
+            siteId));
+
             try
             {
                 ttsbegin;
@@ -223,6 +247,10 @@ internal final class METVendClaimProcessHelper
         InventDim inventDim;
         boolean ret = false;  
         InventLocation  inventLocation;
+
+        info(strFmt("processInventOnhand START - RecId=%1 | ItemId=%2 | ItemBasePrice InventDimId=%3 | Site=%4",  _itemBasePrice.RecId, _itemBasePrice.ItemId,
+                                                                                                                   _itemBasePrice.InventDimId, siteId));
+
         
         // Bug 259384: CB434 Vendor claim journal is not getting auto posted because of missing key details
         // WH is not copied from supplier list price to item base price when unified pricing feature is enabled therefore inventDim only has site.
@@ -241,11 +269,17 @@ internal final class METVendClaimProcessHelper
             onHandDimParm.initFromInventDim(inventDim);
             InventOnhand    onHand = InventOnhand::newItemDim(_itemBasePrice.ItemId, inventDim, onHandDimParm);
         
-            InventQtyAvailPhysical onHandQtyAvailPhysical = onHand.physicalInvent();
+            InventQtyAvailPhysical onHandQtyAvailPhysical = onHand.postedQty() - onHand.deducted() + onHand.received();
+
+            info(strFmt("On-hand calculated - ItemId=%1 | Warehouse=%2 | InventDimId=%3 | PostedQty=%4 | Deducted=%5 | Received=%6 | AvailablePhysical=%7",
+                        _itemBasePrice.ItemId, inventLocation.InventLocationId, inventDim.InventDimId, onHand.postedQty(), onHand.deducted(), onHand.received(), onHandQtyAvailPhysical));
 
             // if we have stock on hand in the site + WH
             if (onHandQtyAvailPhysical > 0)
             {
+                info(strFmt("Available physical quantity > 0 - Creating vendor claim. ItemId=%1 | Warehouse=%2 | Qty=%3", _itemBasePrice.ItemId, inventLocation.InventLocationId,
+                                                                                                                           onHandQtyAvailPhysical));
+
                 METVendorClaimTable vendorClaimTableLocal = this.initVendorClaimFromItemBasePrice(_itemBasePrice, inventDim, onHandQtyAvailPhysical);
             
                 if (vendorClaimTableLocal.ClaimLineId)
@@ -253,6 +287,10 @@ internal final class METVendClaimProcessHelper
                     recordInsertList.add(vendorClaimTableLocal);
                     ret = true;
                 }
+            }
+            else
+            {
+                info(strFmt("No available physical stock - ItemId=%1 | Warehouse=%2 | AvailablePhysical=%3", _itemBasePrice.ItemId, inventLocation.InventLocationId, onHandQtyAvailPhysical));
             }
         }
 
@@ -277,8 +315,15 @@ internal final class METVendClaimProcessHelper
     {
         METVendorClaimTable     vendorClaimTable;
         InventDim               inventDim = InventDim::find(_itemBasePrice.InventDimId);
-        METAmountCurNew         newPrice = decRound(_itemBasePrice.Price / _itemBasePrice.PriceQty, 2);
-        METAmountCurOld         oldPrice = decRound(this.getItemBasePriceOldPrice(_itemBasePrice.ItemId, inventDim, _itemBasePrice), 2);
+        METAmountCurNew         newPrice;
+        METAmountCurOld         oldPrice = this.getItemBasePriceOldPrice(_itemBasePrice.ItemId, inventDim, _itemBasePrice);
+
+        if (_itemBasePrice.PriceQty)
+        {
+            // Bug 417228: UAT Finance - Stock deval GL amount not correct
+            // Rounding to 5 decimal places
+            newPrice = decRound(_itemBasePrice.Price / _itemBasePrice.PriceQty, 5);
+        }
 
         if (newPrice < oldPrice)
         {
@@ -295,7 +340,7 @@ internal final class METVendClaimProcessHelper
             vendorClaimTable.Qty = _availPhysical;
             vendorClaimTable.OldPrice = oldPrice;
             vendorClaimTable.NewPrice = newPrice;
-            vendorClaimTable.UnitClaimAmount = decRound(vendorClaimTable.OldPrice - vendorClaimTable.NewPrice, 2);
+            vendorClaimTable.UnitClaimAmount = vendorClaimTable.OldPrice - vendorClaimTable.NewPrice; // now 5 decimal places
             vendorClaimTable.VendAccount = _itemBasePrice.AccountRelation;
             vendorClaimTable.ItemGSTGroup = InventTableModule::find(_itemBasePrice.ItemId, ModuleInventPurchSales::Purch).TaxItemGroupId;  
                 
@@ -390,9 +435,11 @@ internal final class METVendClaimProcessHelper
                                                 _itemBasePrice);
         METAmountCurOld amountCurOld;
 
-        if(inventItemPriceOld)
+        if (inventItemPriceOld && inventItemPriceOld.PriceQty)
         {
-            amountCurOld = inventItemPriceOld.Price/inventItemPriceOld.PriceQty; //get the unit price
+            // Bug 417228: UAT Finance - Stock deval GL amount not correct
+            // Rounding to 5 decimal places
+            amountCurOld = decRound(inventItemPriceOld.Price/inventItemPriceOld.PriceQty, 5); //get the unit price
         }
 
         return amountCurOld;
