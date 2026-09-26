@@ -88,21 +88,6 @@ final class METPickingListRegistrationPostingJob
                         }
                     }                    
 
-                    // Bug 246341: CB387 - Dallas Picklist Registration - zero pick quantity is updating the picking list registration when importing using data entity Picklist registration entity
-                    // For 0 pick, status updated to cancel, we also need to cancel the SO line deliver remainder.
-                    // For picking list with multiple lines, status is updated to picked first, then when everything is processed status is updated to completed
-                    if (orderTrans.expeditionStatus != WMSExpeditionStatus::Activated)
-                    {
-                        if (orderTrans.inventTransType == InventTransType::TransferOrderShip && this.isPickingListRegistrationCompleteForOrder(orderTrans))
-                        {
-                            //Added for Task 282558: CB913/CB162 - Campbells -Integration - Campbells Transfer Order Receipt
-                            if (METCampbellTransferOrderProcessor::construct().processCampbellsTransferOrder(InventTransferTable::find(orderTrans.inventTransRefId), true) == false)
-                            {
-                                throw error (strFmt("@MET:ProcessFailedTO", orderTrans.inventTransRefId));
-                            }
-                        }
-                    }
-
                     if (orderTrans.qty == 0)
                     {
                         METSalesOrderShipmentLoadLines  shipmentLoadLines;
@@ -573,6 +558,7 @@ final class METPickingListRegistrationPostingJob
         METDallasPicklistRegPendingProcess pendingProcess;
         WMSOrderTrans orderTrans;
         RefRecId pendingProcessRecId;
+        Map routeTransferMap = new Map(Types::String, Types::String);
 
         container picklistPendingRecords = _contract.conPicklistPendingRecords();
 
@@ -608,6 +594,13 @@ final class METPickingListRegistrationPostingJob
                 }
                 
                 ttscommit;
+
+                if (orderTrans.RecId
+                && orderTrans.inventTransType == InventTransType::TransferOrderShip
+                && this.isPickingListRegistrationCompleteForOrder(orderTrans))
+                {
+                    routeTransferMap.insert(orderTrans.routeId, orderTrans.inventTransRefId);
+                }
             }
             catch (Exception::DuplicateKeyException)
             {
@@ -663,8 +656,127 @@ final class METPickingListRegistrationPostingJob
                     ttscommit;
                 }
             }
-            
+            this.processCampbellsTransferOrders(routeTransferMap);
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processCampbellsTransferOrders</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Auto ships Campbells transfer orders once all pending short-pick records of the route are completed.
+    /// </summary>
+    /// <param name = "_routeTransferMap">Route id to transfer id map.</param>
+    private void processCampbellsTransferOrders(Map _routeTransferMap)
+    {
+        #OCCRetryCount
+        MapEnumerator routeEnumerator = _routeTransferMap.getEnumerator();
+
+        while (routeEnumerator.moveNext())
+        {
+            WMSPickingRouteID   routeId     = routeEnumerator.currentKey();
+            InventTransferId    transferId  = routeEnumerator.currentValue();
+            int                 startLine   = infologLine();
+
+            try
+            {
+                if (this.isRouteReadyForCampbellsProcessing(routeId, transferId))
+                {
+                    ttsbegin;
+
+                    if (METCampbellTransferOrderProcessor::construct().processCampbellsTransferOrder(InventTransferTable::find(transferId), true) == false)
+                    {
+                        throw error(strFmt("@MET:ProcessFailedTO", transferId));
+                    }
+
+                    ttscommit;
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                retry;
+            }
+            catch (Exception::UpdateConflict)
+            {
+                if (xSession::currentRetryCount() >= #RetryNum)
+                {
+                    this.markRoutePendingProcessFailed(routeId, startLine);
+                }
+                else
+                {
+                    retry;
+                }
+            }
+            catch
+            {
+                this.markRoutePendingProcessFailed(routeId, startLine);
+            }
+        }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>isRouteReadyForCampbellsProcessing</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Route is ready when registration is complete, no short-pick record of the route is still open
+    /// and the transfer order has not been shipped yet.
+    /// </summary>
+    private boolean isRouteReadyForCampbellsProcessing(WMSPickingRouteID _routeId, InventTransferId _transferId)
+    {
+        WMSPickingRoute                     pickingRoute;
+        METDallasPicklistRegPendingProcess  pendingProcess;
+
+        select firstonly RecId from pickingRoute
+        where pickingRoute.pickingRouteID   == _routeId
+        &&    pickingRoute.expeditionStatus == WMSExpeditionStatus::Complete;
+
+        if (!pickingRoute.RecId)
+        {
+            return false;
+        }
+
+        select firstonly RecId from pendingProcess
+        where pendingProcess.RouteId == _routeId
+        &&    pendingProcess.Status  != METOrderExtractionPendingProcessStatus::Completed;
+
+        if (pendingProcess.RecId)
+        {
+            return false;
+        }
+
+        return InventTransferTable::find(_transferId).TransferStatus == InventTransferStatus::Created;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>markRoutePendingProcessFailed</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Marks the route's pending records as failed so the pending process job retries them.
+    /// </summary>
+    private void markRoutePendingProcessFailed(WMSPickingRouteID _routeId, int _startLine)
+    {
+        METDallasPicklistRegPendingProcess pendingProcess;
+        str errorTxt = METPickingListRegistrationPostingJob::getInfologSince(_startLine);
+
+        ttsbegin;
+
+        while select forupdate pendingProcess
+        where pendingProcess.RouteId == _routeId
+        {
+            pendingProcess.Status               = METOrderExtractionPendingProcessStatus::Failed;
+            pendingProcess.ProcessEndDateTime   = DateTimeUtil::getSystemDateTime();
+            pendingProcess.RetryCount           += 1;
+            pendingProcess.Error                = errorTxt;
+            pendingProcess.update();
+        }
+
+        ttscommit;
     }
 
 ]]></Source>
