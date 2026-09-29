@@ -18,6 +18,8 @@ class METCustActivityStatementController extends SrsPrintMgmtController implemen
 
     CreatedTransactionId        createdTransactionId, createdHeaderTransactionId;
 
+    
+
 }
 ]]></Declaration>
 		<Methods>
@@ -446,6 +448,12 @@ class METCustActivityStatementController extends SrsPrintMgmtController implemen
 
                     custActivityStatementLines.Txt  = custInvoiceLine ? custInvoiceLine.Description : custTrans.Txt;
                 }
+                //Task_424535_InvoiceDescCustomerStatement:: Begin
+                else if (custTrans.TransType ==LedgerTransType::Sales)
+                {
+                    custActivityStatementLines.Txt  = this.metSetSalesOrderDescription(custTrans);
+                }
+                //Task_424535_InvoiceDescCustomerStatement:: End
                 else
                 {
                     custActivityStatementLines.Txt         = custTrans.Txt;
@@ -725,6 +733,138 @@ class METCustActivityStatementController extends SrsPrintMgmtController implemen
         }
 
         return calcGST;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>findSalesTableFromCustTrans</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Finds the sales order invoice journal behind a statement line.
+    /// Free text invoices are also in CustInvoiceJour but with a blank SalesId.
+    /// </summary>
+    public static SalesTable findSalesTableFromCustTrans(
+        CustAccount _accountNum,
+        Voucher     _voucher,
+        InvoiceId   _invoiceId,
+        TransDate   _transDate)
+    {
+        CustInvoiceJour custInvoiceJour;
+
+        if (_voucher)
+        {
+            select firstonly RecId, SalesId, InvoiceId, InvoiceDate, NumberSequenceGroup, InvoiceAmount, SalesType
+                from custInvoiceJour
+                where custInvoiceJour.InvoiceId      == _invoiceId
+                   && custInvoiceJour.InvoiceDate    == _transDate
+                   && custInvoiceJour.InvoiceAccount == _accountNum
+                   && custInvoiceJour.LedgerVoucher  == _voucher
+                   && custInvoiceJour.SalesId        != '';
+        }
+
+        if (!custInvoiceJour.RecId)
+        {
+            // Statement line without voucher, or voucher differs: match on invoice only.
+            select firstonly RecId, SalesId, InvoiceId, InvoiceDate, NumberSequenceGroup, InvoiceAmount, SalesType
+                from custInvoiceJour
+                where custInvoiceJour.InvoiceId      == _invoiceId
+                   && custInvoiceJour.InvoiceDate    == _transDate
+                   && custInvoiceJour.InvoiceAccount == _accountNum
+                   && custInvoiceJour.SalesId        != '';
+        }
+
+        return custInvoiceJour.salesTable();
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metSetSalesOrderDescription</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Sets CustTrans_Txt for the current sales order transaction.
+    /// Leaves the standard value untouched when nothing resolves.
+    /// </summary>
+    private str metSetSalesOrderDescription(CustTrans  _currentTrans)
+    {
+        SalesTable salesTable = METCustActivityStatementController::findSalesTableFromCustTrans(_currentTrans.AccountNum,
+                                                                                                    _currentTrans.Voucher,
+                                                                                                    _currentTrans.Invoice,
+                                                                                                    _currentTrans.TransDate);
+        if (!salesTable.SalesId)
+        {
+            return '';
+        }
+
+        boolean                 isCreditNote    = this.metIsCreditNote(salesTable, _currentTrans);
+        METCustStmtTransType    stmtTransType   = isCreditNote ? METCustStmtTransType::SalesCreditNote : METCustStmtTransType::SalesInvoice;
+        METCustStmtIndustryKey  industryKey     = METCustActivityStatementController::getIndustryKey(salesTable.SalesId);
+
+        // 1. Form notes setup for the industry key.
+        str description = industryKey ? METCustStmtDescriptionSetup::find(stmtTransType, industryKey).DefaultDescription : '';
+
+        // 2. Invoices only: OSC code of the first sales order line on this invoice.
+        if (!description && !isCreditNote)
+        {
+            SalesLine salesLine     = SalesLine::find(salesTable.SalesId);
+            description             = salesLine.displayMETOSCCode();
+        }
+
+        // 3. Charge-through orders.
+        if (!description && this.metIsChargeThrough(salesTable))
+        {
+            description = isCreditNote ? "@MET:METCustStmtCrDirectCharge" : "@MET:METCustStmtDirectCharge";
+        }
+
+        return description;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>getIndustryKey</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Industry key from the sales order header (FDD 2.1, data source METSalesTable).
+    /// </summary>
+    public static METCustStmtIndustryKey getIndustryKey(SalesId _salesId)
+    {
+        METSalesTable metSalesTable;
+
+        // VERIFY: table / link field / IndustryKey field names in the Metcash model.
+        select firstonly IndustryKey from metSalesTable
+            where metSalesTable.SalesId == _salesId;
+
+        return metSalesTable.IndustryKey;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metIsCreditNote</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Credit note = negative transaction or return order.
+    /// </summary>
+    private boolean metIsCreditNote(SalesTable _salesTable, CustTrans   _currentTrans)
+    {
+        return _currentTrans.AmountCur < 0
+            || _salesTable.SalesType == SalesType::ReturnItem;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>metIsChargeThrough</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// True if the sales order is a charge-through order.
+    /// </summary>
+    private boolean metIsChargeThrough(SalesTable _salesTable)
+    {
+        // Compares against the value stored in METSalesOrderType (see note).
+        return _salesTable.METSalesOrderType == '@MET:METChargeThrough';
     }
 
 ]]></Source>

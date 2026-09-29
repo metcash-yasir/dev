@@ -106,6 +106,7 @@ final class METWMSOrderTrans_Extension
     /// </summary>
     public void changeStatus(WMSExpeditionStatus _newStatus)
     {
+        Info("@MET:WMSOrderTrans");
         next changeStatus(_newStatus);
 
         // CB679 - Backorder processes for NDC & CSD
@@ -150,29 +151,12 @@ final class METWMSOrderTrans_Extension
             metSalesOrderShipmentLoadLines.PickingListComplete = isShipmentLineUpdated;
             metSalesOrderShipmentLoadLines.update();
 
-            shipmentHeader = METSalesOrderShipmentLoadHeader::findByShipmentId(
-                metSalesOrderShipmentLoadLines.ShipmentId, true);
+            Info(strFmt("@MET:ShipmentlinePick", isShipmentLineUpdated, metSalesOrderShipmentLoadLines.ShipmentId, metSalesOrderShipmentLoadLines.OrderNum, metSalesOrderShipmentLoadLines.LineNum));
 
-            if (shipmentHeader.RecId)
-            {
-                // Check if any uncompleted lines remain for this shipment
-                select firstonly RecId from metSalesOrderShipmentLoadLinesCheck
-                    where metSalesOrderShipmentLoadLinesCheck.ShipmentId == metSalesOrderShipmentLoadLines.ShipmentId
-                        && metSalesOrderShipmentLoadLinesCheck.PickingListComplete == NoYes::No;
+            METSalesOrderShipmentLoadHeader::updatePickComplete(metSalesOrderShipmentLoadLines.ShipmentId);
 
-                if (metSalesOrderShipmentLoadLinesCheck.RecId == 0)
-                {
-                    shipmentHeader.ShipmentPickComplete = NoYes::Yes;
-                    shipmentHeader.update();
-                }
-                else
-                {
-                    shipmentHeader.ShipmentPickComplete = NoYes::No;
-                    shipmentHeader.update();
-                }
-            }
         }
-
+        
         ttscommit;
     }
 
@@ -398,43 +382,48 @@ final class METWMSOrderTrans_Extension
                         {
                             inventTransferLine.PdsCWQtyRemainShip = this.PdsCWQty;
                         }
-                        inventTransferLine.QtyRemainShip = this.qty;
+                        inventTransferLine.QtyRemainShip = abs(this.qty - inventTransferLine.QtyShipped);
                         inventTransferLine.updateDeliverRemainder(); //std code contains ttsbegin and ttscommit
 
                         // after TO extract reserved qty is always 0, looking back at bug317650 the fix was done to handle the 0 pick scenario
                         // With partial pick we were always going in this method.
                         //if (inventTransferLine.displayQtyReservedPhysical() == 0)
-                        if (!this.qty)
-                        {
-                            select firstonly METAllowBackOrders from salesTable
-                            join salesLine
-                                where salesTable.SalesId == salesLine.SalesId
-                                && salesLine.InventTransId == metInventTransferLine.SalesLineTransId;
 
-                            if (salesLine.recId && !salesTable.METAllowBackOrders)
+                        boolean isCampbells = METInventTransferTableExt::isCampbellsWarehouse(inventTransferLine.inventDim().InventLocationId);
+
+                        if (isCampbells)
+                        {
+                            if (!this.qty)
                             {
-                                ttsbegin;
-                                salesLine.selectForUpdate(true);
-                                SalesUpdateRemain::construct().updateDeliverRemainder(salesLine, 0, 0, 0);
-                                ttscommit;
+                                select firstonly METAllowBackOrders from salesTable
+                                    join salesLine
+                                        where salesTable.SalesId == salesLine.SalesId
+                                        && salesLine.InventTransId == metInventTransferLine.SalesLineTransId;
+
+                                if (salesLine.recId && !salesTable.METAllowBackOrders)
+                                {
+                                    ttsbegin;
+                                    salesLine.selectForUpdate(true);
+                                    SalesUpdateRemain::construct().updateDeliverRemainder(salesLine, 0, 0, 0);
+                                    ttscommit;
+                                }
                             }
-                        }
 
-                        if (this.qty && metInventTransferLine.SalesId && metInventTransferLine.SalesLineTransId)
-                        {
-                            SalesLine       salesLineLocal      = SalesLine::findInventTransId(metInventTransferLine.SalesLineTransId, true);
-                            SalesTable      salesTableLocal     = salesLineLocal.salesTable();
-                            METSalesLine    metSalesLineLocal   = salesLineLocal.metSalesLine();
+                            if (this.qty && metInventTransferLine.SalesId && metInventTransferLine.SalesLineTransId)
+                            {
+                                SalesLine       salesLineLocal      = SalesLine::findInventTransId(metInventTransferLine.SalesLineTransId, true);
+                                SalesTable      salesTableLocal     = salesLineLocal.salesTable();
+                                METSalesLine    metSalesLineLocal   = salesLineLocal.metSalesLine();
 
-                            if (salesTableLocal.RecId   &&
+                                if (salesTableLocal.RecId   &&
                                 salesLineLocal.RecId    &&
                                 salesTableLocal.METAllowBackOrders == NoYes::No &&
                                 metSalesLineLocal.OrderExtractStatus == METOrderExtractStatus::Extracted)
-                            {
-                                ttsbegin;
-                                SalesUpdateRemain metSalesUpdateRemain = SalesUpdateRemain::construct();
+                                {
+                                    ttsbegin;
+                                    SalesUpdateRemain metSalesUpdateRemain = SalesUpdateRemain::construct();
                                 
-                                metSalesUpdateRemain.metUpdateDeliverRemainder(salesLineLocal,
+                                    metSalesUpdateRemain.metUpdateDeliverRemainder(salesLineLocal,
                                                     EcoResProductUnitConverter::convertGivenUnitSymbolsForReleasedProduct(
                                                     salesLineLocal.ItemId,
                                                     salesLineLocal.InventDimId,
@@ -444,10 +433,10 @@ final class METWMSOrderTrans_Extension
                                                     NoYes::Yes),
                                                     this.qty,
                                                     this.pdsCWQty);
-                                ttscommit;
+                                    ttscommit;
+                                }
                             }
                         }
-
 
                         metInventTransferLine.reread();
                         metInventTransferLine.updateExtractionStatus(METOrderExtractStatus::Extracted);
