@@ -124,33 +124,51 @@ class METSalesOrderExtractionPendingProcess
 			<Method>
 				<Name>processSalesOrder</Name>
 				<Source><![CDATA[
+    /// <summary>
+    /// Branches by ActionToPerform. SOExtractCreateOnlyTO only creates the transfer order.
+    /// SOExtractReservedSOPickAndTO/SOExtractOrderedSOPickOnly/SOExtractReservedSOPickOnly run
+    /// the standard pipeline plus the intercompany leg's pick list; the first also creates the
+    /// transfer order. Everything else just runs the standard pipeline.
+    /// </summary>
+    /// <param name = "_salesId">Sales order to process</param>
+    /// <param name = "_pickingRouteId">Picking route id, if any</param>
+    /// <param name = "_actionToPerform">Action code stamped during extraction</param>
     private void processSalesOrder(SalesId _salesId, WMSPickingRouteID _pickingRouteId = '', str _actionToPerform = '')
     {
-        // Fresh SalesUpdateRemain per SalesId — resets orderCheckUpdateDone cache
+        // Fresh SalesUpdateRemain per SalesId - resets orderCheckUpdateDone cache
         salesUpdateRemain        = null;
         totalCancelledLineCount  = 0;
 
         SalesTable salesTable = SalesTable::find(_salesId);
-        METSalesTable metSalesTable = METSalesTable::findBySalesTable(salesTable.RecId);
 
         if (!salesTable.RecId)
         {
             return;
         }
 
-        if (!salesTable.METAllowBackOrders && !metSalesTable.InternalCrossDockOrder)
-        {
-            this.cancelZeroStockLines(salesTable);
-            salesUpdateRemain = null;
-            this.cancelShortPickLines(salesTable);
-        }
+        METSalesTable metSalesTable = METSalesTable::findBySalesTable(salesTable.RecId);
 
-        this.updateSalesTableStatus(salesTable);
-        this.processTMSOrder(_pickingRouteId, salesTable);
-
-        if (_actionToPerform == METConstants::SOExtractReservedSOPickAndTO)
+        switch (_actionToPerform)
         {
-            this.processCrossDockTransferOrder(salesTable);
+            case METConstants::SOExtractCreateOnlyTO:
+                this.processCrossDockTransferOrder(salesTable);
+                break;
+
+            case METConstants::SOExtractReservedSOPickAndTO:
+                this.processStandardPipeline(salesTable, metSalesTable, _pickingRouteId);
+                this.processIntercompanyPickingList(salesTable);
+                this.processCrossDockTransferOrder(salesTable);
+                break;
+
+            case METConstants::SOExtractOrderedSOPickOnly:
+            case METConstants::SOExtractReservedSOPickOnly:
+                this.processStandardPipeline(salesTable, metSalesTable, _pickingRouteId);
+                this.processIntercompanyPickingList(salesTable);
+                break;
+
+            default:
+                this.processStandardPipeline(salesTable, metSalesTable, _pickingRouteId);
+                break;
         }
 
         info(strFmt("@MET:METExtractionPendingProcessCompleted", _salesId));
@@ -358,13 +376,40 @@ class METSalesOrderExtractionPendingProcess
 			<Method>
 				<Name>processCrossDockTransferOrder</Name>
 				<Source><![CDATA[
-    // Runs only for SOExtractReservedSOPickAndTO. CreateTransferOrder manages its own tts + internal TMS.
+    // Runs for SOExtractReservedSOPickAndTO and SOExtractCreateOnlyTO. CreateTransferOrder manages its own tts + internal TMS.
     private void processCrossDockTransferOrder(SalesTable _salesTable)
     {
         _salesTable.reread();
         METCrossDockTransferOrderProcessorBase::construct(_salesTable).CreateTransferOrder();
 
         info(strFmt("@MET:METCrossDockTOProcessCompleted", _salesTable.SalesId));
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processIntercompanyPickingList</Name>
+				<Source><![CDATA[
+    // Mirrors reservation + pick list posting onto the intercompany purchase order's sales side, in its own company.
+    private void processIntercompanyPickingList(SalesTable _salesTable)
+    {
+        PurchTable purchTable_Reference = _salesTable.referencePurchTable();
+
+        if (!purchTable_Reference.RecId || !TradeInterCompany::checkDataAreaAccess(purchTable_Reference.InterCompanyCompanyId))
+        {
+            return;
+        }
+
+        changeCompany(purchTable_Reference.InterCompanyCompanyId)
+        {
+            SalesTable interCompanySalesTable = purchTable_Reference.interCompanySalesTable();
+
+            METStockReservation::construct(interCompanySalesTable).processV2();
+            METSalesPickingListFulfillmentBatch salesPickingListFulFillmentBatch = new METSalesPickingListFulfillmentBatch();
+            salesPickingListFulFillmentBatch.postIntercompanySalesTablePickList(interCompanySalesTable);
+        }
+
+        info(strFmt("@MET:METIntercompanyPickingListPendingProcessCompleted", _salesTable.SalesId));
     }
 
 ]]></Source>
@@ -380,6 +425,31 @@ class METSalesOrderExtractionPendingProcess
             salesUpdateRemain.metParmIsExtraction(true);
         }
         return salesUpdateRemain;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>processStandardPipeline</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Cancel zero-stock/short-pick lines (unless back orders are allowed or this is an
+    /// internal cross-dock order), then update SO status and trigger the TMS order.
+    /// </summary>
+    /// <param name = "_salesTable">The sales order</param>
+    /// <param name = "_metSalesTable">Metcash sales order extension</param>
+    /// <param name = "_pickingRouteId">Picking route id, if any</param>
+    private void processStandardPipeline(SalesTable _salesTable, METSalesTable _metSalesTable, WMSPickingRouteID _pickingRouteId)
+    {
+        if (!_salesTable.METAllowBackOrders && !_metSalesTable.InternalCrossDockOrder)
+        {
+            this.cancelZeroStockLines(_salesTable);
+            salesUpdateRemain = null;
+            this.cancelShortPickLines(_salesTable);
+        }
+
+        this.updateSalesTableStatus(_salesTable);
+        this.processTMSOrder(_pickingRouteId, _salesTable);
     }
 
 ]]></Source>
