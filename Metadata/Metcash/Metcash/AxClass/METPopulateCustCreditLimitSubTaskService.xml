@@ -24,51 +24,168 @@ public class METPopulateCustCreditLimitSubTaskService
     {
         CustTable                           custTable;
         METCustCreditLimit                  metCustCreditLimit;
-        METPopulateCustCreditLimitService   populateCustCreditLimitService = new METPopulateCustCreditLimitService();
-        List                                custAccounts                   = new List(Types::String);
-        ListEnumerator                      enumerator;
-
-
-        custAccounts    = _dataContract.getCustAccountList();
-        enumerator      = custAccounts.getEnumerator();
-
-        while (enumerator.moveNext())
+        RecId                               fromCustRecId;
+        RecId                               toCustRecId;
+        Map                                 custTransBalances;
+        Map                                 salesEstimates;
+        Map                                 dimensionCache;
+        #OCCRetryCount
+   
+        fromCustRecId = _dataContract.parmFromCustRecId();
+        toCustRecId   = _dataContract.parmToCustRecId();
+        custTransBalances = this.loadCustTransBalances(fromCustRecId,toCustRecId);
+        salesEstimates = this.loadSalesEstimates(fromCustRecId,toCustRecId);
+        dimensionCache = new Map(Types::Int64, Types::Container); // task-local cache for derived dimension values
+          
+        while select CreditMax, AccountNum, CredManAccountStatusId,
+                DefaultDimension, RecId from custTable
+            where custTable.RecId >= fromCustRecId
+                && custTable.RecId <= toCustRecId
+            outer join metCustCreditLimit
+                where metCustCreditLimit.AccountNum == custTable.AccountNum
         {
-            select firstonly CreditMax, AccountNum, CredManAccountStatusId, DefaultDimension from custTable
-                where custTable.AccountNum == enumerator.current()
-                    outer join firstonly metCustCreditLimit
-                        where metCustCreditLimit.AccountNum == custTable.AccountNum;
-            
-            metCustCreditLimit.Balance          = populateCustCreditLimitService.getBalance(custTable.AccountNum);
-            metCustCreditLimit.CreditLimit      = custTable.CreditMax;
-            metCustCreditLimit.CreditStatus     = custTable.CredManAccountStatusId;
-            if(metCustCreditLimit.DefaultDimension != custTable.DefaultDimension)
+            try
             {
-                // Update State & Pillar values
-                metCustCreditLimit.State        = METHelper::getDimensionValue(custTable.DefaultDimension, METConstants::state);
-                metCustCreditLimit.Pillar       = METHelper::getDimensionValue(custTable.DefaultDimension, METConstants::pillar);
-                metCustCreditLimit.ProfitCentre = METHelper::getDimensionValue(custTable.DefaultDimension, METConstants::profitCentre);
-            }
-            metCustCreditLimit.DefaultDimension = custTable.DefaultDimension;
-                
-            if (!metCustCreditLimit.RecId)
-            {
-                metCustCreditLimit.AccountNum       = custTable.AccountNum;
-                metCustCreditLimit.insert();
-            }
-            else if(metCustCreditLimit.Balance != metCustCreditLimit.orig().Balance
+                AmountMST custTransBalance = custTransBalances.exists(custTable.AccountNum) ? custTransBalances.lookup(custTable.AccountNum): 0;
+                AmountMST salesEstimate = salesEstimates.exists(custTable.AccountNum) ? salesEstimates.lookup(custTable.AccountNum): 0;
+
+                // re-select the metCustCreditLimit for this account with an exclusive lock
+                select firstonly forupdate metCustCreditLimit
+                    where metCustCreditLimit.AccountNum == custTable.AccountNum;
+
+                metCustCreditLimit.Balance      = custTransBalance + salesEstimate;
+                metCustCreditLimit.CreditLimit  = custTable.CreditMax;
+                metCustCreditLimit.CreditStatus = custTable.CredManAccountStatusId;
+
+                if(metCustCreditLimit.DefaultDimension != custTable.DefaultDimension)
+                {
+                    int64 defaultDim = custTable.DefaultDimension;
+                    container dimValues;
+
+                    if (dimensionCache.exists(defaultDim))
+                    {
+                        dimValues = dimensionCache.lookup(defaultDim);
+                    }
+                    else
+                    {
+                        dimValues = [ METHelper::getDimensionValue(defaultDim, METConstants::state),
+                                        METHelper::getDimensionValue(defaultDim, METConstants::pillar),
+                                        METHelper::getDimensionValue(defaultDim, METConstants::profitCentre) ];
+                        dimensionCache.insert(defaultDim, dimValues);
+                    }
+
+                    metCustCreditLimit.State        = conPeek(dimValues, 1);
+                    metCustCreditLimit.Pillar       = conPeek(dimValues, 2);
+                    metCustCreditLimit.ProfitCentre = conPeek(dimValues, 3);
+                }
+
+                metCustCreditLimit.DefaultDimension = custTable.DefaultDimension;
+
+                if (!metCustCreditLimit.RecId)
+                {
+                    metCustCreditLimit.AccountNum       = custTable.AccountNum;
+                    metCustCreditLimit.insert();
+                }
+                else if(metCustCreditLimit.Balance != metCustCreditLimit.orig().Balance
                     || metCustCreditLimit.CreditLimit   != metCustCreditLimit.orig().CreditLimit
                     || metCustCreditLimit.CreditStatus  != metCustCreditLimit.orig().CreditStatus
                     || metCustCreditLimit.State         != metCustCreditLimit.orig().State
                     || metCustCreditLimit.Pillar        != metCustCreditLimit.orig().Pillar
                     || metCustCreditLimit.ProfitCentre  != metCustCreditLimit.orig().ProfitCentre)
+                {
+                    ttsbegin;
+                    metCustCreditLimit.selectForUpdate(true);
+                    metCustCreditLimit.update();
+                    ttscommit;
+                }
+            }
+            catch (Exception::UpdateConflict)
             {
-                ttsbegin;
-                metCustCreditLimit.selectForUpdate(true);
-                metCustCreditLimit.update();
-                ttscommit;
+                if (appl.ttsLevel() == 0)
+                {
+                    if (xSession::currentRetryCount() >= #RetryNum)
+                    {
+                        throw Exception::UpdateConflictNotRecovered;
+                    }
+                    else
+                    {
+                        retry;
+                    }
+                }
+                else
+                {
+                    throw Exception::UpdateConflict;
+                }
+            }
+            catch (Exception::Deadlock)
+            {
+                if (appl.ttsLevel() == 0 && xSession::currentRetryCount() < #RetryNum)
+                {
+                    retry;
+                }
+                throw Exception::Deadlock;
             }
         }
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadCustTransBalances</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Loads summed customer transaction balances (AmountMST) grouped by AccountNum for customers whose RecId falls within the provided range.
+    /// </summary>
+    /// <param name="_fromCustRecId">Inclusive lower bound of customer RecId to include.</param>
+    /// <param name="_toCustRecId">Inclusive upper bound of customer RecId to include.</param>
+    /// <returns>Map where key is AccountNum (string) and value is the summed AmountMST (real) for that account.</returns>
+    private Map loadCustTransBalances(RecId _fromCustRecId, RecId _toCustRecId)
+    {
+        Map       balances = new Map(Types::String, Types::Real);
+        CustTrans custTrans;
+        CustTable customerFilter;
+
+        while select AccountNum, sum(AmountMST) from custTrans
+        group by AccountNum
+        exists join customerFilter
+            where customerFilter.AccountNum == custTrans.AccountNum
+               && customerFilter.RecId >= _fromCustRecId
+               && customerFilter.RecId <= _toCustRecId
+        {
+            balances.insert(custTrans.AccountNum, custTrans.AmountMST);
+        }
+
+        return balances;
+    }
+
+]]></Source>
+			</Method>
+			<Method>
+				<Name>loadSalesEstimates</Name>
+				<Source><![CDATA[
+    /// <summary>
+    /// Loads summed sales estimates (Estimate) grouped by customer account for customers whose RecId falls within the provided range.
+    /// </summary>
+    /// <param name="_fromCustRecId">Inclusive lower bound of customer RecId to include.</param>
+    /// <param name="_toCustRecId">Inclusive upper bound of customer RecId to include.</param>
+    /// <returns>Map where the key is CustAccount (string) and the value is the summed Estimate (real) for that account.</returns>
+    private Map loadSalesEstimates(RecId _fromCustRecId, RecId _toCustRecId)
+    {
+        Map        estimates = new Map(Types::String, Types::Real);
+        SalesTable salesTable;
+        CustTable  customerFilter;
+
+        while select CustAccount, sum(Estimate) from salesTable
+        group by CustAccount
+        exists join customerFilter
+            where customerFilter.AccountNum == salesTable.CustAccount
+               && customerFilter.RecId >= _fromCustRecId
+               && customerFilter.RecId <= _toCustRecId
+        {
+            estimates.insert(salesTable.CustAccount, salesTable.Estimate);
+        }
+
+        return estimates;
     }
 
 ]]></Source>
