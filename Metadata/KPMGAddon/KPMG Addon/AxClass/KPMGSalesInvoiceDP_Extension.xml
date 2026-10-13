@@ -468,7 +468,7 @@ final class KPMGSalesInvoiceDP_Extension
             if (_custInvoiceTrans.SalesUnit == METConstants::unitEach)
             {
                 // Final Case Cost
-                salesInvoiceTmp.metcaseCost = salesInvoiceTmp.METCost + (combinedCharges + metSalesLinePriceComponentloc.Value)*uomConversion + salesInvoiceTmp.METDeliveryFee;
+                salesInvoiceTmp.metcaseCost = salesInvoiceTmp.METCost + (combinedCharges + metSalesLinePriceComponentloc.Value)*uomConversion + (salesInvoiceTmp.METDeliveryFee*uomConversion);
             }
             else
             {
@@ -574,36 +574,65 @@ final class KPMGSalesInvoiceDP_Extension
             {
                 salesInvoiceTmp.METLucInclGST = salesInvoiceTmp.metcaseCost * salesInvoiceTmp.Qty;//salesLine.SalesQty;
             }
-            // change value to -ve for return type
+            
+            // Start: Bug 410263 / Bug 429853 - Return order Total Price (Incl. GST) calculation with Broken Case fee
             if (salestableloc.SalesType == SalesType::ReturnItem)
             {
-                METSalesLinePriceComponentTmp priceComponentTmp;
+                METSalesLinePriceComponentTmp priceComponentTmp, priceComponentTmpSource;
+                Amount netAmountExt, wetVal, deliveryFeeExtVal, gstTotalVal, brokenCaseFeeUnit, brokenCaseFeeExt, lineTotalInclGST;
 
-                priceComponentTmp.linkPhysicalTableInstance(METSalesPriceComponents::construct(salesLine.salesTable().SalesType).insertTmp(salesLine));
+                // 1. Retrieve Net Amount Ext safely with fallback
+                priceComponentTmpSource = METSalesPriceComponents::construct(salesLine.salesTable().SalesType).insertTmp(salesLine);
+                if (priceComponentTmpSource)
+                {
+                    priceComponentTmp.setTmpData(priceComponentTmpSource);
+                    select firstonly priceComponentTmp
+                        where priceComponentTmp.PriceComponent == METPriceComponent::NetAmount;
+                }
 
-                select firstonly priceComponentTmp
-                    where priceComponentTmp.PriceComponent == METPriceComponent::NetAmount;
+                if (priceComponentTmp.RecId && priceComponentTmp.ExtValue != 0)
+                {
+                    netAmountExt = abs(priceComponentTmp.ExtValue);
+                }
+                else
+                {
+                    // Fallback ensures base amount is never lost even if price component lookup returns 0
+                    netAmountExt = abs(_custInvoiceTrans.LineAmount);
+                }
 
-                select sum(value) from metSalesLinePriceComponentloc
-                    where metSalesLinePriceComponentloc.Component == METConstants::brokenCaseFee && metSalesLinePriceComponentloc.InventTransId == salesLine.inventtransid;
-                
-                real deliveryFeeExtForReturn = -1 * abs(salesInvoiceTmp.METDeliveryFeeExt);
+                // 2. Retrieve Broken Case Fee and multiply by Qty
+                select sum(Value) from metSalesLinePriceComponentloc
+                    where metSalesLinePriceComponentloc.Component == METConstants::brokenCaseFee
+                       && metSalesLinePriceComponentloc.InventTransId == salesLine.inventtransid;
 
-                salesInvoiceTmp.METLucInclGST = -1 * abs(priceComponentTmp.ExtValue + salesInvoiceTmp.METWETValue + deliveryFeeExtForReturn + salesInvoiceTmp.METGSTTotal + metSalesLinePriceComponentloc.Value);
+                brokenCaseFeeUnit = metSalesLinePriceComponentloc.Value;
+                brokenCaseFeeExt  = abs(brokenCaseFeeUnit * salesInvoiceTmp.Qty);
 
-                salesInvoiceTmp.METLucExclGST = -1 * abs(salesInvoiceTmp.METLucInclGST - salesInvoiceTmp.METGSTTotal);
+                // 3. Extract positive absolute values for all components to prevent sign cancellation inside addition
+                wetVal            = abs(salesInvoiceTmp.METWETValue);
+                deliveryFeeExtVal = abs(salesInvoiceTmp.METDeliveryFeeExt);
+                gstTotalVal       = abs(salesInvoiceTmp.METGSTTotal);
 
-                //salesInvoiceTmp.METLucInclGST = -1 * abs(salesInvoiceTmp.METLucInclGST);
+                // 4. Sum all components and apply negative sign for return order
+                lineTotalInclGST  = netAmountExt + wetVal + deliveryFeeExtVal + gstTotalVal + brokenCaseFeeExt;
+
+                salesInvoiceTmp.METLucInclGST = -1 * lineTotalInclGST;
+                salesInvoiceTmp.METLucExclGST = -1 * (lineTotalInclGST - gstTotalVal);
             }
              
-            if(salesInvoiceTmp.Qty && salesInvoiceTmp.METPackQty)
+            if(salesInvoiceTmp.Qty)
             {
                 real totalPriceExclGSTForLUC = salesInvoiceTmp.METLucInclGST - salesInvoiceTmp.METGSTTotal;
                 
+                real packQty = (_custInvoiceTrans.SalesUnit == METConstants::unitEach) ? 1.0 : salesInvoiceTmp.METPackQty;
+                if (!packQty)
+                {
+                    packQty = 1.0;
+                }
+
                 if (!salesInvoiceTmp.METLucExclGST)
                 {
-                    salesInvoiceTmp.METLucExclGST = (totalPriceExclGSTForLUC / salesInvoiceTmp.Qty) / salesInvoiceTmp.METPackQty;
-                    // salesInvoiceTmp.METLucExclGST       = (totalPriceExclGST/salesInvoiceTmp.Qty)/salesInvoiceTmp.METPackQty;
+                    salesInvoiceTmp.METLucExclGST = (totalPriceExclGSTForLUC / salesInvoiceTmp.Qty) / packQty;
 
                     if (salestableloc.SalesType == SalesType::ReturnItem)
                     {

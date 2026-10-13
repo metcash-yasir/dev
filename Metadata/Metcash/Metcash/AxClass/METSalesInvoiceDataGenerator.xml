@@ -940,21 +940,24 @@ public class METSalesInvoiceDataGenerator
             real combinedCharges = bundleSalesInvoiceTmp.METWETValue + bundleSalesInvoiceTmp.METGSTTotal;
 
             real convertedCharges = (combinedCharges / _custInvoiceTrans.Qty) * uomConversion;
-           
-            // Use your new helper method if the unit is 'ea'
+            
             if (_custInvoiceTrans.SalesUnit == METConstants::unitEach)
             {
-                // Final Case Cost
-                bundleSalesInvoiceTmp.metcaseCost = bundleSalesInvoiceTmp.METCost + convertedCharges + bundleSalesInvoiceTmp.METDeliveryFee + (brokenCaseFeeAmt * uomConversion);
-                bundleSalesInvoiceTmp.LineAmountInclTax = (bundleSalesInvoiceTmp.metcaseCost/uomConversion) * _custInvoiceTrans.Qty;
-                Amount caseGST = (bundleSalesInvoiceTmp.METGSTTotal/_custInvoiceTrans.Qty) * uomConversion;
-                bundleSalesInvoiceTmp.METLucExclGST = ((bundleSalesInvoiceTmp.metcaseCost - caseGST)/_custInvoiceTrans.Qty)/uomConversion;
+                // Multiply Delivery Fee by uomConversion so case cost reflects a full pack
+                real deliveryFeePerCase = bundleSalesInvoiceTmp.METDeliveryFee * uomConversion;// refer 430842 on 13/10)
+                real pickFeePerCase     = brokenCaseFeeAmt * uomConversion;//broken case fee.
+
+                bundleSalesInvoiceTmp.metcaseCost = bundleSalesInvoiceTmp.METCost + convertedCharges + deliveryFeePerCase + pickFeePerCase;
+                bundleSalesInvoiceTmp.LineAmountInclTax = (bundleSalesInvoiceTmp.metcaseCost / uomConversion) * _custInvoiceTrans.Qty;
+                
+                // Fix LUC Excl GST: (Case Cost Excl GST) / uomConversion to prevent double division by Qty
+                Amount caseGST = (bundleSalesInvoiceTmp.METGSTTotal / _custInvoiceTrans.Qty) * uomConversion;
+                bundleSalesInvoiceTmp.METLucExclGST = (bundleSalesInvoiceTmp.metcaseCost - caseGST) / uomConversion;
             }
             else
             {
-                bundleSalesInvoiceTmp.metcaseCost = bundleSalesInvoiceTmp.METCost + convertedCharges + brokenCaseFeeAmt + bundleSalesInvoiceTmp.METDeliveryFee ;
-            }
-           
+                bundleSalesInvoiceTmp.metcaseCost = bundleSalesInvoiceTmp.METCost + convertedCharges + brokenCaseFeeAmt + bundleSalesInvoiceTmp.METDeliveryFee;
+            }  
         }
         else
         {
@@ -1030,38 +1033,64 @@ public class METSalesInvoiceDataGenerator
             // change value to -ve for return type
             if (salestable.SalesType == SalesType::ReturnItem)
             {
-                METSalesLinePriceComponentTmp priceComponentTmp;
+                METSalesLinePriceComponentTmp priceComponentTmp, priceComponentTmpSource;
+                Amount netAmountExt, wetVal, deliveryFeeExtVal, gstTotalVal, brokenCaseFeeUnit, brokenCaseFeeExt, lineTotalInclGST;
 
-                priceComponentTmp.linkPhysicalTableInstance(METSalesPriceComponents::construct(SalesType::ReturnItem).insertTmp(salesLine));
-
-                select firstonly priceComponentTmp
-                    where priceComponentTmp.PriceComponent == METPriceComponent::NetAmount;
-
-                real deliveryFeeExtForReturn =  -1 * abs(bundleSalesInvoiceTmp.METDeliveryFeeExt);
-
-                if (priceComponentTmp.RecId)
+                // 1. Retrieve Net Amount Ext safely with fallback
+                priceComponentTmpSource = METSalesPriceComponents::construct(salesLine.salesTable().SalesType).insertTmp(salesLine);
+                if (priceComponentTmpSource)
                 {
-                    bundleSalesInvoiceTmp.METLucInclGST = -1 * abs(priceComponentTmp.ExtValue + bundleSalesInvoiceTmp.METWETValue + deliveryFeeExtForReturn + bundleSalesInvoiceTmp.METGSTTotal + brokenCaseFeeAmt);
-
-                    bundleSalesInvoiceTmp.METLucExclGST = -1 * abs(bundleSalesInvoiceTmp.METLucInclGST - bundleSalesInvoiceTmp.METGSTTotal);
+                    priceComponentTmp.setTmpData(priceComponentTmpSource);
+                    select firstonly priceComponentTmp
+                        where priceComponentTmp.PriceComponent == METPriceComponent::NetAmount;
                 }
 
+                if (priceComponentTmp.RecId && priceComponentTmp.ExtValue != 0)
+                {
+                    netAmountExt = abs(priceComponentTmp.ExtValue);
+                }
+                else
+                {
+                    // Fallback ensures base amount is never lost even if price component lookup returns 0
+                    netAmountExt = abs(_custInvoiceTrans.LineAmount);
+                }
+                METSalesLinePriceComponent  metSalesLinePriceComponentloc; 
+                // 2. Retrieve Broken Case Fee and multiply by Qty
+                select sum(Value) from metSalesLinePriceComponentloc
+                    where metSalesLinePriceComponentloc.Component == METConstants::brokenCaseFee
+                       && metSalesLinePriceComponentloc.InventTransId == _custInvoiceTrans.inventtransid;
+
+                brokenCaseFeeUnit = metSalesLinePriceComponentloc.Value;
+                brokenCaseFeeExt  = abs(brokenCaseFeeUnit * bundleSalesInvoiceTmp.Qty);
+
+                // 3. Extract positive absolute values for all components to prevent sign cancellation inside addition
+                wetVal            = abs(bundleSalesInvoiceTmp.METWETValue);
+                deliveryFeeExtVal = abs(bundleSalesInvoiceTmp.METDeliveryFeeExt);
+                gstTotalVal       = abs(bundleSalesInvoiceTmp.METGSTTotal);
+
+                // 4. Sum all components and apply negative sign for return order
+                lineTotalInclGST  = netAmountExt + wetVal + deliveryFeeExtVal + gstTotalVal + brokenCaseFeeExt;
+
+                bundleSalesInvoiceTmp.METLucInclGST = -1 * lineTotalInclGST;
+                bundleSalesInvoiceTmp.METLucExclGST = -1 * (lineTotalInclGST - gstTotalVal);
             }
              
-            if(bundleSalesInvoiceTmp.Qty && bundleSalesInvoiceTmp.METPackQty)
+            if (bundleSalesInvoiceTmp.Qty)
             {
-                //real totalPriceExclGSTForLUC = bundleSalesInvoiceTmp.METCaseCost - bundleSalesInvoiceTmp.METGSTTotal;
                 real totalPriceExclGSTForLUC = bundleSalesInvoiceTmp.METLucInclGST - bundleSalesInvoiceTmp.METGSTTotal;
                 
-                if (!bundleSalesInvoiceTmp.METLucExclGST)
+                // Pack Qty is 1 for EA lines; uses METPackQty for outer cartons
+                real packQty = (_custInvoiceTrans.SalesUnit == METConstants::unitEach) ? 1.0 : bundleSalesInvoiceTmp.METPackQty;
+                if (!packQty)
                 {
-                    bundleSalesInvoiceTmp.METLucExclGST = (totalPriceExclGSTForLUC / bundleSalesInvoiceTmp.Qty) / bundleSalesInvoiceTmp.METPackQty;
-                    // bundleSalesInvoiceTmp.METLucExclGST       = (totalPriceExclGST/bundleSalesInvoiceTmp.Qty)/bundleSalesInvoiceTmp.METPackQty;
+                    packQty = 1.0;
+                }
 
-                    if (salestable.SalesType == SalesType::ReturnItem)
-                    {
-                        bundleSalesInvoiceTmp.METLucExclGST = -1 * abs(bundleSalesInvoiceTmp.METLucExclGST);
-                    }
+                bundleSalesInvoiceTmp.METLucExclGST = (totalPriceExclGSTForLUC / bundleSalesInvoiceTmp.Qty) / packQty;
+
+                if (salestable.SalesType == SalesType::ReturnItem)
+                {
+                    bundleSalesInvoiceTmp.METLucExclGST = -1 * abs(bundleSalesInvoiceTmp.METLucExclGST);
                 }
             }
             else
@@ -1917,7 +1946,7 @@ private container getProductCategory(VendAccount _vendorAccount, METCBCTNumber _
                 qty = custInvoiceTransloc.METActualWeight;
             }
 
-            calculatedLineTotal = ((metSalesLinePriceComponent.value * qty) + mdfvalue);
+            calculatedLineTotal = ((metSalesLinePriceComponent.value * abs(qty)) + mdfvalue);
 
             // Aggregate into the Map (If it exists, add to it. If not, insert it.)
             if (componentTotalMap.exists(currentComponent))
@@ -1932,16 +1961,21 @@ private container getProductCategory(VendAccount _vendorAccount, METCBCTNumber _
             
             // Incident 424864: WILO - Demand - Rebates/Fees Extended Details displaying incorrect values on PDF Inv - MFG
             // Handle CW items
-            _salesInvoiceHeaderFooterTmp.METHeaderLineChargesTotal += metSalesLinePriceComponent.value * qty;
+            //_salesInvoiceHeaderFooterTmp.METHeaderLineChargesTotal += metSalesLinePriceComponent.value * abs(qty);
         }
 
         // Loop through the map after the while select finishes to build the final string
+        _salesInvoiceHeaderFooterTmp.METHeaderLineChargesTotal = 0;
+
         mapEnum = componentTotalMap.getEnumerator();
         while (mapEnum.moveNext())
         {
             _salesInvoiceHeaderFooterTmp.METHeaderLineChargesCode  += mapEnum.currentKey() + '\n';
             _salesInvoiceHeaderFooterTmp.METHeaderLineChargesValue += strFmt('%1', mapEnum.currentValue()) + '\n';
+            _salesInvoiceHeaderFooterTmp.METHeaderLineChargesTotal += mapEnum.currentValue();
         }
+         
+        // End: Fix Total Rebates/Fees - Sum directly from componentTotalMap to include MDF and line charges
         return _salesInvoiceHeaderFooterTmp;
     }
 
